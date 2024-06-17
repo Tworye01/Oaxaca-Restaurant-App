@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: http.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	http.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2016 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:generate bundle -o=h2_bundle.go -prefix=http2 -tags=!nethttpomithttp2 golang.org/x/net/http2</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package http</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"io"</code></span>
+<span class="codeline" id="line-11"><code>	"strconv"</code></span>
+<span class="codeline" id="line-12"><code>	"strings"</code></span>
+<span class="codeline" id="line-13"><code>	"time"</code></span>
+<span class="codeline" id="line-14"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>	"golang.org/x/net/http/httpguts"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// incomparable is a zero-width, non-comparable type. Adding it to a struct</code></span>
+<span class="codeline" id="line-20"><code>// makes that struct also non-comparable, and generally doesn't add</code></span>
+<span class="codeline" id="line-21"><code>// any size (as long as it's first).</code></span>
+<span class="codeline" id="line-22"><code>type incomparable [0]func()</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>// maxInt64 is the effective "infinite" value for the Server and</code></span>
+<span class="codeline" id="line-25"><code>// Transport's byte-limiting readers.</code></span>
+<span class="codeline" id="line-26"><code>const maxInt64 = 1&lt;&lt;63 - 1</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// aLongTimeAgo is a non-zero time, far in the past, used for</code></span>
+<span class="codeline" id="line-29"><code>// immediate cancellation of network operations.</code></span>
+<span class="codeline" id="line-30"><code>var aLongTimeAgo = time.Unix(1, 0)</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// omitBundledHTTP2 is set by omithttp2.go when the nethttpomithttp2</code></span>
+<span class="codeline" id="line-33"><code>// build tag is set. That means h2_bundle.go isn't compiled in and we</code></span>
+<span class="codeline" id="line-34"><code>// shouldn't try to use it.</code></span>
+<span class="codeline" id="line-35"><code>var omitBundledHTTP2 bool</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// TODO(bradfitz): move common stuff here. The other files have accumulated</code></span>
+<span class="codeline" id="line-38"><code>// generic http stuff in random places.</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>// contextKey is a value for use with context.WithValue. It's used as</code></span>
+<span class="codeline" id="line-41"><code>// a pointer so it fits in an interface{} without allocation.</code></span>
+<span class="codeline" id="line-42"><code>type contextKey struct {</code></span>
+<span class="codeline" id="line-43"><code>	name string</code></span>
+<span class="codeline" id="line-44"><code>}</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>func (k *contextKey) String() string { return "net/http context value " + k.name }</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>// Given a string of the form "host", "host:port", or "[ipv6::address]:port",</code></span>
+<span class="codeline" id="line-49"><code>// return true if the string includes a port.</code></span>
+<span class="codeline" id="line-50"><code>func hasPort(s string) bool { return strings.LastIndex(s, ":") &gt; strings.LastIndex(s, "]") }</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>// removeEmptyPort strips the empty port in ":port" to ""</code></span>
+<span class="codeline" id="line-53"><code>// as mandated by RFC 3986 Section 6.2.3.</code></span>
+<span class="codeline" id="line-54"><code>func removeEmptyPort(host string) string {</code></span>
+<span class="codeline" id="line-55"><code>	if hasPort(host) {</code></span>
+<span class="codeline" id="line-56"><code>		return strings.TrimSuffix(host, ":")</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	return host</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>func isNotToken(r rune) bool {</code></span>
+<span class="codeline" id="line-62"><code>	return !httpguts.IsTokenRune(r)</code></span>
+<span class="codeline" id="line-63"><code>}</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>// stringContainsCTLByte reports whether s contains any ASCII control character.</code></span>
+<span class="codeline" id="line-66"><code>func stringContainsCTLByte(s string) bool {</code></span>
+<span class="codeline" id="line-67"><code>	for i := 0; i &lt; len(s); i++ {</code></span>
+<span class="codeline" id="line-68"><code>		b := s[i]</code></span>
+<span class="codeline" id="line-69"><code>		if b &lt; ' ' || b == 0x7f {</code></span>
+<span class="codeline" id="line-70"><code>			return true</code></span>
+<span class="codeline" id="line-71"><code>		}</code></span>
+<span class="codeline" id="line-72"><code>	}</code></span>
+<span class="codeline" id="line-73"><code>	return false</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>func hexEscapeNonASCII(s string) string {</code></span>
+<span class="codeline" id="line-77"><code>	newLen := 0</code></span>
+<span class="codeline" id="line-78"><code>	for i := 0; i &lt; len(s); i++ {</code></span>
+<span class="codeline" id="line-79"><code>		if s[i] &gt;= utf8.RuneSelf {</code></span>
+<span class="codeline" id="line-80"><code>			newLen += 3</code></span>
+<span class="codeline" id="line-81"><code>		} else {</code></span>
+<span class="codeline" id="line-82"><code>			newLen++</code></span>
+<span class="codeline" id="line-83"><code>		}</code></span>
+<span class="codeline" id="line-84"><code>	}</code></span>
+<span class="codeline" id="line-85"><code>	if newLen == len(s) {</code></span>
+<span class="codeline" id="line-86"><code>		return s</code></span>
+<span class="codeline" id="line-87"><code>	}</code></span>
+<span class="codeline" id="line-88"><code>	b := make([]byte, 0, newLen)</code></span>
+<span class="codeline" id="line-89"><code>	var pos int</code></span>
+<span class="codeline" id="line-90"><code>	for i := 0; i &lt; len(s); i++ {</code></span>
+<span class="codeline" id="line-91"><code>		if s[i] &gt;= utf8.RuneSelf {</code></span>
+<span class="codeline" id="line-92"><code>			if pos &lt; i {</code></span>
+<span class="codeline" id="line-93"><code>				b = append(b, s[pos:i]...)</code></span>
+<span class="codeline" id="line-94"><code>			}</code></span>
+<span class="codeline" id="line-95"><code>			b = append(b, '%')</code></span>
+<span class="codeline" id="line-96"><code>			b = strconv.AppendInt(b, int64(s[i]), 16)</code></span>
+<span class="codeline" id="line-97"><code>			pos = i + 1</code></span>
+<span class="codeline" id="line-98"><code>		}</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	if pos &lt; len(s) {</code></span>
+<span class="codeline" id="line-101"><code>		b = append(b, s[pos:]...)</code></span>
+<span class="codeline" id="line-102"><code>	}</code></span>
+<span class="codeline" id="line-103"><code>	return string(b)</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>// NoBody is an [io.ReadCloser] with no bytes. Read always returns EOF</code></span>
+<span class="codeline" id="line-107"><code>// and Close always returns nil. It can be used in an outgoing client</code></span>
+<span class="codeline" id="line-108"><code>// request to explicitly signal that a request has zero bytes.</code></span>
+<span class="codeline" id="line-109"><code>// An alternative, however, is to simply set [Request.Body] to nil.</code></span>
+<span class="codeline" id="line-110"><code>var NoBody = noBody{}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>type noBody struct{}</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>func (noBody) Read([]byte) (int, error)         { return 0, io.EOF }</code></span>
+<span class="codeline" id="line-115"><code>func (noBody) Close() error                     { return nil }</code></span>
+<span class="codeline" id="line-116"><code>func (noBody) WriteTo(io.Writer) (int64, error) { return 0, nil }</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>var (</code></span>
+<span class="codeline" id="line-119"><code>	// verify that an io.Copy from NoBody won't require a buffer:</code></span>
+<span class="codeline" id="line-120"><code>	_ io.WriterTo   = NoBody</code></span>
+<span class="codeline" id="line-121"><code>	_ io.ReadCloser = NoBody</code></span>
+<span class="codeline" id="line-122"><code>)</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>// PushOptions describes options for [Pusher.Push].</code></span>
+<span class="codeline" id="line-125"><code>type PushOptions struct {</code></span>
+<span class="codeline" id="line-126"><code>	// Method specifies the HTTP method for the promised request.</code></span>
+<span class="codeline" id="line-127"><code>	// If set, it must be "GET" or "HEAD". Empty means "GET".</code></span>
+<span class="codeline" id="line-128"><code>	Method string</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>	// Header specifies additional promised request headers. This cannot</code></span>
+<span class="codeline" id="line-131"><code>	// include HTTP/2 pseudo header fields like ":path" and ":scheme",</code></span>
+<span class="codeline" id="line-132"><code>	// which will be added automatically.</code></span>
+<span class="codeline" id="line-133"><code>	Header Header</code></span>
+<span class="codeline" id="line-134"><code>}</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>// Pusher is the interface implemented by ResponseWriters that support</code></span>
+<span class="codeline" id="line-137"><code>// HTTP/2 server push. For more background, see</code></span>
+<span class="codeline" id="line-138"><code>// https://tools.ietf.org/html/rfc7540#section-8.2.</code></span>
+<span class="codeline" id="line-139"><code>type Pusher interface {</code></span>
+<span class="codeline" id="line-140"><code>	// Push initiates an HTTP/2 server push. This constructs a synthetic</code></span>
+<span class="codeline" id="line-141"><code>	// request using the given target and options, serializes that request</code></span>
+<span class="codeline" id="line-142"><code>	// into a PUSH_PROMISE frame, then dispatches that request using the</code></span>
+<span class="codeline" id="line-143"><code>	// server's request handler. If opts is nil, default options are used.</code></span>
+<span class="codeline" id="line-144"><code>	//</code></span>
+<span class="codeline" id="line-145"><code>	// The target must either be an absolute path (like "/path") or an absolute</code></span>
+<span class="codeline" id="line-146"><code>	// URL that contains a valid host and the same scheme as the parent request.</code></span>
+<span class="codeline" id="line-147"><code>	// If the target is a path, it will inherit the scheme and host of the</code></span>
+<span class="codeline" id="line-148"><code>	// parent request.</code></span>
+<span class="codeline" id="line-149"><code>	//</code></span>
+<span class="codeline" id="line-150"><code>	// The HTTP/2 spec disallows recursive pushes and cross-authority pushes.</code></span>
+<span class="codeline" id="line-151"><code>	// Push may or may not detect these invalid pushes; however, invalid</code></span>
+<span class="codeline" id="line-152"><code>	// pushes will be detected and canceled by conforming clients.</code></span>
+<span class="codeline" id="line-153"><code>	//</code></span>
+<span class="codeline" id="line-154"><code>	// Handlers that wish to push URL X should call Push before sending any</code></span>
+<span class="codeline" id="line-155"><code>	// data that may trigger a request for URL X. This avoids a race where the</code></span>
+<span class="codeline" id="line-156"><code>	// client issues requests for X before receiving the PUSH_PROMISE for X.</code></span>
+<span class="codeline" id="line-157"><code>	//</code></span>
+<span class="codeline" id="line-158"><code>	// Push will run in a separate goroutine making the order of arrival</code></span>
+<span class="codeline" id="line-159"><code>	// non-deterministic. Any required synchronization needs to be implemented</code></span>
+<span class="codeline" id="line-160"><code>	// by the caller.</code></span>
+<span class="codeline" id="line-161"><code>	//</code></span>
+<span class="codeline" id="line-162"><code>	// Push returns ErrNotSupported if the client has disabled push or if push</code></span>
+<span class="codeline" id="line-163"><code>	// is not supported on the underlying connection.</code></span>
+<span class="codeline" id="line-164"><code>	Push(target string, opts *PushOptions) error</code></span>
+<span class="codeline" id="line-165"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

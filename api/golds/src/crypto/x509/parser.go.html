@@ -1,0 +1,1224 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: parser.go in package crypto/x509</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	parser.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/x509.html">crypto/x509</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package x509</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bytes"</code></span>
+<span class="codeline" id="line-9"><code>	"crypto/dsa"</code></span>
+<span class="codeline" id="line-10"><code>	"crypto/ecdh"</code></span>
+<span class="codeline" id="line-11"><code>	"crypto/ecdsa"</code></span>
+<span class="codeline" id="line-12"><code>	"crypto/ed25519"</code></span>
+<span class="codeline" id="line-13"><code>	"crypto/elliptic"</code></span>
+<span class="codeline" id="line-14"><code>	"crypto/rsa"</code></span>
+<span class="codeline" id="line-15"><code>	"crypto/x509/pkix"</code></span>
+<span class="codeline" id="line-16"><code>	"encoding/asn1"</code></span>
+<span class="codeline" id="line-17"><code>	"errors"</code></span>
+<span class="codeline" id="line-18"><code>	"fmt"</code></span>
+<span class="codeline" id="line-19"><code>	"math/big"</code></span>
+<span class="codeline" id="line-20"><code>	"net"</code></span>
+<span class="codeline" id="line-21"><code>	"net/url"</code></span>
+<span class="codeline" id="line-22"><code>	"strconv"</code></span>
+<span class="codeline" id="line-23"><code>	"strings"</code></span>
+<span class="codeline" id="line-24"><code>	"time"</code></span>
+<span class="codeline" id="line-25"><code>	"unicode/utf16"</code></span>
+<span class="codeline" id="line-26"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>	"golang.org/x/crypto/cryptobyte"</code></span>
+<span class="codeline" id="line-29"><code>	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"</code></span>
+<span class="codeline" id="line-30"><code>)</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// isPrintable reports whether the given b is in the ASN.1 PrintableString set.</code></span>
+<span class="codeline" id="line-33"><code>// This is a simplified version of encoding/asn1.isPrintable.</code></span>
+<span class="codeline" id="line-34"><code>func isPrintable(b byte) bool {</code></span>
+<span class="codeline" id="line-35"><code>	return 'a' &lt;= b &amp;&amp; b &lt;= 'z' ||</code></span>
+<span class="codeline" id="line-36"><code>		'A' &lt;= b &amp;&amp; b &lt;= 'Z' ||</code></span>
+<span class="codeline" id="line-37"><code>		'0' &lt;= b &amp;&amp; b &lt;= '9' ||</code></span>
+<span class="codeline" id="line-38"><code>		'\'' &lt;= b &amp;&amp; b &lt;= ')' ||</code></span>
+<span class="codeline" id="line-39"><code>		'+' &lt;= b &amp;&amp; b &lt;= '/' ||</code></span>
+<span class="codeline" id="line-40"><code>		b == ' ' ||</code></span>
+<span class="codeline" id="line-41"><code>		b == ':' ||</code></span>
+<span class="codeline" id="line-42"><code>		b == '=' ||</code></span>
+<span class="codeline" id="line-43"><code>		b == '?' ||</code></span>
+<span class="codeline" id="line-44"><code>		// This is technically not allowed in a PrintableString.</code></span>
+<span class="codeline" id="line-45"><code>		// However, x509 certificates with wildcard strings don't</code></span>
+<span class="codeline" id="line-46"><code>		// always use the correct string type so we permit it.</code></span>
+<span class="codeline" id="line-47"><code>		b == '*' ||</code></span>
+<span class="codeline" id="line-48"><code>		// This is not technically allowed either. However, not</code></span>
+<span class="codeline" id="line-49"><code>		// only is it relatively common, but there are also a</code></span>
+<span class="codeline" id="line-50"><code>		// handful of CA certificates that contain it. At least</code></span>
+<span class="codeline" id="line-51"><code>		// one of which will not expire until 2027.</code></span>
+<span class="codeline" id="line-52"><code>		b == '&amp;'</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>// parseASN1String parses the ASN.1 string types T61String, PrintableString,</code></span>
+<span class="codeline" id="line-56"><code>// UTF8String, BMPString, IA5String, and NumericString. This is mostly copied</code></span>
+<span class="codeline" id="line-57"><code>// from the respective encoding/asn1.parse... methods, rather than just</code></span>
+<span class="codeline" id="line-58"><code>// increasing the API surface of that package.</code></span>
+<span class="codeline" id="line-59"><code>func parseASN1String(tag cryptobyte_asn1.Tag, value []byte) (string, error) {</code></span>
+<span class="codeline" id="line-60"><code>	switch tag {</code></span>
+<span class="codeline" id="line-61"><code>	case cryptobyte_asn1.T61String:</code></span>
+<span class="codeline" id="line-62"><code>		return string(value), nil</code></span>
+<span class="codeline" id="line-63"><code>	case cryptobyte_asn1.PrintableString:</code></span>
+<span class="codeline" id="line-64"><code>		for _, b := range value {</code></span>
+<span class="codeline" id="line-65"><code>			if !isPrintable(b) {</code></span>
+<span class="codeline" id="line-66"><code>				return "", errors.New("invalid PrintableString")</code></span>
+<span class="codeline" id="line-67"><code>			}</code></span>
+<span class="codeline" id="line-68"><code>		}</code></span>
+<span class="codeline" id="line-69"><code>		return string(value), nil</code></span>
+<span class="codeline" id="line-70"><code>	case cryptobyte_asn1.UTF8String:</code></span>
+<span class="codeline" id="line-71"><code>		if !utf8.Valid(value) {</code></span>
+<span class="codeline" id="line-72"><code>			return "", errors.New("invalid UTF-8 string")</code></span>
+<span class="codeline" id="line-73"><code>		}</code></span>
+<span class="codeline" id="line-74"><code>		return string(value), nil</code></span>
+<span class="codeline" id="line-75"><code>	case cryptobyte_asn1.Tag(asn1.TagBMPString):</code></span>
+<span class="codeline" id="line-76"><code>		if len(value)%2 != 0 {</code></span>
+<span class="codeline" id="line-77"><code>			return "", errors.New("invalid BMPString")</code></span>
+<span class="codeline" id="line-78"><code>		}</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>		// Strip terminator if present.</code></span>
+<span class="codeline" id="line-81"><code>		if l := len(value); l &gt;= 2 &amp;&amp; value[l-1] == 0 &amp;&amp; value[l-2] == 0 {</code></span>
+<span class="codeline" id="line-82"><code>			value = value[:l-2]</code></span>
+<span class="codeline" id="line-83"><code>		}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>		s := make([]uint16, 0, len(value)/2)</code></span>
+<span class="codeline" id="line-86"><code>		for len(value) &gt; 0 {</code></span>
+<span class="codeline" id="line-87"><code>			s = append(s, uint16(value[0])&lt;&lt;8+uint16(value[1]))</code></span>
+<span class="codeline" id="line-88"><code>			value = value[2:]</code></span>
+<span class="codeline" id="line-89"><code>		}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>		return string(utf16.Decode(s)), nil</code></span>
+<span class="codeline" id="line-92"><code>	case cryptobyte_asn1.IA5String:</code></span>
+<span class="codeline" id="line-93"><code>		s := string(value)</code></span>
+<span class="codeline" id="line-94"><code>		if isIA5String(s) != nil {</code></span>
+<span class="codeline" id="line-95"><code>			return "", errors.New("invalid IA5String")</code></span>
+<span class="codeline" id="line-96"><code>		}</code></span>
+<span class="codeline" id="line-97"><code>		return s, nil</code></span>
+<span class="codeline" id="line-98"><code>	case cryptobyte_asn1.Tag(asn1.TagNumericString):</code></span>
+<span class="codeline" id="line-99"><code>		for _, b := range value {</code></span>
+<span class="codeline" id="line-100"><code>			if !('0' &lt;= b &amp;&amp; b &lt;= '9' || b == ' ') {</code></span>
+<span class="codeline" id="line-101"><code>				return "", errors.New("invalid NumericString")</code></span>
+<span class="codeline" id="line-102"><code>			}</code></span>
+<span class="codeline" id="line-103"><code>		}</code></span>
+<span class="codeline" id="line-104"><code>		return string(value), nil</code></span>
+<span class="codeline" id="line-105"><code>	}</code></span>
+<span class="codeline" id="line-106"><code>	return "", fmt.Errorf("unsupported string type: %v", tag)</code></span>
+<span class="codeline" id="line-107"><code>}</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>// parseName parses a DER encoded Name as defined in RFC 5280. We may</code></span>
+<span class="codeline" id="line-110"><code>// want to export this function in the future for use in crypto/tls.</code></span>
+<span class="codeline" id="line-111"><code>func parseName(raw cryptobyte.String) (*pkix.RDNSequence, error) {</code></span>
+<span class="codeline" id="line-112"><code>	if !raw.ReadASN1(&amp;raw, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-113"><code>		return nil, errors.New("x509: invalid RDNSequence")</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	var rdnSeq pkix.RDNSequence</code></span>
+<span class="codeline" id="line-117"><code>	for !raw.Empty() {</code></span>
+<span class="codeline" id="line-118"><code>		var rdnSet pkix.RelativeDistinguishedNameSET</code></span>
+<span class="codeline" id="line-119"><code>		var set cryptobyte.String</code></span>
+<span class="codeline" id="line-120"><code>		if !raw.ReadASN1(&amp;set, cryptobyte_asn1.SET) {</code></span>
+<span class="codeline" id="line-121"><code>			return nil, errors.New("x509: invalid RDNSequence")</code></span>
+<span class="codeline" id="line-122"><code>		}</code></span>
+<span class="codeline" id="line-123"><code>		for !set.Empty() {</code></span>
+<span class="codeline" id="line-124"><code>			var atav cryptobyte.String</code></span>
+<span class="codeline" id="line-125"><code>			if !set.ReadASN1(&amp;atav, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-126"><code>				return nil, errors.New("x509: invalid RDNSequence: invalid attribute")</code></span>
+<span class="codeline" id="line-127"><code>			}</code></span>
+<span class="codeline" id="line-128"><code>			var attr pkix.AttributeTypeAndValue</code></span>
+<span class="codeline" id="line-129"><code>			if !atav.ReadASN1ObjectIdentifier(&amp;attr.Type) {</code></span>
+<span class="codeline" id="line-130"><code>				return nil, errors.New("x509: invalid RDNSequence: invalid attribute type")</code></span>
+<span class="codeline" id="line-131"><code>			}</code></span>
+<span class="codeline" id="line-132"><code>			var rawValue cryptobyte.String</code></span>
+<span class="codeline" id="line-133"><code>			var valueTag cryptobyte_asn1.Tag</code></span>
+<span class="codeline" id="line-134"><code>			if !atav.ReadAnyASN1(&amp;rawValue, &amp;valueTag) {</code></span>
+<span class="codeline" id="line-135"><code>				return nil, errors.New("x509: invalid RDNSequence: invalid attribute value")</code></span>
+<span class="codeline" id="line-136"><code>			}</code></span>
+<span class="codeline" id="line-137"><code>			var err error</code></span>
+<span class="codeline" id="line-138"><code>			attr.Value, err = parseASN1String(valueTag, rawValue)</code></span>
+<span class="codeline" id="line-139"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-140"><code>				return nil, fmt.Errorf("x509: invalid RDNSequence: invalid attribute value: %s", err)</code></span>
+<span class="codeline" id="line-141"><code>			}</code></span>
+<span class="codeline" id="line-142"><code>			rdnSet = append(rdnSet, attr)</code></span>
+<span class="codeline" id="line-143"><code>		}</code></span>
+<span class="codeline" id="line-144"><code></code></span>
+<span class="codeline" id="line-145"><code>		rdnSeq = append(rdnSeq, rdnSet)</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>	return &amp;rdnSeq, nil</code></span>
+<span class="codeline" id="line-149"><code>}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>func parseAI(der cryptobyte.String) (pkix.AlgorithmIdentifier, error) {</code></span>
+<span class="codeline" id="line-152"><code>	ai := pkix.AlgorithmIdentifier{}</code></span>
+<span class="codeline" id="line-153"><code>	if !der.ReadASN1ObjectIdentifier(&amp;ai.Algorithm) {</code></span>
+<span class="codeline" id="line-154"><code>		return ai, errors.New("x509: malformed OID")</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code>	if der.Empty() {</code></span>
+<span class="codeline" id="line-157"><code>		return ai, nil</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>	var params cryptobyte.String</code></span>
+<span class="codeline" id="line-160"><code>	var tag cryptobyte_asn1.Tag</code></span>
+<span class="codeline" id="line-161"><code>	if !der.ReadAnyASN1Element(&amp;params, &amp;tag) {</code></span>
+<span class="codeline" id="line-162"><code>		return ai, errors.New("x509: malformed parameters")</code></span>
+<span class="codeline" id="line-163"><code>	}</code></span>
+<span class="codeline" id="line-164"><code>	ai.Parameters.Tag = int(tag)</code></span>
+<span class="codeline" id="line-165"><code>	ai.Parameters.FullBytes = params</code></span>
+<span class="codeline" id="line-166"><code>	return ai, nil</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>func parseTime(der *cryptobyte.String) (time.Time, error) {</code></span>
+<span class="codeline" id="line-170"><code>	var t time.Time</code></span>
+<span class="codeline" id="line-171"><code>	switch {</code></span>
+<span class="codeline" id="line-172"><code>	case der.PeekASN1Tag(cryptobyte_asn1.UTCTime):</code></span>
+<span class="codeline" id="line-173"><code>		if !der.ReadASN1UTCTime(&amp;t) {</code></span>
+<span class="codeline" id="line-174"><code>			return t, errors.New("x509: malformed UTCTime")</code></span>
+<span class="codeline" id="line-175"><code>		}</code></span>
+<span class="codeline" id="line-176"><code>	case der.PeekASN1Tag(cryptobyte_asn1.GeneralizedTime):</code></span>
+<span class="codeline" id="line-177"><code>		if !der.ReadASN1GeneralizedTime(&amp;t) {</code></span>
+<span class="codeline" id="line-178"><code>			return t, errors.New("x509: malformed GeneralizedTime")</code></span>
+<span class="codeline" id="line-179"><code>		}</code></span>
+<span class="codeline" id="line-180"><code>	default:</code></span>
+<span class="codeline" id="line-181"><code>		return t, errors.New("x509: unsupported time format")</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	return t, nil</code></span>
+<span class="codeline" id="line-184"><code>}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>func parseValidity(der cryptobyte.String) (time.Time, time.Time, error) {</code></span>
+<span class="codeline" id="line-187"><code>	notBefore, err := parseTime(&amp;der)</code></span>
+<span class="codeline" id="line-188"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-189"><code>		return time.Time{}, time.Time{}, err</code></span>
+<span class="codeline" id="line-190"><code>	}</code></span>
+<span class="codeline" id="line-191"><code>	notAfter, err := parseTime(&amp;der)</code></span>
+<span class="codeline" id="line-192"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-193"><code>		return time.Time{}, time.Time{}, err</code></span>
+<span class="codeline" id="line-194"><code>	}</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>	return notBefore, notAfter, nil</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>func parseExtension(der cryptobyte.String) (pkix.Extension, error) {</code></span>
+<span class="codeline" id="line-200"><code>	var ext pkix.Extension</code></span>
+<span class="codeline" id="line-201"><code>	if !der.ReadASN1ObjectIdentifier(&amp;ext.Id) {</code></span>
+<span class="codeline" id="line-202"><code>		return ext, errors.New("x509: malformed extension OID field")</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code>	if der.PeekASN1Tag(cryptobyte_asn1.BOOLEAN) {</code></span>
+<span class="codeline" id="line-205"><code>		if !der.ReadASN1Boolean(&amp;ext.Critical) {</code></span>
+<span class="codeline" id="line-206"><code>			return ext, errors.New("x509: malformed extension critical field")</code></span>
+<span class="codeline" id="line-207"><code>		}</code></span>
+<span class="codeline" id="line-208"><code>	}</code></span>
+<span class="codeline" id="line-209"><code>	var val cryptobyte.String</code></span>
+<span class="codeline" id="line-210"><code>	if !der.ReadASN1(&amp;val, cryptobyte_asn1.OCTET_STRING) {</code></span>
+<span class="codeline" id="line-211"><code>		return ext, errors.New("x509: malformed extension value field")</code></span>
+<span class="codeline" id="line-212"><code>	}</code></span>
+<span class="codeline" id="line-213"><code>	ext.Value = val</code></span>
+<span class="codeline" id="line-214"><code>	return ext, nil</code></span>
+<span class="codeline" id="line-215"><code>}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>func parsePublicKey(keyData *publicKeyInfo) (any, error) {</code></span>
+<span class="codeline" id="line-218"><code>	oid := keyData.Algorithm.Algorithm</code></span>
+<span class="codeline" id="line-219"><code>	params := keyData.Algorithm.Parameters</code></span>
+<span class="codeline" id="line-220"><code>	der := cryptobyte.String(keyData.PublicKey.RightAlign())</code></span>
+<span class="codeline" id="line-221"><code>	switch {</code></span>
+<span class="codeline" id="line-222"><code>	case oid.Equal(oidPublicKeyRSA):</code></span>
+<span class="codeline" id="line-223"><code>		// RSA public keys must have a NULL in the parameters.</code></span>
+<span class="codeline" id="line-224"><code>		// See RFC 3279, Section 2.3.1.</code></span>
+<span class="codeline" id="line-225"><code>		if !bytes.Equal(params.FullBytes, asn1.NullBytes) {</code></span>
+<span class="codeline" id="line-226"><code>			return nil, errors.New("x509: RSA key missing NULL parameters")</code></span>
+<span class="codeline" id="line-227"><code>		}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>		p := &amp;pkcs1PublicKey{N: new(big.Int)}</code></span>
+<span class="codeline" id="line-230"><code>		if !der.ReadASN1(&amp;der, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-231"><code>			return nil, errors.New("x509: invalid RSA public key")</code></span>
+<span class="codeline" id="line-232"><code>		}</code></span>
+<span class="codeline" id="line-233"><code>		if !der.ReadASN1Integer(p.N) {</code></span>
+<span class="codeline" id="line-234"><code>			return nil, errors.New("x509: invalid RSA modulus")</code></span>
+<span class="codeline" id="line-235"><code>		}</code></span>
+<span class="codeline" id="line-236"><code>		if !der.ReadASN1Integer(&amp;p.E) {</code></span>
+<span class="codeline" id="line-237"><code>			return nil, errors.New("x509: invalid RSA public exponent")</code></span>
+<span class="codeline" id="line-238"><code>		}</code></span>
+<span class="codeline" id="line-239"><code></code></span>
+<span class="codeline" id="line-240"><code>		if p.N.Sign() &lt;= 0 {</code></span>
+<span class="codeline" id="line-241"><code>			return nil, errors.New("x509: RSA modulus is not a positive number")</code></span>
+<span class="codeline" id="line-242"><code>		}</code></span>
+<span class="codeline" id="line-243"><code>		if p.E &lt;= 0 {</code></span>
+<span class="codeline" id="line-244"><code>			return nil, errors.New("x509: RSA public exponent is not a positive number")</code></span>
+<span class="codeline" id="line-245"><code>		}</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>		pub := &amp;rsa.PublicKey{</code></span>
+<span class="codeline" id="line-248"><code>			E: p.E,</code></span>
+<span class="codeline" id="line-249"><code>			N: p.N,</code></span>
+<span class="codeline" id="line-250"><code>		}</code></span>
+<span class="codeline" id="line-251"><code>		return pub, nil</code></span>
+<span class="codeline" id="line-252"><code>	case oid.Equal(oidPublicKeyECDSA):</code></span>
+<span class="codeline" id="line-253"><code>		paramsDer := cryptobyte.String(params.FullBytes)</code></span>
+<span class="codeline" id="line-254"><code>		namedCurveOID := new(asn1.ObjectIdentifier)</code></span>
+<span class="codeline" id="line-255"><code>		if !paramsDer.ReadASN1ObjectIdentifier(namedCurveOID) {</code></span>
+<span class="codeline" id="line-256"><code>			return nil, errors.New("x509: invalid ECDSA parameters")</code></span>
+<span class="codeline" id="line-257"><code>		}</code></span>
+<span class="codeline" id="line-258"><code>		namedCurve := namedCurveFromOID(*namedCurveOID)</code></span>
+<span class="codeline" id="line-259"><code>		if namedCurve == nil {</code></span>
+<span class="codeline" id="line-260"><code>			return nil, errors.New("x509: unsupported elliptic curve")</code></span>
+<span class="codeline" id="line-261"><code>		}</code></span>
+<span class="codeline" id="line-262"><code>		x, y := elliptic.Unmarshal(namedCurve, der)</code></span>
+<span class="codeline" id="line-263"><code>		if x == nil {</code></span>
+<span class="codeline" id="line-264"><code>			return nil, errors.New("x509: failed to unmarshal elliptic curve point")</code></span>
+<span class="codeline" id="line-265"><code>		}</code></span>
+<span class="codeline" id="line-266"><code>		pub := &amp;ecdsa.PublicKey{</code></span>
+<span class="codeline" id="line-267"><code>			Curve: namedCurve,</code></span>
+<span class="codeline" id="line-268"><code>			X:     x,</code></span>
+<span class="codeline" id="line-269"><code>			Y:     y,</code></span>
+<span class="codeline" id="line-270"><code>		}</code></span>
+<span class="codeline" id="line-271"><code>		return pub, nil</code></span>
+<span class="codeline" id="line-272"><code>	case oid.Equal(oidPublicKeyEd25519):</code></span>
+<span class="codeline" id="line-273"><code>		// RFC 8410, Section 3</code></span>
+<span class="codeline" id="line-274"><code>		// &gt; For all of the OIDs, the parameters MUST be absent.</code></span>
+<span class="codeline" id="line-275"><code>		if len(params.FullBytes) != 0 {</code></span>
+<span class="codeline" id="line-276"><code>			return nil, errors.New("x509: Ed25519 key encoded with illegal parameters")</code></span>
+<span class="codeline" id="line-277"><code>		}</code></span>
+<span class="codeline" id="line-278"><code>		if len(der) != ed25519.PublicKeySize {</code></span>
+<span class="codeline" id="line-279"><code>			return nil, errors.New("x509: wrong Ed25519 public key size")</code></span>
+<span class="codeline" id="line-280"><code>		}</code></span>
+<span class="codeline" id="line-281"><code>		return ed25519.PublicKey(der), nil</code></span>
+<span class="codeline" id="line-282"><code>	case oid.Equal(oidPublicKeyX25519):</code></span>
+<span class="codeline" id="line-283"><code>		// RFC 8410, Section 3</code></span>
+<span class="codeline" id="line-284"><code>		// &gt; For all of the OIDs, the parameters MUST be absent.</code></span>
+<span class="codeline" id="line-285"><code>		if len(params.FullBytes) != 0 {</code></span>
+<span class="codeline" id="line-286"><code>			return nil, errors.New("x509: X25519 key encoded with illegal parameters")</code></span>
+<span class="codeline" id="line-287"><code>		}</code></span>
+<span class="codeline" id="line-288"><code>		return ecdh.X25519().NewPublicKey(der)</code></span>
+<span class="codeline" id="line-289"><code>	case oid.Equal(oidPublicKeyDSA):</code></span>
+<span class="codeline" id="line-290"><code>		y := new(big.Int)</code></span>
+<span class="codeline" id="line-291"><code>		if !der.ReadASN1Integer(y) {</code></span>
+<span class="codeline" id="line-292"><code>			return nil, errors.New("x509: invalid DSA public key")</code></span>
+<span class="codeline" id="line-293"><code>		}</code></span>
+<span class="codeline" id="line-294"><code>		pub := &amp;dsa.PublicKey{</code></span>
+<span class="codeline" id="line-295"><code>			Y: y,</code></span>
+<span class="codeline" id="line-296"><code>			Parameters: dsa.Parameters{</code></span>
+<span class="codeline" id="line-297"><code>				P: new(big.Int),</code></span>
+<span class="codeline" id="line-298"><code>				Q: new(big.Int),</code></span>
+<span class="codeline" id="line-299"><code>				G: new(big.Int),</code></span>
+<span class="codeline" id="line-300"><code>			},</code></span>
+<span class="codeline" id="line-301"><code>		}</code></span>
+<span class="codeline" id="line-302"><code>		paramsDer := cryptobyte.String(params.FullBytes)</code></span>
+<span class="codeline" id="line-303"><code>		if !paramsDer.ReadASN1(&amp;paramsDer, cryptobyte_asn1.SEQUENCE) ||</code></span>
+<span class="codeline" id="line-304"><code>			!paramsDer.ReadASN1Integer(pub.Parameters.P) ||</code></span>
+<span class="codeline" id="line-305"><code>			!paramsDer.ReadASN1Integer(pub.Parameters.Q) ||</code></span>
+<span class="codeline" id="line-306"><code>			!paramsDer.ReadASN1Integer(pub.Parameters.G) {</code></span>
+<span class="codeline" id="line-307"><code>			return nil, errors.New("x509: invalid DSA parameters")</code></span>
+<span class="codeline" id="line-308"><code>		}</code></span>
+<span class="codeline" id="line-309"><code>		if pub.Y.Sign() &lt;= 0 || pub.Parameters.P.Sign() &lt;= 0 ||</code></span>
+<span class="codeline" id="line-310"><code>			pub.Parameters.Q.Sign() &lt;= 0 || pub.Parameters.G.Sign() &lt;= 0 {</code></span>
+<span class="codeline" id="line-311"><code>			return nil, errors.New("x509: zero or negative DSA parameter")</code></span>
+<span class="codeline" id="line-312"><code>		}</code></span>
+<span class="codeline" id="line-313"><code>		return pub, nil</code></span>
+<span class="codeline" id="line-314"><code>	default:</code></span>
+<span class="codeline" id="line-315"><code>		return nil, errors.New("x509: unknown public key algorithm")</code></span>
+<span class="codeline" id="line-316"><code>	}</code></span>
+<span class="codeline" id="line-317"><code>}</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>func parseKeyUsageExtension(der cryptobyte.String) (KeyUsage, error) {</code></span>
+<span class="codeline" id="line-320"><code>	var usageBits asn1.BitString</code></span>
+<span class="codeline" id="line-321"><code>	if !der.ReadASN1BitString(&amp;usageBits) {</code></span>
+<span class="codeline" id="line-322"><code>		return 0, errors.New("x509: invalid key usage")</code></span>
+<span class="codeline" id="line-323"><code>	}</code></span>
+<span class="codeline" id="line-324"><code></code></span>
+<span class="codeline" id="line-325"><code>	var usage int</code></span>
+<span class="codeline" id="line-326"><code>	for i := 0; i &lt; 9; i++ {</code></span>
+<span class="codeline" id="line-327"><code>		if usageBits.At(i) != 0 {</code></span>
+<span class="codeline" id="line-328"><code>			usage |= 1 &lt;&lt; uint(i)</code></span>
+<span class="codeline" id="line-329"><code>		}</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	return KeyUsage(usage), nil</code></span>
+<span class="codeline" id="line-332"><code>}</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>func parseBasicConstraintsExtension(der cryptobyte.String) (bool, int, error) {</code></span>
+<span class="codeline" id="line-335"><code>	var isCA bool</code></span>
+<span class="codeline" id="line-336"><code>	if !der.ReadASN1(&amp;der, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-337"><code>		return false, 0, errors.New("x509: invalid basic constraints")</code></span>
+<span class="codeline" id="line-338"><code>	}</code></span>
+<span class="codeline" id="line-339"><code>	if der.PeekASN1Tag(cryptobyte_asn1.BOOLEAN) {</code></span>
+<span class="codeline" id="line-340"><code>		if !der.ReadASN1Boolean(&amp;isCA) {</code></span>
+<span class="codeline" id="line-341"><code>			return false, 0, errors.New("x509: invalid basic constraints")</code></span>
+<span class="codeline" id="line-342"><code>		}</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code>	maxPathLen := -1</code></span>
+<span class="codeline" id="line-345"><code>	if der.PeekASN1Tag(cryptobyte_asn1.INTEGER) {</code></span>
+<span class="codeline" id="line-346"><code>		if !der.ReadASN1Integer(&amp;maxPathLen) {</code></span>
+<span class="codeline" id="line-347"><code>			return false, 0, errors.New("x509: invalid basic constraints")</code></span>
+<span class="codeline" id="line-348"><code>		}</code></span>
+<span class="codeline" id="line-349"><code>	}</code></span>
+<span class="codeline" id="line-350"><code></code></span>
+<span class="codeline" id="line-351"><code>	// TODO: map out.MaxPathLen to 0 if it has the -1 default value? (Issue 19285)</code></span>
+<span class="codeline" id="line-352"><code>	return isCA, maxPathLen, nil</code></span>
+<span class="codeline" id="line-353"><code>}</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>func forEachSAN(der cryptobyte.String, callback func(tag int, data []byte) error) error {</code></span>
+<span class="codeline" id="line-356"><code>	if !der.ReadASN1(&amp;der, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-357"><code>		return errors.New("x509: invalid subject alternative names")</code></span>
+<span class="codeline" id="line-358"><code>	}</code></span>
+<span class="codeline" id="line-359"><code>	for !der.Empty() {</code></span>
+<span class="codeline" id="line-360"><code>		var san cryptobyte.String</code></span>
+<span class="codeline" id="line-361"><code>		var tag cryptobyte_asn1.Tag</code></span>
+<span class="codeline" id="line-362"><code>		if !der.ReadAnyASN1(&amp;san, &amp;tag) {</code></span>
+<span class="codeline" id="line-363"><code>			return errors.New("x509: invalid subject alternative name")</code></span>
+<span class="codeline" id="line-364"><code>		}</code></span>
+<span class="codeline" id="line-365"><code>		if err := callback(int(tag^0x80), san); err != nil {</code></span>
+<span class="codeline" id="line-366"><code>			return err</code></span>
+<span class="codeline" id="line-367"><code>		}</code></span>
+<span class="codeline" id="line-368"><code>	}</code></span>
+<span class="codeline" id="line-369"><code></code></span>
+<span class="codeline" id="line-370"><code>	return nil</code></span>
+<span class="codeline" id="line-371"><code>}</code></span>
+<span class="codeline" id="line-372"><code></code></span>
+<span class="codeline" id="line-373"><code>func parseSANExtension(der cryptobyte.String) (dnsNames, emailAddresses []string, ipAddresses []net.IP, uris []*url.URL, err error) {</code></span>
+<span class="codeline" id="line-374"><code>	err = forEachSAN(der, func(tag int, data []byte) error {</code></span>
+<span class="codeline" id="line-375"><code>		switch tag {</code></span>
+<span class="codeline" id="line-376"><code>		case nameTypeEmail:</code></span>
+<span class="codeline" id="line-377"><code>			email := string(data)</code></span>
+<span class="codeline" id="line-378"><code>			if err := isIA5String(email); err != nil {</code></span>
+<span class="codeline" id="line-379"><code>				return errors.New("x509: SAN rfc822Name is malformed")</code></span>
+<span class="codeline" id="line-380"><code>			}</code></span>
+<span class="codeline" id="line-381"><code>			emailAddresses = append(emailAddresses, email)</code></span>
+<span class="codeline" id="line-382"><code>		case nameTypeDNS:</code></span>
+<span class="codeline" id="line-383"><code>			name := string(data)</code></span>
+<span class="codeline" id="line-384"><code>			if err := isIA5String(name); err != nil {</code></span>
+<span class="codeline" id="line-385"><code>				return errors.New("x509: SAN dNSName is malformed")</code></span>
+<span class="codeline" id="line-386"><code>			}</code></span>
+<span class="codeline" id="line-387"><code>			dnsNames = append(dnsNames, string(name))</code></span>
+<span class="codeline" id="line-388"><code>		case nameTypeURI:</code></span>
+<span class="codeline" id="line-389"><code>			uriStr := string(data)</code></span>
+<span class="codeline" id="line-390"><code>			if err := isIA5String(uriStr); err != nil {</code></span>
+<span class="codeline" id="line-391"><code>				return errors.New("x509: SAN uniformResourceIdentifier is malformed")</code></span>
+<span class="codeline" id="line-392"><code>			}</code></span>
+<span class="codeline" id="line-393"><code>			uri, err := url.Parse(uriStr)</code></span>
+<span class="codeline" id="line-394"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-395"><code>				return fmt.Errorf("x509: cannot parse URI %q: %s", uriStr, err)</code></span>
+<span class="codeline" id="line-396"><code>			}</code></span>
+<span class="codeline" id="line-397"><code>			if len(uri.Host) &gt; 0 {</code></span>
+<span class="codeline" id="line-398"><code>				if _, ok := domainToReverseLabels(uri.Host); !ok {</code></span>
+<span class="codeline" id="line-399"><code>					return fmt.Errorf("x509: cannot parse URI %q: invalid domain", uriStr)</code></span>
+<span class="codeline" id="line-400"><code>				}</code></span>
+<span class="codeline" id="line-401"><code>			}</code></span>
+<span class="codeline" id="line-402"><code>			uris = append(uris, uri)</code></span>
+<span class="codeline" id="line-403"><code>		case nameTypeIP:</code></span>
+<span class="codeline" id="line-404"><code>			switch len(data) {</code></span>
+<span class="codeline" id="line-405"><code>			case net.IPv4len, net.IPv6len:</code></span>
+<span class="codeline" id="line-406"><code>				ipAddresses = append(ipAddresses, data)</code></span>
+<span class="codeline" id="line-407"><code>			default:</code></span>
+<span class="codeline" id="line-408"><code>				return errors.New("x509: cannot parse IP address of length " + strconv.Itoa(len(data)))</code></span>
+<span class="codeline" id="line-409"><code>			}</code></span>
+<span class="codeline" id="line-410"><code>		}</code></span>
+<span class="codeline" id="line-411"><code></code></span>
+<span class="codeline" id="line-412"><code>		return nil</code></span>
+<span class="codeline" id="line-413"><code>	})</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>	return</code></span>
+<span class="codeline" id="line-416"><code>}</code></span>
+<span class="codeline" id="line-417"><code></code></span>
+<span class="codeline" id="line-418"><code>func parseExtKeyUsageExtension(der cryptobyte.String) ([]ExtKeyUsage, []asn1.ObjectIdentifier, error) {</code></span>
+<span class="codeline" id="line-419"><code>	var extKeyUsages []ExtKeyUsage</code></span>
+<span class="codeline" id="line-420"><code>	var unknownUsages []asn1.ObjectIdentifier</code></span>
+<span class="codeline" id="line-421"><code>	if !der.ReadASN1(&amp;der, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-422"><code>		return nil, nil, errors.New("x509: invalid extended key usages")</code></span>
+<span class="codeline" id="line-423"><code>	}</code></span>
+<span class="codeline" id="line-424"><code>	for !der.Empty() {</code></span>
+<span class="codeline" id="line-425"><code>		var eku asn1.ObjectIdentifier</code></span>
+<span class="codeline" id="line-426"><code>		if !der.ReadASN1ObjectIdentifier(&amp;eku) {</code></span>
+<span class="codeline" id="line-427"><code>			return nil, nil, errors.New("x509: invalid extended key usages")</code></span>
+<span class="codeline" id="line-428"><code>		}</code></span>
+<span class="codeline" id="line-429"><code>		if extKeyUsage, ok := extKeyUsageFromOID(eku); ok {</code></span>
+<span class="codeline" id="line-430"><code>			extKeyUsages = append(extKeyUsages, extKeyUsage)</code></span>
+<span class="codeline" id="line-431"><code>		} else {</code></span>
+<span class="codeline" id="line-432"><code>			unknownUsages = append(unknownUsages, eku)</code></span>
+<span class="codeline" id="line-433"><code>		}</code></span>
+<span class="codeline" id="line-434"><code>	}</code></span>
+<span class="codeline" id="line-435"><code>	return extKeyUsages, unknownUsages, nil</code></span>
+<span class="codeline" id="line-436"><code>}</code></span>
+<span class="codeline" id="line-437"><code></code></span>
+<span class="codeline" id="line-438"><code>func parseCertificatePoliciesExtension(der cryptobyte.String) ([]OID, error) {</code></span>
+<span class="codeline" id="line-439"><code>	var oids []OID</code></span>
+<span class="codeline" id="line-440"><code>	if !der.ReadASN1(&amp;der, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-441"><code>		return nil, errors.New("x509: invalid certificate policies")</code></span>
+<span class="codeline" id="line-442"><code>	}</code></span>
+<span class="codeline" id="line-443"><code>	for !der.Empty() {</code></span>
+<span class="codeline" id="line-444"><code>		var cp cryptobyte.String</code></span>
+<span class="codeline" id="line-445"><code>		var OIDBytes cryptobyte.String</code></span>
+<span class="codeline" id="line-446"><code>		if !der.ReadASN1(&amp;cp, cryptobyte_asn1.SEQUENCE) || !cp.ReadASN1(&amp;OIDBytes, cryptobyte_asn1.OBJECT_IDENTIFIER) {</code></span>
+<span class="codeline" id="line-447"><code>			return nil, errors.New("x509: invalid certificate policies")</code></span>
+<span class="codeline" id="line-448"><code>		}</code></span>
+<span class="codeline" id="line-449"><code>		oid, ok := newOIDFromDER(OIDBytes)</code></span>
+<span class="codeline" id="line-450"><code>		if !ok {</code></span>
+<span class="codeline" id="line-451"><code>			return nil, errors.New("x509: invalid certificate policies")</code></span>
+<span class="codeline" id="line-452"><code>		}</code></span>
+<span class="codeline" id="line-453"><code>		oids = append(oids, oid)</code></span>
+<span class="codeline" id="line-454"><code>	}</code></span>
+<span class="codeline" id="line-455"><code>	return oids, nil</code></span>
+<span class="codeline" id="line-456"><code>}</code></span>
+<span class="codeline" id="line-457"><code></code></span>
+<span class="codeline" id="line-458"><code>// isValidIPMask reports whether mask consists of zero or more 1 bits, followed by zero bits.</code></span>
+<span class="codeline" id="line-459"><code>func isValidIPMask(mask []byte) bool {</code></span>
+<span class="codeline" id="line-460"><code>	seenZero := false</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>	for _, b := range mask {</code></span>
+<span class="codeline" id="line-463"><code>		if seenZero {</code></span>
+<span class="codeline" id="line-464"><code>			if b != 0 {</code></span>
+<span class="codeline" id="line-465"><code>				return false</code></span>
+<span class="codeline" id="line-466"><code>			}</code></span>
+<span class="codeline" id="line-467"><code></code></span>
+<span class="codeline" id="line-468"><code>			continue</code></span>
+<span class="codeline" id="line-469"><code>		}</code></span>
+<span class="codeline" id="line-470"><code></code></span>
+<span class="codeline" id="line-471"><code>		switch b {</code></span>
+<span class="codeline" id="line-472"><code>		case 0x00, 0x80, 0xc0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe:</code></span>
+<span class="codeline" id="line-473"><code>			seenZero = true</code></span>
+<span class="codeline" id="line-474"><code>		case 0xff:</code></span>
+<span class="codeline" id="line-475"><code>		default:</code></span>
+<span class="codeline" id="line-476"><code>			return false</code></span>
+<span class="codeline" id="line-477"><code>		}</code></span>
+<span class="codeline" id="line-478"><code>	}</code></span>
+<span class="codeline" id="line-479"><code></code></span>
+<span class="codeline" id="line-480"><code>	return true</code></span>
+<span class="codeline" id="line-481"><code>}</code></span>
+<span class="codeline" id="line-482"><code></code></span>
+<span class="codeline" id="line-483"><code>func parseNameConstraintsExtension(out *Certificate, e pkix.Extension) (unhandled bool, err error) {</code></span>
+<span class="codeline" id="line-484"><code>	// RFC 5280, 4.2.1.10</code></span>
+<span class="codeline" id="line-485"><code></code></span>
+<span class="codeline" id="line-486"><code>	// NameConstraints ::= SEQUENCE {</code></span>
+<span class="codeline" id="line-487"><code>	//      permittedSubtrees       [0]     GeneralSubtrees OPTIONAL,</code></span>
+<span class="codeline" id="line-488"><code>	//      excludedSubtrees        [1]     GeneralSubtrees OPTIONAL }</code></span>
+<span class="codeline" id="line-489"><code>	//</code></span>
+<span class="codeline" id="line-490"><code>	// GeneralSubtrees ::= SEQUENCE SIZE (1..MAX) OF GeneralSubtree</code></span>
+<span class="codeline" id="line-491"><code>	//</code></span>
+<span class="codeline" id="line-492"><code>	// GeneralSubtree ::= SEQUENCE {</code></span>
+<span class="codeline" id="line-493"><code>	//      base                    GeneralName,</code></span>
+<span class="codeline" id="line-494"><code>	//      minimum         [0]     BaseDistance DEFAULT 0,</code></span>
+<span class="codeline" id="line-495"><code>	//      maximum         [1]     BaseDistance OPTIONAL }</code></span>
+<span class="codeline" id="line-496"><code>	//</code></span>
+<span class="codeline" id="line-497"><code>	// BaseDistance ::= INTEGER (0..MAX)</code></span>
+<span class="codeline" id="line-498"><code></code></span>
+<span class="codeline" id="line-499"><code>	outer := cryptobyte.String(e.Value)</code></span>
+<span class="codeline" id="line-500"><code>	var toplevel, permitted, excluded cryptobyte.String</code></span>
+<span class="codeline" id="line-501"><code>	var havePermitted, haveExcluded bool</code></span>
+<span class="codeline" id="line-502"><code>	if !outer.ReadASN1(&amp;toplevel, cryptobyte_asn1.SEQUENCE) ||</code></span>
+<span class="codeline" id="line-503"><code>		!outer.Empty() ||</code></span>
+<span class="codeline" id="line-504"><code>		!toplevel.ReadOptionalASN1(&amp;permitted, &amp;havePermitted, cryptobyte_asn1.Tag(0).ContextSpecific().Constructed()) ||</code></span>
+<span class="codeline" id="line-505"><code>		!toplevel.ReadOptionalASN1(&amp;excluded, &amp;haveExcluded, cryptobyte_asn1.Tag(1).ContextSpecific().Constructed()) ||</code></span>
+<span class="codeline" id="line-506"><code>		!toplevel.Empty() {</code></span>
+<span class="codeline" id="line-507"><code>		return false, errors.New("x509: invalid NameConstraints extension")</code></span>
+<span class="codeline" id="line-508"><code>	}</code></span>
+<span class="codeline" id="line-509"><code></code></span>
+<span class="codeline" id="line-510"><code>	if !havePermitted &amp;&amp; !haveExcluded || len(permitted) == 0 &amp;&amp; len(excluded) == 0 {</code></span>
+<span class="codeline" id="line-511"><code>		// From RFC 5280, Section 4.2.1.10:</code></span>
+<span class="codeline" id="line-512"><code>		//   “either the permittedSubtrees field</code></span>
+<span class="codeline" id="line-513"><code>		//   or the excludedSubtrees MUST be</code></span>
+<span class="codeline" id="line-514"><code>		//   present”</code></span>
+<span class="codeline" id="line-515"><code>		return false, errors.New("x509: empty name constraints extension")</code></span>
+<span class="codeline" id="line-516"><code>	}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>	getValues := func(subtrees cryptobyte.String) (dnsNames []string, ips []*net.IPNet, emails, uriDomains []string, err error) {</code></span>
+<span class="codeline" id="line-519"><code>		for !subtrees.Empty() {</code></span>
+<span class="codeline" id="line-520"><code>			var seq, value cryptobyte.String</code></span>
+<span class="codeline" id="line-521"><code>			var tag cryptobyte_asn1.Tag</code></span>
+<span class="codeline" id="line-522"><code>			if !subtrees.ReadASN1(&amp;seq, cryptobyte_asn1.SEQUENCE) ||</code></span>
+<span class="codeline" id="line-523"><code>				!seq.ReadAnyASN1(&amp;value, &amp;tag) {</code></span>
+<span class="codeline" id="line-524"><code>				return nil, nil, nil, nil, fmt.Errorf("x509: invalid NameConstraints extension")</code></span>
+<span class="codeline" id="line-525"><code>			}</code></span>
+<span class="codeline" id="line-526"><code></code></span>
+<span class="codeline" id="line-527"><code>			var (</code></span>
+<span class="codeline" id="line-528"><code>				dnsTag   = cryptobyte_asn1.Tag(2).ContextSpecific()</code></span>
+<span class="codeline" id="line-529"><code>				emailTag = cryptobyte_asn1.Tag(1).ContextSpecific()</code></span>
+<span class="codeline" id="line-530"><code>				ipTag    = cryptobyte_asn1.Tag(7).ContextSpecific()</code></span>
+<span class="codeline" id="line-531"><code>				uriTag   = cryptobyte_asn1.Tag(6).ContextSpecific()</code></span>
+<span class="codeline" id="line-532"><code>			)</code></span>
+<span class="codeline" id="line-533"><code></code></span>
+<span class="codeline" id="line-534"><code>			switch tag {</code></span>
+<span class="codeline" id="line-535"><code>			case dnsTag:</code></span>
+<span class="codeline" id="line-536"><code>				domain := string(value)</code></span>
+<span class="codeline" id="line-537"><code>				if err := isIA5String(domain); err != nil {</code></span>
+<span class="codeline" id="line-538"><code>					return nil, nil, nil, nil, errors.New("x509: invalid constraint value: " + err.Error())</code></span>
+<span class="codeline" id="line-539"><code>				}</code></span>
+<span class="codeline" id="line-540"><code></code></span>
+<span class="codeline" id="line-541"><code>				trimmedDomain := domain</code></span>
+<span class="codeline" id="line-542"><code>				if len(trimmedDomain) &gt; 0 &amp;&amp; trimmedDomain[0] == '.' {</code></span>
+<span class="codeline" id="line-543"><code>					// constraints can have a leading</code></span>
+<span class="codeline" id="line-544"><code>					// period to exclude the domain</code></span>
+<span class="codeline" id="line-545"><code>					// itself, but that's not valid in a</code></span>
+<span class="codeline" id="line-546"><code>					// normal domain name.</code></span>
+<span class="codeline" id="line-547"><code>					trimmedDomain = trimmedDomain[1:]</code></span>
+<span class="codeline" id="line-548"><code>				}</code></span>
+<span class="codeline" id="line-549"><code>				if _, ok := domainToReverseLabels(trimmedDomain); !ok {</code></span>
+<span class="codeline" id="line-550"><code>					return nil, nil, nil, nil, fmt.Errorf("x509: failed to parse dnsName constraint %q", domain)</code></span>
+<span class="codeline" id="line-551"><code>				}</code></span>
+<span class="codeline" id="line-552"><code>				dnsNames = append(dnsNames, domain)</code></span>
+<span class="codeline" id="line-553"><code></code></span>
+<span class="codeline" id="line-554"><code>			case ipTag:</code></span>
+<span class="codeline" id="line-555"><code>				l := len(value)</code></span>
+<span class="codeline" id="line-556"><code>				var ip, mask []byte</code></span>
+<span class="codeline" id="line-557"><code></code></span>
+<span class="codeline" id="line-558"><code>				switch l {</code></span>
+<span class="codeline" id="line-559"><code>				case 8:</code></span>
+<span class="codeline" id="line-560"><code>					ip = value[:4]</code></span>
+<span class="codeline" id="line-561"><code>					mask = value[4:]</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>				case 32:</code></span>
+<span class="codeline" id="line-564"><code>					ip = value[:16]</code></span>
+<span class="codeline" id="line-565"><code>					mask = value[16:]</code></span>
+<span class="codeline" id="line-566"><code></code></span>
+<span class="codeline" id="line-567"><code>				default:</code></span>
+<span class="codeline" id="line-568"><code>					return nil, nil, nil, nil, fmt.Errorf("x509: IP constraint contained value of length %d", l)</code></span>
+<span class="codeline" id="line-569"><code>				}</code></span>
+<span class="codeline" id="line-570"><code></code></span>
+<span class="codeline" id="line-571"><code>				if !isValidIPMask(mask) {</code></span>
+<span class="codeline" id="line-572"><code>					return nil, nil, nil, nil, fmt.Errorf("x509: IP constraint contained invalid mask %x", mask)</code></span>
+<span class="codeline" id="line-573"><code>				}</code></span>
+<span class="codeline" id="line-574"><code></code></span>
+<span class="codeline" id="line-575"><code>				ips = append(ips, &amp;net.IPNet{IP: net.IP(ip), Mask: net.IPMask(mask)})</code></span>
+<span class="codeline" id="line-576"><code></code></span>
+<span class="codeline" id="line-577"><code>			case emailTag:</code></span>
+<span class="codeline" id="line-578"><code>				constraint := string(value)</code></span>
+<span class="codeline" id="line-579"><code>				if err := isIA5String(constraint); err != nil {</code></span>
+<span class="codeline" id="line-580"><code>					return nil, nil, nil, nil, errors.New("x509: invalid constraint value: " + err.Error())</code></span>
+<span class="codeline" id="line-581"><code>				}</code></span>
+<span class="codeline" id="line-582"><code></code></span>
+<span class="codeline" id="line-583"><code>				// If the constraint contains an @ then</code></span>
+<span class="codeline" id="line-584"><code>				// it specifies an exact mailbox name.</code></span>
+<span class="codeline" id="line-585"><code>				if strings.Contains(constraint, "@") {</code></span>
+<span class="codeline" id="line-586"><code>					if _, ok := parseRFC2821Mailbox(constraint); !ok {</code></span>
+<span class="codeline" id="line-587"><code>						return nil, nil, nil, nil, fmt.Errorf("x509: failed to parse rfc822Name constraint %q", constraint)</code></span>
+<span class="codeline" id="line-588"><code>					}</code></span>
+<span class="codeline" id="line-589"><code>				} else {</code></span>
+<span class="codeline" id="line-590"><code>					// Otherwise it's a domain name.</code></span>
+<span class="codeline" id="line-591"><code>					domain := constraint</code></span>
+<span class="codeline" id="line-592"><code>					if len(domain) &gt; 0 &amp;&amp; domain[0] == '.' {</code></span>
+<span class="codeline" id="line-593"><code>						domain = domain[1:]</code></span>
+<span class="codeline" id="line-594"><code>					}</code></span>
+<span class="codeline" id="line-595"><code>					if _, ok := domainToReverseLabels(domain); !ok {</code></span>
+<span class="codeline" id="line-596"><code>						return nil, nil, nil, nil, fmt.Errorf("x509: failed to parse rfc822Name constraint %q", constraint)</code></span>
+<span class="codeline" id="line-597"><code>					}</code></span>
+<span class="codeline" id="line-598"><code>				}</code></span>
+<span class="codeline" id="line-599"><code>				emails = append(emails, constraint)</code></span>
+<span class="codeline" id="line-600"><code></code></span>
+<span class="codeline" id="line-601"><code>			case uriTag:</code></span>
+<span class="codeline" id="line-602"><code>				domain := string(value)</code></span>
+<span class="codeline" id="line-603"><code>				if err := isIA5String(domain); err != nil {</code></span>
+<span class="codeline" id="line-604"><code>					return nil, nil, nil, nil, errors.New("x509: invalid constraint value: " + err.Error())</code></span>
+<span class="codeline" id="line-605"><code>				}</code></span>
+<span class="codeline" id="line-606"><code></code></span>
+<span class="codeline" id="line-607"><code>				if net.ParseIP(domain) != nil {</code></span>
+<span class="codeline" id="line-608"><code>					return nil, nil, nil, nil, fmt.Errorf("x509: failed to parse URI constraint %q: cannot be IP address", domain)</code></span>
+<span class="codeline" id="line-609"><code>				}</code></span>
+<span class="codeline" id="line-610"><code></code></span>
+<span class="codeline" id="line-611"><code>				trimmedDomain := domain</code></span>
+<span class="codeline" id="line-612"><code>				if len(trimmedDomain) &gt; 0 &amp;&amp; trimmedDomain[0] == '.' {</code></span>
+<span class="codeline" id="line-613"><code>					// constraints can have a leading</code></span>
+<span class="codeline" id="line-614"><code>					// period to exclude the domain itself,</code></span>
+<span class="codeline" id="line-615"><code>					// but that's not valid in a normal</code></span>
+<span class="codeline" id="line-616"><code>					// domain name.</code></span>
+<span class="codeline" id="line-617"><code>					trimmedDomain = trimmedDomain[1:]</code></span>
+<span class="codeline" id="line-618"><code>				}</code></span>
+<span class="codeline" id="line-619"><code>				if _, ok := domainToReverseLabels(trimmedDomain); !ok {</code></span>
+<span class="codeline" id="line-620"><code>					return nil, nil, nil, nil, fmt.Errorf("x509: failed to parse URI constraint %q", domain)</code></span>
+<span class="codeline" id="line-621"><code>				}</code></span>
+<span class="codeline" id="line-622"><code>				uriDomains = append(uriDomains, domain)</code></span>
+<span class="codeline" id="line-623"><code></code></span>
+<span class="codeline" id="line-624"><code>			default:</code></span>
+<span class="codeline" id="line-625"><code>				unhandled = true</code></span>
+<span class="codeline" id="line-626"><code>			}</code></span>
+<span class="codeline" id="line-627"><code>		}</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>		return dnsNames, ips, emails, uriDomains, nil</code></span>
+<span class="codeline" id="line-630"><code>	}</code></span>
+<span class="codeline" id="line-631"><code></code></span>
+<span class="codeline" id="line-632"><code>	if out.PermittedDNSDomains, out.PermittedIPRanges, out.PermittedEmailAddresses, out.PermittedURIDomains, err = getValues(permitted); err != nil {</code></span>
+<span class="codeline" id="line-633"><code>		return false, err</code></span>
+<span class="codeline" id="line-634"><code>	}</code></span>
+<span class="codeline" id="line-635"><code>	if out.ExcludedDNSDomains, out.ExcludedIPRanges, out.ExcludedEmailAddresses, out.ExcludedURIDomains, err = getValues(excluded); err != nil {</code></span>
+<span class="codeline" id="line-636"><code>		return false, err</code></span>
+<span class="codeline" id="line-637"><code>	}</code></span>
+<span class="codeline" id="line-638"><code>	out.PermittedDNSDomainsCritical = e.Critical</code></span>
+<span class="codeline" id="line-639"><code></code></span>
+<span class="codeline" id="line-640"><code>	return unhandled, nil</code></span>
+<span class="codeline" id="line-641"><code>}</code></span>
+<span class="codeline" id="line-642"><code></code></span>
+<span class="codeline" id="line-643"><code>func processExtensions(out *Certificate) error {</code></span>
+<span class="codeline" id="line-644"><code>	var err error</code></span>
+<span class="codeline" id="line-645"><code>	for _, e := range out.Extensions {</code></span>
+<span class="codeline" id="line-646"><code>		unhandled := false</code></span>
+<span class="codeline" id="line-647"><code></code></span>
+<span class="codeline" id="line-648"><code>		if len(e.Id) == 4 &amp;&amp; e.Id[0] == 2 &amp;&amp; e.Id[1] == 5 &amp;&amp; e.Id[2] == 29 {</code></span>
+<span class="codeline" id="line-649"><code>			switch e.Id[3] {</code></span>
+<span class="codeline" id="line-650"><code>			case 15:</code></span>
+<span class="codeline" id="line-651"><code>				out.KeyUsage, err = parseKeyUsageExtension(e.Value)</code></span>
+<span class="codeline" id="line-652"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-653"><code>					return err</code></span>
+<span class="codeline" id="line-654"><code>				}</code></span>
+<span class="codeline" id="line-655"><code>			case 19:</code></span>
+<span class="codeline" id="line-656"><code>				out.IsCA, out.MaxPathLen, err = parseBasicConstraintsExtension(e.Value)</code></span>
+<span class="codeline" id="line-657"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-658"><code>					return err</code></span>
+<span class="codeline" id="line-659"><code>				}</code></span>
+<span class="codeline" id="line-660"><code>				out.BasicConstraintsValid = true</code></span>
+<span class="codeline" id="line-661"><code>				out.MaxPathLenZero = out.MaxPathLen == 0</code></span>
+<span class="codeline" id="line-662"><code>			case 17:</code></span>
+<span class="codeline" id="line-663"><code>				out.DNSNames, out.EmailAddresses, out.IPAddresses, out.URIs, err = parseSANExtension(e.Value)</code></span>
+<span class="codeline" id="line-664"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-665"><code>					return err</code></span>
+<span class="codeline" id="line-666"><code>				}</code></span>
+<span class="codeline" id="line-667"><code></code></span>
+<span class="codeline" id="line-668"><code>				if len(out.DNSNames) == 0 &amp;&amp; len(out.EmailAddresses) == 0 &amp;&amp; len(out.IPAddresses) == 0 &amp;&amp; len(out.URIs) == 0 {</code></span>
+<span class="codeline" id="line-669"><code>					// If we didn't parse anything then we do the critical check, below.</code></span>
+<span class="codeline" id="line-670"><code>					unhandled = true</code></span>
+<span class="codeline" id="line-671"><code>				}</code></span>
+<span class="codeline" id="line-672"><code></code></span>
+<span class="codeline" id="line-673"><code>			case 30:</code></span>
+<span class="codeline" id="line-674"><code>				unhandled, err = parseNameConstraintsExtension(out, e)</code></span>
+<span class="codeline" id="line-675"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-676"><code>					return err</code></span>
+<span class="codeline" id="line-677"><code>				}</code></span>
+<span class="codeline" id="line-678"><code></code></span>
+<span class="codeline" id="line-679"><code>			case 31:</code></span>
+<span class="codeline" id="line-680"><code>				// RFC 5280, 4.2.1.13</code></span>
+<span class="codeline" id="line-681"><code></code></span>
+<span class="codeline" id="line-682"><code>				// CRLDistributionPoints ::= SEQUENCE SIZE (1..MAX) OF DistributionPoint</code></span>
+<span class="codeline" id="line-683"><code>				//</code></span>
+<span class="codeline" id="line-684"><code>				// DistributionPoint ::= SEQUENCE {</code></span>
+<span class="codeline" id="line-685"><code>				//     distributionPoint       [0]     DistributionPointName OPTIONAL,</code></span>
+<span class="codeline" id="line-686"><code>				//     reasons                 [1]     ReasonFlags OPTIONAL,</code></span>
+<span class="codeline" id="line-687"><code>				//     cRLIssuer               [2]     GeneralNames OPTIONAL }</code></span>
+<span class="codeline" id="line-688"><code>				//</code></span>
+<span class="codeline" id="line-689"><code>				// DistributionPointName ::= CHOICE {</code></span>
+<span class="codeline" id="line-690"><code>				//     fullName                [0]     GeneralNames,</code></span>
+<span class="codeline" id="line-691"><code>				//     nameRelativeToCRLIssuer [1]     RelativeDistinguishedName }</code></span>
+<span class="codeline" id="line-692"><code>				val := cryptobyte.String(e.Value)</code></span>
+<span class="codeline" id="line-693"><code>				if !val.ReadASN1(&amp;val, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-694"><code>					return errors.New("x509: invalid CRL distribution points")</code></span>
+<span class="codeline" id="line-695"><code>				}</code></span>
+<span class="codeline" id="line-696"><code>				for !val.Empty() {</code></span>
+<span class="codeline" id="line-697"><code>					var dpDER cryptobyte.String</code></span>
+<span class="codeline" id="line-698"><code>					if !val.ReadASN1(&amp;dpDER, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-699"><code>						return errors.New("x509: invalid CRL distribution point")</code></span>
+<span class="codeline" id="line-700"><code>					}</code></span>
+<span class="codeline" id="line-701"><code>					var dpNameDER cryptobyte.String</code></span>
+<span class="codeline" id="line-702"><code>					var dpNamePresent bool</code></span>
+<span class="codeline" id="line-703"><code>					if !dpDER.ReadOptionalASN1(&amp;dpNameDER, &amp;dpNamePresent, cryptobyte_asn1.Tag(0).Constructed().ContextSpecific()) {</code></span>
+<span class="codeline" id="line-704"><code>						return errors.New("x509: invalid CRL distribution point")</code></span>
+<span class="codeline" id="line-705"><code>					}</code></span>
+<span class="codeline" id="line-706"><code>					if !dpNamePresent {</code></span>
+<span class="codeline" id="line-707"><code>						continue</code></span>
+<span class="codeline" id="line-708"><code>					}</code></span>
+<span class="codeline" id="line-709"><code>					if !dpNameDER.ReadASN1(&amp;dpNameDER, cryptobyte_asn1.Tag(0).Constructed().ContextSpecific()) {</code></span>
+<span class="codeline" id="line-710"><code>						return errors.New("x509: invalid CRL distribution point")</code></span>
+<span class="codeline" id="line-711"><code>					}</code></span>
+<span class="codeline" id="line-712"><code>					for !dpNameDER.Empty() {</code></span>
+<span class="codeline" id="line-713"><code>						if !dpNameDER.PeekASN1Tag(cryptobyte_asn1.Tag(6).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-714"><code>							break</code></span>
+<span class="codeline" id="line-715"><code>						}</code></span>
+<span class="codeline" id="line-716"><code>						var uri cryptobyte.String</code></span>
+<span class="codeline" id="line-717"><code>						if !dpNameDER.ReadASN1(&amp;uri, cryptobyte_asn1.Tag(6).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-718"><code>							return errors.New("x509: invalid CRL distribution point")</code></span>
+<span class="codeline" id="line-719"><code>						}</code></span>
+<span class="codeline" id="line-720"><code>						out.CRLDistributionPoints = append(out.CRLDistributionPoints, string(uri))</code></span>
+<span class="codeline" id="line-721"><code>					}</code></span>
+<span class="codeline" id="line-722"><code>				}</code></span>
+<span class="codeline" id="line-723"><code></code></span>
+<span class="codeline" id="line-724"><code>			case 35:</code></span>
+<span class="codeline" id="line-725"><code>				// RFC 5280, 4.2.1.1</code></span>
+<span class="codeline" id="line-726"><code>				val := cryptobyte.String(e.Value)</code></span>
+<span class="codeline" id="line-727"><code>				var akid cryptobyte.String</code></span>
+<span class="codeline" id="line-728"><code>				if !val.ReadASN1(&amp;akid, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-729"><code>					return errors.New("x509: invalid authority key identifier")</code></span>
+<span class="codeline" id="line-730"><code>				}</code></span>
+<span class="codeline" id="line-731"><code>				if akid.PeekASN1Tag(cryptobyte_asn1.Tag(0).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-732"><code>					if !akid.ReadASN1(&amp;akid, cryptobyte_asn1.Tag(0).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-733"><code>						return errors.New("x509: invalid authority key identifier")</code></span>
+<span class="codeline" id="line-734"><code>					}</code></span>
+<span class="codeline" id="line-735"><code>					out.AuthorityKeyId = akid</code></span>
+<span class="codeline" id="line-736"><code>				}</code></span>
+<span class="codeline" id="line-737"><code>			case 37:</code></span>
+<span class="codeline" id="line-738"><code>				out.ExtKeyUsage, out.UnknownExtKeyUsage, err = parseExtKeyUsageExtension(e.Value)</code></span>
+<span class="codeline" id="line-739"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-740"><code>					return err</code></span>
+<span class="codeline" id="line-741"><code>				}</code></span>
+<span class="codeline" id="line-742"><code>			case 14:</code></span>
+<span class="codeline" id="line-743"><code>				// RFC 5280, 4.2.1.2</code></span>
+<span class="codeline" id="line-744"><code>				val := cryptobyte.String(e.Value)</code></span>
+<span class="codeline" id="line-745"><code>				var skid cryptobyte.String</code></span>
+<span class="codeline" id="line-746"><code>				if !val.ReadASN1(&amp;skid, cryptobyte_asn1.OCTET_STRING) {</code></span>
+<span class="codeline" id="line-747"><code>					return errors.New("x509: invalid subject key identifier")</code></span>
+<span class="codeline" id="line-748"><code>				}</code></span>
+<span class="codeline" id="line-749"><code>				out.SubjectKeyId = skid</code></span>
+<span class="codeline" id="line-750"><code>			case 32:</code></span>
+<span class="codeline" id="line-751"><code>				out.Policies, err = parseCertificatePoliciesExtension(e.Value)</code></span>
+<span class="codeline" id="line-752"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-753"><code>					return err</code></span>
+<span class="codeline" id="line-754"><code>				}</code></span>
+<span class="codeline" id="line-755"><code>				out.PolicyIdentifiers = make([]asn1.ObjectIdentifier, 0, len(out.Policies))</code></span>
+<span class="codeline" id="line-756"><code>				for _, oid := range out.Policies {</code></span>
+<span class="codeline" id="line-757"><code>					if oid, ok := oid.toASN1OID(); ok {</code></span>
+<span class="codeline" id="line-758"><code>						out.PolicyIdentifiers = append(out.PolicyIdentifiers, oid)</code></span>
+<span class="codeline" id="line-759"><code>					}</code></span>
+<span class="codeline" id="line-760"><code>				}</code></span>
+<span class="codeline" id="line-761"><code>			default:</code></span>
+<span class="codeline" id="line-762"><code>				// Unknown extensions are recorded if critical.</code></span>
+<span class="codeline" id="line-763"><code>				unhandled = true</code></span>
+<span class="codeline" id="line-764"><code>			}</code></span>
+<span class="codeline" id="line-765"><code>		} else if e.Id.Equal(oidExtensionAuthorityInfoAccess) {</code></span>
+<span class="codeline" id="line-766"><code>			// RFC 5280 4.2.2.1: Authority Information Access</code></span>
+<span class="codeline" id="line-767"><code>			val := cryptobyte.String(e.Value)</code></span>
+<span class="codeline" id="line-768"><code>			if !val.ReadASN1(&amp;val, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-769"><code>				return errors.New("x509: invalid authority info access")</code></span>
+<span class="codeline" id="line-770"><code>			}</code></span>
+<span class="codeline" id="line-771"><code>			for !val.Empty() {</code></span>
+<span class="codeline" id="line-772"><code>				var aiaDER cryptobyte.String</code></span>
+<span class="codeline" id="line-773"><code>				if !val.ReadASN1(&amp;aiaDER, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-774"><code>					return errors.New("x509: invalid authority info access")</code></span>
+<span class="codeline" id="line-775"><code>				}</code></span>
+<span class="codeline" id="line-776"><code>				var method asn1.ObjectIdentifier</code></span>
+<span class="codeline" id="line-777"><code>				if !aiaDER.ReadASN1ObjectIdentifier(&amp;method) {</code></span>
+<span class="codeline" id="line-778"><code>					return errors.New("x509: invalid authority info access")</code></span>
+<span class="codeline" id="line-779"><code>				}</code></span>
+<span class="codeline" id="line-780"><code>				if !aiaDER.PeekASN1Tag(cryptobyte_asn1.Tag(6).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-781"><code>					continue</code></span>
+<span class="codeline" id="line-782"><code>				}</code></span>
+<span class="codeline" id="line-783"><code>				if !aiaDER.ReadASN1(&amp;aiaDER, cryptobyte_asn1.Tag(6).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-784"><code>					return errors.New("x509: invalid authority info access")</code></span>
+<span class="codeline" id="line-785"><code>				}</code></span>
+<span class="codeline" id="line-786"><code>				switch {</code></span>
+<span class="codeline" id="line-787"><code>				case method.Equal(oidAuthorityInfoAccessOcsp):</code></span>
+<span class="codeline" id="line-788"><code>					out.OCSPServer = append(out.OCSPServer, string(aiaDER))</code></span>
+<span class="codeline" id="line-789"><code>				case method.Equal(oidAuthorityInfoAccessIssuers):</code></span>
+<span class="codeline" id="line-790"><code>					out.IssuingCertificateURL = append(out.IssuingCertificateURL, string(aiaDER))</code></span>
+<span class="codeline" id="line-791"><code>				}</code></span>
+<span class="codeline" id="line-792"><code>			}</code></span>
+<span class="codeline" id="line-793"><code>		} else {</code></span>
+<span class="codeline" id="line-794"><code>			// Unknown extensions are recorded if critical.</code></span>
+<span class="codeline" id="line-795"><code>			unhandled = true</code></span>
+<span class="codeline" id="line-796"><code>		}</code></span>
+<span class="codeline" id="line-797"><code></code></span>
+<span class="codeline" id="line-798"><code>		if e.Critical &amp;&amp; unhandled {</code></span>
+<span class="codeline" id="line-799"><code>			out.UnhandledCriticalExtensions = append(out.UnhandledCriticalExtensions, e.Id)</code></span>
+<span class="codeline" id="line-800"><code>		}</code></span>
+<span class="codeline" id="line-801"><code>	}</code></span>
+<span class="codeline" id="line-802"><code></code></span>
+<span class="codeline" id="line-803"><code>	return nil</code></span>
+<span class="codeline" id="line-804"><code>}</code></span>
+<span class="codeline" id="line-805"><code></code></span>
+<span class="codeline" id="line-806"><code>func parseCertificate(der []byte) (*Certificate, error) {</code></span>
+<span class="codeline" id="line-807"><code>	cert := &amp;Certificate{}</code></span>
+<span class="codeline" id="line-808"><code></code></span>
+<span class="codeline" id="line-809"><code>	input := cryptobyte.String(der)</code></span>
+<span class="codeline" id="line-810"><code>	// we read the SEQUENCE including length and tag bytes so that</code></span>
+<span class="codeline" id="line-811"><code>	// we can populate Certificate.Raw, before unwrapping the</code></span>
+<span class="codeline" id="line-812"><code>	// SEQUENCE so it can be operated on</code></span>
+<span class="codeline" id="line-813"><code>	if !input.ReadASN1Element(&amp;input, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-814"><code>		return nil, errors.New("x509: malformed certificate")</code></span>
+<span class="codeline" id="line-815"><code>	}</code></span>
+<span class="codeline" id="line-816"><code>	cert.Raw = input</code></span>
+<span class="codeline" id="line-817"><code>	if !input.ReadASN1(&amp;input, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-818"><code>		return nil, errors.New("x509: malformed certificate")</code></span>
+<span class="codeline" id="line-819"><code>	}</code></span>
+<span class="codeline" id="line-820"><code></code></span>
+<span class="codeline" id="line-821"><code>	var tbs cryptobyte.String</code></span>
+<span class="codeline" id="line-822"><code>	// do the same trick again as above to extract the raw</code></span>
+<span class="codeline" id="line-823"><code>	// bytes for Certificate.RawTBSCertificate</code></span>
+<span class="codeline" id="line-824"><code>	if !input.ReadASN1Element(&amp;tbs, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-825"><code>		return nil, errors.New("x509: malformed tbs certificate")</code></span>
+<span class="codeline" id="line-826"><code>	}</code></span>
+<span class="codeline" id="line-827"><code>	cert.RawTBSCertificate = tbs</code></span>
+<span class="codeline" id="line-828"><code>	if !tbs.ReadASN1(&amp;tbs, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-829"><code>		return nil, errors.New("x509: malformed tbs certificate")</code></span>
+<span class="codeline" id="line-830"><code>	}</code></span>
+<span class="codeline" id="line-831"><code></code></span>
+<span class="codeline" id="line-832"><code>	if !tbs.ReadOptionalASN1Integer(&amp;cert.Version, cryptobyte_asn1.Tag(0).Constructed().ContextSpecific(), 0) {</code></span>
+<span class="codeline" id="line-833"><code>		return nil, errors.New("x509: malformed version")</code></span>
+<span class="codeline" id="line-834"><code>	}</code></span>
+<span class="codeline" id="line-835"><code>	if cert.Version &lt; 0 {</code></span>
+<span class="codeline" id="line-836"><code>		return nil, errors.New("x509: malformed version")</code></span>
+<span class="codeline" id="line-837"><code>	}</code></span>
+<span class="codeline" id="line-838"><code>	// for backwards compat reasons Version is one-indexed,</code></span>
+<span class="codeline" id="line-839"><code>	// rather than zero-indexed as defined in 5280</code></span>
+<span class="codeline" id="line-840"><code>	cert.Version++</code></span>
+<span class="codeline" id="line-841"><code>	if cert.Version &gt; 3 {</code></span>
+<span class="codeline" id="line-842"><code>		return nil, errors.New("x509: invalid version")</code></span>
+<span class="codeline" id="line-843"><code>	}</code></span>
+<span class="codeline" id="line-844"><code></code></span>
+<span class="codeline" id="line-845"><code>	serial := new(big.Int)</code></span>
+<span class="codeline" id="line-846"><code>	if !tbs.ReadASN1Integer(serial) {</code></span>
+<span class="codeline" id="line-847"><code>		return nil, errors.New("x509: malformed serial number")</code></span>
+<span class="codeline" id="line-848"><code>	}</code></span>
+<span class="codeline" id="line-849"><code>	// we ignore the presence of negative serial numbers because</code></span>
+<span class="codeline" id="line-850"><code>	// of their prevalence, despite them being invalid</code></span>
+<span class="codeline" id="line-851"><code>	// TODO(rolandshoemaker): revisit this decision, there are currently</code></span>
+<span class="codeline" id="line-852"><code>	// only 10 trusted certificates with negative serial numbers</code></span>
+<span class="codeline" id="line-853"><code>	// according to censys.io.</code></span>
+<span class="codeline" id="line-854"><code>	cert.SerialNumber = serial</code></span>
+<span class="codeline" id="line-855"><code></code></span>
+<span class="codeline" id="line-856"><code>	var sigAISeq cryptobyte.String</code></span>
+<span class="codeline" id="line-857"><code>	if !tbs.ReadASN1(&amp;sigAISeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-858"><code>		return nil, errors.New("x509: malformed signature algorithm identifier")</code></span>
+<span class="codeline" id="line-859"><code>	}</code></span>
+<span class="codeline" id="line-860"><code>	// Before parsing the inner algorithm identifier, extract</code></span>
+<span class="codeline" id="line-861"><code>	// the outer algorithm identifier and make sure that they</code></span>
+<span class="codeline" id="line-862"><code>	// match.</code></span>
+<span class="codeline" id="line-863"><code>	var outerSigAISeq cryptobyte.String</code></span>
+<span class="codeline" id="line-864"><code>	if !input.ReadASN1(&amp;outerSigAISeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-865"><code>		return nil, errors.New("x509: malformed algorithm identifier")</code></span>
+<span class="codeline" id="line-866"><code>	}</code></span>
+<span class="codeline" id="line-867"><code>	if !bytes.Equal(outerSigAISeq, sigAISeq) {</code></span>
+<span class="codeline" id="line-868"><code>		return nil, errors.New("x509: inner and outer signature algorithm identifiers don't match")</code></span>
+<span class="codeline" id="line-869"><code>	}</code></span>
+<span class="codeline" id="line-870"><code>	sigAI, err := parseAI(sigAISeq)</code></span>
+<span class="codeline" id="line-871"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-872"><code>		return nil, err</code></span>
+<span class="codeline" id="line-873"><code>	}</code></span>
+<span class="codeline" id="line-874"><code>	cert.SignatureAlgorithm = getSignatureAlgorithmFromAI(sigAI)</code></span>
+<span class="codeline" id="line-875"><code></code></span>
+<span class="codeline" id="line-876"><code>	var issuerSeq cryptobyte.String</code></span>
+<span class="codeline" id="line-877"><code>	if !tbs.ReadASN1Element(&amp;issuerSeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-878"><code>		return nil, errors.New("x509: malformed issuer")</code></span>
+<span class="codeline" id="line-879"><code>	}</code></span>
+<span class="codeline" id="line-880"><code>	cert.RawIssuer = issuerSeq</code></span>
+<span class="codeline" id="line-881"><code>	issuerRDNs, err := parseName(issuerSeq)</code></span>
+<span class="codeline" id="line-882"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-883"><code>		return nil, err</code></span>
+<span class="codeline" id="line-884"><code>	}</code></span>
+<span class="codeline" id="line-885"><code>	cert.Issuer.FillFromRDNSequence(issuerRDNs)</code></span>
+<span class="codeline" id="line-886"><code></code></span>
+<span class="codeline" id="line-887"><code>	var validity cryptobyte.String</code></span>
+<span class="codeline" id="line-888"><code>	if !tbs.ReadASN1(&amp;validity, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-889"><code>		return nil, errors.New("x509: malformed validity")</code></span>
+<span class="codeline" id="line-890"><code>	}</code></span>
+<span class="codeline" id="line-891"><code>	cert.NotBefore, cert.NotAfter, err = parseValidity(validity)</code></span>
+<span class="codeline" id="line-892"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-893"><code>		return nil, err</code></span>
+<span class="codeline" id="line-894"><code>	}</code></span>
+<span class="codeline" id="line-895"><code></code></span>
+<span class="codeline" id="line-896"><code>	var subjectSeq cryptobyte.String</code></span>
+<span class="codeline" id="line-897"><code>	if !tbs.ReadASN1Element(&amp;subjectSeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-898"><code>		return nil, errors.New("x509: malformed issuer")</code></span>
+<span class="codeline" id="line-899"><code>	}</code></span>
+<span class="codeline" id="line-900"><code>	cert.RawSubject = subjectSeq</code></span>
+<span class="codeline" id="line-901"><code>	subjectRDNs, err := parseName(subjectSeq)</code></span>
+<span class="codeline" id="line-902"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-903"><code>		return nil, err</code></span>
+<span class="codeline" id="line-904"><code>	}</code></span>
+<span class="codeline" id="line-905"><code>	cert.Subject.FillFromRDNSequence(subjectRDNs)</code></span>
+<span class="codeline" id="line-906"><code></code></span>
+<span class="codeline" id="line-907"><code>	var spki cryptobyte.String</code></span>
+<span class="codeline" id="line-908"><code>	if !tbs.ReadASN1Element(&amp;spki, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-909"><code>		return nil, errors.New("x509: malformed spki")</code></span>
+<span class="codeline" id="line-910"><code>	}</code></span>
+<span class="codeline" id="line-911"><code>	cert.RawSubjectPublicKeyInfo = spki</code></span>
+<span class="codeline" id="line-912"><code>	if !spki.ReadASN1(&amp;spki, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-913"><code>		return nil, errors.New("x509: malformed spki")</code></span>
+<span class="codeline" id="line-914"><code>	}</code></span>
+<span class="codeline" id="line-915"><code>	var pkAISeq cryptobyte.String</code></span>
+<span class="codeline" id="line-916"><code>	if !spki.ReadASN1(&amp;pkAISeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-917"><code>		return nil, errors.New("x509: malformed public key algorithm identifier")</code></span>
+<span class="codeline" id="line-918"><code>	}</code></span>
+<span class="codeline" id="line-919"><code>	pkAI, err := parseAI(pkAISeq)</code></span>
+<span class="codeline" id="line-920"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-921"><code>		return nil, err</code></span>
+<span class="codeline" id="line-922"><code>	}</code></span>
+<span class="codeline" id="line-923"><code>	cert.PublicKeyAlgorithm = getPublicKeyAlgorithmFromOID(pkAI.Algorithm)</code></span>
+<span class="codeline" id="line-924"><code>	var spk asn1.BitString</code></span>
+<span class="codeline" id="line-925"><code>	if !spki.ReadASN1BitString(&amp;spk) {</code></span>
+<span class="codeline" id="line-926"><code>		return nil, errors.New("x509: malformed subjectPublicKey")</code></span>
+<span class="codeline" id="line-927"><code>	}</code></span>
+<span class="codeline" id="line-928"><code>	if cert.PublicKeyAlgorithm != UnknownPublicKeyAlgorithm {</code></span>
+<span class="codeline" id="line-929"><code>		cert.PublicKey, err = parsePublicKey(&amp;publicKeyInfo{</code></span>
+<span class="codeline" id="line-930"><code>			Algorithm: pkAI,</code></span>
+<span class="codeline" id="line-931"><code>			PublicKey: spk,</code></span>
+<span class="codeline" id="line-932"><code>		})</code></span>
+<span class="codeline" id="line-933"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-934"><code>			return nil, err</code></span>
+<span class="codeline" id="line-935"><code>		}</code></span>
+<span class="codeline" id="line-936"><code>	}</code></span>
+<span class="codeline" id="line-937"><code></code></span>
+<span class="codeline" id="line-938"><code>	if cert.Version &gt; 1 {</code></span>
+<span class="codeline" id="line-939"><code>		if !tbs.SkipOptionalASN1(cryptobyte_asn1.Tag(1).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-940"><code>			return nil, errors.New("x509: malformed issuerUniqueID")</code></span>
+<span class="codeline" id="line-941"><code>		}</code></span>
+<span class="codeline" id="line-942"><code>		if !tbs.SkipOptionalASN1(cryptobyte_asn1.Tag(2).ContextSpecific()) {</code></span>
+<span class="codeline" id="line-943"><code>			return nil, errors.New("x509: malformed subjectUniqueID")</code></span>
+<span class="codeline" id="line-944"><code>		}</code></span>
+<span class="codeline" id="line-945"><code>		if cert.Version == 3 {</code></span>
+<span class="codeline" id="line-946"><code>			var extensions cryptobyte.String</code></span>
+<span class="codeline" id="line-947"><code>			var present bool</code></span>
+<span class="codeline" id="line-948"><code>			if !tbs.ReadOptionalASN1(&amp;extensions, &amp;present, cryptobyte_asn1.Tag(3).Constructed().ContextSpecific()) {</code></span>
+<span class="codeline" id="line-949"><code>				return nil, errors.New("x509: malformed extensions")</code></span>
+<span class="codeline" id="line-950"><code>			}</code></span>
+<span class="codeline" id="line-951"><code>			if present {</code></span>
+<span class="codeline" id="line-952"><code>				seenExts := make(map[string]bool)</code></span>
+<span class="codeline" id="line-953"><code>				if !extensions.ReadASN1(&amp;extensions, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-954"><code>					return nil, errors.New("x509: malformed extensions")</code></span>
+<span class="codeline" id="line-955"><code>				}</code></span>
+<span class="codeline" id="line-956"><code>				for !extensions.Empty() {</code></span>
+<span class="codeline" id="line-957"><code>					var extension cryptobyte.String</code></span>
+<span class="codeline" id="line-958"><code>					if !extensions.ReadASN1(&amp;extension, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-959"><code>						return nil, errors.New("x509: malformed extension")</code></span>
+<span class="codeline" id="line-960"><code>					}</code></span>
+<span class="codeline" id="line-961"><code>					ext, err := parseExtension(extension)</code></span>
+<span class="codeline" id="line-962"><code>					if err != nil {</code></span>
+<span class="codeline" id="line-963"><code>						return nil, err</code></span>
+<span class="codeline" id="line-964"><code>					}</code></span>
+<span class="codeline" id="line-965"><code>					oidStr := ext.Id.String()</code></span>
+<span class="codeline" id="line-966"><code>					if seenExts[oidStr] {</code></span>
+<span class="codeline" id="line-967"><code>						return nil, errors.New("x509: certificate contains duplicate extensions")</code></span>
+<span class="codeline" id="line-968"><code>					}</code></span>
+<span class="codeline" id="line-969"><code>					seenExts[oidStr] = true</code></span>
+<span class="codeline" id="line-970"><code>					cert.Extensions = append(cert.Extensions, ext)</code></span>
+<span class="codeline" id="line-971"><code>				}</code></span>
+<span class="codeline" id="line-972"><code>				err = processExtensions(cert)</code></span>
+<span class="codeline" id="line-973"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-974"><code>					return nil, err</code></span>
+<span class="codeline" id="line-975"><code>				}</code></span>
+<span class="codeline" id="line-976"><code>			}</code></span>
+<span class="codeline" id="line-977"><code>		}</code></span>
+<span class="codeline" id="line-978"><code>	}</code></span>
+<span class="codeline" id="line-979"><code></code></span>
+<span class="codeline" id="line-980"><code>	var signature asn1.BitString</code></span>
+<span class="codeline" id="line-981"><code>	if !input.ReadASN1BitString(&amp;signature) {</code></span>
+<span class="codeline" id="line-982"><code>		return nil, errors.New("x509: malformed signature")</code></span>
+<span class="codeline" id="line-983"><code>	}</code></span>
+<span class="codeline" id="line-984"><code>	cert.Signature = signature.RightAlign()</code></span>
+<span class="codeline" id="line-985"><code></code></span>
+<span class="codeline" id="line-986"><code>	return cert, nil</code></span>
+<span class="codeline" id="line-987"><code>}</code></span>
+<span class="codeline" id="line-988"><code></code></span>
+<span class="codeline" id="line-989"><code>// ParseCertificate parses a single certificate from the given ASN.1 DER data.</code></span>
+<span class="codeline" id="line-990"><code>func ParseCertificate(der []byte) (*Certificate, error) {</code></span>
+<span class="codeline" id="line-991"><code>	cert, err := parseCertificate(der)</code></span>
+<span class="codeline" id="line-992"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-993"><code>		return nil, err</code></span>
+<span class="codeline" id="line-994"><code>	}</code></span>
+<span class="codeline" id="line-995"><code>	if len(der) != len(cert.Raw) {</code></span>
+<span class="codeline" id="line-996"><code>		return nil, errors.New("x509: trailing data")</code></span>
+<span class="codeline" id="line-997"><code>	}</code></span>
+<span class="codeline" id="line-998"><code>	return cert, err</code></span>
+<span class="codeline" id="line-999"><code>}</code></span>
+<span class="codeline" id="line-1000"><code></code></span>
+<span class="codeline" id="line-1001"><code>// ParseCertificates parses one or more certificates from the given ASN.1 DER</code></span>
+<span class="codeline" id="line-1002"><code>// data. The certificates must be concatenated with no intermediate padding.</code></span>
+<span class="codeline" id="line-1003"><code>func ParseCertificates(der []byte) ([]*Certificate, error) {</code></span>
+<span class="codeline" id="line-1004"><code>	var certs []*Certificate</code></span>
+<span class="codeline" id="line-1005"><code>	for len(der) &gt; 0 {</code></span>
+<span class="codeline" id="line-1006"><code>		cert, err := parseCertificate(der)</code></span>
+<span class="codeline" id="line-1007"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1008"><code>			return nil, err</code></span>
+<span class="codeline" id="line-1009"><code>		}</code></span>
+<span class="codeline" id="line-1010"><code>		certs = append(certs, cert)</code></span>
+<span class="codeline" id="line-1011"><code>		der = der[len(cert.Raw):]</code></span>
+<span class="codeline" id="line-1012"><code>	}</code></span>
+<span class="codeline" id="line-1013"><code>	return certs, nil</code></span>
+<span class="codeline" id="line-1014"><code>}</code></span>
+<span class="codeline" id="line-1015"><code></code></span>
+<span class="codeline" id="line-1016"><code>// The X.509 standards confusingly 1-indexed the version names, but 0-indexed</code></span>
+<span class="codeline" id="line-1017"><code>// the actual encoded version, so the version for X.509v2 is 1.</code></span>
+<span class="codeline" id="line-1018"><code>const x509v2Version = 1</code></span>
+<span class="codeline" id="line-1019"><code></code></span>
+<span class="codeline" id="line-1020"><code>// ParseRevocationList parses a X509 v2 [Certificate] Revocation List from the given</code></span>
+<span class="codeline" id="line-1021"><code>// ASN.1 DER data.</code></span>
+<span class="codeline" id="line-1022"><code>func ParseRevocationList(der []byte) (*RevocationList, error) {</code></span>
+<span class="codeline" id="line-1023"><code>	rl := &amp;RevocationList{}</code></span>
+<span class="codeline" id="line-1024"><code></code></span>
+<span class="codeline" id="line-1025"><code>	input := cryptobyte.String(der)</code></span>
+<span class="codeline" id="line-1026"><code>	// we read the SEQUENCE including length and tag bytes so that</code></span>
+<span class="codeline" id="line-1027"><code>	// we can populate RevocationList.Raw, before unwrapping the</code></span>
+<span class="codeline" id="line-1028"><code>	// SEQUENCE so it can be operated on</code></span>
+<span class="codeline" id="line-1029"><code>	if !input.ReadASN1Element(&amp;input, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1030"><code>		return nil, errors.New("x509: malformed crl")</code></span>
+<span class="codeline" id="line-1031"><code>	}</code></span>
+<span class="codeline" id="line-1032"><code>	rl.Raw = input</code></span>
+<span class="codeline" id="line-1033"><code>	if !input.ReadASN1(&amp;input, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1034"><code>		return nil, errors.New("x509: malformed crl")</code></span>
+<span class="codeline" id="line-1035"><code>	}</code></span>
+<span class="codeline" id="line-1036"><code></code></span>
+<span class="codeline" id="line-1037"><code>	var tbs cryptobyte.String</code></span>
+<span class="codeline" id="line-1038"><code>	// do the same trick again as above to extract the raw</code></span>
+<span class="codeline" id="line-1039"><code>	// bytes for Certificate.RawTBSCertificate</code></span>
+<span class="codeline" id="line-1040"><code>	if !input.ReadASN1Element(&amp;tbs, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1041"><code>		return nil, errors.New("x509: malformed tbs crl")</code></span>
+<span class="codeline" id="line-1042"><code>	}</code></span>
+<span class="codeline" id="line-1043"><code>	rl.RawTBSRevocationList = tbs</code></span>
+<span class="codeline" id="line-1044"><code>	if !tbs.ReadASN1(&amp;tbs, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1045"><code>		return nil, errors.New("x509: malformed tbs crl")</code></span>
+<span class="codeline" id="line-1046"><code>	}</code></span>
+<span class="codeline" id="line-1047"><code></code></span>
+<span class="codeline" id="line-1048"><code>	var version int</code></span>
+<span class="codeline" id="line-1049"><code>	if !tbs.PeekASN1Tag(cryptobyte_asn1.INTEGER) {</code></span>
+<span class="codeline" id="line-1050"><code>		return nil, errors.New("x509: unsupported crl version")</code></span>
+<span class="codeline" id="line-1051"><code>	}</code></span>
+<span class="codeline" id="line-1052"><code>	if !tbs.ReadASN1Integer(&amp;version) {</code></span>
+<span class="codeline" id="line-1053"><code>		return nil, errors.New("x509: malformed crl")</code></span>
+<span class="codeline" id="line-1054"><code>	}</code></span>
+<span class="codeline" id="line-1055"><code>	if version != x509v2Version {</code></span>
+<span class="codeline" id="line-1056"><code>		return nil, fmt.Errorf("x509: unsupported crl version: %d", version)</code></span>
+<span class="codeline" id="line-1057"><code>	}</code></span>
+<span class="codeline" id="line-1058"><code></code></span>
+<span class="codeline" id="line-1059"><code>	var sigAISeq cryptobyte.String</code></span>
+<span class="codeline" id="line-1060"><code>	if !tbs.ReadASN1(&amp;sigAISeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1061"><code>		return nil, errors.New("x509: malformed signature algorithm identifier")</code></span>
+<span class="codeline" id="line-1062"><code>	}</code></span>
+<span class="codeline" id="line-1063"><code>	// Before parsing the inner algorithm identifier, extract</code></span>
+<span class="codeline" id="line-1064"><code>	// the outer algorithm identifier and make sure that they</code></span>
+<span class="codeline" id="line-1065"><code>	// match.</code></span>
+<span class="codeline" id="line-1066"><code>	var outerSigAISeq cryptobyte.String</code></span>
+<span class="codeline" id="line-1067"><code>	if !input.ReadASN1(&amp;outerSigAISeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1068"><code>		return nil, errors.New("x509: malformed algorithm identifier")</code></span>
+<span class="codeline" id="line-1069"><code>	}</code></span>
+<span class="codeline" id="line-1070"><code>	if !bytes.Equal(outerSigAISeq, sigAISeq) {</code></span>
+<span class="codeline" id="line-1071"><code>		return nil, errors.New("x509: inner and outer signature algorithm identifiers don't match")</code></span>
+<span class="codeline" id="line-1072"><code>	}</code></span>
+<span class="codeline" id="line-1073"><code>	sigAI, err := parseAI(sigAISeq)</code></span>
+<span class="codeline" id="line-1074"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1075"><code>		return nil, err</code></span>
+<span class="codeline" id="line-1076"><code>	}</code></span>
+<span class="codeline" id="line-1077"><code>	rl.SignatureAlgorithm = getSignatureAlgorithmFromAI(sigAI)</code></span>
+<span class="codeline" id="line-1078"><code></code></span>
+<span class="codeline" id="line-1079"><code>	var signature asn1.BitString</code></span>
+<span class="codeline" id="line-1080"><code>	if !input.ReadASN1BitString(&amp;signature) {</code></span>
+<span class="codeline" id="line-1081"><code>		return nil, errors.New("x509: malformed signature")</code></span>
+<span class="codeline" id="line-1082"><code>	}</code></span>
+<span class="codeline" id="line-1083"><code>	rl.Signature = signature.RightAlign()</code></span>
+<span class="codeline" id="line-1084"><code></code></span>
+<span class="codeline" id="line-1085"><code>	var issuerSeq cryptobyte.String</code></span>
+<span class="codeline" id="line-1086"><code>	if !tbs.ReadASN1Element(&amp;issuerSeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1087"><code>		return nil, errors.New("x509: malformed issuer")</code></span>
+<span class="codeline" id="line-1088"><code>	}</code></span>
+<span class="codeline" id="line-1089"><code>	rl.RawIssuer = issuerSeq</code></span>
+<span class="codeline" id="line-1090"><code>	issuerRDNs, err := parseName(issuerSeq)</code></span>
+<span class="codeline" id="line-1091"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1092"><code>		return nil, err</code></span>
+<span class="codeline" id="line-1093"><code>	}</code></span>
+<span class="codeline" id="line-1094"><code>	rl.Issuer.FillFromRDNSequence(issuerRDNs)</code></span>
+<span class="codeline" id="line-1095"><code></code></span>
+<span class="codeline" id="line-1096"><code>	rl.ThisUpdate, err = parseTime(&amp;tbs)</code></span>
+<span class="codeline" id="line-1097"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1098"><code>		return nil, err</code></span>
+<span class="codeline" id="line-1099"><code>	}</code></span>
+<span class="codeline" id="line-1100"><code>	if tbs.PeekASN1Tag(cryptobyte_asn1.GeneralizedTime) || tbs.PeekASN1Tag(cryptobyte_asn1.UTCTime) {</code></span>
+<span class="codeline" id="line-1101"><code>		rl.NextUpdate, err = parseTime(&amp;tbs)</code></span>
+<span class="codeline" id="line-1102"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1103"><code>			return nil, err</code></span>
+<span class="codeline" id="line-1104"><code>		}</code></span>
+<span class="codeline" id="line-1105"><code>	}</code></span>
+<span class="codeline" id="line-1106"><code></code></span>
+<span class="codeline" id="line-1107"><code>	if tbs.PeekASN1Tag(cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1108"><code>		var revokedSeq cryptobyte.String</code></span>
+<span class="codeline" id="line-1109"><code>		if !tbs.ReadASN1(&amp;revokedSeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1110"><code>			return nil, errors.New("x509: malformed crl")</code></span>
+<span class="codeline" id="line-1111"><code>		}</code></span>
+<span class="codeline" id="line-1112"><code>		for !revokedSeq.Empty() {</code></span>
+<span class="codeline" id="line-1113"><code>			rce := RevocationListEntry{}</code></span>
+<span class="codeline" id="line-1114"><code></code></span>
+<span class="codeline" id="line-1115"><code>			var certSeq cryptobyte.String</code></span>
+<span class="codeline" id="line-1116"><code>			if !revokedSeq.ReadASN1Element(&amp;certSeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1117"><code>				return nil, errors.New("x509: malformed crl")</code></span>
+<span class="codeline" id="line-1118"><code>			}</code></span>
+<span class="codeline" id="line-1119"><code>			rce.Raw = certSeq</code></span>
+<span class="codeline" id="line-1120"><code>			if !certSeq.ReadASN1(&amp;certSeq, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1121"><code>				return nil, errors.New("x509: malformed crl")</code></span>
+<span class="codeline" id="line-1122"><code>			}</code></span>
+<span class="codeline" id="line-1123"><code></code></span>
+<span class="codeline" id="line-1124"><code>			rce.SerialNumber = new(big.Int)</code></span>
+<span class="codeline" id="line-1125"><code>			if !certSeq.ReadASN1Integer(rce.SerialNumber) {</code></span>
+<span class="codeline" id="line-1126"><code>				return nil, errors.New("x509: malformed serial number")</code></span>
+<span class="codeline" id="line-1127"><code>			}</code></span>
+<span class="codeline" id="line-1128"><code>			rce.RevocationTime, err = parseTime(&amp;certSeq)</code></span>
+<span class="codeline" id="line-1129"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-1130"><code>				return nil, err</code></span>
+<span class="codeline" id="line-1131"><code>			}</code></span>
+<span class="codeline" id="line-1132"><code>			var extensions cryptobyte.String</code></span>
+<span class="codeline" id="line-1133"><code>			var present bool</code></span>
+<span class="codeline" id="line-1134"><code>			if !certSeq.ReadOptionalASN1(&amp;extensions, &amp;present, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1135"><code>				return nil, errors.New("x509: malformed extensions")</code></span>
+<span class="codeline" id="line-1136"><code>			}</code></span>
+<span class="codeline" id="line-1137"><code>			if present {</code></span>
+<span class="codeline" id="line-1138"><code>				for !extensions.Empty() {</code></span>
+<span class="codeline" id="line-1139"><code>					var extension cryptobyte.String</code></span>
+<span class="codeline" id="line-1140"><code>					if !extensions.ReadASN1(&amp;extension, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1141"><code>						return nil, errors.New("x509: malformed extension")</code></span>
+<span class="codeline" id="line-1142"><code>					}</code></span>
+<span class="codeline" id="line-1143"><code>					ext, err := parseExtension(extension)</code></span>
+<span class="codeline" id="line-1144"><code>					if err != nil {</code></span>
+<span class="codeline" id="line-1145"><code>						return nil, err</code></span>
+<span class="codeline" id="line-1146"><code>					}</code></span>
+<span class="codeline" id="line-1147"><code>					if ext.Id.Equal(oidExtensionReasonCode) {</code></span>
+<span class="codeline" id="line-1148"><code>						val := cryptobyte.String(ext.Value)</code></span>
+<span class="codeline" id="line-1149"><code>						if !val.ReadASN1Enum(&amp;rce.ReasonCode) {</code></span>
+<span class="codeline" id="line-1150"><code>							return nil, fmt.Errorf("x509: malformed reasonCode extension")</code></span>
+<span class="codeline" id="line-1151"><code>						}</code></span>
+<span class="codeline" id="line-1152"><code>					}</code></span>
+<span class="codeline" id="line-1153"><code>					rce.Extensions = append(rce.Extensions, ext)</code></span>
+<span class="codeline" id="line-1154"><code>				}</code></span>
+<span class="codeline" id="line-1155"><code>			}</code></span>
+<span class="codeline" id="line-1156"><code></code></span>
+<span class="codeline" id="line-1157"><code>			rl.RevokedCertificateEntries = append(rl.RevokedCertificateEntries, rce)</code></span>
+<span class="codeline" id="line-1158"><code>			rcDeprecated := pkix.RevokedCertificate{</code></span>
+<span class="codeline" id="line-1159"><code>				SerialNumber:   rce.SerialNumber,</code></span>
+<span class="codeline" id="line-1160"><code>				RevocationTime: rce.RevocationTime,</code></span>
+<span class="codeline" id="line-1161"><code>				Extensions:     rce.Extensions,</code></span>
+<span class="codeline" id="line-1162"><code>			}</code></span>
+<span class="codeline" id="line-1163"><code>			rl.RevokedCertificates = append(rl.RevokedCertificates, rcDeprecated)</code></span>
+<span class="codeline" id="line-1164"><code>		}</code></span>
+<span class="codeline" id="line-1165"><code>	}</code></span>
+<span class="codeline" id="line-1166"><code></code></span>
+<span class="codeline" id="line-1167"><code>	var extensions cryptobyte.String</code></span>
+<span class="codeline" id="line-1168"><code>	var present bool</code></span>
+<span class="codeline" id="line-1169"><code>	if !tbs.ReadOptionalASN1(&amp;extensions, &amp;present, cryptobyte_asn1.Tag(0).Constructed().ContextSpecific()) {</code></span>
+<span class="codeline" id="line-1170"><code>		return nil, errors.New("x509: malformed extensions")</code></span>
+<span class="codeline" id="line-1171"><code>	}</code></span>
+<span class="codeline" id="line-1172"><code>	if present {</code></span>
+<span class="codeline" id="line-1173"><code>		if !extensions.ReadASN1(&amp;extensions, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1174"><code>			return nil, errors.New("x509: malformed extensions")</code></span>
+<span class="codeline" id="line-1175"><code>		}</code></span>
+<span class="codeline" id="line-1176"><code>		for !extensions.Empty() {</code></span>
+<span class="codeline" id="line-1177"><code>			var extension cryptobyte.String</code></span>
+<span class="codeline" id="line-1178"><code>			if !extensions.ReadASN1(&amp;extension, cryptobyte_asn1.SEQUENCE) {</code></span>
+<span class="codeline" id="line-1179"><code>				return nil, errors.New("x509: malformed extension")</code></span>
+<span class="codeline" id="line-1180"><code>			}</code></span>
+<span class="codeline" id="line-1181"><code>			ext, err := parseExtension(extension)</code></span>
+<span class="codeline" id="line-1182"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-1183"><code>				return nil, err</code></span>
+<span class="codeline" id="line-1184"><code>			}</code></span>
+<span class="codeline" id="line-1185"><code>			if ext.Id.Equal(oidExtensionAuthorityKeyId) {</code></span>
+<span class="codeline" id="line-1186"><code>				rl.AuthorityKeyId = ext.Value</code></span>
+<span class="codeline" id="line-1187"><code>			} else if ext.Id.Equal(oidExtensionCRLNumber) {</code></span>
+<span class="codeline" id="line-1188"><code>				value := cryptobyte.String(ext.Value)</code></span>
+<span class="codeline" id="line-1189"><code>				rl.Number = new(big.Int)</code></span>
+<span class="codeline" id="line-1190"><code>				if !value.ReadASN1Integer(rl.Number) {</code></span>
+<span class="codeline" id="line-1191"><code>					return nil, errors.New("x509: malformed crl number")</code></span>
+<span class="codeline" id="line-1192"><code>				}</code></span>
+<span class="codeline" id="line-1193"><code>			}</code></span>
+<span class="codeline" id="line-1194"><code>			rl.Extensions = append(rl.Extensions, ext)</code></span>
+<span class="codeline" id="line-1195"><code>		}</code></span>
+<span class="codeline" id="line-1196"><code>	}</code></span>
+<span class="codeline" id="line-1197"><code></code></span>
+<span class="codeline" id="line-1198"><code>	return rl, nil</code></span>
+<span class="codeline" id="line-1199"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

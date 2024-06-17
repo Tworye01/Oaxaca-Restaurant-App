@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: annotation.go in package runtime/trace</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	annotation.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/runtime/trace.html">runtime/trace</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2018 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package trace</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"context"</code></span>
+<span class="codeline" id="line-9"><code>	"fmt"</code></span>
+<span class="codeline" id="line-10"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-11"><code>	_ "unsafe"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>type traceContextKey struct{}</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// NewTask creates a task instance with the type taskType and returns</code></span>
+<span class="codeline" id="line-17"><code>// it along with a Context that carries the task.</code></span>
+<span class="codeline" id="line-18"><code>// If the input context contains a task, the new task is its subtask.</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>// The taskType is used to classify task instances. Analysis tools</code></span>
+<span class="codeline" id="line-21"><code>// like the Go execution tracer may assume there are only a bounded</code></span>
+<span class="codeline" id="line-22"><code>// number of unique task types in the system.</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>// The returned Task's [Task.End] method is used to mark the task's end.</code></span>
+<span class="codeline" id="line-25"><code>// The trace tool measures task latency as the time between task creation</code></span>
+<span class="codeline" id="line-26"><code>// and when the End method is called, and provides the latency</code></span>
+<span class="codeline" id="line-27"><code>// distribution per task type.</code></span>
+<span class="codeline" id="line-28"><code>// If the End method is called multiple times, only the first</code></span>
+<span class="codeline" id="line-29"><code>// call is used in the latency measurement.</code></span>
+<span class="codeline" id="line-30"><code>//</code></span>
+<span class="codeline" id="line-31"><code>//	ctx, task := trace.NewTask(ctx, "awesomeTask")</code></span>
+<span class="codeline" id="line-32"><code>//	trace.WithRegion(ctx, "preparation", prepWork)</code></span>
+<span class="codeline" id="line-33"><code>//	// preparation of the task</code></span>
+<span class="codeline" id="line-34"><code>//	go func() {  // continue processing the task in a separate goroutine.</code></span>
+<span class="codeline" id="line-35"><code>//	    defer task.End()</code></span>
+<span class="codeline" id="line-36"><code>//	    trace.WithRegion(ctx, "remainingWork", remainingWork)</code></span>
+<span class="codeline" id="line-37"><code>//	}()</code></span>
+<span class="codeline" id="line-38"><code>func NewTask(pctx context.Context, taskType string) (ctx context.Context, task *Task) {</code></span>
+<span class="codeline" id="line-39"><code>	pid := fromContext(pctx).id</code></span>
+<span class="codeline" id="line-40"><code>	id := newID()</code></span>
+<span class="codeline" id="line-41"><code>	userTaskCreate(id, pid, taskType)</code></span>
+<span class="codeline" id="line-42"><code>	s := &amp;Task{id: id}</code></span>
+<span class="codeline" id="line-43"><code>	return context.WithValue(pctx, traceContextKey{}, s), s</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>	// We allocate a new task even when</code></span>
+<span class="codeline" id="line-46"><code>	// the tracing is disabled because the context and task</code></span>
+<span class="codeline" id="line-47"><code>	// can be used across trace enable/disable boundaries,</code></span>
+<span class="codeline" id="line-48"><code>	// which complicates the problem.</code></span>
+<span class="codeline" id="line-49"><code>	//</code></span>
+<span class="codeline" id="line-50"><code>	// For example, consider the following scenario:</code></span>
+<span class="codeline" id="line-51"><code>	//   - trace is enabled.</code></span>
+<span class="codeline" id="line-52"><code>	//   - trace.WithRegion is called, so a new context ctx</code></span>
+<span class="codeline" id="line-53"><code>	//     with a new region is created.</code></span>
+<span class="codeline" id="line-54"><code>	//   - trace is disabled.</code></span>
+<span class="codeline" id="line-55"><code>	//   - trace is enabled again.</code></span>
+<span class="codeline" id="line-56"><code>	//   - trace APIs with the ctx is called. Is the ID in the task</code></span>
+<span class="codeline" id="line-57"><code>	//   a valid one to use?</code></span>
+<span class="codeline" id="line-58"><code>	//</code></span>
+<span class="codeline" id="line-59"><code>	// TODO(hyangah): reduce the overhead at least when</code></span>
+<span class="codeline" id="line-60"><code>	// tracing is disabled. Maybe the id can embed a tracing</code></span>
+<span class="codeline" id="line-61"><code>	// round number and ignore ids generated from previous</code></span>
+<span class="codeline" id="line-62"><code>	// tracing round.</code></span>
+<span class="codeline" id="line-63"><code>}</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>func fromContext(ctx context.Context) *Task {</code></span>
+<span class="codeline" id="line-66"><code>	if s, ok := ctx.Value(traceContextKey{}).(*Task); ok {</code></span>
+<span class="codeline" id="line-67"><code>		return s</code></span>
+<span class="codeline" id="line-68"><code>	}</code></span>
+<span class="codeline" id="line-69"><code>	return &amp;bgTask</code></span>
+<span class="codeline" id="line-70"><code>}</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>// Task is a data type for tracing a user-defined, logical operation.</code></span>
+<span class="codeline" id="line-73"><code>type Task struct {</code></span>
+<span class="codeline" id="line-74"><code>	id uint64</code></span>
+<span class="codeline" id="line-75"><code>	// TODO(hyangah): record parent id?</code></span>
+<span class="codeline" id="line-76"><code>}</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>// End marks the end of the operation represented by the [Task].</code></span>
+<span class="codeline" id="line-79"><code>func (t *Task) End() {</code></span>
+<span class="codeline" id="line-80"><code>	userTaskEnd(t.id)</code></span>
+<span class="codeline" id="line-81"><code>}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>var lastTaskID uint64 = 0 // task id issued last time</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>func newID() uint64 {</code></span>
+<span class="codeline" id="line-86"><code>	// TODO(hyangah): use per-P cache</code></span>
+<span class="codeline" id="line-87"><code>	return atomic.AddUint64(&amp;lastTaskID, 1)</code></span>
+<span class="codeline" id="line-88"><code>}</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>var bgTask = Task{id: uint64(0)}</code></span>
+<span class="codeline" id="line-91"><code></code></span>
+<span class="codeline" id="line-92"><code>// Log emits a one-off event with the given category and message.</code></span>
+<span class="codeline" id="line-93"><code>// Category can be empty and the API assumes there are only a handful of</code></span>
+<span class="codeline" id="line-94"><code>// unique categories in the system.</code></span>
+<span class="codeline" id="line-95"><code>func Log(ctx context.Context, category, message string) {</code></span>
+<span class="codeline" id="line-96"><code>	id := fromContext(ctx).id</code></span>
+<span class="codeline" id="line-97"><code>	userLog(id, category, message)</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// Logf is like [Log], but the value is formatted using the specified format spec.</code></span>
+<span class="codeline" id="line-101"><code>func Logf(ctx context.Context, category, format string, args ...any) {</code></span>
+<span class="codeline" id="line-102"><code>	if IsEnabled() {</code></span>
+<span class="codeline" id="line-103"><code>		// Ideally this should be just Log, but that will</code></span>
+<span class="codeline" id="line-104"><code>		// add one more frame in the stack trace.</code></span>
+<span class="codeline" id="line-105"><code>		id := fromContext(ctx).id</code></span>
+<span class="codeline" id="line-106"><code>		userLog(id, category, fmt.Sprintf(format, args...))</code></span>
+<span class="codeline" id="line-107"><code>	}</code></span>
+<span class="codeline" id="line-108"><code>}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>const (</code></span>
+<span class="codeline" id="line-111"><code>	regionStartCode = uint64(0)</code></span>
+<span class="codeline" id="line-112"><code>	regionEndCode   = uint64(1)</code></span>
+<span class="codeline" id="line-113"><code>)</code></span>
+<span class="codeline" id="line-114"><code></code></span>
+<span class="codeline" id="line-115"><code>// WithRegion starts a region associated with its calling goroutine, runs fn,</code></span>
+<span class="codeline" id="line-116"><code>// and then ends the region. If the context carries a task, the region is</code></span>
+<span class="codeline" id="line-117"><code>// associated with the task. Otherwise, the region is attached to the background</code></span>
+<span class="codeline" id="line-118"><code>// task.</code></span>
+<span class="codeline" id="line-119"><code>//</code></span>
+<span class="codeline" id="line-120"><code>// The regionType is used to classify regions, so there should be only a</code></span>
+<span class="codeline" id="line-121"><code>// handful of unique region types.</code></span>
+<span class="codeline" id="line-122"><code>func WithRegion(ctx context.Context, regionType string, fn func()) {</code></span>
+<span class="codeline" id="line-123"><code>	// NOTE:</code></span>
+<span class="codeline" id="line-124"><code>	// WithRegion helps avoiding misuse of the API but in practice,</code></span>
+<span class="codeline" id="line-125"><code>	// this is very restrictive:</code></span>
+<span class="codeline" id="line-126"><code>	// - Use of WithRegion makes the stack traces captured from</code></span>
+<span class="codeline" id="line-127"><code>	//   region start and end are identical.</code></span>
+<span class="codeline" id="line-128"><code>	// - Refactoring the existing code to use WithRegion is sometimes</code></span>
+<span class="codeline" id="line-129"><code>	//   hard and makes the code less readable.</code></span>
+<span class="codeline" id="line-130"><code>	//     e.g. code block nested deep in the loop with various</code></span>
+<span class="codeline" id="line-131"><code>	//          exit point with return values</code></span>
+<span class="codeline" id="line-132"><code>	// - Refactoring the code to use this API with closure can</code></span>
+<span class="codeline" id="line-133"><code>	//   cause different GC behavior such as retaining some parameters</code></span>
+<span class="codeline" id="line-134"><code>	//   longer.</code></span>
+<span class="codeline" id="line-135"><code>	// This causes more churns in code than I hoped, and sometimes</code></span>
+<span class="codeline" id="line-136"><code>	// makes the code less readable.</code></span>
+<span class="codeline" id="line-137"><code></code></span>
+<span class="codeline" id="line-138"><code>	id := fromContext(ctx).id</code></span>
+<span class="codeline" id="line-139"><code>	userRegion(id, regionStartCode, regionType)</code></span>
+<span class="codeline" id="line-140"><code>	defer userRegion(id, regionEndCode, regionType)</code></span>
+<span class="codeline" id="line-141"><code>	fn()</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>// StartRegion starts a region and returns it.</code></span>
+<span class="codeline" id="line-145"><code>// The returned Region's [Region.End] method must be called</code></span>
+<span class="codeline" id="line-146"><code>// from the same goroutine where the region was started.</code></span>
+<span class="codeline" id="line-147"><code>// Within each goroutine, regions must nest. That is, regions started</code></span>
+<span class="codeline" id="line-148"><code>// after this region must be ended before this region can be ended.</code></span>
+<span class="codeline" id="line-149"><code>// Recommended usage is</code></span>
+<span class="codeline" id="line-150"><code>//</code></span>
+<span class="codeline" id="line-151"><code>//	defer trace.StartRegion(ctx, "myTracedRegion").End()</code></span>
+<span class="codeline" id="line-152"><code>func StartRegion(ctx context.Context, regionType string) *Region {</code></span>
+<span class="codeline" id="line-153"><code>	if !IsEnabled() {</code></span>
+<span class="codeline" id="line-154"><code>		return noopRegion</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code>	id := fromContext(ctx).id</code></span>
+<span class="codeline" id="line-157"><code>	userRegion(id, regionStartCode, regionType)</code></span>
+<span class="codeline" id="line-158"><code>	return &amp;Region{id, regionType}</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>// Region is a region of code whose execution time interval is traced.</code></span>
+<span class="codeline" id="line-162"><code>type Region struct {</code></span>
+<span class="codeline" id="line-163"><code>	id         uint64</code></span>
+<span class="codeline" id="line-164"><code>	regionType string</code></span>
+<span class="codeline" id="line-165"><code>}</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>var noopRegion = &amp;Region{}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>// End marks the end of the traced code region.</code></span>
+<span class="codeline" id="line-170"><code>func (r *Region) End() {</code></span>
+<span class="codeline" id="line-171"><code>	if r == noopRegion {</code></span>
+<span class="codeline" id="line-172"><code>		return</code></span>
+<span class="codeline" id="line-173"><code>	}</code></span>
+<span class="codeline" id="line-174"><code>	userRegion(r.id, regionEndCode, r.regionType)</code></span>
+<span class="codeline" id="line-175"><code>}</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>// IsEnabled reports whether tracing is enabled.</code></span>
+<span class="codeline" id="line-178"><code>// The information is advisory only. The tracing status</code></span>
+<span class="codeline" id="line-179"><code>// may have changed by the time this function returns.</code></span>
+<span class="codeline" id="line-180"><code>func IsEnabled() bool {</code></span>
+<span class="codeline" id="line-181"><code>	return tracing.enabled.Load()</code></span>
+<span class="codeline" id="line-182"><code>}</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>//</code></span>
+<span class="codeline" id="line-185"><code>// Function bodies are defined in runtime/trace.go</code></span>
+<span class="codeline" id="line-186"><code>//</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>// emits UserTaskCreate event.</code></span>
+<span class="codeline" id="line-189"><code>func userTaskCreate(id, parentID uint64, taskType string)</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>// emits UserTaskEnd event.</code></span>
+<span class="codeline" id="line-192"><code>func userTaskEnd(id uint64)</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>// emits UserRegion event.</code></span>
+<span class="codeline" id="line-195"><code>func userRegion(id, mode uint64, regionType string)</code></span>
+<span class="codeline" id="line-196"><code></code></span>
+<span class="codeline" id="line-197"><code>// emits UserLog event.</code></span>
+<span class="codeline" id="line-198"><code>func userLog(id uint64, category, message string)</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

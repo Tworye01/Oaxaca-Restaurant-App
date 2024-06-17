@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: pipe.go in package net</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	pipe.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/net.html">net</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2010 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package net</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"io"</code></span>
+<span class="codeline" id="line-9"><code>	"os"</code></span>
+<span class="codeline" id="line-10"><code>	"sync"</code></span>
+<span class="codeline" id="line-11"><code>	"time"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>// pipeDeadline is an abstraction for handling timeouts.</code></span>
+<span class="codeline" id="line-15"><code>type pipeDeadline struct {</code></span>
+<span class="codeline" id="line-16"><code>	mu     sync.Mutex // Guards timer and cancel</code></span>
+<span class="codeline" id="line-17"><code>	timer  *time.Timer</code></span>
+<span class="codeline" id="line-18"><code>	cancel chan struct{} // Must be non-nil</code></span>
+<span class="codeline" id="line-19"><code>}</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>func makePipeDeadline() pipeDeadline {</code></span>
+<span class="codeline" id="line-22"><code>	return pipeDeadline{cancel: make(chan struct{})}</code></span>
+<span class="codeline" id="line-23"><code>}</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>// set sets the point in time when the deadline will time out.</code></span>
+<span class="codeline" id="line-26"><code>// A timeout event is signaled by closing the channel returned by waiter.</code></span>
+<span class="codeline" id="line-27"><code>// Once a timeout has occurred, the deadline can be refreshed by specifying a</code></span>
+<span class="codeline" id="line-28"><code>// t value in the future.</code></span>
+<span class="codeline" id="line-29"><code>//</code></span>
+<span class="codeline" id="line-30"><code>// A zero value for t prevents timeout.</code></span>
+<span class="codeline" id="line-31"><code>func (d *pipeDeadline) set(t time.Time) {</code></span>
+<span class="codeline" id="line-32"><code>	d.mu.Lock()</code></span>
+<span class="codeline" id="line-33"><code>	defer d.mu.Unlock()</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>	if d.timer != nil &amp;&amp; !d.timer.Stop() {</code></span>
+<span class="codeline" id="line-36"><code>		&lt;-d.cancel // Wait for the timer callback to finish and close cancel</code></span>
+<span class="codeline" id="line-37"><code>	}</code></span>
+<span class="codeline" id="line-38"><code>	d.timer = nil</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	// Time is zero, then there is no deadline.</code></span>
+<span class="codeline" id="line-41"><code>	closed := isClosedChan(d.cancel)</code></span>
+<span class="codeline" id="line-42"><code>	if t.IsZero() {</code></span>
+<span class="codeline" id="line-43"><code>		if closed {</code></span>
+<span class="codeline" id="line-44"><code>			d.cancel = make(chan struct{})</code></span>
+<span class="codeline" id="line-45"><code>		}</code></span>
+<span class="codeline" id="line-46"><code>		return</code></span>
+<span class="codeline" id="line-47"><code>	}</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>	// Time in the future, setup a timer to cancel in the future.</code></span>
+<span class="codeline" id="line-50"><code>	if dur := time.Until(t); dur &gt; 0 {</code></span>
+<span class="codeline" id="line-51"><code>		if closed {</code></span>
+<span class="codeline" id="line-52"><code>			d.cancel = make(chan struct{})</code></span>
+<span class="codeline" id="line-53"><code>		}</code></span>
+<span class="codeline" id="line-54"><code>		d.timer = time.AfterFunc(dur, func() {</code></span>
+<span class="codeline" id="line-55"><code>			close(d.cancel)</code></span>
+<span class="codeline" id="line-56"><code>		})</code></span>
+<span class="codeline" id="line-57"><code>		return</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// Time in the past, so close immediately.</code></span>
+<span class="codeline" id="line-61"><code>	if !closed {</code></span>
+<span class="codeline" id="line-62"><code>		close(d.cancel)</code></span>
+<span class="codeline" id="line-63"><code>	}</code></span>
+<span class="codeline" id="line-64"><code>}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>// wait returns a channel that is closed when the deadline is exceeded.</code></span>
+<span class="codeline" id="line-67"><code>func (d *pipeDeadline) wait() chan struct{} {</code></span>
+<span class="codeline" id="line-68"><code>	d.mu.Lock()</code></span>
+<span class="codeline" id="line-69"><code>	defer d.mu.Unlock()</code></span>
+<span class="codeline" id="line-70"><code>	return d.cancel</code></span>
+<span class="codeline" id="line-71"><code>}</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>func isClosedChan(c &lt;-chan struct{}) bool {</code></span>
+<span class="codeline" id="line-74"><code>	select {</code></span>
+<span class="codeline" id="line-75"><code>	case &lt;-c:</code></span>
+<span class="codeline" id="line-76"><code>		return true</code></span>
+<span class="codeline" id="line-77"><code>	default:</code></span>
+<span class="codeline" id="line-78"><code>		return false</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>type pipeAddr struct{}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>func (pipeAddr) Network() string { return "pipe" }</code></span>
+<span class="codeline" id="line-85"><code>func (pipeAddr) String() string  { return "pipe" }</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>type pipe struct {</code></span>
+<span class="codeline" id="line-88"><code>	wrMu sync.Mutex // Serialize Write operations</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	// Used by local Read to interact with remote Write.</code></span>
+<span class="codeline" id="line-91"><code>	// Successful receive on rdRx is always followed by send on rdTx.</code></span>
+<span class="codeline" id="line-92"><code>	rdRx &lt;-chan []byte</code></span>
+<span class="codeline" id="line-93"><code>	rdTx chan&lt;- int</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>	// Used by local Write to interact with remote Read.</code></span>
+<span class="codeline" id="line-96"><code>	// Successful send on wrTx is always followed by receive on wrRx.</code></span>
+<span class="codeline" id="line-97"><code>	wrTx chan&lt;- []byte</code></span>
+<span class="codeline" id="line-98"><code>	wrRx &lt;-chan int</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>	once       sync.Once // Protects closing localDone</code></span>
+<span class="codeline" id="line-101"><code>	localDone  chan struct{}</code></span>
+<span class="codeline" id="line-102"><code>	remoteDone &lt;-chan struct{}</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	readDeadline  pipeDeadline</code></span>
+<span class="codeline" id="line-105"><code>	writeDeadline pipeDeadline</code></span>
+<span class="codeline" id="line-106"><code>}</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>// Pipe creates a synchronous, in-memory, full duplex</code></span>
+<span class="codeline" id="line-109"><code>// network connection; both ends implement the [Conn] interface.</code></span>
+<span class="codeline" id="line-110"><code>// Reads on one end are matched with writes on the other,</code></span>
+<span class="codeline" id="line-111"><code>// copying data directly between the two; there is no internal</code></span>
+<span class="codeline" id="line-112"><code>// buffering.</code></span>
+<span class="codeline" id="line-113"><code>func Pipe() (Conn, Conn) {</code></span>
+<span class="codeline" id="line-114"><code>	cb1 := make(chan []byte)</code></span>
+<span class="codeline" id="line-115"><code>	cb2 := make(chan []byte)</code></span>
+<span class="codeline" id="line-116"><code>	cn1 := make(chan int)</code></span>
+<span class="codeline" id="line-117"><code>	cn2 := make(chan int)</code></span>
+<span class="codeline" id="line-118"><code>	done1 := make(chan struct{})</code></span>
+<span class="codeline" id="line-119"><code>	done2 := make(chan struct{})</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>	p1 := &amp;pipe{</code></span>
+<span class="codeline" id="line-122"><code>		rdRx: cb1, rdTx: cn1,</code></span>
+<span class="codeline" id="line-123"><code>		wrTx: cb2, wrRx: cn2,</code></span>
+<span class="codeline" id="line-124"><code>		localDone: done1, remoteDone: done2,</code></span>
+<span class="codeline" id="line-125"><code>		readDeadline:  makePipeDeadline(),</code></span>
+<span class="codeline" id="line-126"><code>		writeDeadline: makePipeDeadline(),</code></span>
+<span class="codeline" id="line-127"><code>	}</code></span>
+<span class="codeline" id="line-128"><code>	p2 := &amp;pipe{</code></span>
+<span class="codeline" id="line-129"><code>		rdRx: cb2, rdTx: cn2,</code></span>
+<span class="codeline" id="line-130"><code>		wrTx: cb1, wrRx: cn1,</code></span>
+<span class="codeline" id="line-131"><code>		localDone: done2, remoteDone: done1,</code></span>
+<span class="codeline" id="line-132"><code>		readDeadline:  makePipeDeadline(),</code></span>
+<span class="codeline" id="line-133"><code>		writeDeadline: makePipeDeadline(),</code></span>
+<span class="codeline" id="line-134"><code>	}</code></span>
+<span class="codeline" id="line-135"><code>	return p1, p2</code></span>
+<span class="codeline" id="line-136"><code>}</code></span>
+<span class="codeline" id="line-137"><code></code></span>
+<span class="codeline" id="line-138"><code>func (*pipe) LocalAddr() Addr  { return pipeAddr{} }</code></span>
+<span class="codeline" id="line-139"><code>func (*pipe) RemoteAddr() Addr { return pipeAddr{} }</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>func (p *pipe) Read(b []byte) (int, error) {</code></span>
+<span class="codeline" id="line-142"><code>	n, err := p.read(b)</code></span>
+<span class="codeline" id="line-143"><code>	if err != nil &amp;&amp; err != io.EOF &amp;&amp; err != io.ErrClosedPipe {</code></span>
+<span class="codeline" id="line-144"><code>		err = &amp;OpError{Op: "read", Net: "pipe", Err: err}</code></span>
+<span class="codeline" id="line-145"><code>	}</code></span>
+<span class="codeline" id="line-146"><code>	return n, err</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>func (p *pipe) read(b []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-150"><code>	switch {</code></span>
+<span class="codeline" id="line-151"><code>	case isClosedChan(p.localDone):</code></span>
+<span class="codeline" id="line-152"><code>		return 0, io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-153"><code>	case isClosedChan(p.remoteDone):</code></span>
+<span class="codeline" id="line-154"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-155"><code>	case isClosedChan(p.readDeadline.wait()):</code></span>
+<span class="codeline" id="line-156"><code>		return 0, os.ErrDeadlineExceeded</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>	select {</code></span>
+<span class="codeline" id="line-160"><code>	case bw := &lt;-p.rdRx:</code></span>
+<span class="codeline" id="line-161"><code>		nr := copy(b, bw)</code></span>
+<span class="codeline" id="line-162"><code>		p.rdTx &lt;- nr</code></span>
+<span class="codeline" id="line-163"><code>		return nr, nil</code></span>
+<span class="codeline" id="line-164"><code>	case &lt;-p.localDone:</code></span>
+<span class="codeline" id="line-165"><code>		return 0, io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-166"><code>	case &lt;-p.remoteDone:</code></span>
+<span class="codeline" id="line-167"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-168"><code>	case &lt;-p.readDeadline.wait():</code></span>
+<span class="codeline" id="line-169"><code>		return 0, os.ErrDeadlineExceeded</code></span>
+<span class="codeline" id="line-170"><code>	}</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>func (p *pipe) Write(b []byte) (int, error) {</code></span>
+<span class="codeline" id="line-174"><code>	n, err := p.write(b)</code></span>
+<span class="codeline" id="line-175"><code>	if err != nil &amp;&amp; err != io.ErrClosedPipe {</code></span>
+<span class="codeline" id="line-176"><code>		err = &amp;OpError{Op: "write", Net: "pipe", Err: err}</code></span>
+<span class="codeline" id="line-177"><code>	}</code></span>
+<span class="codeline" id="line-178"><code>	return n, err</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>func (p *pipe) write(b []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-182"><code>	switch {</code></span>
+<span class="codeline" id="line-183"><code>	case isClosedChan(p.localDone):</code></span>
+<span class="codeline" id="line-184"><code>		return 0, io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-185"><code>	case isClosedChan(p.remoteDone):</code></span>
+<span class="codeline" id="line-186"><code>		return 0, io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-187"><code>	case isClosedChan(p.writeDeadline.wait()):</code></span>
+<span class="codeline" id="line-188"><code>		return 0, os.ErrDeadlineExceeded</code></span>
+<span class="codeline" id="line-189"><code>	}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>	p.wrMu.Lock() // Ensure entirety of b is written together</code></span>
+<span class="codeline" id="line-192"><code>	defer p.wrMu.Unlock()</code></span>
+<span class="codeline" id="line-193"><code>	for once := true; once || len(b) &gt; 0; once = false {</code></span>
+<span class="codeline" id="line-194"><code>		select {</code></span>
+<span class="codeline" id="line-195"><code>		case p.wrTx &lt;- b:</code></span>
+<span class="codeline" id="line-196"><code>			nw := &lt;-p.wrRx</code></span>
+<span class="codeline" id="line-197"><code>			b = b[nw:]</code></span>
+<span class="codeline" id="line-198"><code>			n += nw</code></span>
+<span class="codeline" id="line-199"><code>		case &lt;-p.localDone:</code></span>
+<span class="codeline" id="line-200"><code>			return n, io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-201"><code>		case &lt;-p.remoteDone:</code></span>
+<span class="codeline" id="line-202"><code>			return n, io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-203"><code>		case &lt;-p.writeDeadline.wait():</code></span>
+<span class="codeline" id="line-204"><code>			return n, os.ErrDeadlineExceeded</code></span>
+<span class="codeline" id="line-205"><code>		}</code></span>
+<span class="codeline" id="line-206"><code>	}</code></span>
+<span class="codeline" id="line-207"><code>	return n, nil</code></span>
+<span class="codeline" id="line-208"><code>}</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>func (p *pipe) SetDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-211"><code>	if isClosedChan(p.localDone) || isClosedChan(p.remoteDone) {</code></span>
+<span class="codeline" id="line-212"><code>		return io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-213"><code>	}</code></span>
+<span class="codeline" id="line-214"><code>	p.readDeadline.set(t)</code></span>
+<span class="codeline" id="line-215"><code>	p.writeDeadline.set(t)</code></span>
+<span class="codeline" id="line-216"><code>	return nil</code></span>
+<span class="codeline" id="line-217"><code>}</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>func (p *pipe) SetReadDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-220"><code>	if isClosedChan(p.localDone) || isClosedChan(p.remoteDone) {</code></span>
+<span class="codeline" id="line-221"><code>		return io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-222"><code>	}</code></span>
+<span class="codeline" id="line-223"><code>	p.readDeadline.set(t)</code></span>
+<span class="codeline" id="line-224"><code>	return nil</code></span>
+<span class="codeline" id="line-225"><code>}</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>func (p *pipe) SetWriteDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-228"><code>	if isClosedChan(p.localDone) || isClosedChan(p.remoteDone) {</code></span>
+<span class="codeline" id="line-229"><code>		return io.ErrClosedPipe</code></span>
+<span class="codeline" id="line-230"><code>	}</code></span>
+<span class="codeline" id="line-231"><code>	p.writeDeadline.set(t)</code></span>
+<span class="codeline" id="line-232"><code>	return nil</code></span>
+<span class="codeline" id="line-233"><code>}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>func (p *pipe) Close() error {</code></span>
+<span class="codeline" id="line-236"><code>	p.once.Do(func() { close(p.localDone) })</code></span>
+<span class="codeline" id="line-237"><code>	return nil</code></span>
+<span class="codeline" id="line-238"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

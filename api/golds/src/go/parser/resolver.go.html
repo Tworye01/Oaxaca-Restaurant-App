@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: resolver.go in package go/parser</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	resolver.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/parser.html">go/parser</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package parser</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"fmt"</code></span>
+<span class="codeline" id="line-9"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-10"><code>	"go/token"</code></span>
+<span class="codeline" id="line-11"><code>	"strings"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>const debugResolve = false</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// resolveFile walks the given file to resolve identifiers within the file</code></span>
+<span class="codeline" id="line-17"><code>// scope, updating ast.Ident.Obj fields with declaration information.</code></span>
+<span class="codeline" id="line-18"><code>//</code></span>
+<span class="codeline" id="line-19"><code>// If declErr is non-nil, it is used to report declaration errors during</code></span>
+<span class="codeline" id="line-20"><code>// resolution. tok is used to format position in error messages.</code></span>
+<span class="codeline" id="line-21"><code>func resolveFile(file *ast.File, handle *token.File, declErr func(token.Pos, string)) {</code></span>
+<span class="codeline" id="line-22"><code>	pkgScope := ast.NewScope(nil)</code></span>
+<span class="codeline" id="line-23"><code>	r := &amp;resolver{</code></span>
+<span class="codeline" id="line-24"><code>		handle:   handle,</code></span>
+<span class="codeline" id="line-25"><code>		declErr:  declErr,</code></span>
+<span class="codeline" id="line-26"><code>		topScope: pkgScope,</code></span>
+<span class="codeline" id="line-27"><code>		pkgScope: pkgScope,</code></span>
+<span class="codeline" id="line-28"><code>		depth:    1,</code></span>
+<span class="codeline" id="line-29"><code>	}</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>	for _, decl := range file.Decls {</code></span>
+<span class="codeline" id="line-32"><code>		ast.Walk(r, decl)</code></span>
+<span class="codeline" id="line-33"><code>	}</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>	r.closeScope()</code></span>
+<span class="codeline" id="line-36"><code>	assert(r.topScope == nil, "unbalanced scopes")</code></span>
+<span class="codeline" id="line-37"><code>	assert(r.labelScope == nil, "unbalanced label scopes")</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>	// resolve global identifiers within the same file</code></span>
+<span class="codeline" id="line-40"><code>	i := 0</code></span>
+<span class="codeline" id="line-41"><code>	for _, ident := range r.unresolved {</code></span>
+<span class="codeline" id="line-42"><code>		// i &lt;= index for current ident</code></span>
+<span class="codeline" id="line-43"><code>		assert(ident.Obj == unresolved, "object already resolved")</code></span>
+<span class="codeline" id="line-44"><code>		ident.Obj = r.pkgScope.Lookup(ident.Name) // also removes unresolved sentinel</code></span>
+<span class="codeline" id="line-45"><code>		if ident.Obj == nil {</code></span>
+<span class="codeline" id="line-46"><code>			r.unresolved[i] = ident</code></span>
+<span class="codeline" id="line-47"><code>			i++</code></span>
+<span class="codeline" id="line-48"><code>		} else if debugResolve {</code></span>
+<span class="codeline" id="line-49"><code>			pos := ident.Obj.Decl.(interface{ Pos() token.Pos }).Pos()</code></span>
+<span class="codeline" id="line-50"><code>			r.trace("resolved %s@%v to package object %v", ident.Name, ident.Pos(), pos)</code></span>
+<span class="codeline" id="line-51"><code>		}</code></span>
+<span class="codeline" id="line-52"><code>	}</code></span>
+<span class="codeline" id="line-53"><code>	file.Scope = r.pkgScope</code></span>
+<span class="codeline" id="line-54"><code>	file.Unresolved = r.unresolved[0:i]</code></span>
+<span class="codeline" id="line-55"><code>}</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>const maxScopeDepth int = 1e3</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>type resolver struct {</code></span>
+<span class="codeline" id="line-60"><code>	handle  *token.File</code></span>
+<span class="codeline" id="line-61"><code>	declErr func(token.Pos, string)</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>	// Ordinary identifier scopes</code></span>
+<span class="codeline" id="line-64"><code>	pkgScope   *ast.Scope   // pkgScope.Outer == nil</code></span>
+<span class="codeline" id="line-65"><code>	topScope   *ast.Scope   // top-most scope; may be pkgScope</code></span>
+<span class="codeline" id="line-66"><code>	unresolved []*ast.Ident // unresolved identifiers</code></span>
+<span class="codeline" id="line-67"><code>	depth      int          // scope depth</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>	// Label scopes</code></span>
+<span class="codeline" id="line-70"><code>	// (maintained by open/close LabelScope)</code></span>
+<span class="codeline" id="line-71"><code>	labelScope  *ast.Scope     // label scope for current function</code></span>
+<span class="codeline" id="line-72"><code>	targetStack [][]*ast.Ident // stack of unresolved labels</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>func (r *resolver) trace(format string, args ...any) {</code></span>
+<span class="codeline" id="line-76"><code>	fmt.Println(strings.Repeat(". ", r.depth) + r.sprintf(format, args...))</code></span>
+<span class="codeline" id="line-77"><code>}</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>func (r *resolver) sprintf(format string, args ...any) string {</code></span>
+<span class="codeline" id="line-80"><code>	for i, arg := range args {</code></span>
+<span class="codeline" id="line-81"><code>		switch arg := arg.(type) {</code></span>
+<span class="codeline" id="line-82"><code>		case token.Pos:</code></span>
+<span class="codeline" id="line-83"><code>			args[i] = r.handle.Position(arg)</code></span>
+<span class="codeline" id="line-84"><code>		}</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code>	return fmt.Sprintf(format, args...)</code></span>
+<span class="codeline" id="line-87"><code>}</code></span>
+<span class="codeline" id="line-88"><code></code></span>
+<span class="codeline" id="line-89"><code>func (r *resolver) openScope(pos token.Pos) {</code></span>
+<span class="codeline" id="line-90"><code>	r.depth++</code></span>
+<span class="codeline" id="line-91"><code>	if r.depth &gt; maxScopeDepth {</code></span>
+<span class="codeline" id="line-92"><code>		panic(bailout{pos: pos, msg: "exceeded max scope depth during object resolution"})</code></span>
+<span class="codeline" id="line-93"><code>	}</code></span>
+<span class="codeline" id="line-94"><code>	if debugResolve {</code></span>
+<span class="codeline" id="line-95"><code>		r.trace("opening scope @%v", pos)</code></span>
+<span class="codeline" id="line-96"><code>	}</code></span>
+<span class="codeline" id="line-97"><code>	r.topScope = ast.NewScope(r.topScope)</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>func (r *resolver) closeScope() {</code></span>
+<span class="codeline" id="line-101"><code>	r.depth--</code></span>
+<span class="codeline" id="line-102"><code>	if debugResolve {</code></span>
+<span class="codeline" id="line-103"><code>		r.trace("closing scope")</code></span>
+<span class="codeline" id="line-104"><code>	}</code></span>
+<span class="codeline" id="line-105"><code>	r.topScope = r.topScope.Outer</code></span>
+<span class="codeline" id="line-106"><code>}</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>func (r *resolver) openLabelScope() {</code></span>
+<span class="codeline" id="line-109"><code>	r.labelScope = ast.NewScope(r.labelScope)</code></span>
+<span class="codeline" id="line-110"><code>	r.targetStack = append(r.targetStack, nil)</code></span>
+<span class="codeline" id="line-111"><code>}</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>func (r *resolver) closeLabelScope() {</code></span>
+<span class="codeline" id="line-114"><code>	// resolve labels</code></span>
+<span class="codeline" id="line-115"><code>	n := len(r.targetStack) - 1</code></span>
+<span class="codeline" id="line-116"><code>	scope := r.labelScope</code></span>
+<span class="codeline" id="line-117"><code>	for _, ident := range r.targetStack[n] {</code></span>
+<span class="codeline" id="line-118"><code>		ident.Obj = scope.Lookup(ident.Name)</code></span>
+<span class="codeline" id="line-119"><code>		if ident.Obj == nil &amp;&amp; r.declErr != nil {</code></span>
+<span class="codeline" id="line-120"><code>			r.declErr(ident.Pos(), fmt.Sprintf("label %s undefined", ident.Name))</code></span>
+<span class="codeline" id="line-121"><code>		}</code></span>
+<span class="codeline" id="line-122"><code>	}</code></span>
+<span class="codeline" id="line-123"><code>	// pop label scope</code></span>
+<span class="codeline" id="line-124"><code>	r.targetStack = r.targetStack[0:n]</code></span>
+<span class="codeline" id="line-125"><code>	r.labelScope = r.labelScope.Outer</code></span>
+<span class="codeline" id="line-126"><code>}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>func (r *resolver) declare(decl, data any, scope *ast.Scope, kind ast.ObjKind, idents ...*ast.Ident) {</code></span>
+<span class="codeline" id="line-129"><code>	for _, ident := range idents {</code></span>
+<span class="codeline" id="line-130"><code>		if ident.Obj != nil {</code></span>
+<span class="codeline" id="line-131"><code>			panic(fmt.Sprintf("%v: identifier %s already declared or resolved", ident.Pos(), ident.Name))</code></span>
+<span class="codeline" id="line-132"><code>		}</code></span>
+<span class="codeline" id="line-133"><code>		obj := ast.NewObj(kind, ident.Name)</code></span>
+<span class="codeline" id="line-134"><code>		// remember the corresponding declaration for redeclaration</code></span>
+<span class="codeline" id="line-135"><code>		// errors and global variable resolution/typechecking phase</code></span>
+<span class="codeline" id="line-136"><code>		obj.Decl = decl</code></span>
+<span class="codeline" id="line-137"><code>		obj.Data = data</code></span>
+<span class="codeline" id="line-138"><code>		// Identifiers (for receiver type parameters) are written to the scope, but</code></span>
+<span class="codeline" id="line-139"><code>		// never set as the resolved object. See go.dev/issue/50956.</code></span>
+<span class="codeline" id="line-140"><code>		if _, ok := decl.(*ast.Ident); !ok {</code></span>
+<span class="codeline" id="line-141"><code>			ident.Obj = obj</code></span>
+<span class="codeline" id="line-142"><code>		}</code></span>
+<span class="codeline" id="line-143"><code>		if ident.Name != "_" {</code></span>
+<span class="codeline" id="line-144"><code>			if debugResolve {</code></span>
+<span class="codeline" id="line-145"><code>				r.trace("declaring %s@%v", ident.Name, ident.Pos())</code></span>
+<span class="codeline" id="line-146"><code>			}</code></span>
+<span class="codeline" id="line-147"><code>			if alt := scope.Insert(obj); alt != nil &amp;&amp; r.declErr != nil {</code></span>
+<span class="codeline" id="line-148"><code>				prevDecl := ""</code></span>
+<span class="codeline" id="line-149"><code>				if pos := alt.Pos(); pos.IsValid() {</code></span>
+<span class="codeline" id="line-150"><code>					prevDecl = r.sprintf("\n\tprevious declaration at %v", pos)</code></span>
+<span class="codeline" id="line-151"><code>				}</code></span>
+<span class="codeline" id="line-152"><code>				r.declErr(ident.Pos(), fmt.Sprintf("%s redeclared in this block%s", ident.Name, prevDecl))</code></span>
+<span class="codeline" id="line-153"><code>			}</code></span>
+<span class="codeline" id="line-154"><code>		}</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code>}</code></span>
+<span class="codeline" id="line-157"><code></code></span>
+<span class="codeline" id="line-158"><code>func (r *resolver) shortVarDecl(decl *ast.AssignStmt) {</code></span>
+<span class="codeline" id="line-159"><code>	// Go spec: A short variable declaration may redeclare variables</code></span>
+<span class="codeline" id="line-160"><code>	// provided they were originally declared in the same block with</code></span>
+<span class="codeline" id="line-161"><code>	// the same type, and at least one of the non-blank variables is new.</code></span>
+<span class="codeline" id="line-162"><code>	n := 0 // number of new variables</code></span>
+<span class="codeline" id="line-163"><code>	for _, x := range decl.Lhs {</code></span>
+<span class="codeline" id="line-164"><code>		if ident, isIdent := x.(*ast.Ident); isIdent {</code></span>
+<span class="codeline" id="line-165"><code>			assert(ident.Obj == nil, "identifier already declared or resolved")</code></span>
+<span class="codeline" id="line-166"><code>			obj := ast.NewObj(ast.Var, ident.Name)</code></span>
+<span class="codeline" id="line-167"><code>			// remember corresponding assignment for other tools</code></span>
+<span class="codeline" id="line-168"><code>			obj.Decl = decl</code></span>
+<span class="codeline" id="line-169"><code>			ident.Obj = obj</code></span>
+<span class="codeline" id="line-170"><code>			if ident.Name != "_" {</code></span>
+<span class="codeline" id="line-171"><code>				if debugResolve {</code></span>
+<span class="codeline" id="line-172"><code>					r.trace("declaring %s@%v", ident.Name, ident.Pos())</code></span>
+<span class="codeline" id="line-173"><code>				}</code></span>
+<span class="codeline" id="line-174"><code>				if alt := r.topScope.Insert(obj); alt != nil {</code></span>
+<span class="codeline" id="line-175"><code>					ident.Obj = alt // redeclaration</code></span>
+<span class="codeline" id="line-176"><code>				} else {</code></span>
+<span class="codeline" id="line-177"><code>					n++ // new declaration</code></span>
+<span class="codeline" id="line-178"><code>				}</code></span>
+<span class="codeline" id="line-179"><code>			}</code></span>
+<span class="codeline" id="line-180"><code>		}</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code>	if n == 0 &amp;&amp; r.declErr != nil {</code></span>
+<span class="codeline" id="line-183"><code>		r.declErr(decl.Lhs[0].Pos(), "no new variables on left side of :=")</code></span>
+<span class="codeline" id="line-184"><code>	}</code></span>
+<span class="codeline" id="line-185"><code>}</code></span>
+<span class="codeline" id="line-186"><code></code></span>
+<span class="codeline" id="line-187"><code>// The unresolved object is a sentinel to mark identifiers that have been added</code></span>
+<span class="codeline" id="line-188"><code>// to the list of unresolved identifiers. The sentinel is only used for verifying</code></span>
+<span class="codeline" id="line-189"><code>// internal consistency.</code></span>
+<span class="codeline" id="line-190"><code>var unresolved = new(ast.Object)</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>// If x is an identifier, resolve attempts to resolve x by looking up</code></span>
+<span class="codeline" id="line-193"><code>// the object it denotes. If no object is found and collectUnresolved is</code></span>
+<span class="codeline" id="line-194"><code>// set, x is marked as unresolved and collected in the list of unresolved</code></span>
+<span class="codeline" id="line-195"><code>// identifiers.</code></span>
+<span class="codeline" id="line-196"><code>func (r *resolver) resolve(ident *ast.Ident, collectUnresolved bool) {</code></span>
+<span class="codeline" id="line-197"><code>	if ident.Obj != nil {</code></span>
+<span class="codeline" id="line-198"><code>		panic(r.sprintf("%v: identifier %s already declared or resolved", ident.Pos(), ident.Name))</code></span>
+<span class="codeline" id="line-199"><code>	}</code></span>
+<span class="codeline" id="line-200"><code>	// '_' should never refer to existing declarations, because it has special</code></span>
+<span class="codeline" id="line-201"><code>	// handling in the spec.</code></span>
+<span class="codeline" id="line-202"><code>	if ident.Name == "_" {</code></span>
+<span class="codeline" id="line-203"><code>		return</code></span>
+<span class="codeline" id="line-204"><code>	}</code></span>
+<span class="codeline" id="line-205"><code>	for s := r.topScope; s != nil; s = s.Outer {</code></span>
+<span class="codeline" id="line-206"><code>		if obj := s.Lookup(ident.Name); obj != nil {</code></span>
+<span class="codeline" id="line-207"><code>			if debugResolve {</code></span>
+<span class="codeline" id="line-208"><code>				r.trace("resolved %v:%s to %v", ident.Pos(), ident.Name, obj)</code></span>
+<span class="codeline" id="line-209"><code>			}</code></span>
+<span class="codeline" id="line-210"><code>			assert(obj.Name != "", "obj with no name")</code></span>
+<span class="codeline" id="line-211"><code>			// Identifiers (for receiver type parameters) are written to the scope,</code></span>
+<span class="codeline" id="line-212"><code>			// but never set as the resolved object. See go.dev/issue/50956.</code></span>
+<span class="codeline" id="line-213"><code>			if _, ok := obj.Decl.(*ast.Ident); !ok {</code></span>
+<span class="codeline" id="line-214"><code>				ident.Obj = obj</code></span>
+<span class="codeline" id="line-215"><code>			}</code></span>
+<span class="codeline" id="line-216"><code>			return</code></span>
+<span class="codeline" id="line-217"><code>		}</code></span>
+<span class="codeline" id="line-218"><code>	}</code></span>
+<span class="codeline" id="line-219"><code>	// all local scopes are known, so any unresolved identifier</code></span>
+<span class="codeline" id="line-220"><code>	// must be found either in the file scope, package scope</code></span>
+<span class="codeline" id="line-221"><code>	// (perhaps in another file), or universe scope --- collect</code></span>
+<span class="codeline" id="line-222"><code>	// them so that they can be resolved later</code></span>
+<span class="codeline" id="line-223"><code>	if collectUnresolved {</code></span>
+<span class="codeline" id="line-224"><code>		ident.Obj = unresolved</code></span>
+<span class="codeline" id="line-225"><code>		r.unresolved = append(r.unresolved, ident)</code></span>
+<span class="codeline" id="line-226"><code>	}</code></span>
+<span class="codeline" id="line-227"><code>}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>func (r *resolver) walkExprs(list []ast.Expr) {</code></span>
+<span class="codeline" id="line-230"><code>	for _, node := range list {</code></span>
+<span class="codeline" id="line-231"><code>		ast.Walk(r, node)</code></span>
+<span class="codeline" id="line-232"><code>	}</code></span>
+<span class="codeline" id="line-233"><code>}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>func (r *resolver) walkLHS(list []ast.Expr) {</code></span>
+<span class="codeline" id="line-236"><code>	for _, expr := range list {</code></span>
+<span class="codeline" id="line-237"><code>		expr := ast.Unparen(expr)</code></span>
+<span class="codeline" id="line-238"><code>		if _, ok := expr.(*ast.Ident); !ok &amp;&amp; expr != nil {</code></span>
+<span class="codeline" id="line-239"><code>			ast.Walk(r, expr)</code></span>
+<span class="codeline" id="line-240"><code>		}</code></span>
+<span class="codeline" id="line-241"><code>	}</code></span>
+<span class="codeline" id="line-242"><code>}</code></span>
+<span class="codeline" id="line-243"><code></code></span>
+<span class="codeline" id="line-244"><code>func (r *resolver) walkStmts(list []ast.Stmt) {</code></span>
+<span class="codeline" id="line-245"><code>	for _, stmt := range list {</code></span>
+<span class="codeline" id="line-246"><code>		ast.Walk(r, stmt)</code></span>
+<span class="codeline" id="line-247"><code>	}</code></span>
+<span class="codeline" id="line-248"><code>}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>func (r *resolver) Visit(node ast.Node) ast.Visitor {</code></span>
+<span class="codeline" id="line-251"><code>	if debugResolve &amp;&amp; node != nil {</code></span>
+<span class="codeline" id="line-252"><code>		r.trace("node %T@%v", node, node.Pos())</code></span>
+<span class="codeline" id="line-253"><code>	}</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>	switch n := node.(type) {</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>	// Expressions.</code></span>
+<span class="codeline" id="line-258"><code>	case *ast.Ident:</code></span>
+<span class="codeline" id="line-259"><code>		r.resolve(n, true)</code></span>
+<span class="codeline" id="line-260"><code></code></span>
+<span class="codeline" id="line-261"><code>	case *ast.FuncLit:</code></span>
+<span class="codeline" id="line-262"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-263"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-264"><code>		r.walkFuncType(n.Type)</code></span>
+<span class="codeline" id="line-265"><code>		r.walkBody(n.Body)</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>	case *ast.SelectorExpr:</code></span>
+<span class="codeline" id="line-268"><code>		ast.Walk(r, n.X)</code></span>
+<span class="codeline" id="line-269"><code>		// Note: don't try to resolve n.Sel, as we don't support qualified</code></span>
+<span class="codeline" id="line-270"><code>		// resolution.</code></span>
+<span class="codeline" id="line-271"><code></code></span>
+<span class="codeline" id="line-272"><code>	case *ast.StructType:</code></span>
+<span class="codeline" id="line-273"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-274"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-275"><code>		r.walkFieldList(n.Fields, ast.Var)</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>	case *ast.FuncType:</code></span>
+<span class="codeline" id="line-278"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-279"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-280"><code>		r.walkFuncType(n)</code></span>
+<span class="codeline" id="line-281"><code></code></span>
+<span class="codeline" id="line-282"><code>	case *ast.CompositeLit:</code></span>
+<span class="codeline" id="line-283"><code>		if n.Type != nil {</code></span>
+<span class="codeline" id="line-284"><code>			ast.Walk(r, n.Type)</code></span>
+<span class="codeline" id="line-285"><code>		}</code></span>
+<span class="codeline" id="line-286"><code>		for _, e := range n.Elts {</code></span>
+<span class="codeline" id="line-287"><code>			if kv, _ := e.(*ast.KeyValueExpr); kv != nil {</code></span>
+<span class="codeline" id="line-288"><code>				// See go.dev/issue/45160: try to resolve composite lit keys, but don't</code></span>
+<span class="codeline" id="line-289"><code>				// collect them as unresolved if resolution failed. This replicates</code></span>
+<span class="codeline" id="line-290"><code>				// existing behavior when resolving during parsing.</code></span>
+<span class="codeline" id="line-291"><code>				if ident, _ := kv.Key.(*ast.Ident); ident != nil {</code></span>
+<span class="codeline" id="line-292"><code>					r.resolve(ident, false)</code></span>
+<span class="codeline" id="line-293"><code>				} else {</code></span>
+<span class="codeline" id="line-294"><code>					ast.Walk(r, kv.Key)</code></span>
+<span class="codeline" id="line-295"><code>				}</code></span>
+<span class="codeline" id="line-296"><code>				ast.Walk(r, kv.Value)</code></span>
+<span class="codeline" id="line-297"><code>			} else {</code></span>
+<span class="codeline" id="line-298"><code>				ast.Walk(r, e)</code></span>
+<span class="codeline" id="line-299"><code>			}</code></span>
+<span class="codeline" id="line-300"><code>		}</code></span>
+<span class="codeline" id="line-301"><code></code></span>
+<span class="codeline" id="line-302"><code>	case *ast.InterfaceType:</code></span>
+<span class="codeline" id="line-303"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-304"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-305"><code>		r.walkFieldList(n.Methods, ast.Fun)</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>	// Statements</code></span>
+<span class="codeline" id="line-308"><code>	case *ast.LabeledStmt:</code></span>
+<span class="codeline" id="line-309"><code>		r.declare(n, nil, r.labelScope, ast.Lbl, n.Label)</code></span>
+<span class="codeline" id="line-310"><code>		ast.Walk(r, n.Stmt)</code></span>
+<span class="codeline" id="line-311"><code></code></span>
+<span class="codeline" id="line-312"><code>	case *ast.AssignStmt:</code></span>
+<span class="codeline" id="line-313"><code>		r.walkExprs(n.Rhs)</code></span>
+<span class="codeline" id="line-314"><code>		if n.Tok == token.DEFINE {</code></span>
+<span class="codeline" id="line-315"><code>			r.shortVarDecl(n)</code></span>
+<span class="codeline" id="line-316"><code>		} else {</code></span>
+<span class="codeline" id="line-317"><code>			r.walkExprs(n.Lhs)</code></span>
+<span class="codeline" id="line-318"><code>		}</code></span>
+<span class="codeline" id="line-319"><code></code></span>
+<span class="codeline" id="line-320"><code>	case *ast.BranchStmt:</code></span>
+<span class="codeline" id="line-321"><code>		// add to list of unresolved targets</code></span>
+<span class="codeline" id="line-322"><code>		if n.Tok != token.FALLTHROUGH &amp;&amp; n.Label != nil {</code></span>
+<span class="codeline" id="line-323"><code>			depth := len(r.targetStack) - 1</code></span>
+<span class="codeline" id="line-324"><code>			r.targetStack[depth] = append(r.targetStack[depth], n.Label)</code></span>
+<span class="codeline" id="line-325"><code>		}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>	case *ast.BlockStmt:</code></span>
+<span class="codeline" id="line-328"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-329"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-330"><code>		r.walkStmts(n.List)</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>	case *ast.IfStmt:</code></span>
+<span class="codeline" id="line-333"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-334"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-335"><code>		if n.Init != nil {</code></span>
+<span class="codeline" id="line-336"><code>			ast.Walk(r, n.Init)</code></span>
+<span class="codeline" id="line-337"><code>		}</code></span>
+<span class="codeline" id="line-338"><code>		ast.Walk(r, n.Cond)</code></span>
+<span class="codeline" id="line-339"><code>		ast.Walk(r, n.Body)</code></span>
+<span class="codeline" id="line-340"><code>		if n.Else != nil {</code></span>
+<span class="codeline" id="line-341"><code>			ast.Walk(r, n.Else)</code></span>
+<span class="codeline" id="line-342"><code>		}</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>	case *ast.CaseClause:</code></span>
+<span class="codeline" id="line-345"><code>		r.walkExprs(n.List)</code></span>
+<span class="codeline" id="line-346"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-347"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-348"><code>		r.walkStmts(n.Body)</code></span>
+<span class="codeline" id="line-349"><code></code></span>
+<span class="codeline" id="line-350"><code>	case *ast.SwitchStmt:</code></span>
+<span class="codeline" id="line-351"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-352"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-353"><code>		if n.Init != nil {</code></span>
+<span class="codeline" id="line-354"><code>			ast.Walk(r, n.Init)</code></span>
+<span class="codeline" id="line-355"><code>		}</code></span>
+<span class="codeline" id="line-356"><code>		if n.Tag != nil {</code></span>
+<span class="codeline" id="line-357"><code>			// The scope below reproduces some unnecessary behavior of the parser,</code></span>
+<span class="codeline" id="line-358"><code>			// opening an extra scope in case this is a type switch. It's not needed</code></span>
+<span class="codeline" id="line-359"><code>			// for expression switches.</code></span>
+<span class="codeline" id="line-360"><code>			// TODO: remove this once we've matched the parser resolution exactly.</code></span>
+<span class="codeline" id="line-361"><code>			if n.Init != nil {</code></span>
+<span class="codeline" id="line-362"><code>				r.openScope(n.Tag.Pos())</code></span>
+<span class="codeline" id="line-363"><code>				defer r.closeScope()</code></span>
+<span class="codeline" id="line-364"><code>			}</code></span>
+<span class="codeline" id="line-365"><code>			ast.Walk(r, n.Tag)</code></span>
+<span class="codeline" id="line-366"><code>		}</code></span>
+<span class="codeline" id="line-367"><code>		if n.Body != nil {</code></span>
+<span class="codeline" id="line-368"><code>			r.walkStmts(n.Body.List)</code></span>
+<span class="codeline" id="line-369"><code>		}</code></span>
+<span class="codeline" id="line-370"><code></code></span>
+<span class="codeline" id="line-371"><code>	case *ast.TypeSwitchStmt:</code></span>
+<span class="codeline" id="line-372"><code>		if n.Init != nil {</code></span>
+<span class="codeline" id="line-373"><code>			r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-374"><code>			defer r.closeScope()</code></span>
+<span class="codeline" id="line-375"><code>			ast.Walk(r, n.Init)</code></span>
+<span class="codeline" id="line-376"><code>		}</code></span>
+<span class="codeline" id="line-377"><code>		r.openScope(n.Assign.Pos())</code></span>
+<span class="codeline" id="line-378"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-379"><code>		ast.Walk(r, n.Assign)</code></span>
+<span class="codeline" id="line-380"><code>		// s.Body consists only of case clauses, so does not get its own</code></span>
+<span class="codeline" id="line-381"><code>		// scope.</code></span>
+<span class="codeline" id="line-382"><code>		if n.Body != nil {</code></span>
+<span class="codeline" id="line-383"><code>			r.walkStmts(n.Body.List)</code></span>
+<span class="codeline" id="line-384"><code>		}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>	case *ast.CommClause:</code></span>
+<span class="codeline" id="line-387"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-388"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-389"><code>		if n.Comm != nil {</code></span>
+<span class="codeline" id="line-390"><code>			ast.Walk(r, n.Comm)</code></span>
+<span class="codeline" id="line-391"><code>		}</code></span>
+<span class="codeline" id="line-392"><code>		r.walkStmts(n.Body)</code></span>
+<span class="codeline" id="line-393"><code></code></span>
+<span class="codeline" id="line-394"><code>	case *ast.SelectStmt:</code></span>
+<span class="codeline" id="line-395"><code>		// as for switch statements, select statement bodies don't get their own</code></span>
+<span class="codeline" id="line-396"><code>		// scope.</code></span>
+<span class="codeline" id="line-397"><code>		if n.Body != nil {</code></span>
+<span class="codeline" id="line-398"><code>			r.walkStmts(n.Body.List)</code></span>
+<span class="codeline" id="line-399"><code>		}</code></span>
+<span class="codeline" id="line-400"><code></code></span>
+<span class="codeline" id="line-401"><code>	case *ast.ForStmt:</code></span>
+<span class="codeline" id="line-402"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-403"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-404"><code>		if n.Init != nil {</code></span>
+<span class="codeline" id="line-405"><code>			ast.Walk(r, n.Init)</code></span>
+<span class="codeline" id="line-406"><code>		}</code></span>
+<span class="codeline" id="line-407"><code>		if n.Cond != nil {</code></span>
+<span class="codeline" id="line-408"><code>			ast.Walk(r, n.Cond)</code></span>
+<span class="codeline" id="line-409"><code>		}</code></span>
+<span class="codeline" id="line-410"><code>		if n.Post != nil {</code></span>
+<span class="codeline" id="line-411"><code>			ast.Walk(r, n.Post)</code></span>
+<span class="codeline" id="line-412"><code>		}</code></span>
+<span class="codeline" id="line-413"><code>		ast.Walk(r, n.Body)</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>	case *ast.RangeStmt:</code></span>
+<span class="codeline" id="line-416"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-417"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-418"><code>		ast.Walk(r, n.X)</code></span>
+<span class="codeline" id="line-419"><code>		var lhs []ast.Expr</code></span>
+<span class="codeline" id="line-420"><code>		if n.Key != nil {</code></span>
+<span class="codeline" id="line-421"><code>			lhs = append(lhs, n.Key)</code></span>
+<span class="codeline" id="line-422"><code>		}</code></span>
+<span class="codeline" id="line-423"><code>		if n.Value != nil {</code></span>
+<span class="codeline" id="line-424"><code>			lhs = append(lhs, n.Value)</code></span>
+<span class="codeline" id="line-425"><code>		}</code></span>
+<span class="codeline" id="line-426"><code>		if len(lhs) &gt; 0 {</code></span>
+<span class="codeline" id="line-427"><code>			if n.Tok == token.DEFINE {</code></span>
+<span class="codeline" id="line-428"><code>				// Note: we can't exactly match the behavior of object resolution</code></span>
+<span class="codeline" id="line-429"><code>				// during the parsing pass here, as it uses the position of the RANGE</code></span>
+<span class="codeline" id="line-430"><code>				// token for the RHS OpPos. That information is not contained within</code></span>
+<span class="codeline" id="line-431"><code>				// the AST.</code></span>
+<span class="codeline" id="line-432"><code>				as := &amp;ast.AssignStmt{</code></span>
+<span class="codeline" id="line-433"><code>					Lhs:    lhs,</code></span>
+<span class="codeline" id="line-434"><code>					Tok:    token.DEFINE,</code></span>
+<span class="codeline" id="line-435"><code>					TokPos: n.TokPos,</code></span>
+<span class="codeline" id="line-436"><code>					Rhs:    []ast.Expr{&amp;ast.UnaryExpr{Op: token.RANGE, X: n.X}},</code></span>
+<span class="codeline" id="line-437"><code>				}</code></span>
+<span class="codeline" id="line-438"><code>				// TODO(rFindley): this walkLHS reproduced the parser resolution, but</code></span>
+<span class="codeline" id="line-439"><code>				// is it necessary? By comparison, for a normal AssignStmt we don't</code></span>
+<span class="codeline" id="line-440"><code>				// walk the LHS in case there is an invalid identifier list.</code></span>
+<span class="codeline" id="line-441"><code>				r.walkLHS(lhs)</code></span>
+<span class="codeline" id="line-442"><code>				r.shortVarDecl(as)</code></span>
+<span class="codeline" id="line-443"><code>			} else {</code></span>
+<span class="codeline" id="line-444"><code>				r.walkExprs(lhs)</code></span>
+<span class="codeline" id="line-445"><code>			}</code></span>
+<span class="codeline" id="line-446"><code>		}</code></span>
+<span class="codeline" id="line-447"><code>		ast.Walk(r, n.Body)</code></span>
+<span class="codeline" id="line-448"><code></code></span>
+<span class="codeline" id="line-449"><code>	// Declarations</code></span>
+<span class="codeline" id="line-450"><code>	case *ast.GenDecl:</code></span>
+<span class="codeline" id="line-451"><code>		switch n.Tok {</code></span>
+<span class="codeline" id="line-452"><code>		case token.CONST, token.VAR:</code></span>
+<span class="codeline" id="line-453"><code>			for i, spec := range n.Specs {</code></span>
+<span class="codeline" id="line-454"><code>				spec := spec.(*ast.ValueSpec)</code></span>
+<span class="codeline" id="line-455"><code>				kind := ast.Con</code></span>
+<span class="codeline" id="line-456"><code>				if n.Tok == token.VAR {</code></span>
+<span class="codeline" id="line-457"><code>					kind = ast.Var</code></span>
+<span class="codeline" id="line-458"><code>				}</code></span>
+<span class="codeline" id="line-459"><code>				r.walkExprs(spec.Values)</code></span>
+<span class="codeline" id="line-460"><code>				if spec.Type != nil {</code></span>
+<span class="codeline" id="line-461"><code>					ast.Walk(r, spec.Type)</code></span>
+<span class="codeline" id="line-462"><code>				}</code></span>
+<span class="codeline" id="line-463"><code>				r.declare(spec, i, r.topScope, kind, spec.Names...)</code></span>
+<span class="codeline" id="line-464"><code>			}</code></span>
+<span class="codeline" id="line-465"><code>		case token.TYPE:</code></span>
+<span class="codeline" id="line-466"><code>			for _, spec := range n.Specs {</code></span>
+<span class="codeline" id="line-467"><code>				spec := spec.(*ast.TypeSpec)</code></span>
+<span class="codeline" id="line-468"><code>				// Go spec: The scope of a type identifier declared inside a function begins</code></span>
+<span class="codeline" id="line-469"><code>				// at the identifier in the TypeSpec and ends at the end of the innermost</code></span>
+<span class="codeline" id="line-470"><code>				// containing block.</code></span>
+<span class="codeline" id="line-471"><code>				r.declare(spec, nil, r.topScope, ast.Typ, spec.Name)</code></span>
+<span class="codeline" id="line-472"><code>				if spec.TypeParams != nil {</code></span>
+<span class="codeline" id="line-473"><code>					r.openScope(spec.Pos())</code></span>
+<span class="codeline" id="line-474"><code>					defer r.closeScope()</code></span>
+<span class="codeline" id="line-475"><code>					r.walkTParams(spec.TypeParams)</code></span>
+<span class="codeline" id="line-476"><code>				}</code></span>
+<span class="codeline" id="line-477"><code>				ast.Walk(r, spec.Type)</code></span>
+<span class="codeline" id="line-478"><code>			}</code></span>
+<span class="codeline" id="line-479"><code>		}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>	case *ast.FuncDecl:</code></span>
+<span class="codeline" id="line-482"><code>		// Open the function scope.</code></span>
+<span class="codeline" id="line-483"><code>		r.openScope(n.Pos())</code></span>
+<span class="codeline" id="line-484"><code>		defer r.closeScope()</code></span>
+<span class="codeline" id="line-485"><code></code></span>
+<span class="codeline" id="line-486"><code>		r.walkRecv(n.Recv)</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>		// Type parameters are walked normally: they can reference each other, and</code></span>
+<span class="codeline" id="line-489"><code>		// can be referenced by normal parameters.</code></span>
+<span class="codeline" id="line-490"><code>		if n.Type.TypeParams != nil {</code></span>
+<span class="codeline" id="line-491"><code>			r.walkTParams(n.Type.TypeParams)</code></span>
+<span class="codeline" id="line-492"><code>			// TODO(rFindley): need to address receiver type parameters.</code></span>
+<span class="codeline" id="line-493"><code>		}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>		// Resolve and declare parameters in a specific order to get duplicate</code></span>
+<span class="codeline" id="line-496"><code>		// declaration errors in the correct location.</code></span>
+<span class="codeline" id="line-497"><code>		r.resolveList(n.Type.Params)</code></span>
+<span class="codeline" id="line-498"><code>		r.resolveList(n.Type.Results)</code></span>
+<span class="codeline" id="line-499"><code>		r.declareList(n.Recv, ast.Var)</code></span>
+<span class="codeline" id="line-500"><code>		r.declareList(n.Type.Params, ast.Var)</code></span>
+<span class="codeline" id="line-501"><code>		r.declareList(n.Type.Results, ast.Var)</code></span>
+<span class="codeline" id="line-502"><code></code></span>
+<span class="codeline" id="line-503"><code>		r.walkBody(n.Body)</code></span>
+<span class="codeline" id="line-504"><code>		if n.Recv == nil &amp;&amp; n.Name.Name != "init" {</code></span>
+<span class="codeline" id="line-505"><code>			r.declare(n, nil, r.pkgScope, ast.Fun, n.Name)</code></span>
+<span class="codeline" id="line-506"><code>		}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>	default:</code></span>
+<span class="codeline" id="line-509"><code>		return r</code></span>
+<span class="codeline" id="line-510"><code>	}</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>	return nil</code></span>
+<span class="codeline" id="line-513"><code>}</code></span>
+<span class="codeline" id="line-514"><code></code></span>
+<span class="codeline" id="line-515"><code>func (r *resolver) walkFuncType(typ *ast.FuncType) {</code></span>
+<span class="codeline" id="line-516"><code>	// typ.TypeParams must be walked separately for FuncDecls.</code></span>
+<span class="codeline" id="line-517"><code>	r.resolveList(typ.Params)</code></span>
+<span class="codeline" id="line-518"><code>	r.resolveList(typ.Results)</code></span>
+<span class="codeline" id="line-519"><code>	r.declareList(typ.Params, ast.Var)</code></span>
+<span class="codeline" id="line-520"><code>	r.declareList(typ.Results, ast.Var)</code></span>
+<span class="codeline" id="line-521"><code>}</code></span>
+<span class="codeline" id="line-522"><code></code></span>
+<span class="codeline" id="line-523"><code>func (r *resolver) resolveList(list *ast.FieldList) {</code></span>
+<span class="codeline" id="line-524"><code>	if list == nil {</code></span>
+<span class="codeline" id="line-525"><code>		return</code></span>
+<span class="codeline" id="line-526"><code>	}</code></span>
+<span class="codeline" id="line-527"><code>	for _, f := range list.List {</code></span>
+<span class="codeline" id="line-528"><code>		if f.Type != nil {</code></span>
+<span class="codeline" id="line-529"><code>			ast.Walk(r, f.Type)</code></span>
+<span class="codeline" id="line-530"><code>		}</code></span>
+<span class="codeline" id="line-531"><code>	}</code></span>
+<span class="codeline" id="line-532"><code>}</code></span>
+<span class="codeline" id="line-533"><code></code></span>
+<span class="codeline" id="line-534"><code>func (r *resolver) declareList(list *ast.FieldList, kind ast.ObjKind) {</code></span>
+<span class="codeline" id="line-535"><code>	if list == nil {</code></span>
+<span class="codeline" id="line-536"><code>		return</code></span>
+<span class="codeline" id="line-537"><code>	}</code></span>
+<span class="codeline" id="line-538"><code>	for _, f := range list.List {</code></span>
+<span class="codeline" id="line-539"><code>		r.declare(f, nil, r.topScope, kind, f.Names...)</code></span>
+<span class="codeline" id="line-540"><code>	}</code></span>
+<span class="codeline" id="line-541"><code>}</code></span>
+<span class="codeline" id="line-542"><code></code></span>
+<span class="codeline" id="line-543"><code>func (r *resolver) walkRecv(recv *ast.FieldList) {</code></span>
+<span class="codeline" id="line-544"><code>	// If our receiver has receiver type parameters, we must declare them before</code></span>
+<span class="codeline" id="line-545"><code>	// trying to resolve the rest of the receiver, and avoid re-resolving the</code></span>
+<span class="codeline" id="line-546"><code>	// type parameter identifiers.</code></span>
+<span class="codeline" id="line-547"><code>	if recv == nil || len(recv.List) == 0 {</code></span>
+<span class="codeline" id="line-548"><code>		return // nothing to do</code></span>
+<span class="codeline" id="line-549"><code>	}</code></span>
+<span class="codeline" id="line-550"><code>	typ := recv.List[0].Type</code></span>
+<span class="codeline" id="line-551"><code>	if ptr, ok := typ.(*ast.StarExpr); ok {</code></span>
+<span class="codeline" id="line-552"><code>		typ = ptr.X</code></span>
+<span class="codeline" id="line-553"><code>	}</code></span>
+<span class="codeline" id="line-554"><code></code></span>
+<span class="codeline" id="line-555"><code>	var declareExprs []ast.Expr // exprs to declare</code></span>
+<span class="codeline" id="line-556"><code>	var resolveExprs []ast.Expr // exprs to resolve</code></span>
+<span class="codeline" id="line-557"><code>	switch typ := typ.(type) {</code></span>
+<span class="codeline" id="line-558"><code>	case *ast.IndexExpr:</code></span>
+<span class="codeline" id="line-559"><code>		declareExprs = []ast.Expr{typ.Index}</code></span>
+<span class="codeline" id="line-560"><code>		resolveExprs = append(resolveExprs, typ.X)</code></span>
+<span class="codeline" id="line-561"><code>	case *ast.IndexListExpr:</code></span>
+<span class="codeline" id="line-562"><code>		declareExprs = typ.Indices</code></span>
+<span class="codeline" id="line-563"><code>		resolveExprs = append(resolveExprs, typ.X)</code></span>
+<span class="codeline" id="line-564"><code>	default:</code></span>
+<span class="codeline" id="line-565"><code>		resolveExprs = append(resolveExprs, typ)</code></span>
+<span class="codeline" id="line-566"><code>	}</code></span>
+<span class="codeline" id="line-567"><code>	for _, expr := range declareExprs {</code></span>
+<span class="codeline" id="line-568"><code>		if id, _ := expr.(*ast.Ident); id != nil {</code></span>
+<span class="codeline" id="line-569"><code>			r.declare(expr, nil, r.topScope, ast.Typ, id)</code></span>
+<span class="codeline" id="line-570"><code>		} else {</code></span>
+<span class="codeline" id="line-571"><code>			// The receiver type parameter expression is invalid, but try to resolve</code></span>
+<span class="codeline" id="line-572"><code>			// it anyway for consistency.</code></span>
+<span class="codeline" id="line-573"><code>			resolveExprs = append(resolveExprs, expr)</code></span>
+<span class="codeline" id="line-574"><code>		}</code></span>
+<span class="codeline" id="line-575"><code>	}</code></span>
+<span class="codeline" id="line-576"><code>	for _, expr := range resolveExprs {</code></span>
+<span class="codeline" id="line-577"><code>		if expr != nil {</code></span>
+<span class="codeline" id="line-578"><code>			ast.Walk(r, expr)</code></span>
+<span class="codeline" id="line-579"><code>		}</code></span>
+<span class="codeline" id="line-580"><code>	}</code></span>
+<span class="codeline" id="line-581"><code>	// The receiver is invalid, but try to resolve it anyway for consistency.</code></span>
+<span class="codeline" id="line-582"><code>	for _, f := range recv.List[1:] {</code></span>
+<span class="codeline" id="line-583"><code>		if f.Type != nil {</code></span>
+<span class="codeline" id="line-584"><code>			ast.Walk(r, f.Type)</code></span>
+<span class="codeline" id="line-585"><code>		}</code></span>
+<span class="codeline" id="line-586"><code>	}</code></span>
+<span class="codeline" id="line-587"><code>}</code></span>
+<span class="codeline" id="line-588"><code></code></span>
+<span class="codeline" id="line-589"><code>func (r *resolver) walkFieldList(list *ast.FieldList, kind ast.ObjKind) {</code></span>
+<span class="codeline" id="line-590"><code>	if list == nil {</code></span>
+<span class="codeline" id="line-591"><code>		return</code></span>
+<span class="codeline" id="line-592"><code>	}</code></span>
+<span class="codeline" id="line-593"><code>	r.resolveList(list)</code></span>
+<span class="codeline" id="line-594"><code>	r.declareList(list, kind)</code></span>
+<span class="codeline" id="line-595"><code>}</code></span>
+<span class="codeline" id="line-596"><code></code></span>
+<span class="codeline" id="line-597"><code>// walkTParams is like walkFieldList, but declares type parameters eagerly so</code></span>
+<span class="codeline" id="line-598"><code>// that they may be resolved in the constraint expressions held in the field</code></span>
+<span class="codeline" id="line-599"><code>// Type.</code></span>
+<span class="codeline" id="line-600"><code>func (r *resolver) walkTParams(list *ast.FieldList) {</code></span>
+<span class="codeline" id="line-601"><code>	r.declareList(list, ast.Typ)</code></span>
+<span class="codeline" id="line-602"><code>	r.resolveList(list)</code></span>
+<span class="codeline" id="line-603"><code>}</code></span>
+<span class="codeline" id="line-604"><code></code></span>
+<span class="codeline" id="line-605"><code>func (r *resolver) walkBody(body *ast.BlockStmt) {</code></span>
+<span class="codeline" id="line-606"><code>	if body == nil {</code></span>
+<span class="codeline" id="line-607"><code>		return</code></span>
+<span class="codeline" id="line-608"><code>	}</code></span>
+<span class="codeline" id="line-609"><code>	r.openLabelScope()</code></span>
+<span class="codeline" id="line-610"><code>	defer r.closeLabelScope()</code></span>
+<span class="codeline" id="line-611"><code>	r.walkStmts(body.List)</code></span>
+<span class="codeline" id="line-612"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

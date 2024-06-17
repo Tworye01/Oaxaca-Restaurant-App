@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: pss.go in package crypto/rsa</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	pss.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/rsa.html">crypto/rsa</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2013 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package rsa</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// This file implements the RSASSA-PSS signature scheme according to RFC 8017.</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"bytes"</code></span>
+<span class="codeline" id="line-11"><code>	"crypto"</code></span>
+<span class="codeline" id="line-12"><code>	"crypto/internal/boring"</code></span>
+<span class="codeline" id="line-13"><code>	"errors"</code></span>
+<span class="codeline" id="line-14"><code>	"hash"</code></span>
+<span class="codeline" id="line-15"><code>	"io"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>// Per RFC 8017, Section 9.1</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>//     EM = MGF1 xor DB || H( 8*0x00 || mHash || salt ) || 0xbc</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// where</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>//     DB = PS || 0x01 || salt</code></span>
+<span class="codeline" id="line-25"><code>//</code></span>
+<span class="codeline" id="line-26"><code>// and PS can be empty so</code></span>
+<span class="codeline" id="line-27"><code>//</code></span>
+<span class="codeline" id="line-28"><code>//     emLen = dbLen + hLen + 1 = psLen + sLen + hLen + 2</code></span>
+<span class="codeline" id="line-29"><code>//</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>func emsaPSSEncode(mHash []byte, emBits int, salt []byte, hash hash.Hash) ([]byte, error) {</code></span>
+<span class="codeline" id="line-32"><code>	// See RFC 8017, Section 9.1.1.</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>	hLen := hash.Size()</code></span>
+<span class="codeline" id="line-35"><code>	sLen := len(salt)</code></span>
+<span class="codeline" id="line-36"><code>	emLen := (emBits + 7) / 8</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>	// 1.  If the length of M is greater than the input limitation for the</code></span>
+<span class="codeline" id="line-39"><code>	//     hash function (2^61 - 1 octets for SHA-1), output "message too</code></span>
+<span class="codeline" id="line-40"><code>	//     long" and stop.</code></span>
+<span class="codeline" id="line-41"><code>	//</code></span>
+<span class="codeline" id="line-42"><code>	// 2.  Let mHash = Hash(M), an octet string of length hLen.</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>	if len(mHash) != hLen {</code></span>
+<span class="codeline" id="line-45"><code>		return nil, errors.New("crypto/rsa: input must be hashed with given hash")</code></span>
+<span class="codeline" id="line-46"><code>	}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>	// 3.  If emLen &lt; hLen + sLen + 2, output "encoding error" and stop.</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>	if emLen &lt; hLen+sLen+2 {</code></span>
+<span class="codeline" id="line-51"><code>		return nil, ErrMessageTooLong</code></span>
+<span class="codeline" id="line-52"><code>	}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>	em := make([]byte, emLen)</code></span>
+<span class="codeline" id="line-55"><code>	psLen := emLen - sLen - hLen - 2</code></span>
+<span class="codeline" id="line-56"><code>	db := em[:psLen+1+sLen]</code></span>
+<span class="codeline" id="line-57"><code>	h := em[psLen+1+sLen : emLen-1]</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>	// 4.  Generate a random octet string salt of length sLen; if sLen = 0,</code></span>
+<span class="codeline" id="line-60"><code>	//     then salt is the empty string.</code></span>
+<span class="codeline" id="line-61"><code>	//</code></span>
+<span class="codeline" id="line-62"><code>	// 5.  Let</code></span>
+<span class="codeline" id="line-63"><code>	//       M' = (0x)00 00 00 00 00 00 00 00 || mHash || salt;</code></span>
+<span class="codeline" id="line-64"><code>	//</code></span>
+<span class="codeline" id="line-65"><code>	//     M' is an octet string of length 8 + hLen + sLen with eight</code></span>
+<span class="codeline" id="line-66"><code>	//     initial zero octets.</code></span>
+<span class="codeline" id="line-67"><code>	//</code></span>
+<span class="codeline" id="line-68"><code>	// 6.  Let H = Hash(M'), an octet string of length hLen.</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>	var prefix [8]byte</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	hash.Write(prefix[:])</code></span>
+<span class="codeline" id="line-73"><code>	hash.Write(mHash)</code></span>
+<span class="codeline" id="line-74"><code>	hash.Write(salt)</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>	h = hash.Sum(h[:0])</code></span>
+<span class="codeline" id="line-77"><code>	hash.Reset()</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>	// 7.  Generate an octet string PS consisting of emLen - sLen - hLen - 2</code></span>
+<span class="codeline" id="line-80"><code>	//     zero octets. The length of PS may be 0.</code></span>
+<span class="codeline" id="line-81"><code>	//</code></span>
+<span class="codeline" id="line-82"><code>	// 8.  Let DB = PS || 0x01 || salt; DB is an octet string of length</code></span>
+<span class="codeline" id="line-83"><code>	//     emLen - hLen - 1.</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>	db[psLen] = 0x01</code></span>
+<span class="codeline" id="line-86"><code>	copy(db[psLen+1:], salt)</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>	// 9.  Let dbMask = MGF(H, emLen - hLen - 1).</code></span>
+<span class="codeline" id="line-89"><code>	//</code></span>
+<span class="codeline" id="line-90"><code>	// 10. Let maskedDB = DB \xor dbMask.</code></span>
+<span class="codeline" id="line-91"><code></code></span>
+<span class="codeline" id="line-92"><code>	mgf1XOR(db, hash, h)</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>	// 11. Set the leftmost 8 * emLen - emBits bits of the leftmost octet in</code></span>
+<span class="codeline" id="line-95"><code>	//     maskedDB to zero.</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>	db[0] &amp;= 0xff &gt;&gt; (8*emLen - emBits)</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>	// 12. Let EM = maskedDB || H || 0xbc.</code></span>
+<span class="codeline" id="line-100"><code>	em[emLen-1] = 0xbc</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>	// 13. Output EM.</code></span>
+<span class="codeline" id="line-103"><code>	return em, nil</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>func emsaPSSVerify(mHash, em []byte, emBits, sLen int, hash hash.Hash) error {</code></span>
+<span class="codeline" id="line-107"><code>	// See RFC 8017, Section 9.1.2.</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>	hLen := hash.Size()</code></span>
+<span class="codeline" id="line-110"><code>	if sLen == PSSSaltLengthEqualsHash {</code></span>
+<span class="codeline" id="line-111"><code>		sLen = hLen</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code>	emLen := (emBits + 7) / 8</code></span>
+<span class="codeline" id="line-114"><code>	if emLen != len(em) {</code></span>
+<span class="codeline" id="line-115"><code>		return errors.New("rsa: internal error: inconsistent length")</code></span>
+<span class="codeline" id="line-116"><code>	}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	// 1.  If the length of M is greater than the input limitation for the</code></span>
+<span class="codeline" id="line-119"><code>	//     hash function (2^61 - 1 octets for SHA-1), output "inconsistent"</code></span>
+<span class="codeline" id="line-120"><code>	//     and stop.</code></span>
+<span class="codeline" id="line-121"><code>	//</code></span>
+<span class="codeline" id="line-122"><code>	// 2.  Let mHash = Hash(M), an octet string of length hLen.</code></span>
+<span class="codeline" id="line-123"><code>	if hLen != len(mHash) {</code></span>
+<span class="codeline" id="line-124"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-125"><code>	}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>	// 3.  If emLen &lt; hLen + sLen + 2, output "inconsistent" and stop.</code></span>
+<span class="codeline" id="line-128"><code>	if emLen &lt; hLen+sLen+2 {</code></span>
+<span class="codeline" id="line-129"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	// 4.  If the rightmost octet of EM does not have hexadecimal value</code></span>
+<span class="codeline" id="line-133"><code>	//     0xbc, output "inconsistent" and stop.</code></span>
+<span class="codeline" id="line-134"><code>	if em[emLen-1] != 0xbc {</code></span>
+<span class="codeline" id="line-135"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-136"><code>	}</code></span>
+<span class="codeline" id="line-137"><code></code></span>
+<span class="codeline" id="line-138"><code>	// 5.  Let maskedDB be the leftmost emLen - hLen - 1 octets of EM, and</code></span>
+<span class="codeline" id="line-139"><code>	//     let H be the next hLen octets.</code></span>
+<span class="codeline" id="line-140"><code>	db := em[:emLen-hLen-1]</code></span>
+<span class="codeline" id="line-141"><code>	h := em[emLen-hLen-1 : emLen-1]</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>	// 6.  If the leftmost 8 * emLen - emBits bits of the leftmost octet in</code></span>
+<span class="codeline" id="line-144"><code>	//     maskedDB are not all equal to zero, output "inconsistent" and</code></span>
+<span class="codeline" id="line-145"><code>	//     stop.</code></span>
+<span class="codeline" id="line-146"><code>	var bitMask byte = 0xff &gt;&gt; (8*emLen - emBits)</code></span>
+<span class="codeline" id="line-147"><code>	if em[0] &amp; ^bitMask != 0 {</code></span>
+<span class="codeline" id="line-148"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	// 7.  Let dbMask = MGF(H, emLen - hLen - 1).</code></span>
+<span class="codeline" id="line-152"><code>	//</code></span>
+<span class="codeline" id="line-153"><code>	// 8.  Let DB = maskedDB \xor dbMask.</code></span>
+<span class="codeline" id="line-154"><code>	mgf1XOR(db, hash, h)</code></span>
+<span class="codeline" id="line-155"><code></code></span>
+<span class="codeline" id="line-156"><code>	// 9.  Set the leftmost 8 * emLen - emBits bits of the leftmost octet in DB</code></span>
+<span class="codeline" id="line-157"><code>	//     to zero.</code></span>
+<span class="codeline" id="line-158"><code>	db[0] &amp;= bitMask</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>	// If we don't know the salt length, look for the 0x01 delimiter.</code></span>
+<span class="codeline" id="line-161"><code>	if sLen == PSSSaltLengthAuto {</code></span>
+<span class="codeline" id="line-162"><code>		psLen := bytes.IndexByte(db, 0x01)</code></span>
+<span class="codeline" id="line-163"><code>		if psLen &lt; 0 {</code></span>
+<span class="codeline" id="line-164"><code>			return ErrVerification</code></span>
+<span class="codeline" id="line-165"><code>		}</code></span>
+<span class="codeline" id="line-166"><code>		sLen = len(db) - psLen - 1</code></span>
+<span class="codeline" id="line-167"><code>	}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>	// 10. If the emLen - hLen - sLen - 2 leftmost octets of DB are not zero</code></span>
+<span class="codeline" id="line-170"><code>	//     or if the octet at position emLen - hLen - sLen - 1 (the leftmost</code></span>
+<span class="codeline" id="line-171"><code>	//     position is "position 1") does not have hexadecimal value 0x01,</code></span>
+<span class="codeline" id="line-172"><code>	//     output "inconsistent" and stop.</code></span>
+<span class="codeline" id="line-173"><code>	psLen := emLen - hLen - sLen - 2</code></span>
+<span class="codeline" id="line-174"><code>	for _, e := range db[:psLen] {</code></span>
+<span class="codeline" id="line-175"><code>		if e != 0x00 {</code></span>
+<span class="codeline" id="line-176"><code>			return ErrVerification</code></span>
+<span class="codeline" id="line-177"><code>		}</code></span>
+<span class="codeline" id="line-178"><code>	}</code></span>
+<span class="codeline" id="line-179"><code>	if db[psLen] != 0x01 {</code></span>
+<span class="codeline" id="line-180"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>	// 11.  Let salt be the last sLen octets of DB.</code></span>
+<span class="codeline" id="line-184"><code>	salt := db[len(db)-sLen:]</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>	// 12.  Let</code></span>
+<span class="codeline" id="line-187"><code>	//          M' = (0x)00 00 00 00 00 00 00 00 || mHash || salt ;</code></span>
+<span class="codeline" id="line-188"><code>	//     M' is an octet string of length 8 + hLen + sLen with eight</code></span>
+<span class="codeline" id="line-189"><code>	//     initial zero octets.</code></span>
+<span class="codeline" id="line-190"><code>	//</code></span>
+<span class="codeline" id="line-191"><code>	// 13. Let H' = Hash(M'), an octet string of length hLen.</code></span>
+<span class="codeline" id="line-192"><code>	var prefix [8]byte</code></span>
+<span class="codeline" id="line-193"><code>	hash.Write(prefix[:])</code></span>
+<span class="codeline" id="line-194"><code>	hash.Write(mHash)</code></span>
+<span class="codeline" id="line-195"><code>	hash.Write(salt)</code></span>
+<span class="codeline" id="line-196"><code></code></span>
+<span class="codeline" id="line-197"><code>	h0 := hash.Sum(nil)</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>	// 14. If H = H', output "consistent." Otherwise, output "inconsistent."</code></span>
+<span class="codeline" id="line-200"><code>	if !bytes.Equal(h0, h) { // TODO: constant time?</code></span>
+<span class="codeline" id="line-201"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-202"><code>	}</code></span>
+<span class="codeline" id="line-203"><code>	return nil</code></span>
+<span class="codeline" id="line-204"><code>}</code></span>
+<span class="codeline" id="line-205"><code></code></span>
+<span class="codeline" id="line-206"><code>// signPSSWithSalt calculates the signature of hashed using PSS with specified salt.</code></span>
+<span class="codeline" id="line-207"><code>// Note that hashed must be the result of hashing the input message using the</code></span>
+<span class="codeline" id="line-208"><code>// given hash function. salt is a random sequence of bytes whose length will be</code></span>
+<span class="codeline" id="line-209"><code>// later used to verify the signature.</code></span>
+<span class="codeline" id="line-210"><code>func signPSSWithSalt(priv *PrivateKey, hash crypto.Hash, hashed, salt []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-211"><code>	emBits := priv.N.BitLen() - 1</code></span>
+<span class="codeline" id="line-212"><code>	em, err := emsaPSSEncode(hashed, emBits, salt, hash.New())</code></span>
+<span class="codeline" id="line-213"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-214"><code>		return nil, err</code></span>
+<span class="codeline" id="line-215"><code>	}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>	if boring.Enabled {</code></span>
+<span class="codeline" id="line-218"><code>		bkey, err := boringPrivateKey(priv)</code></span>
+<span class="codeline" id="line-219"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-220"><code>			return nil, err</code></span>
+<span class="codeline" id="line-221"><code>		}</code></span>
+<span class="codeline" id="line-222"><code>		// Note: BoringCrypto always does decrypt "withCheck".</code></span>
+<span class="codeline" id="line-223"><code>		// (It's not just decrypt.)</code></span>
+<span class="codeline" id="line-224"><code>		s, err := boring.DecryptRSANoPadding(bkey, em)</code></span>
+<span class="codeline" id="line-225"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-226"><code>			return nil, err</code></span>
+<span class="codeline" id="line-227"><code>		}</code></span>
+<span class="codeline" id="line-228"><code>		return s, nil</code></span>
+<span class="codeline" id="line-229"><code>	}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>	// RFC 8017: "Note that the octet length of EM will be one less than k if</code></span>
+<span class="codeline" id="line-232"><code>	// modBits - 1 is divisible by 8 and equal to k otherwise, where k is the</code></span>
+<span class="codeline" id="line-233"><code>	// length in octets of the RSA modulus n." 🙄</code></span>
+<span class="codeline" id="line-234"><code>	//</code></span>
+<span class="codeline" id="line-235"><code>	// This is extremely annoying, as all other encrypt and decrypt inputs are</code></span>
+<span class="codeline" id="line-236"><code>	// always the exact same size as the modulus. Since it only happens for</code></span>
+<span class="codeline" id="line-237"><code>	// weird modulus sizes, fix it by padding inefficiently.</code></span>
+<span class="codeline" id="line-238"><code>	if emLen, k := len(em), priv.Size(); emLen &lt; k {</code></span>
+<span class="codeline" id="line-239"><code>		emNew := make([]byte, k)</code></span>
+<span class="codeline" id="line-240"><code>		copy(emNew[k-emLen:], em)</code></span>
+<span class="codeline" id="line-241"><code>		em = emNew</code></span>
+<span class="codeline" id="line-242"><code>	}</code></span>
+<span class="codeline" id="line-243"><code></code></span>
+<span class="codeline" id="line-244"><code>	return decrypt(priv, em, withCheck)</code></span>
+<span class="codeline" id="line-245"><code>}</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>const (</code></span>
+<span class="codeline" id="line-248"><code>	// PSSSaltLengthAuto causes the salt in a PSS signature to be as large</code></span>
+<span class="codeline" id="line-249"><code>	// as possible when signing, and to be auto-detected when verifying.</code></span>
+<span class="codeline" id="line-250"><code>	PSSSaltLengthAuto = 0</code></span>
+<span class="codeline" id="line-251"><code>	// PSSSaltLengthEqualsHash causes the salt length to equal the length</code></span>
+<span class="codeline" id="line-252"><code>	// of the hash used in the signature.</code></span>
+<span class="codeline" id="line-253"><code>	PSSSaltLengthEqualsHash = -1</code></span>
+<span class="codeline" id="line-254"><code>)</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>// PSSOptions contains options for creating and verifying PSS signatures.</code></span>
+<span class="codeline" id="line-257"><code>type PSSOptions struct {</code></span>
+<span class="codeline" id="line-258"><code>	// SaltLength controls the length of the salt used in the PSS signature. It</code></span>
+<span class="codeline" id="line-259"><code>	// can either be a positive number of bytes, or one of the special</code></span>
+<span class="codeline" id="line-260"><code>	// PSSSaltLength constants.</code></span>
+<span class="codeline" id="line-261"><code>	SaltLength int</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>	// Hash is the hash function used to generate the message digest. If not</code></span>
+<span class="codeline" id="line-264"><code>	// zero, it overrides the hash function passed to SignPSS. It's required</code></span>
+<span class="codeline" id="line-265"><code>	// when using PrivateKey.Sign.</code></span>
+<span class="codeline" id="line-266"><code>	Hash crypto.Hash</code></span>
+<span class="codeline" id="line-267"><code>}</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>// HashFunc returns opts.Hash so that [PSSOptions] implements [crypto.SignerOpts].</code></span>
+<span class="codeline" id="line-270"><code>func (opts *PSSOptions) HashFunc() crypto.Hash {</code></span>
+<span class="codeline" id="line-271"><code>	return opts.Hash</code></span>
+<span class="codeline" id="line-272"><code>}</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>func (opts *PSSOptions) saltLength() int {</code></span>
+<span class="codeline" id="line-275"><code>	if opts == nil {</code></span>
+<span class="codeline" id="line-276"><code>		return PSSSaltLengthAuto</code></span>
+<span class="codeline" id="line-277"><code>	}</code></span>
+<span class="codeline" id="line-278"><code>	return opts.SaltLength</code></span>
+<span class="codeline" id="line-279"><code>}</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>var invalidSaltLenErr = errors.New("crypto/rsa: PSSOptions.SaltLength cannot be negative")</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>// SignPSS calculates the signature of digest using PSS.</code></span>
+<span class="codeline" id="line-284"><code>//</code></span>
+<span class="codeline" id="line-285"><code>// digest must be the result of hashing the input message using the given hash</code></span>
+<span class="codeline" id="line-286"><code>// function. The opts argument may be nil, in which case sensible defaults are</code></span>
+<span class="codeline" id="line-287"><code>// used. If opts.Hash is set, it overrides hash.</code></span>
+<span class="codeline" id="line-288"><code>//</code></span>
+<span class="codeline" id="line-289"><code>// The signature is randomized depending on the message, key, and salt size,</code></span>
+<span class="codeline" id="line-290"><code>// using bytes from rand. Most applications should use [crypto/rand.Reader] as</code></span>
+<span class="codeline" id="line-291"><code>// rand.</code></span>
+<span class="codeline" id="line-292"><code>func SignPSS(rand io.Reader, priv *PrivateKey, hash crypto.Hash, digest []byte, opts *PSSOptions) ([]byte, error) {</code></span>
+<span class="codeline" id="line-293"><code>	// Note that while we don't commit to deterministic execution with respect</code></span>
+<span class="codeline" id="line-294"><code>	// to the rand stream, we also don't apply MaybeReadByte, so per Hyrum's Law</code></span>
+<span class="codeline" id="line-295"><code>	// it's probably relied upon by some. It's a tolerable promise because a</code></span>
+<span class="codeline" id="line-296"><code>	// well-specified number of random bytes is included in the signature, in a</code></span>
+<span class="codeline" id="line-297"><code>	// well-specified way.</code></span>
+<span class="codeline" id="line-298"><code></code></span>
+<span class="codeline" id="line-299"><code>	if boring.Enabled &amp;&amp; rand == boring.RandReader {</code></span>
+<span class="codeline" id="line-300"><code>		bkey, err := boringPrivateKey(priv)</code></span>
+<span class="codeline" id="line-301"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-302"><code>			return nil, err</code></span>
+<span class="codeline" id="line-303"><code>		}</code></span>
+<span class="codeline" id="line-304"><code>		return boring.SignRSAPSS(bkey, hash, digest, opts.saltLength())</code></span>
+<span class="codeline" id="line-305"><code>	}</code></span>
+<span class="codeline" id="line-306"><code>	boring.UnreachableExceptTests()</code></span>
+<span class="codeline" id="line-307"><code></code></span>
+<span class="codeline" id="line-308"><code>	if opts != nil &amp;&amp; opts.Hash != 0 {</code></span>
+<span class="codeline" id="line-309"><code>		hash = opts.Hash</code></span>
+<span class="codeline" id="line-310"><code>	}</code></span>
+<span class="codeline" id="line-311"><code></code></span>
+<span class="codeline" id="line-312"><code>	saltLength := opts.saltLength()</code></span>
+<span class="codeline" id="line-313"><code>	switch saltLength {</code></span>
+<span class="codeline" id="line-314"><code>	case PSSSaltLengthAuto:</code></span>
+<span class="codeline" id="line-315"><code>		saltLength = (priv.N.BitLen()-1+7)/8 - 2 - hash.Size()</code></span>
+<span class="codeline" id="line-316"><code>		if saltLength &lt; 0 {</code></span>
+<span class="codeline" id="line-317"><code>			return nil, ErrMessageTooLong</code></span>
+<span class="codeline" id="line-318"><code>		}</code></span>
+<span class="codeline" id="line-319"><code>	case PSSSaltLengthEqualsHash:</code></span>
+<span class="codeline" id="line-320"><code>		saltLength = hash.Size()</code></span>
+<span class="codeline" id="line-321"><code>	default:</code></span>
+<span class="codeline" id="line-322"><code>		// If we get here saltLength is either &gt; 0 or &lt; -1, in the</code></span>
+<span class="codeline" id="line-323"><code>		// latter case we fail out.</code></span>
+<span class="codeline" id="line-324"><code>		if saltLength &lt;= 0 {</code></span>
+<span class="codeline" id="line-325"><code>			return nil, invalidSaltLenErr</code></span>
+<span class="codeline" id="line-326"><code>		}</code></span>
+<span class="codeline" id="line-327"><code>	}</code></span>
+<span class="codeline" id="line-328"><code>	salt := make([]byte, saltLength)</code></span>
+<span class="codeline" id="line-329"><code>	if _, err := io.ReadFull(rand, salt); err != nil {</code></span>
+<span class="codeline" id="line-330"><code>		return nil, err</code></span>
+<span class="codeline" id="line-331"><code>	}</code></span>
+<span class="codeline" id="line-332"><code>	return signPSSWithSalt(priv, hash, digest, salt)</code></span>
+<span class="codeline" id="line-333"><code>}</code></span>
+<span class="codeline" id="line-334"><code></code></span>
+<span class="codeline" id="line-335"><code>// VerifyPSS verifies a PSS signature.</code></span>
+<span class="codeline" id="line-336"><code>//</code></span>
+<span class="codeline" id="line-337"><code>// A valid signature is indicated by returning a nil error. digest must be the</code></span>
+<span class="codeline" id="line-338"><code>// result of hashing the input message using the given hash function. The opts</code></span>
+<span class="codeline" id="line-339"><code>// argument may be nil, in which case sensible defaults are used. opts.Hash is</code></span>
+<span class="codeline" id="line-340"><code>// ignored.</code></span>
+<span class="codeline" id="line-341"><code>func VerifyPSS(pub *PublicKey, hash crypto.Hash, digest []byte, sig []byte, opts *PSSOptions) error {</code></span>
+<span class="codeline" id="line-342"><code>	if boring.Enabled {</code></span>
+<span class="codeline" id="line-343"><code>		bkey, err := boringPublicKey(pub)</code></span>
+<span class="codeline" id="line-344"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-345"><code>			return err</code></span>
+<span class="codeline" id="line-346"><code>		}</code></span>
+<span class="codeline" id="line-347"><code>		if err := boring.VerifyRSAPSS(bkey, hash, digest, sig, opts.saltLength()); err != nil {</code></span>
+<span class="codeline" id="line-348"><code>			return ErrVerification</code></span>
+<span class="codeline" id="line-349"><code>		}</code></span>
+<span class="codeline" id="line-350"><code>		return nil</code></span>
+<span class="codeline" id="line-351"><code>	}</code></span>
+<span class="codeline" id="line-352"><code>	if len(sig) != pub.Size() {</code></span>
+<span class="codeline" id="line-353"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-354"><code>	}</code></span>
+<span class="codeline" id="line-355"><code>	// Salt length must be either one of the special constants (-1 or 0)</code></span>
+<span class="codeline" id="line-356"><code>	// or otherwise positive. If it is &lt; PSSSaltLengthEqualsHash (-1)</code></span>
+<span class="codeline" id="line-357"><code>	// we return an error.</code></span>
+<span class="codeline" id="line-358"><code>	if opts.saltLength() &lt; PSSSaltLengthEqualsHash {</code></span>
+<span class="codeline" id="line-359"><code>		return invalidSaltLenErr</code></span>
+<span class="codeline" id="line-360"><code>	}</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>	emBits := pub.N.BitLen() - 1</code></span>
+<span class="codeline" id="line-363"><code>	emLen := (emBits + 7) / 8</code></span>
+<span class="codeline" id="line-364"><code>	em, err := encrypt(pub, sig)</code></span>
+<span class="codeline" id="line-365"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-366"><code>		return ErrVerification</code></span>
+<span class="codeline" id="line-367"><code>	}</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>	// Like in signPSSWithSalt, deal with mismatches between emLen and the size</code></span>
+<span class="codeline" id="line-370"><code>	// of the modulus. The spec would have us wire emLen into the encoding</code></span>
+<span class="codeline" id="line-371"><code>	// function, but we'd rather always encode to the size of the modulus and</code></span>
+<span class="codeline" id="line-372"><code>	// then strip leading zeroes if necessary. This only happens for weird</code></span>
+<span class="codeline" id="line-373"><code>	// modulus sizes anyway.</code></span>
+<span class="codeline" id="line-374"><code>	for len(em) &gt; emLen &amp;&amp; len(em) &gt; 0 {</code></span>
+<span class="codeline" id="line-375"><code>		if em[0] != 0 {</code></span>
+<span class="codeline" id="line-376"><code>			return ErrVerification</code></span>
+<span class="codeline" id="line-377"><code>		}</code></span>
+<span class="codeline" id="line-378"><code>		em = em[1:]</code></span>
+<span class="codeline" id="line-379"><code>	}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>	return emsaPSSVerify(digest, em, emBits, opts.saltLength(), hash.New())</code></span>
+<span class="codeline" id="line-382"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

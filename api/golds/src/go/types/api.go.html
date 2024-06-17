@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: api.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	api.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2012 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package types declares the data types and implements</code></span>
+<span class="codeline" id="line-6"><code>// the algorithms for type-checking of Go packages. Use</code></span>
+<span class="codeline" id="line-7"><code>// [Config.Check] to invoke the type checker for a package.</code></span>
+<span class="codeline" id="line-8"><code>// Alternatively, create a new type checker with [NewChecker]</code></span>
+<span class="codeline" id="line-9"><code>// and invoke it incrementally by calling [Checker.Files].</code></span>
+<span class="codeline" id="line-10"><code>//</code></span>
+<span class="codeline" id="line-11"><code>// Type-checking consists of several interdependent phases:</code></span>
+<span class="codeline" id="line-12"><code>//</code></span>
+<span class="codeline" id="line-13"><code>// Name resolution maps each identifier (ast.Ident) in the program to the</code></span>
+<span class="codeline" id="line-14"><code>// language object ([Object]) it denotes.</code></span>
+<span class="codeline" id="line-15"><code>// Use [Info].{Defs,Uses,Implicits} for the results of name resolution.</code></span>
+<span class="codeline" id="line-16"><code>//</code></span>
+<span class="codeline" id="line-17"><code>// Constant folding computes the exact constant value (constant.Value)</code></span>
+<span class="codeline" id="line-18"><code>// for every expression (ast.Expr) that is a compile-time constant.</code></span>
+<span class="codeline" id="line-19"><code>// Use Info.Types[expr].Value for the results of constant folding.</code></span>
+<span class="codeline" id="line-20"><code>//</code></span>
+<span class="codeline" id="line-21"><code>// [Type] inference computes the type ([Type]) of every expression ([ast.Expr])</code></span>
+<span class="codeline" id="line-22"><code>// and checks for compliance with the language specification.</code></span>
+<span class="codeline" id="line-23"><code>// Use [Info.Types][expr].Type for the results of type inference.</code></span>
+<span class="codeline" id="line-24"><code>//</code></span>
+<span class="codeline" id="line-25"><code>// For a tutorial, see https://golang.org/s/types-tutorial.</code></span></div><span class="codeline" id="line-26"><code>package types</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>import (</code></span>
+<span class="codeline" id="line-29"><code>	"bytes"</code></span>
+<span class="codeline" id="line-30"><code>	"fmt"</code></span>
+<span class="codeline" id="line-31"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-32"><code>	"go/constant"</code></span>
+<span class="codeline" id="line-33"><code>	"go/token"</code></span>
+<span class="codeline" id="line-34"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-35"><code>)</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// An Error describes a type-checking error; it implements the error interface.</code></span>
+<span class="codeline" id="line-38"><code>// A "soft" error is an error that still permits a valid interpretation of a</code></span>
+<span class="codeline" id="line-39"><code>// package (such as "unused variable"); "hard" errors may lead to unpredictable</code></span>
+<span class="codeline" id="line-40"><code>// behavior if ignored.</code></span>
+<span class="codeline" id="line-41"><code>type Error struct {</code></span>
+<span class="codeline" id="line-42"><code>	Fset *token.FileSet // file set for interpretation of Pos</code></span>
+<span class="codeline" id="line-43"><code>	Pos  token.Pos      // error position</code></span>
+<span class="codeline" id="line-44"><code>	Msg  string         // error message</code></span>
+<span class="codeline" id="line-45"><code>	Soft bool           // if set, error is "soft"</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>	// go116code is a future API, unexported as the set of error codes is large</code></span>
+<span class="codeline" id="line-48"><code>	// and likely to change significantly during experimentation. Tools wishing</code></span>
+<span class="codeline" id="line-49"><code>	// to preview this feature may read go116code using reflection (see</code></span>
+<span class="codeline" id="line-50"><code>	// errorcodes_test.go), but beware that there is no guarantee of future</code></span>
+<span class="codeline" id="line-51"><code>	// compatibility.</code></span>
+<span class="codeline" id="line-52"><code>	go116code  Code</code></span>
+<span class="codeline" id="line-53"><code>	go116start token.Pos</code></span>
+<span class="codeline" id="line-54"><code>	go116end   token.Pos</code></span>
+<span class="codeline" id="line-55"><code>}</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>// Error returns an error string formatted as follows:</code></span>
+<span class="codeline" id="line-58"><code>// filename:line:column: message</code></span>
+<span class="codeline" id="line-59"><code>func (err Error) Error() string {</code></span>
+<span class="codeline" id="line-60"><code>	return fmt.Sprintf("%s: %s", err.Fset.Position(err.Pos), err.Msg)</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// An ArgumentError holds an error associated with an argument index.</code></span>
+<span class="codeline" id="line-64"><code>type ArgumentError struct {</code></span>
+<span class="codeline" id="line-65"><code>	Index int</code></span>
+<span class="codeline" id="line-66"><code>	Err   error</code></span>
+<span class="codeline" id="line-67"><code>}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>func (e *ArgumentError) Error() string { return e.Err.Error() }</code></span>
+<span class="codeline" id="line-70"><code>func (e *ArgumentError) Unwrap() error { return e.Err }</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>// An Importer resolves import paths to Packages.</code></span>
+<span class="codeline" id="line-73"><code>//</code></span>
+<span class="codeline" id="line-74"><code>// CAUTION: This interface does not support the import of locally</code></span>
+<span class="codeline" id="line-75"><code>// vendored packages. See https://golang.org/s/go15vendor.</code></span>
+<span class="codeline" id="line-76"><code>// If possible, external implementations should implement [ImporterFrom].</code></span>
+<span class="codeline" id="line-77"><code>type Importer interface {</code></span>
+<span class="codeline" id="line-78"><code>	// Import returns the imported package for the given import path.</code></span>
+<span class="codeline" id="line-79"><code>	// The semantics is like for ImporterFrom.ImportFrom except that</code></span>
+<span class="codeline" id="line-80"><code>	// dir and mode are ignored (since they are not present).</code></span>
+<span class="codeline" id="line-81"><code>	Import(path string) (*Package, error)</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// ImportMode is reserved for future use.</code></span>
+<span class="codeline" id="line-85"><code>type ImportMode int</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>// An ImporterFrom resolves import paths to packages; it</code></span>
+<span class="codeline" id="line-88"><code>// supports vendoring per https://golang.org/s/go15vendor.</code></span>
+<span class="codeline" id="line-89"><code>// Use go/importer to obtain an ImporterFrom implementation.</code></span>
+<span class="codeline" id="line-90"><code>type ImporterFrom interface {</code></span>
+<span class="codeline" id="line-91"><code>	// Importer is present for backward-compatibility. Calling</code></span>
+<span class="codeline" id="line-92"><code>	// Import(path) is the same as calling ImportFrom(path, "", 0);</code></span>
+<span class="codeline" id="line-93"><code>	// i.e., locally vendored packages may not be found.</code></span>
+<span class="codeline" id="line-94"><code>	// The types package does not call Import if an ImporterFrom</code></span>
+<span class="codeline" id="line-95"><code>	// is present.</code></span>
+<span class="codeline" id="line-96"><code>	Importer</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>	// ImportFrom returns the imported package for the given import</code></span>
+<span class="codeline" id="line-99"><code>	// path when imported by a package file located in dir.</code></span>
+<span class="codeline" id="line-100"><code>	// If the import failed, besides returning an error, ImportFrom</code></span>
+<span class="codeline" id="line-101"><code>	// is encouraged to cache and return a package anyway, if one</code></span>
+<span class="codeline" id="line-102"><code>	// was created. This will reduce package inconsistencies and</code></span>
+<span class="codeline" id="line-103"><code>	// follow-on type checker errors due to the missing package.</code></span>
+<span class="codeline" id="line-104"><code>	// The mode value must be 0; it is reserved for future use.</code></span>
+<span class="codeline" id="line-105"><code>	// Two calls to ImportFrom with the same path and dir must</code></span>
+<span class="codeline" id="line-106"><code>	// return the same package.</code></span>
+<span class="codeline" id="line-107"><code>	ImportFrom(path, dir string, mode ImportMode) (*Package, error)</code></span>
+<span class="codeline" id="line-108"><code>}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>// A Config specifies the configuration for type checking.</code></span>
+<span class="codeline" id="line-111"><code>// The zero value for Config is a ready-to-use default configuration.</code></span>
+<span class="codeline" id="line-112"><code>type Config struct {</code></span>
+<span class="codeline" id="line-113"><code>	// Context is the context used for resolving global identifiers. If nil, the</code></span>
+<span class="codeline" id="line-114"><code>	// type checker will initialize this field with a newly created context.</code></span>
+<span class="codeline" id="line-115"><code>	Context *Context</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>	// GoVersion describes the accepted Go language version. The string must</code></span>
+<span class="codeline" id="line-118"><code>	// start with a prefix of the form "go%d.%d" (e.g. "go1.20", "go1.21rc1", or</code></span>
+<span class="codeline" id="line-119"><code>	// "go1.21.0") or it must be empty; an empty string disables Go language</code></span>
+<span class="codeline" id="line-120"><code>	// version checks. If the format is invalid, invoking the type checker will</code></span>
+<span class="codeline" id="line-121"><code>	// result in an error.</code></span>
+<span class="codeline" id="line-122"><code>	GoVersion string</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>	// If IgnoreFuncBodies is set, function bodies are not</code></span>
+<span class="codeline" id="line-125"><code>	// type-checked.</code></span>
+<span class="codeline" id="line-126"><code>	IgnoreFuncBodies bool</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>	// If FakeImportC is set, `import "C"` (for packages requiring Cgo)</code></span>
+<span class="codeline" id="line-129"><code>	// declares an empty "C" package and errors are omitted for qualified</code></span>
+<span class="codeline" id="line-130"><code>	// identifiers referring to package C (which won't find an object).</code></span>
+<span class="codeline" id="line-131"><code>	// This feature is intended for the standard library cmd/api tool.</code></span>
+<span class="codeline" id="line-132"><code>	//</code></span>
+<span class="codeline" id="line-133"><code>	// Caution: Effects may be unpredictable due to follow-on errors.</code></span>
+<span class="codeline" id="line-134"><code>	//          Do not use casually!</code></span>
+<span class="codeline" id="line-135"><code>	FakeImportC bool</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>	// If go115UsesCgo is set, the type checker expects the</code></span>
+<span class="codeline" id="line-138"><code>	// _cgo_gotypes.go file generated by running cmd/cgo to be</code></span>
+<span class="codeline" id="line-139"><code>	// provided as a package source file. Qualified identifiers</code></span>
+<span class="codeline" id="line-140"><code>	// referring to package C will be resolved to cgo-provided</code></span>
+<span class="codeline" id="line-141"><code>	// declarations within _cgo_gotypes.go.</code></span>
+<span class="codeline" id="line-142"><code>	//</code></span>
+<span class="codeline" id="line-143"><code>	// It is an error to set both FakeImportC and go115UsesCgo.</code></span>
+<span class="codeline" id="line-144"><code>	go115UsesCgo bool</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	// If _Trace is set, a debug trace is printed to stdout.</code></span>
+<span class="codeline" id="line-147"><code>	_Trace bool</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>	// If Error != nil, it is called with each error found</code></span>
+<span class="codeline" id="line-150"><code>	// during type checking; err has dynamic type Error.</code></span>
+<span class="codeline" id="line-151"><code>	// Secondary errors (for instance, to enumerate all types</code></span>
+<span class="codeline" id="line-152"><code>	// involved in an invalid recursive type declaration) have</code></span>
+<span class="codeline" id="line-153"><code>	// error strings that start with a '\t' character.</code></span>
+<span class="codeline" id="line-154"><code>	// If Error == nil, type-checking stops with the first</code></span>
+<span class="codeline" id="line-155"><code>	// error found.</code></span>
+<span class="codeline" id="line-156"><code>	Error func(err error)</code></span>
+<span class="codeline" id="line-157"><code></code></span>
+<span class="codeline" id="line-158"><code>	// An importer is used to import packages referred to from</code></span>
+<span class="codeline" id="line-159"><code>	// import declarations.</code></span>
+<span class="codeline" id="line-160"><code>	// If the installed importer implements ImporterFrom, the type</code></span>
+<span class="codeline" id="line-161"><code>	// checker calls ImportFrom instead of Import.</code></span>
+<span class="codeline" id="line-162"><code>	// The type checker reports an error if an importer is needed</code></span>
+<span class="codeline" id="line-163"><code>	// but none was installed.</code></span>
+<span class="codeline" id="line-164"><code>	Importer Importer</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>	// If Sizes != nil, it provides the sizing functions for package unsafe.</code></span>
+<span class="codeline" id="line-167"><code>	// Otherwise SizesFor("gc", "amd64") is used instead.</code></span>
+<span class="codeline" id="line-168"><code>	Sizes Sizes</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>	// If DisableUnusedImportCheck is set, packages are not checked</code></span>
+<span class="codeline" id="line-171"><code>	// for unused imports.</code></span>
+<span class="codeline" id="line-172"><code>	DisableUnusedImportCheck bool</code></span>
+<span class="codeline" id="line-173"><code></code></span>
+<span class="codeline" id="line-174"><code>	// If a non-empty _ErrorURL format string is provided, it is used</code></span>
+<span class="codeline" id="line-175"><code>	// to format an error URL link that is appended to the first line</code></span>
+<span class="codeline" id="line-176"><code>	// of an error message. ErrorURL must be a format string containing</code></span>
+<span class="codeline" id="line-177"><code>	// exactly one "%s" format, e.g. "[go.dev/e/%s]".</code></span>
+<span class="codeline" id="line-178"><code>	_ErrorURL string</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>func srcimporter_setUsesCgo(conf *Config) {</code></span>
+<span class="codeline" id="line-182"><code>	conf.go115UsesCgo = true</code></span>
+<span class="codeline" id="line-183"><code>}</code></span>
+<span class="codeline" id="line-184"><code></code></span>
+<span class="codeline" id="line-185"><code>// Info holds result type information for a type-checked package.</code></span>
+<span class="codeline" id="line-186"><code>// Only the information for which a map is provided is collected.</code></span>
+<span class="codeline" id="line-187"><code>// If the package has type errors, the collected information may</code></span>
+<span class="codeline" id="line-188"><code>// be incomplete.</code></span>
+<span class="codeline" id="line-189"><code>type Info struct {</code></span>
+<span class="codeline" id="line-190"><code>	// Types maps expressions to their types, and for constant</code></span>
+<span class="codeline" id="line-191"><code>	// expressions, also their values. Invalid expressions are</code></span>
+<span class="codeline" id="line-192"><code>	// omitted.</code></span>
+<span class="codeline" id="line-193"><code>	//</code></span>
+<span class="codeline" id="line-194"><code>	// For (possibly parenthesized) identifiers denoting built-in</code></span>
+<span class="codeline" id="line-195"><code>	// functions, the recorded signatures are call-site specific:</code></span>
+<span class="codeline" id="line-196"><code>	// if the call result is not a constant, the recorded type is</code></span>
+<span class="codeline" id="line-197"><code>	// an argument-specific signature. Otherwise, the recorded type</code></span>
+<span class="codeline" id="line-198"><code>	// is invalid.</code></span>
+<span class="codeline" id="line-199"><code>	//</code></span>
+<span class="codeline" id="line-200"><code>	// The Types map does not record the type of every identifier,</code></span>
+<span class="codeline" id="line-201"><code>	// only those that appear where an arbitrary expression is</code></span>
+<span class="codeline" id="line-202"><code>	// permitted. For instance, the identifier f in a selector</code></span>
+<span class="codeline" id="line-203"><code>	// expression x.f is found only in the Selections map, the</code></span>
+<span class="codeline" id="line-204"><code>	// identifier z in a variable declaration 'var z int' is found</code></span>
+<span class="codeline" id="line-205"><code>	// only in the Defs map, and identifiers denoting packages in</code></span>
+<span class="codeline" id="line-206"><code>	// qualified identifiers are collected in the Uses map.</code></span>
+<span class="codeline" id="line-207"><code>	Types map[ast.Expr]TypeAndValue</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>	// Instances maps identifiers denoting generic types or functions to their</code></span>
+<span class="codeline" id="line-210"><code>	// type arguments and instantiated type.</code></span>
+<span class="codeline" id="line-211"><code>	//</code></span>
+<span class="codeline" id="line-212"><code>	// For example, Instances will map the identifier for 'T' in the type</code></span>
+<span class="codeline" id="line-213"><code>	// instantiation T[int, string] to the type arguments [int, string] and</code></span>
+<span class="codeline" id="line-214"><code>	// resulting instantiated *Named type. Given a generic function</code></span>
+<span class="codeline" id="line-215"><code>	// func F[A any](A), Instances will map the identifier for 'F' in the call</code></span>
+<span class="codeline" id="line-216"><code>	// expression F(int(1)) to the inferred type arguments [int], and resulting</code></span>
+<span class="codeline" id="line-217"><code>	// instantiated *Signature.</code></span>
+<span class="codeline" id="line-218"><code>	//</code></span>
+<span class="codeline" id="line-219"><code>	// Invariant: Instantiating Uses[id].Type() with Instances[id].TypeArgs</code></span>
+<span class="codeline" id="line-220"><code>	// results in an equivalent of Instances[id].Type.</code></span>
+<span class="codeline" id="line-221"><code>	Instances map[*ast.Ident]Instance</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>	// Defs maps identifiers to the objects they define (including</code></span>
+<span class="codeline" id="line-224"><code>	// package names, dots "." of dot-imports, and blank "_" identifiers).</code></span>
+<span class="codeline" id="line-225"><code>	// For identifiers that do not denote objects (e.g., the package name</code></span>
+<span class="codeline" id="line-226"><code>	// in package clauses, or symbolic variables t in t := x.(type) of</code></span>
+<span class="codeline" id="line-227"><code>	// type switch headers), the corresponding objects are nil.</code></span>
+<span class="codeline" id="line-228"><code>	//</code></span>
+<span class="codeline" id="line-229"><code>	// For an embedded field, Defs returns the field *Var it defines.</code></span>
+<span class="codeline" id="line-230"><code>	//</code></span>
+<span class="codeline" id="line-231"><code>	// Invariant: Defs[id] == nil || Defs[id].Pos() == id.Pos()</code></span>
+<span class="codeline" id="line-232"><code>	Defs map[*ast.Ident]Object</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>	// Uses maps identifiers to the objects they denote.</code></span>
+<span class="codeline" id="line-235"><code>	//</code></span>
+<span class="codeline" id="line-236"><code>	// For an embedded field, Uses returns the *TypeName it denotes.</code></span>
+<span class="codeline" id="line-237"><code>	//</code></span>
+<span class="codeline" id="line-238"><code>	// Invariant: Uses[id].Pos() != id.Pos()</code></span>
+<span class="codeline" id="line-239"><code>	Uses map[*ast.Ident]Object</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>	// Implicits maps nodes to their implicitly declared objects, if any.</code></span>
+<span class="codeline" id="line-242"><code>	// The following node and object types may appear:</code></span>
+<span class="codeline" id="line-243"><code>	//</code></span>
+<span class="codeline" id="line-244"><code>	//     node               declared object</code></span>
+<span class="codeline" id="line-245"><code>	//</code></span>
+<span class="codeline" id="line-246"><code>	//     *ast.ImportSpec    *PkgName for imports without renames</code></span>
+<span class="codeline" id="line-247"><code>	//     *ast.CaseClause    type-specific *Var for each type switch case clause (incl. default)</code></span>
+<span class="codeline" id="line-248"><code>	//     *ast.Field         anonymous parameter *Var (incl. unnamed results)</code></span>
+<span class="codeline" id="line-249"><code>	//</code></span>
+<span class="codeline" id="line-250"><code>	Implicits map[ast.Node]Object</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>	// Selections maps selector expressions (excluding qualified identifiers)</code></span>
+<span class="codeline" id="line-253"><code>	// to their corresponding selections.</code></span>
+<span class="codeline" id="line-254"><code>	Selections map[*ast.SelectorExpr]*Selection</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>	// Scopes maps ast.Nodes to the scopes they define. Package scopes are not</code></span>
+<span class="codeline" id="line-257"><code>	// associated with a specific node but with all files belonging to a package.</code></span>
+<span class="codeline" id="line-258"><code>	// Thus, the package scope can be found in the type-checked Package object.</code></span>
+<span class="codeline" id="line-259"><code>	// Scopes nest, with the Universe scope being the outermost scope, enclosing</code></span>
+<span class="codeline" id="line-260"><code>	// the package scope, which contains (one or more) files scopes, which enclose</code></span>
+<span class="codeline" id="line-261"><code>	// function scopes which in turn enclose statement and function literal scopes.</code></span>
+<span class="codeline" id="line-262"><code>	// Note that even though package-level functions are declared in the package</code></span>
+<span class="codeline" id="line-263"><code>	// scope, the function scopes are embedded in the file scope of the file</code></span>
+<span class="codeline" id="line-264"><code>	// containing the function declaration.</code></span>
+<span class="codeline" id="line-265"><code>	//</code></span>
+<span class="codeline" id="line-266"><code>	// The Scope of a function contains the declarations of any</code></span>
+<span class="codeline" id="line-267"><code>	// type parameters, parameters, and named results, plus any</code></span>
+<span class="codeline" id="line-268"><code>	// local declarations in the body block.</code></span>
+<span class="codeline" id="line-269"><code>	// It is coextensive with the complete extent of the</code></span>
+<span class="codeline" id="line-270"><code>	// function's syntax ([*ast.FuncDecl] or [*ast.FuncLit]).</code></span>
+<span class="codeline" id="line-271"><code>	// The Scopes mapping does not contain an entry for the</code></span>
+<span class="codeline" id="line-272"><code>	// function body ([*ast.BlockStmt]); the function's scope is</code></span>
+<span class="codeline" id="line-273"><code>	// associated with the [*ast.FuncType].</code></span>
+<span class="codeline" id="line-274"><code>	//</code></span>
+<span class="codeline" id="line-275"><code>	// The following node types may appear in Scopes:</code></span>
+<span class="codeline" id="line-276"><code>	//</code></span>
+<span class="codeline" id="line-277"><code>	//     *ast.File</code></span>
+<span class="codeline" id="line-278"><code>	//     *ast.FuncType</code></span>
+<span class="codeline" id="line-279"><code>	//     *ast.TypeSpec</code></span>
+<span class="codeline" id="line-280"><code>	//     *ast.BlockStmt</code></span>
+<span class="codeline" id="line-281"><code>	//     *ast.IfStmt</code></span>
+<span class="codeline" id="line-282"><code>	//     *ast.SwitchStmt</code></span>
+<span class="codeline" id="line-283"><code>	//     *ast.TypeSwitchStmt</code></span>
+<span class="codeline" id="line-284"><code>	//     *ast.CaseClause</code></span>
+<span class="codeline" id="line-285"><code>	//     *ast.CommClause</code></span>
+<span class="codeline" id="line-286"><code>	//     *ast.ForStmt</code></span>
+<span class="codeline" id="line-287"><code>	//     *ast.RangeStmt</code></span>
+<span class="codeline" id="line-288"><code>	//</code></span>
+<span class="codeline" id="line-289"><code>	Scopes map[ast.Node]*Scope</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>	// InitOrder is the list of package-level initializers in the order in which</code></span>
+<span class="codeline" id="line-292"><code>	// they must be executed. Initializers referring to variables related by an</code></span>
+<span class="codeline" id="line-293"><code>	// initialization dependency appear in topological order, the others appear</code></span>
+<span class="codeline" id="line-294"><code>	// in source order. Variables without an initialization expression do not</code></span>
+<span class="codeline" id="line-295"><code>	// appear in this list.</code></span>
+<span class="codeline" id="line-296"><code>	InitOrder []*Initializer</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	// FileVersions maps a file to its Go version string.</code></span>
+<span class="codeline" id="line-299"><code>	// If the file doesn't specify a version, the reported</code></span>
+<span class="codeline" id="line-300"><code>	// string is Config.GoVersion.</code></span>
+<span class="codeline" id="line-301"><code>	// Version strings begin with “go”, like “go1.21”, and</code></span>
+<span class="codeline" id="line-302"><code>	// are suitable for use with the [go/version] package.</code></span>
+<span class="codeline" id="line-303"><code>	FileVersions map[*ast.File]string</code></span>
+<span class="codeline" id="line-304"><code>}</code></span>
+<span class="codeline" id="line-305"><code></code></span>
+<span class="codeline" id="line-306"><code>func (info *Info) recordTypes() bool {</code></span>
+<span class="codeline" id="line-307"><code>	return info.Types != nil</code></span>
+<span class="codeline" id="line-308"><code>}</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>// TypeOf returns the type of expression e, or nil if not found.</code></span>
+<span class="codeline" id="line-311"><code>// Precondition: the Types, Uses and Defs maps are populated.</code></span>
+<span class="codeline" id="line-312"><code>func (info *Info) TypeOf(e ast.Expr) Type {</code></span>
+<span class="codeline" id="line-313"><code>	if t, ok := info.Types[e]; ok {</code></span>
+<span class="codeline" id="line-314"><code>		return t.Type</code></span>
+<span class="codeline" id="line-315"><code>	}</code></span>
+<span class="codeline" id="line-316"><code>	if id, _ := e.(*ast.Ident); id != nil {</code></span>
+<span class="codeline" id="line-317"><code>		if obj := info.ObjectOf(id); obj != nil {</code></span>
+<span class="codeline" id="line-318"><code>			return obj.Type()</code></span>
+<span class="codeline" id="line-319"><code>		}</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code>	return nil</code></span>
+<span class="codeline" id="line-322"><code>}</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>// ObjectOf returns the object denoted by the specified id,</code></span>
+<span class="codeline" id="line-325"><code>// or nil if not found.</code></span>
+<span class="codeline" id="line-326"><code>//</code></span>
+<span class="codeline" id="line-327"><code>// If id is an embedded struct field, [Info.ObjectOf] returns the field (*[Var])</code></span>
+<span class="codeline" id="line-328"><code>// it defines, not the type (*[TypeName]) it uses.</code></span>
+<span class="codeline" id="line-329"><code>//</code></span>
+<span class="codeline" id="line-330"><code>// Precondition: the Uses and Defs maps are populated.</code></span>
+<span class="codeline" id="line-331"><code>func (info *Info) ObjectOf(id *ast.Ident) Object {</code></span>
+<span class="codeline" id="line-332"><code>	if obj := info.Defs[id]; obj != nil {</code></span>
+<span class="codeline" id="line-333"><code>		return obj</code></span>
+<span class="codeline" id="line-334"><code>	}</code></span>
+<span class="codeline" id="line-335"><code>	return info.Uses[id]</code></span>
+<span class="codeline" id="line-336"><code>}</code></span>
+<span class="codeline" id="line-337"><code></code></span>
+<span class="codeline" id="line-338"><code>// PkgNameOf returns the local package name defined by the import,</code></span>
+<span class="codeline" id="line-339"><code>// or nil if not found.</code></span>
+<span class="codeline" id="line-340"><code>//</code></span>
+<span class="codeline" id="line-341"><code>// For dot-imports, the package name is ".".</code></span>
+<span class="codeline" id="line-342"><code>//</code></span>
+<span class="codeline" id="line-343"><code>// Precondition: the Defs and Implicts maps are populated.</code></span>
+<span class="codeline" id="line-344"><code>func (info *Info) PkgNameOf(imp *ast.ImportSpec) *PkgName {</code></span>
+<span class="codeline" id="line-345"><code>	var obj Object</code></span>
+<span class="codeline" id="line-346"><code>	if imp.Name != nil {</code></span>
+<span class="codeline" id="line-347"><code>		obj = info.Defs[imp.Name]</code></span>
+<span class="codeline" id="line-348"><code>	} else {</code></span>
+<span class="codeline" id="line-349"><code>		obj = info.Implicits[imp]</code></span>
+<span class="codeline" id="line-350"><code>	}</code></span>
+<span class="codeline" id="line-351"><code>	pkgname, _ := obj.(*PkgName)</code></span>
+<span class="codeline" id="line-352"><code>	return pkgname</code></span>
+<span class="codeline" id="line-353"><code>}</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>// TypeAndValue reports the type and value (for constants)</code></span>
+<span class="codeline" id="line-356"><code>// of the corresponding expression.</code></span>
+<span class="codeline" id="line-357"><code>type TypeAndValue struct {</code></span>
+<span class="codeline" id="line-358"><code>	mode  operandMode</code></span>
+<span class="codeline" id="line-359"><code>	Type  Type</code></span>
+<span class="codeline" id="line-360"><code>	Value constant.Value</code></span>
+<span class="codeline" id="line-361"><code>}</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>// IsVoid reports whether the corresponding expression</code></span>
+<span class="codeline" id="line-364"><code>// is a function call without results.</code></span>
+<span class="codeline" id="line-365"><code>func (tv TypeAndValue) IsVoid() bool {</code></span>
+<span class="codeline" id="line-366"><code>	return tv.mode == novalue</code></span>
+<span class="codeline" id="line-367"><code>}</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>// IsType reports whether the corresponding expression specifies a type.</code></span>
+<span class="codeline" id="line-370"><code>func (tv TypeAndValue) IsType() bool {</code></span>
+<span class="codeline" id="line-371"><code>	return tv.mode == typexpr</code></span>
+<span class="codeline" id="line-372"><code>}</code></span>
+<span class="codeline" id="line-373"><code></code></span>
+<span class="codeline" id="line-374"><code>// IsBuiltin reports whether the corresponding expression denotes</code></span>
+<span class="codeline" id="line-375"><code>// a (possibly parenthesized) built-in function.</code></span>
+<span class="codeline" id="line-376"><code>func (tv TypeAndValue) IsBuiltin() bool {</code></span>
+<span class="codeline" id="line-377"><code>	return tv.mode == builtin</code></span>
+<span class="codeline" id="line-378"><code>}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>// IsValue reports whether the corresponding expression is a value.</code></span>
+<span class="codeline" id="line-381"><code>// Builtins are not considered values. Constant values have a non-</code></span>
+<span class="codeline" id="line-382"><code>// nil Value.</code></span>
+<span class="codeline" id="line-383"><code>func (tv TypeAndValue) IsValue() bool {</code></span>
+<span class="codeline" id="line-384"><code>	switch tv.mode {</code></span>
+<span class="codeline" id="line-385"><code>	case constant_, variable, mapindex, value, commaok, commaerr:</code></span>
+<span class="codeline" id="line-386"><code>		return true</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code>	return false</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>// IsNil reports whether the corresponding expression denotes the</code></span>
+<span class="codeline" id="line-392"><code>// predeclared value nil.</code></span>
+<span class="codeline" id="line-393"><code>func (tv TypeAndValue) IsNil() bool {</code></span>
+<span class="codeline" id="line-394"><code>	return tv.mode == value &amp;&amp; tv.Type == Typ[UntypedNil]</code></span>
+<span class="codeline" id="line-395"><code>}</code></span>
+<span class="codeline" id="line-396"><code></code></span>
+<span class="codeline" id="line-397"><code>// Addressable reports whether the corresponding expression</code></span>
+<span class="codeline" id="line-398"><code>// is addressable (https://golang.org/ref/spec#Address_operators).</code></span>
+<span class="codeline" id="line-399"><code>func (tv TypeAndValue) Addressable() bool {</code></span>
+<span class="codeline" id="line-400"><code>	return tv.mode == variable</code></span>
+<span class="codeline" id="line-401"><code>}</code></span>
+<span class="codeline" id="line-402"><code></code></span>
+<span class="codeline" id="line-403"><code>// Assignable reports whether the corresponding expression</code></span>
+<span class="codeline" id="line-404"><code>// is assignable to (provided a value of the right type).</code></span>
+<span class="codeline" id="line-405"><code>func (tv TypeAndValue) Assignable() bool {</code></span>
+<span class="codeline" id="line-406"><code>	return tv.mode == variable || tv.mode == mapindex</code></span>
+<span class="codeline" id="line-407"><code>}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>// HasOk reports whether the corresponding expression may be</code></span>
+<span class="codeline" id="line-410"><code>// used on the rhs of a comma-ok assignment.</code></span>
+<span class="codeline" id="line-411"><code>func (tv TypeAndValue) HasOk() bool {</code></span>
+<span class="codeline" id="line-412"><code>	return tv.mode == commaok || tv.mode == mapindex</code></span>
+<span class="codeline" id="line-413"><code>}</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>// Instance reports the type arguments and instantiated type for type and</code></span>
+<span class="codeline" id="line-416"><code>// function instantiations. For type instantiations, [Type] will be of dynamic</code></span>
+<span class="codeline" id="line-417"><code>// type *[Named]. For function instantiations, [Type] will be of dynamic type</code></span>
+<span class="codeline" id="line-418"><code>// *Signature.</code></span>
+<span class="codeline" id="line-419"><code>type Instance struct {</code></span>
+<span class="codeline" id="line-420"><code>	TypeArgs *TypeList</code></span>
+<span class="codeline" id="line-421"><code>	Type     Type</code></span>
+<span class="codeline" id="line-422"><code>}</code></span>
+<span class="codeline" id="line-423"><code></code></span>
+<span class="codeline" id="line-424"><code>// An Initializer describes a package-level variable, or a list of variables in case</code></span>
+<span class="codeline" id="line-425"><code>// of a multi-valued initialization expression, and the corresponding initialization</code></span>
+<span class="codeline" id="line-426"><code>// expression.</code></span>
+<span class="codeline" id="line-427"><code>type Initializer struct {</code></span>
+<span class="codeline" id="line-428"><code>	Lhs []*Var // var Lhs = Rhs</code></span>
+<span class="codeline" id="line-429"><code>	Rhs ast.Expr</code></span>
+<span class="codeline" id="line-430"><code>}</code></span>
+<span class="codeline" id="line-431"><code></code></span>
+<span class="codeline" id="line-432"><code>func (init *Initializer) String() string {</code></span>
+<span class="codeline" id="line-433"><code>	var buf bytes.Buffer</code></span>
+<span class="codeline" id="line-434"><code>	for i, lhs := range init.Lhs {</code></span>
+<span class="codeline" id="line-435"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-436"><code>			buf.WriteString(", ")</code></span>
+<span class="codeline" id="line-437"><code>		}</code></span>
+<span class="codeline" id="line-438"><code>		buf.WriteString(lhs.Name())</code></span>
+<span class="codeline" id="line-439"><code>	}</code></span>
+<span class="codeline" id="line-440"><code>	buf.WriteString(" = ")</code></span>
+<span class="codeline" id="line-441"><code>	WriteExpr(&amp;buf, init.Rhs)</code></span>
+<span class="codeline" id="line-442"><code>	return buf.String()</code></span>
+<span class="codeline" id="line-443"><code>}</code></span>
+<span class="codeline" id="line-444"><code></code></span>
+<span class="codeline" id="line-445"><code>// Check type-checks a package and returns the resulting package object and</code></span>
+<span class="codeline" id="line-446"><code>// the first error if any. Additionally, if info != nil, Check populates each</code></span>
+<span class="codeline" id="line-447"><code>// of the non-nil maps in the [Info] struct.</code></span>
+<span class="codeline" id="line-448"><code>//</code></span>
+<span class="codeline" id="line-449"><code>// The package is marked as complete if no errors occurred, otherwise it is</code></span>
+<span class="codeline" id="line-450"><code>// incomplete. See [Config.Error] for controlling behavior in the presence of</code></span>
+<span class="codeline" id="line-451"><code>// errors.</code></span>
+<span class="codeline" id="line-452"><code>//</code></span>
+<span class="codeline" id="line-453"><code>// The package is specified by a list of *ast.Files and corresponding</code></span>
+<span class="codeline" id="line-454"><code>// file set, and the package path the package is identified with.</code></span>
+<span class="codeline" id="line-455"><code>// The clean path must not be empty or dot (".").</code></span>
+<span class="codeline" id="line-456"><code>func (conf *Config) Check(path string, fset *token.FileSet, files []*ast.File, info *Info) (*Package, error) {</code></span>
+<span class="codeline" id="line-457"><code>	pkg := NewPackage(path, "")</code></span>
+<span class="codeline" id="line-458"><code>	return pkg, NewChecker(conf, fset, pkg, info).Files(files)</code></span>
+<span class="codeline" id="line-459"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

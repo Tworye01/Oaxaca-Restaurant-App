@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: extjson_parser.go in package go.mongodb.org/mongo-driver/bson/bsonrw</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	extjson_parser.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/go.mongodb.org/mongo-driver/bson/bsonrw.html">go.mongodb.org/mongo-driver/bson/bsonrw</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright (C) MongoDB, Inc. 2017-present.</code></span>
+<span class="codeline" id="line-2"><code>//</code></span>
+<span class="codeline" id="line-3"><code>// Licensed under the Apache License, Version 2.0 (the "License"); you may</code></span>
+<span class="codeline" id="line-4"><code>// not use this file except in compliance with the License. You may obtain</code></span>
+<span class="codeline" id="line-5"><code>// a copy of the License at http://www.apache.org/licenses/LICENSE-2.0</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package bsonrw</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"encoding/base64"</code></span>
+<span class="codeline" id="line-11"><code>	"encoding/hex"</code></span>
+<span class="codeline" id="line-12"><code>	"errors"</code></span>
+<span class="codeline" id="line-13"><code>	"fmt"</code></span>
+<span class="codeline" id="line-14"><code>	"io"</code></span>
+<span class="codeline" id="line-15"><code>	"strings"</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>	"go.mongodb.org/mongo-driver/bson/bsontype"</code></span>
+<span class="codeline" id="line-18"><code>)</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>const maxNestingDepth = 200</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>// ErrInvalidJSON indicates the JSON input is invalid</code></span>
+<span class="codeline" id="line-23"><code>var ErrInvalidJSON = errors.New("invalid JSON input")</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>type jsonParseState byte</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>const (</code></span>
+<span class="codeline" id="line-28"><code>	jpsStartState jsonParseState = iota</code></span>
+<span class="codeline" id="line-29"><code>	jpsSawBeginObject</code></span>
+<span class="codeline" id="line-30"><code>	jpsSawEndObject</code></span>
+<span class="codeline" id="line-31"><code>	jpsSawBeginArray</code></span>
+<span class="codeline" id="line-32"><code>	jpsSawEndArray</code></span>
+<span class="codeline" id="line-33"><code>	jpsSawColon</code></span>
+<span class="codeline" id="line-34"><code>	jpsSawComma</code></span>
+<span class="codeline" id="line-35"><code>	jpsSawKey</code></span>
+<span class="codeline" id="line-36"><code>	jpsSawValue</code></span>
+<span class="codeline" id="line-37"><code>	jpsDoneState</code></span>
+<span class="codeline" id="line-38"><code>	jpsInvalidState</code></span>
+<span class="codeline" id="line-39"><code>)</code></span>
+<span class="codeline" id="line-40"><code></code></span>
+<span class="codeline" id="line-41"><code>type jsonParseMode byte</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>const (</code></span>
+<span class="codeline" id="line-44"><code>	jpmInvalidMode jsonParseMode = iota</code></span>
+<span class="codeline" id="line-45"><code>	jpmObjectMode</code></span>
+<span class="codeline" id="line-46"><code>	jpmArrayMode</code></span>
+<span class="codeline" id="line-47"><code>)</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>type extJSONValue struct {</code></span>
+<span class="codeline" id="line-50"><code>	t bsontype.Type</code></span>
+<span class="codeline" id="line-51"><code>	v interface{}</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>type extJSONObject struct {</code></span>
+<span class="codeline" id="line-55"><code>	keys   []string</code></span>
+<span class="codeline" id="line-56"><code>	values []*extJSONValue</code></span>
+<span class="codeline" id="line-57"><code>}</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>type extJSONParser struct {</code></span>
+<span class="codeline" id="line-60"><code>	js *jsonScanner</code></span>
+<span class="codeline" id="line-61"><code>	s  jsonParseState</code></span>
+<span class="codeline" id="line-62"><code>	m  []jsonParseMode</code></span>
+<span class="codeline" id="line-63"><code>	k  string</code></span>
+<span class="codeline" id="line-64"><code>	v  *extJSONValue</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>	err       error</code></span>
+<span class="codeline" id="line-67"><code>	canonical bool</code></span>
+<span class="codeline" id="line-68"><code>	depth     int</code></span>
+<span class="codeline" id="line-69"><code>	maxDepth  int</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>	emptyObject bool</code></span>
+<span class="codeline" id="line-72"><code>	relaxedUUID bool</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>// newExtJSONParser returns a new extended JSON parser, ready to to begin</code></span>
+<span class="codeline" id="line-76"><code>// parsing from the first character of the argued json input. It will not</code></span>
+<span class="codeline" id="line-77"><code>// perform any read-ahead and will therefore not report any errors about</code></span>
+<span class="codeline" id="line-78"><code>// malformed JSON at this point.</code></span>
+<span class="codeline" id="line-79"><code>func newExtJSONParser(r io.Reader, canonical bool) *extJSONParser {</code></span>
+<span class="codeline" id="line-80"><code>	return &amp;extJSONParser{</code></span>
+<span class="codeline" id="line-81"><code>		js:        &amp;jsonScanner{r: r},</code></span>
+<span class="codeline" id="line-82"><code>		s:         jpsStartState,</code></span>
+<span class="codeline" id="line-83"><code>		m:         []jsonParseMode{},</code></span>
+<span class="codeline" id="line-84"><code>		canonical: canonical,</code></span>
+<span class="codeline" id="line-85"><code>		maxDepth:  maxNestingDepth,</code></span>
+<span class="codeline" id="line-86"><code>	}</code></span>
+<span class="codeline" id="line-87"><code>}</code></span>
+<span class="codeline" id="line-88"><code></code></span>
+<span class="codeline" id="line-89"><code>// peekType examines the next value and returns its BSON Type</code></span>
+<span class="codeline" id="line-90"><code>func (ejp *extJSONParser) peekType() (bsontype.Type, error) {</code></span>
+<span class="codeline" id="line-91"><code>	var t bsontype.Type</code></span>
+<span class="codeline" id="line-92"><code>	var err error</code></span>
+<span class="codeline" id="line-93"><code>	initialState := ejp.s</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>	ejp.advanceState()</code></span>
+<span class="codeline" id="line-96"><code>	switch ejp.s {</code></span>
+<span class="codeline" id="line-97"><code>	case jpsSawValue:</code></span>
+<span class="codeline" id="line-98"><code>		t = ejp.v.t</code></span>
+<span class="codeline" id="line-99"><code>	case jpsSawBeginArray:</code></span>
+<span class="codeline" id="line-100"><code>		t = bsontype.Array</code></span>
+<span class="codeline" id="line-101"><code>	case jpsInvalidState:</code></span>
+<span class="codeline" id="line-102"><code>		err = ejp.err</code></span>
+<span class="codeline" id="line-103"><code>	case jpsSawComma:</code></span>
+<span class="codeline" id="line-104"><code>		// in array mode, seeing a comma means we need to progress again to actually observe a type</code></span>
+<span class="codeline" id="line-105"><code>		if ejp.peekMode() == jpmArrayMode {</code></span>
+<span class="codeline" id="line-106"><code>			return ejp.peekType()</code></span>
+<span class="codeline" id="line-107"><code>		}</code></span>
+<span class="codeline" id="line-108"><code>	case jpsSawEndArray:</code></span>
+<span class="codeline" id="line-109"><code>		// this would only be a valid state if we were in array mode, so return end-of-array error</code></span>
+<span class="codeline" id="line-110"><code>		err = ErrEOA</code></span>
+<span class="codeline" id="line-111"><code>	case jpsSawBeginObject:</code></span>
+<span class="codeline" id="line-112"><code>		// peek key to determine type</code></span>
+<span class="codeline" id="line-113"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-114"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-115"><code>		case jpsSawEndObject: // empty embedded document</code></span>
+<span class="codeline" id="line-116"><code>			t = bsontype.EmbeddedDocument</code></span>
+<span class="codeline" id="line-117"><code>			ejp.emptyObject = true</code></span>
+<span class="codeline" id="line-118"><code>		case jpsInvalidState:</code></span>
+<span class="codeline" id="line-119"><code>			err = ejp.err</code></span>
+<span class="codeline" id="line-120"><code>		case jpsSawKey:</code></span>
+<span class="codeline" id="line-121"><code>			if initialState == jpsStartState {</code></span>
+<span class="codeline" id="line-122"><code>				return bsontype.EmbeddedDocument, nil</code></span>
+<span class="codeline" id="line-123"><code>			}</code></span>
+<span class="codeline" id="line-124"><code>			t = wrapperKeyBSONType(ejp.k)</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>			// if $uuid is encountered, parse as binary subtype 4</code></span>
+<span class="codeline" id="line-127"><code>			if ejp.k == "$uuid" {</code></span>
+<span class="codeline" id="line-128"><code>				ejp.relaxedUUID = true</code></span>
+<span class="codeline" id="line-129"><code>				t = bsontype.Binary</code></span>
+<span class="codeline" id="line-130"><code>			}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>			switch t {</code></span>
+<span class="codeline" id="line-133"><code>			case bsontype.JavaScript:</code></span>
+<span class="codeline" id="line-134"><code>				// just saw $code, need to check for $scope at same level</code></span>
+<span class="codeline" id="line-135"><code>				_, err = ejp.readValue(bsontype.JavaScript)</code></span>
+<span class="codeline" id="line-136"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-137"><code>					break</code></span>
+<span class="codeline" id="line-138"><code>				}</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>				switch ejp.s {</code></span>
+<span class="codeline" id="line-141"><code>				case jpsSawEndObject: // type is TypeJavaScript</code></span>
+<span class="codeline" id="line-142"><code>				case jpsSawComma:</code></span>
+<span class="codeline" id="line-143"><code>					ejp.advanceState()</code></span>
+<span class="codeline" id="line-144"><code></code></span>
+<span class="codeline" id="line-145"><code>					if ejp.s == jpsSawKey &amp;&amp; ejp.k == "$scope" {</code></span>
+<span class="codeline" id="line-146"><code>						t = bsontype.CodeWithScope</code></span>
+<span class="codeline" id="line-147"><code>					} else {</code></span>
+<span class="codeline" id="line-148"><code>						err = fmt.Errorf("invalid extended JSON: unexpected key %s in CodeWithScope object", ejp.k)</code></span>
+<span class="codeline" id="line-149"><code>					}</code></span>
+<span class="codeline" id="line-150"><code>				case jpsInvalidState:</code></span>
+<span class="codeline" id="line-151"><code>					err = ejp.err</code></span>
+<span class="codeline" id="line-152"><code>				default:</code></span>
+<span class="codeline" id="line-153"><code>					err = ErrInvalidJSON</code></span>
+<span class="codeline" id="line-154"><code>				}</code></span>
+<span class="codeline" id="line-155"><code>			case bsontype.CodeWithScope:</code></span>
+<span class="codeline" id="line-156"><code>				err = errors.New("invalid extended JSON: code with $scope must contain $code before $scope")</code></span>
+<span class="codeline" id="line-157"><code>			}</code></span>
+<span class="codeline" id="line-158"><code>		}</code></span>
+<span class="codeline" id="line-159"><code>	}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>	return t, err</code></span>
+<span class="codeline" id="line-162"><code>}</code></span>
+<span class="codeline" id="line-163"><code></code></span>
+<span class="codeline" id="line-164"><code>// readKey parses the next key and its type and returns them</code></span>
+<span class="codeline" id="line-165"><code>func (ejp *extJSONParser) readKey() (string, bsontype.Type, error) {</code></span>
+<span class="codeline" id="line-166"><code>	if ejp.emptyObject {</code></span>
+<span class="codeline" id="line-167"><code>		ejp.emptyObject = false</code></span>
+<span class="codeline" id="line-168"><code>		return "", 0, ErrEOD</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>	// advance to key (or return with error)</code></span>
+<span class="codeline" id="line-172"><code>	switch ejp.s {</code></span>
+<span class="codeline" id="line-173"><code>	case jpsStartState:</code></span>
+<span class="codeline" id="line-174"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-175"><code>		if ejp.s == jpsSawBeginObject {</code></span>
+<span class="codeline" id="line-176"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-177"><code>		}</code></span>
+<span class="codeline" id="line-178"><code>	case jpsSawBeginObject:</code></span>
+<span class="codeline" id="line-179"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-180"><code>	case jpsSawValue, jpsSawEndObject, jpsSawEndArray:</code></span>
+<span class="codeline" id="line-181"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-182"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-183"><code>		case jpsSawBeginObject, jpsSawComma:</code></span>
+<span class="codeline" id="line-184"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-185"><code>		case jpsSawEndObject:</code></span>
+<span class="codeline" id="line-186"><code>			return "", 0, ErrEOD</code></span>
+<span class="codeline" id="line-187"><code>		case jpsDoneState:</code></span>
+<span class="codeline" id="line-188"><code>			return "", 0, io.EOF</code></span>
+<span class="codeline" id="line-189"><code>		case jpsInvalidState:</code></span>
+<span class="codeline" id="line-190"><code>			return "", 0, ejp.err</code></span>
+<span class="codeline" id="line-191"><code>		default:</code></span>
+<span class="codeline" id="line-192"><code>			return "", 0, ErrInvalidJSON</code></span>
+<span class="codeline" id="line-193"><code>		}</code></span>
+<span class="codeline" id="line-194"><code>	case jpsSawKey: // do nothing (key was peeked before)</code></span>
+<span class="codeline" id="line-195"><code>	default:</code></span>
+<span class="codeline" id="line-196"><code>		return "", 0, invalidRequestError("key")</code></span>
+<span class="codeline" id="line-197"><code>	}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>	// read key</code></span>
+<span class="codeline" id="line-200"><code>	var key string</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>	switch ejp.s {</code></span>
+<span class="codeline" id="line-203"><code>	case jpsSawKey:</code></span>
+<span class="codeline" id="line-204"><code>		key = ejp.k</code></span>
+<span class="codeline" id="line-205"><code>	case jpsSawEndObject:</code></span>
+<span class="codeline" id="line-206"><code>		return "", 0, ErrEOD</code></span>
+<span class="codeline" id="line-207"><code>	case jpsInvalidState:</code></span>
+<span class="codeline" id="line-208"><code>		return "", 0, ejp.err</code></span>
+<span class="codeline" id="line-209"><code>	default:</code></span>
+<span class="codeline" id="line-210"><code>		return "", 0, invalidRequestError("key")</code></span>
+<span class="codeline" id="line-211"><code>	}</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>	// check for colon</code></span>
+<span class="codeline" id="line-214"><code>	ejp.advanceState()</code></span>
+<span class="codeline" id="line-215"><code>	if err := ensureColon(ejp.s, key); err != nil {</code></span>
+<span class="codeline" id="line-216"><code>		return "", 0, err</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>	// peek at the value to determine type</code></span>
+<span class="codeline" id="line-220"><code>	t, err := ejp.peekType()</code></span>
+<span class="codeline" id="line-221"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-222"><code>		return "", 0, err</code></span>
+<span class="codeline" id="line-223"><code>	}</code></span>
+<span class="codeline" id="line-224"><code></code></span>
+<span class="codeline" id="line-225"><code>	return key, t, nil</code></span>
+<span class="codeline" id="line-226"><code>}</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>// readValue returns the value corresponding to the Type returned by peekType</code></span>
+<span class="codeline" id="line-229"><code>func (ejp *extJSONParser) readValue(t bsontype.Type) (*extJSONValue, error) {</code></span>
+<span class="codeline" id="line-230"><code>	if ejp.s == jpsInvalidState {</code></span>
+<span class="codeline" id="line-231"><code>		return nil, ejp.err</code></span>
+<span class="codeline" id="line-232"><code>	}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>	var v *extJSONValue</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>	switch t {</code></span>
+<span class="codeline" id="line-237"><code>	case bsontype.Null, bsontype.Boolean, bsontype.String:</code></span>
+<span class="codeline" id="line-238"><code>		if ejp.s != jpsSawValue {</code></span>
+<span class="codeline" id="line-239"><code>			return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-240"><code>		}</code></span>
+<span class="codeline" id="line-241"><code>		v = ejp.v</code></span>
+<span class="codeline" id="line-242"><code>	case bsontype.Int32, bsontype.Int64, bsontype.Double:</code></span>
+<span class="codeline" id="line-243"><code>		// relaxed version allows these to be literal number values</code></span>
+<span class="codeline" id="line-244"><code>		if ejp.s == jpsSawValue {</code></span>
+<span class="codeline" id="line-245"><code>			v = ejp.v</code></span>
+<span class="codeline" id="line-246"><code>			break</code></span>
+<span class="codeline" id="line-247"><code>		}</code></span>
+<span class="codeline" id="line-248"><code>		fallthrough</code></span>
+<span class="codeline" id="line-249"><code>	case bsontype.Decimal128, bsontype.Symbol, bsontype.ObjectID, bsontype.MinKey, bsontype.MaxKey, bsontype.Undefined:</code></span>
+<span class="codeline" id="line-250"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-251"><code>		case jpsSawKey:</code></span>
+<span class="codeline" id="line-252"><code>			// read colon</code></span>
+<span class="codeline" id="line-253"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-254"><code>			if err := ensureColon(ejp.s, ejp.k); err != nil {</code></span>
+<span class="codeline" id="line-255"><code>				return nil, err</code></span>
+<span class="codeline" id="line-256"><code>			}</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>			// read value</code></span>
+<span class="codeline" id="line-259"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-260"><code>			if ejp.s != jpsSawValue || !ejp.ensureExtValueType(t) {</code></span>
+<span class="codeline" id="line-261"><code>				return nil, invalidJSONErrorForType("value", t)</code></span>
+<span class="codeline" id="line-262"><code>			}</code></span>
+<span class="codeline" id="line-263"><code></code></span>
+<span class="codeline" id="line-264"><code>			v = ejp.v</code></span>
+<span class="codeline" id="line-265"><code></code></span>
+<span class="codeline" id="line-266"><code>			// read end object</code></span>
+<span class="codeline" id="line-267"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-268"><code>			if ejp.s != jpsSawEndObject {</code></span>
+<span class="codeline" id="line-269"><code>				return nil, invalidJSONErrorForType("} after value", t)</code></span>
+<span class="codeline" id="line-270"><code>			}</code></span>
+<span class="codeline" id="line-271"><code>		default:</code></span>
+<span class="codeline" id="line-272"><code>			return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-273"><code>		}</code></span>
+<span class="codeline" id="line-274"><code>	case bsontype.Binary, bsontype.Regex, bsontype.Timestamp, bsontype.DBPointer:</code></span>
+<span class="codeline" id="line-275"><code>		if ejp.s != jpsSawKey {</code></span>
+<span class="codeline" id="line-276"><code>			return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-277"><code>		}</code></span>
+<span class="codeline" id="line-278"><code>		// read colon</code></span>
+<span class="codeline" id="line-279"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-280"><code>		if err := ensureColon(ejp.s, ejp.k); err != nil {</code></span>
+<span class="codeline" id="line-281"><code>			return nil, err</code></span>
+<span class="codeline" id="line-282"><code>		}</code></span>
+<span class="codeline" id="line-283"><code></code></span>
+<span class="codeline" id="line-284"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-285"><code>		if t == bsontype.Binary &amp;&amp; ejp.s == jpsSawValue {</code></span>
+<span class="codeline" id="line-286"><code>			// convert relaxed $uuid format</code></span>
+<span class="codeline" id="line-287"><code>			if ejp.relaxedUUID {</code></span>
+<span class="codeline" id="line-288"><code>				defer func() { ejp.relaxedUUID = false }()</code></span>
+<span class="codeline" id="line-289"><code>				uuid, err := ejp.v.parseSymbol()</code></span>
+<span class="codeline" id="line-290"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-291"><code>					return nil, err</code></span>
+<span class="codeline" id="line-292"><code>				}</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>				// RFC 4122 defines the length of a UUID as 36 and the hyphens in a UUID as appearing</code></span>
+<span class="codeline" id="line-295"><code>				// in the 8th, 13th, 18th, and 23rd characters.</code></span>
+<span class="codeline" id="line-296"><code>				//</code></span>
+<span class="codeline" id="line-297"><code>				// See https://tools.ietf.org/html/rfc4122#section-3</code></span>
+<span class="codeline" id="line-298"><code>				valid := len(uuid) == 36 &amp;&amp;</code></span>
+<span class="codeline" id="line-299"><code>					string(uuid[8]) == "-" &amp;&amp;</code></span>
+<span class="codeline" id="line-300"><code>					string(uuid[13]) == "-" &amp;&amp;</code></span>
+<span class="codeline" id="line-301"><code>					string(uuid[18]) == "-" &amp;&amp;</code></span>
+<span class="codeline" id="line-302"><code>					string(uuid[23]) == "-"</code></span>
+<span class="codeline" id="line-303"><code>				if !valid {</code></span>
+<span class="codeline" id="line-304"><code>					return nil, fmt.Errorf("$uuid value does not follow RFC 4122 format regarding length and hyphens")</code></span>
+<span class="codeline" id="line-305"><code>				}</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>				// remove hyphens</code></span>
+<span class="codeline" id="line-308"><code>				uuidNoHyphens := strings.Replace(uuid, "-", "", -1)</code></span>
+<span class="codeline" id="line-309"><code>				if len(uuidNoHyphens) != 32 {</code></span>
+<span class="codeline" id="line-310"><code>					return nil, fmt.Errorf("$uuid value does not follow RFC 4122 format regarding length and hyphens")</code></span>
+<span class="codeline" id="line-311"><code>				}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>				// convert hex to bytes</code></span>
+<span class="codeline" id="line-314"><code>				bytes, err := hex.DecodeString(uuidNoHyphens)</code></span>
+<span class="codeline" id="line-315"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-316"><code>					return nil, fmt.Errorf("$uuid value does not follow RFC 4122 format regarding hex bytes: %w", err)</code></span>
+<span class="codeline" id="line-317"><code>				}</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>				ejp.advanceState()</code></span>
+<span class="codeline" id="line-320"><code>				if ejp.s != jpsSawEndObject {</code></span>
+<span class="codeline" id="line-321"><code>					return nil, invalidJSONErrorForType("$uuid and value and then }", bsontype.Binary)</code></span>
+<span class="codeline" id="line-322"><code>				}</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>				base64 := &amp;extJSONValue{</code></span>
+<span class="codeline" id="line-325"><code>					t: bsontype.String,</code></span>
+<span class="codeline" id="line-326"><code>					v: base64.StdEncoding.EncodeToString(bytes),</code></span>
+<span class="codeline" id="line-327"><code>				}</code></span>
+<span class="codeline" id="line-328"><code>				subType := &amp;extJSONValue{</code></span>
+<span class="codeline" id="line-329"><code>					t: bsontype.String,</code></span>
+<span class="codeline" id="line-330"><code>					v: "04",</code></span>
+<span class="codeline" id="line-331"><code>				}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>				v = &amp;extJSONValue{</code></span>
+<span class="codeline" id="line-334"><code>					t: bsontype.EmbeddedDocument,</code></span>
+<span class="codeline" id="line-335"><code>					v: &amp;extJSONObject{</code></span>
+<span class="codeline" id="line-336"><code>						keys:   []string{"base64", "subType"},</code></span>
+<span class="codeline" id="line-337"><code>						values: []*extJSONValue{base64, subType},</code></span>
+<span class="codeline" id="line-338"><code>					},</code></span>
+<span class="codeline" id="line-339"><code>				}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>				break</code></span>
+<span class="codeline" id="line-342"><code>			}</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>			// convert legacy $binary format</code></span>
+<span class="codeline" id="line-345"><code>			base64 := ejp.v</code></span>
+<span class="codeline" id="line-346"><code></code></span>
+<span class="codeline" id="line-347"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-348"><code>			if ejp.s != jpsSawComma {</code></span>
+<span class="codeline" id="line-349"><code>				return nil, invalidJSONErrorForType(",", bsontype.Binary)</code></span>
+<span class="codeline" id="line-350"><code>			}</code></span>
+<span class="codeline" id="line-351"><code></code></span>
+<span class="codeline" id="line-352"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-353"><code>			key, t, err := ejp.readKey()</code></span>
+<span class="codeline" id="line-354"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-355"><code>				return nil, err</code></span>
+<span class="codeline" id="line-356"><code>			}</code></span>
+<span class="codeline" id="line-357"><code>			if key != "$type" {</code></span>
+<span class="codeline" id="line-358"><code>				return nil, invalidJSONErrorForType("$type", bsontype.Binary)</code></span>
+<span class="codeline" id="line-359"><code>			}</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>			subType, err := ejp.readValue(t)</code></span>
+<span class="codeline" id="line-362"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-363"><code>				return nil, err</code></span>
+<span class="codeline" id="line-364"><code>			}</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-367"><code>			if ejp.s != jpsSawEndObject {</code></span>
+<span class="codeline" id="line-368"><code>				return nil, invalidJSONErrorForType("2 key-value pairs and then }", bsontype.Binary)</code></span>
+<span class="codeline" id="line-369"><code>			}</code></span>
+<span class="codeline" id="line-370"><code></code></span>
+<span class="codeline" id="line-371"><code>			v = &amp;extJSONValue{</code></span>
+<span class="codeline" id="line-372"><code>				t: bsontype.EmbeddedDocument,</code></span>
+<span class="codeline" id="line-373"><code>				v: &amp;extJSONObject{</code></span>
+<span class="codeline" id="line-374"><code>					keys:   []string{"base64", "subType"},</code></span>
+<span class="codeline" id="line-375"><code>					values: []*extJSONValue{base64, subType},</code></span>
+<span class="codeline" id="line-376"><code>				},</code></span>
+<span class="codeline" id="line-377"><code>			}</code></span>
+<span class="codeline" id="line-378"><code>			break</code></span>
+<span class="codeline" id="line-379"><code>		}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>		// read KV pairs</code></span>
+<span class="codeline" id="line-382"><code>		if ejp.s != jpsSawBeginObject {</code></span>
+<span class="codeline" id="line-383"><code>			return nil, invalidJSONErrorForType("{", t)</code></span>
+<span class="codeline" id="line-384"><code>		}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>		keys, vals, err := ejp.readObject(2, true)</code></span>
+<span class="codeline" id="line-387"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-388"><code>			return nil, err</code></span>
+<span class="codeline" id="line-389"><code>		}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-392"><code>		if ejp.s != jpsSawEndObject {</code></span>
+<span class="codeline" id="line-393"><code>			return nil, invalidJSONErrorForType("2 key-value pairs and then }", t)</code></span>
+<span class="codeline" id="line-394"><code>		}</code></span>
+<span class="codeline" id="line-395"><code></code></span>
+<span class="codeline" id="line-396"><code>		v = &amp;extJSONValue{t: bsontype.EmbeddedDocument, v: &amp;extJSONObject{keys: keys, values: vals}}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>	case bsontype.DateTime:</code></span>
+<span class="codeline" id="line-399"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-400"><code>		case jpsSawValue:</code></span>
+<span class="codeline" id="line-401"><code>			v = ejp.v</code></span>
+<span class="codeline" id="line-402"><code>		case jpsSawKey:</code></span>
+<span class="codeline" id="line-403"><code>			// read colon</code></span>
+<span class="codeline" id="line-404"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-405"><code>			if err := ensureColon(ejp.s, ejp.k); err != nil {</code></span>
+<span class="codeline" id="line-406"><code>				return nil, err</code></span>
+<span class="codeline" id="line-407"><code>			}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-410"><code>			switch ejp.s {</code></span>
+<span class="codeline" id="line-411"><code>			case jpsSawBeginObject:</code></span>
+<span class="codeline" id="line-412"><code>				keys, vals, err := ejp.readObject(1, true)</code></span>
+<span class="codeline" id="line-413"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-414"><code>					return nil, err</code></span>
+<span class="codeline" id="line-415"><code>				}</code></span>
+<span class="codeline" id="line-416"><code>				v = &amp;extJSONValue{t: bsontype.EmbeddedDocument, v: &amp;extJSONObject{keys: keys, values: vals}}</code></span>
+<span class="codeline" id="line-417"><code>			case jpsSawValue:</code></span>
+<span class="codeline" id="line-418"><code>				if ejp.canonical {</code></span>
+<span class="codeline" id="line-419"><code>					return nil, invalidJSONError("{")</code></span>
+<span class="codeline" id="line-420"><code>				}</code></span>
+<span class="codeline" id="line-421"><code>				v = ejp.v</code></span>
+<span class="codeline" id="line-422"><code>			default:</code></span>
+<span class="codeline" id="line-423"><code>				if ejp.canonical {</code></span>
+<span class="codeline" id="line-424"><code>					return nil, invalidJSONErrorForType("object", t)</code></span>
+<span class="codeline" id="line-425"><code>				}</code></span>
+<span class="codeline" id="line-426"><code>				return nil, invalidJSONErrorForType("ISO-8601 Internet Date/Time Format as described in RFC-3339", t)</code></span>
+<span class="codeline" id="line-427"><code>			}</code></span>
+<span class="codeline" id="line-428"><code></code></span>
+<span class="codeline" id="line-429"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-430"><code>			if ejp.s != jpsSawEndObject {</code></span>
+<span class="codeline" id="line-431"><code>				return nil, invalidJSONErrorForType("value and then }", t)</code></span>
+<span class="codeline" id="line-432"><code>			}</code></span>
+<span class="codeline" id="line-433"><code>		default:</code></span>
+<span class="codeline" id="line-434"><code>			return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-435"><code>		}</code></span>
+<span class="codeline" id="line-436"><code>	case bsontype.JavaScript:</code></span>
+<span class="codeline" id="line-437"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-438"><code>		case jpsSawKey:</code></span>
+<span class="codeline" id="line-439"><code>			// read colon</code></span>
+<span class="codeline" id="line-440"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-441"><code>			if err := ensureColon(ejp.s, ejp.k); err != nil {</code></span>
+<span class="codeline" id="line-442"><code>				return nil, err</code></span>
+<span class="codeline" id="line-443"><code>			}</code></span>
+<span class="codeline" id="line-444"><code></code></span>
+<span class="codeline" id="line-445"><code>			// read value</code></span>
+<span class="codeline" id="line-446"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-447"><code>			if ejp.s != jpsSawValue {</code></span>
+<span class="codeline" id="line-448"><code>				return nil, invalidJSONErrorForType("value", t)</code></span>
+<span class="codeline" id="line-449"><code>			}</code></span>
+<span class="codeline" id="line-450"><code>			v = ejp.v</code></span>
+<span class="codeline" id="line-451"><code></code></span>
+<span class="codeline" id="line-452"><code>			// read end object or comma and just return</code></span>
+<span class="codeline" id="line-453"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-454"><code>		case jpsSawEndObject:</code></span>
+<span class="codeline" id="line-455"><code>			v = ejp.v</code></span>
+<span class="codeline" id="line-456"><code>		default:</code></span>
+<span class="codeline" id="line-457"><code>			return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-458"><code>		}</code></span>
+<span class="codeline" id="line-459"><code>	case bsontype.CodeWithScope:</code></span>
+<span class="codeline" id="line-460"><code>		if ejp.s == jpsSawKey &amp;&amp; ejp.k == "$scope" {</code></span>
+<span class="codeline" id="line-461"><code>			v = ejp.v // this is the $code string from earlier</code></span>
+<span class="codeline" id="line-462"><code></code></span>
+<span class="codeline" id="line-463"><code>			// read colon</code></span>
+<span class="codeline" id="line-464"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-465"><code>			if err := ensureColon(ejp.s, ejp.k); err != nil {</code></span>
+<span class="codeline" id="line-466"><code>				return nil, err</code></span>
+<span class="codeline" id="line-467"><code>			}</code></span>
+<span class="codeline" id="line-468"><code></code></span>
+<span class="codeline" id="line-469"><code>			// read {</code></span>
+<span class="codeline" id="line-470"><code>			ejp.advanceState()</code></span>
+<span class="codeline" id="line-471"><code>			if ejp.s != jpsSawBeginObject {</code></span>
+<span class="codeline" id="line-472"><code>				return nil, invalidJSONError("$scope to be embedded document")</code></span>
+<span class="codeline" id="line-473"><code>			}</code></span>
+<span class="codeline" id="line-474"><code>		} else {</code></span>
+<span class="codeline" id="line-475"><code>			return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-476"><code>		}</code></span>
+<span class="codeline" id="line-477"><code>	case bsontype.EmbeddedDocument, bsontype.Array:</code></span>
+<span class="codeline" id="line-478"><code>		return nil, invalidRequestError(t.String())</code></span>
+<span class="codeline" id="line-479"><code>	}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>	return v, nil</code></span>
+<span class="codeline" id="line-482"><code>}</code></span>
+<span class="codeline" id="line-483"><code></code></span>
+<span class="codeline" id="line-484"><code>// readObject is a utility method for reading full objects of known (or expected) size</code></span>
+<span class="codeline" id="line-485"><code>// it is useful for extended JSON types such as binary, datetime, regex, and timestamp</code></span>
+<span class="codeline" id="line-486"><code>func (ejp *extJSONParser) readObject(numKeys int, started bool) ([]string, []*extJSONValue, error) {</code></span>
+<span class="codeline" id="line-487"><code>	keys := make([]string, numKeys)</code></span>
+<span class="codeline" id="line-488"><code>	vals := make([]*extJSONValue, numKeys)</code></span>
+<span class="codeline" id="line-489"><code></code></span>
+<span class="codeline" id="line-490"><code>	if !started {</code></span>
+<span class="codeline" id="line-491"><code>		ejp.advanceState()</code></span>
+<span class="codeline" id="line-492"><code>		if ejp.s != jpsSawBeginObject {</code></span>
+<span class="codeline" id="line-493"><code>			return nil, nil, invalidJSONError("{")</code></span>
+<span class="codeline" id="line-494"><code>		}</code></span>
+<span class="codeline" id="line-495"><code>	}</code></span>
+<span class="codeline" id="line-496"><code></code></span>
+<span class="codeline" id="line-497"><code>	for i := 0; i &lt; numKeys; i++ {</code></span>
+<span class="codeline" id="line-498"><code>		key, t, err := ejp.readKey()</code></span>
+<span class="codeline" id="line-499"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-500"><code>			return nil, nil, err</code></span>
+<span class="codeline" id="line-501"><code>		}</code></span>
+<span class="codeline" id="line-502"><code></code></span>
+<span class="codeline" id="line-503"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-504"><code>		case jpsSawKey:</code></span>
+<span class="codeline" id="line-505"><code>			v, err := ejp.readValue(t)</code></span>
+<span class="codeline" id="line-506"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-507"><code>				return nil, nil, err</code></span>
+<span class="codeline" id="line-508"><code>			}</code></span>
+<span class="codeline" id="line-509"><code></code></span>
+<span class="codeline" id="line-510"><code>			keys[i] = key</code></span>
+<span class="codeline" id="line-511"><code>			vals[i] = v</code></span>
+<span class="codeline" id="line-512"><code>		case jpsSawValue:</code></span>
+<span class="codeline" id="line-513"><code>			keys[i] = key</code></span>
+<span class="codeline" id="line-514"><code>			vals[i] = ejp.v</code></span>
+<span class="codeline" id="line-515"><code>		default:</code></span>
+<span class="codeline" id="line-516"><code>			return nil, nil, invalidJSONError("value")</code></span>
+<span class="codeline" id="line-517"><code>		}</code></span>
+<span class="codeline" id="line-518"><code>	}</code></span>
+<span class="codeline" id="line-519"><code></code></span>
+<span class="codeline" id="line-520"><code>	ejp.advanceState()</code></span>
+<span class="codeline" id="line-521"><code>	if ejp.s != jpsSawEndObject {</code></span>
+<span class="codeline" id="line-522"><code>		return nil, nil, invalidJSONError("}")</code></span>
+<span class="codeline" id="line-523"><code>	}</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>	return keys, vals, nil</code></span>
+<span class="codeline" id="line-526"><code>}</code></span>
+<span class="codeline" id="line-527"><code></code></span>
+<span class="codeline" id="line-528"><code>// advanceState reads the next JSON token from the scanner and transitions</code></span>
+<span class="codeline" id="line-529"><code>// from the current state based on that token's type</code></span>
+<span class="codeline" id="line-530"><code>func (ejp *extJSONParser) advanceState() {</code></span>
+<span class="codeline" id="line-531"><code>	if ejp.s == jpsDoneState || ejp.s == jpsInvalidState {</code></span>
+<span class="codeline" id="line-532"><code>		return</code></span>
+<span class="codeline" id="line-533"><code>	}</code></span>
+<span class="codeline" id="line-534"><code></code></span>
+<span class="codeline" id="line-535"><code>	jt, err := ejp.js.nextToken()</code></span>
+<span class="codeline" id="line-536"><code></code></span>
+<span class="codeline" id="line-537"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-538"><code>		ejp.err = err</code></span>
+<span class="codeline" id="line-539"><code>		ejp.s = jpsInvalidState</code></span>
+<span class="codeline" id="line-540"><code>		return</code></span>
+<span class="codeline" id="line-541"><code>	}</code></span>
+<span class="codeline" id="line-542"><code></code></span>
+<span class="codeline" id="line-543"><code>	valid := ejp.validateToken(jt.t)</code></span>
+<span class="codeline" id="line-544"><code>	if !valid {</code></span>
+<span class="codeline" id="line-545"><code>		ejp.err = unexpectedTokenError(jt)</code></span>
+<span class="codeline" id="line-546"><code>		ejp.s = jpsInvalidState</code></span>
+<span class="codeline" id="line-547"><code>		return</code></span>
+<span class="codeline" id="line-548"><code>	}</code></span>
+<span class="codeline" id="line-549"><code></code></span>
+<span class="codeline" id="line-550"><code>	switch jt.t {</code></span>
+<span class="codeline" id="line-551"><code>	case jttBeginObject:</code></span>
+<span class="codeline" id="line-552"><code>		ejp.s = jpsSawBeginObject</code></span>
+<span class="codeline" id="line-553"><code>		ejp.pushMode(jpmObjectMode)</code></span>
+<span class="codeline" id="line-554"><code>		ejp.depth++</code></span>
+<span class="codeline" id="line-555"><code></code></span>
+<span class="codeline" id="line-556"><code>		if ejp.depth &gt; ejp.maxDepth {</code></span>
+<span class="codeline" id="line-557"><code>			ejp.err = nestingDepthError(jt.p, ejp.depth)</code></span>
+<span class="codeline" id="line-558"><code>			ejp.s = jpsInvalidState</code></span>
+<span class="codeline" id="line-559"><code>		}</code></span>
+<span class="codeline" id="line-560"><code>	case jttEndObject:</code></span>
+<span class="codeline" id="line-561"><code>		ejp.s = jpsSawEndObject</code></span>
+<span class="codeline" id="line-562"><code>		ejp.depth--</code></span>
+<span class="codeline" id="line-563"><code></code></span>
+<span class="codeline" id="line-564"><code>		if ejp.popMode() != jpmObjectMode {</code></span>
+<span class="codeline" id="line-565"><code>			ejp.err = unexpectedTokenError(jt)</code></span>
+<span class="codeline" id="line-566"><code>			ejp.s = jpsInvalidState</code></span>
+<span class="codeline" id="line-567"><code>		}</code></span>
+<span class="codeline" id="line-568"><code>	case jttBeginArray:</code></span>
+<span class="codeline" id="line-569"><code>		ejp.s = jpsSawBeginArray</code></span>
+<span class="codeline" id="line-570"><code>		ejp.pushMode(jpmArrayMode)</code></span>
+<span class="codeline" id="line-571"><code>	case jttEndArray:</code></span>
+<span class="codeline" id="line-572"><code>		ejp.s = jpsSawEndArray</code></span>
+<span class="codeline" id="line-573"><code></code></span>
+<span class="codeline" id="line-574"><code>		if ejp.popMode() != jpmArrayMode {</code></span>
+<span class="codeline" id="line-575"><code>			ejp.err = unexpectedTokenError(jt)</code></span>
+<span class="codeline" id="line-576"><code>			ejp.s = jpsInvalidState</code></span>
+<span class="codeline" id="line-577"><code>		}</code></span>
+<span class="codeline" id="line-578"><code>	case jttColon:</code></span>
+<span class="codeline" id="line-579"><code>		ejp.s = jpsSawColon</code></span>
+<span class="codeline" id="line-580"><code>	case jttComma:</code></span>
+<span class="codeline" id="line-581"><code>		ejp.s = jpsSawComma</code></span>
+<span class="codeline" id="line-582"><code>	case jttEOF:</code></span>
+<span class="codeline" id="line-583"><code>		ejp.s = jpsDoneState</code></span>
+<span class="codeline" id="line-584"><code>		if len(ejp.m) != 0 {</code></span>
+<span class="codeline" id="line-585"><code>			ejp.err = unexpectedTokenError(jt)</code></span>
+<span class="codeline" id="line-586"><code>			ejp.s = jpsInvalidState</code></span>
+<span class="codeline" id="line-587"><code>		}</code></span>
+<span class="codeline" id="line-588"><code>	case jttString:</code></span>
+<span class="codeline" id="line-589"><code>		switch ejp.s {</code></span>
+<span class="codeline" id="line-590"><code>		case jpsSawComma:</code></span>
+<span class="codeline" id="line-591"><code>			if ejp.peekMode() == jpmArrayMode {</code></span>
+<span class="codeline" id="line-592"><code>				ejp.s = jpsSawValue</code></span>
+<span class="codeline" id="line-593"><code>				ejp.v = extendJSONToken(jt)</code></span>
+<span class="codeline" id="line-594"><code>				return</code></span>
+<span class="codeline" id="line-595"><code>			}</code></span>
+<span class="codeline" id="line-596"><code>			fallthrough</code></span>
+<span class="codeline" id="line-597"><code>		case jpsSawBeginObject:</code></span>
+<span class="codeline" id="line-598"><code>			ejp.s = jpsSawKey</code></span>
+<span class="codeline" id="line-599"><code>			ejp.k = jt.v.(string)</code></span>
+<span class="codeline" id="line-600"><code>			return</code></span>
+<span class="codeline" id="line-601"><code>		}</code></span>
+<span class="codeline" id="line-602"><code>		fallthrough</code></span>
+<span class="codeline" id="line-603"><code>	default:</code></span>
+<span class="codeline" id="line-604"><code>		ejp.s = jpsSawValue</code></span>
+<span class="codeline" id="line-605"><code>		ejp.v = extendJSONToken(jt)</code></span>
+<span class="codeline" id="line-606"><code>	}</code></span>
+<span class="codeline" id="line-607"><code>}</code></span>
+<span class="codeline" id="line-608"><code></code></span>
+<span class="codeline" id="line-609"><code>var jpsValidTransitionTokens = map[jsonParseState]map[jsonTokenType]bool{</code></span>
+<span class="codeline" id="line-610"><code>	jpsStartState: {</code></span>
+<span class="codeline" id="line-611"><code>		jttBeginObject: true,</code></span>
+<span class="codeline" id="line-612"><code>		jttBeginArray:  true,</code></span>
+<span class="codeline" id="line-613"><code>		jttInt32:       true,</code></span>
+<span class="codeline" id="line-614"><code>		jttInt64:       true,</code></span>
+<span class="codeline" id="line-615"><code>		jttDouble:      true,</code></span>
+<span class="codeline" id="line-616"><code>		jttString:      true,</code></span>
+<span class="codeline" id="line-617"><code>		jttBool:        true,</code></span>
+<span class="codeline" id="line-618"><code>		jttNull:        true,</code></span>
+<span class="codeline" id="line-619"><code>		jttEOF:         true,</code></span>
+<span class="codeline" id="line-620"><code>	},</code></span>
+<span class="codeline" id="line-621"><code>	jpsSawBeginObject: {</code></span>
+<span class="codeline" id="line-622"><code>		jttEndObject: true,</code></span>
+<span class="codeline" id="line-623"><code>		jttString:    true,</code></span>
+<span class="codeline" id="line-624"><code>	},</code></span>
+<span class="codeline" id="line-625"><code>	jpsSawEndObject: {</code></span>
+<span class="codeline" id="line-626"><code>		jttEndObject: true,</code></span>
+<span class="codeline" id="line-627"><code>		jttEndArray:  true,</code></span>
+<span class="codeline" id="line-628"><code>		jttComma:     true,</code></span>
+<span class="codeline" id="line-629"><code>		jttEOF:       true,</code></span>
+<span class="codeline" id="line-630"><code>	},</code></span>
+<span class="codeline" id="line-631"><code>	jpsSawBeginArray: {</code></span>
+<span class="codeline" id="line-632"><code>		jttBeginObject: true,</code></span>
+<span class="codeline" id="line-633"><code>		jttBeginArray:  true,</code></span>
+<span class="codeline" id="line-634"><code>		jttEndArray:    true,</code></span>
+<span class="codeline" id="line-635"><code>		jttInt32:       true,</code></span>
+<span class="codeline" id="line-636"><code>		jttInt64:       true,</code></span>
+<span class="codeline" id="line-637"><code>		jttDouble:      true,</code></span>
+<span class="codeline" id="line-638"><code>		jttString:      true,</code></span>
+<span class="codeline" id="line-639"><code>		jttBool:        true,</code></span>
+<span class="codeline" id="line-640"><code>		jttNull:        true,</code></span>
+<span class="codeline" id="line-641"><code>	},</code></span>
+<span class="codeline" id="line-642"><code>	jpsSawEndArray: {</code></span>
+<span class="codeline" id="line-643"><code>		jttEndObject: true,</code></span>
+<span class="codeline" id="line-644"><code>		jttEndArray:  true,</code></span>
+<span class="codeline" id="line-645"><code>		jttComma:     true,</code></span>
+<span class="codeline" id="line-646"><code>		jttEOF:       true,</code></span>
+<span class="codeline" id="line-647"><code>	},</code></span>
+<span class="codeline" id="line-648"><code>	jpsSawColon: {</code></span>
+<span class="codeline" id="line-649"><code>		jttBeginObject: true,</code></span>
+<span class="codeline" id="line-650"><code>		jttBeginArray:  true,</code></span>
+<span class="codeline" id="line-651"><code>		jttInt32:       true,</code></span>
+<span class="codeline" id="line-652"><code>		jttInt64:       true,</code></span>
+<span class="codeline" id="line-653"><code>		jttDouble:      true,</code></span>
+<span class="codeline" id="line-654"><code>		jttString:      true,</code></span>
+<span class="codeline" id="line-655"><code>		jttBool:        true,</code></span>
+<span class="codeline" id="line-656"><code>		jttNull:        true,</code></span>
+<span class="codeline" id="line-657"><code>	},</code></span>
+<span class="codeline" id="line-658"><code>	jpsSawComma: {</code></span>
+<span class="codeline" id="line-659"><code>		jttBeginObject: true,</code></span>
+<span class="codeline" id="line-660"><code>		jttBeginArray:  true,</code></span>
+<span class="codeline" id="line-661"><code>		jttInt32:       true,</code></span>
+<span class="codeline" id="line-662"><code>		jttInt64:       true,</code></span>
+<span class="codeline" id="line-663"><code>		jttDouble:      true,</code></span>
+<span class="codeline" id="line-664"><code>		jttString:      true,</code></span>
+<span class="codeline" id="line-665"><code>		jttBool:        true,</code></span>
+<span class="codeline" id="line-666"><code>		jttNull:        true,</code></span>
+<span class="codeline" id="line-667"><code>	},</code></span>
+<span class="codeline" id="line-668"><code>	jpsSawKey: {</code></span>
+<span class="codeline" id="line-669"><code>		jttColon: true,</code></span>
+<span class="codeline" id="line-670"><code>	},</code></span>
+<span class="codeline" id="line-671"><code>	jpsSawValue: {</code></span>
+<span class="codeline" id="line-672"><code>		jttEndObject: true,</code></span>
+<span class="codeline" id="line-673"><code>		jttEndArray:  true,</code></span>
+<span class="codeline" id="line-674"><code>		jttComma:     true,</code></span>
+<span class="codeline" id="line-675"><code>		jttEOF:       true,</code></span>
+<span class="codeline" id="line-676"><code>	},</code></span>
+<span class="codeline" id="line-677"><code>	jpsDoneState:    {},</code></span>
+<span class="codeline" id="line-678"><code>	jpsInvalidState: {},</code></span>
+<span class="codeline" id="line-679"><code>}</code></span>
+<span class="codeline" id="line-680"><code></code></span>
+<span class="codeline" id="line-681"><code>func (ejp *extJSONParser) validateToken(jtt jsonTokenType) bool {</code></span>
+<span class="codeline" id="line-682"><code>	switch ejp.s {</code></span>
+<span class="codeline" id="line-683"><code>	case jpsSawEndObject:</code></span>
+<span class="codeline" id="line-684"><code>		// if we are at depth zero and the next token is a '{',</code></span>
+<span class="codeline" id="line-685"><code>		// we can consider it valid only if we are not in array mode.</code></span>
+<span class="codeline" id="line-686"><code>		if jtt == jttBeginObject &amp;&amp; ejp.depth == 0 {</code></span>
+<span class="codeline" id="line-687"><code>			return ejp.peekMode() != jpmArrayMode</code></span>
+<span class="codeline" id="line-688"><code>		}</code></span>
+<span class="codeline" id="line-689"><code>	case jpsSawComma:</code></span>
+<span class="codeline" id="line-690"><code>		switch ejp.peekMode() {</code></span>
+<span class="codeline" id="line-691"><code>		// the only valid next token after a comma inside a document is a string (a key)</code></span>
+<span class="codeline" id="line-692"><code>		case jpmObjectMode:</code></span>
+<span class="codeline" id="line-693"><code>			return jtt == jttString</code></span>
+<span class="codeline" id="line-694"><code>		case jpmInvalidMode:</code></span>
+<span class="codeline" id="line-695"><code>			return false</code></span>
+<span class="codeline" id="line-696"><code>		}</code></span>
+<span class="codeline" id="line-697"><code>	}</code></span>
+<span class="codeline" id="line-698"><code></code></span>
+<span class="codeline" id="line-699"><code>	_, ok := jpsValidTransitionTokens[ejp.s][jtt]</code></span>
+<span class="codeline" id="line-700"><code>	return ok</code></span>
+<span class="codeline" id="line-701"><code>}</code></span>
+<span class="codeline" id="line-702"><code></code></span>
+<span class="codeline" id="line-703"><code>// ensureExtValueType returns true if the current value has the expected</code></span>
+<span class="codeline" id="line-704"><code>// value type for single-key extended JSON types. For example,</code></span>
+<span class="codeline" id="line-705"><code>// {"$numberInt": v} v must be TypeString</code></span>
+<span class="codeline" id="line-706"><code>func (ejp *extJSONParser) ensureExtValueType(t bsontype.Type) bool {</code></span>
+<span class="codeline" id="line-707"><code>	switch t {</code></span>
+<span class="codeline" id="line-708"><code>	case bsontype.MinKey, bsontype.MaxKey:</code></span>
+<span class="codeline" id="line-709"><code>		return ejp.v.t == bsontype.Int32</code></span>
+<span class="codeline" id="line-710"><code>	case bsontype.Undefined:</code></span>
+<span class="codeline" id="line-711"><code>		return ejp.v.t == bsontype.Boolean</code></span>
+<span class="codeline" id="line-712"><code>	case bsontype.Int32, bsontype.Int64, bsontype.Double, bsontype.Decimal128, bsontype.Symbol, bsontype.ObjectID:</code></span>
+<span class="codeline" id="line-713"><code>		return ejp.v.t == bsontype.String</code></span>
+<span class="codeline" id="line-714"><code>	default:</code></span>
+<span class="codeline" id="line-715"><code>		return false</code></span>
+<span class="codeline" id="line-716"><code>	}</code></span>
+<span class="codeline" id="line-717"><code>}</code></span>
+<span class="codeline" id="line-718"><code></code></span>
+<span class="codeline" id="line-719"><code>func (ejp *extJSONParser) pushMode(m jsonParseMode) {</code></span>
+<span class="codeline" id="line-720"><code>	ejp.m = append(ejp.m, m)</code></span>
+<span class="codeline" id="line-721"><code>}</code></span>
+<span class="codeline" id="line-722"><code></code></span>
+<span class="codeline" id="line-723"><code>func (ejp *extJSONParser) popMode() jsonParseMode {</code></span>
+<span class="codeline" id="line-724"><code>	l := len(ejp.m)</code></span>
+<span class="codeline" id="line-725"><code>	if l == 0 {</code></span>
+<span class="codeline" id="line-726"><code>		return jpmInvalidMode</code></span>
+<span class="codeline" id="line-727"><code>	}</code></span>
+<span class="codeline" id="line-728"><code></code></span>
+<span class="codeline" id="line-729"><code>	m := ejp.m[l-1]</code></span>
+<span class="codeline" id="line-730"><code>	ejp.m = ejp.m[:l-1]</code></span>
+<span class="codeline" id="line-731"><code></code></span>
+<span class="codeline" id="line-732"><code>	return m</code></span>
+<span class="codeline" id="line-733"><code>}</code></span>
+<span class="codeline" id="line-734"><code></code></span>
+<span class="codeline" id="line-735"><code>func (ejp *extJSONParser) peekMode() jsonParseMode {</code></span>
+<span class="codeline" id="line-736"><code>	l := len(ejp.m)</code></span>
+<span class="codeline" id="line-737"><code>	if l == 0 {</code></span>
+<span class="codeline" id="line-738"><code>		return jpmInvalidMode</code></span>
+<span class="codeline" id="line-739"><code>	}</code></span>
+<span class="codeline" id="line-740"><code></code></span>
+<span class="codeline" id="line-741"><code>	return ejp.m[l-1]</code></span>
+<span class="codeline" id="line-742"><code>}</code></span>
+<span class="codeline" id="line-743"><code></code></span>
+<span class="codeline" id="line-744"><code>func extendJSONToken(jt *jsonToken) *extJSONValue {</code></span>
+<span class="codeline" id="line-745"><code>	var t bsontype.Type</code></span>
+<span class="codeline" id="line-746"><code></code></span>
+<span class="codeline" id="line-747"><code>	switch jt.t {</code></span>
+<span class="codeline" id="line-748"><code>	case jttInt32:</code></span>
+<span class="codeline" id="line-749"><code>		t = bsontype.Int32</code></span>
+<span class="codeline" id="line-750"><code>	case jttInt64:</code></span>
+<span class="codeline" id="line-751"><code>		t = bsontype.Int64</code></span>
+<span class="codeline" id="line-752"><code>	case jttDouble:</code></span>
+<span class="codeline" id="line-753"><code>		t = bsontype.Double</code></span>
+<span class="codeline" id="line-754"><code>	case jttString:</code></span>
+<span class="codeline" id="line-755"><code>		t = bsontype.String</code></span>
+<span class="codeline" id="line-756"><code>	case jttBool:</code></span>
+<span class="codeline" id="line-757"><code>		t = bsontype.Boolean</code></span>
+<span class="codeline" id="line-758"><code>	case jttNull:</code></span>
+<span class="codeline" id="line-759"><code>		t = bsontype.Null</code></span>
+<span class="codeline" id="line-760"><code>	default:</code></span>
+<span class="codeline" id="line-761"><code>		return nil</code></span>
+<span class="codeline" id="line-762"><code>	}</code></span>
+<span class="codeline" id="line-763"><code></code></span>
+<span class="codeline" id="line-764"><code>	return &amp;extJSONValue{t: t, v: jt.v}</code></span>
+<span class="codeline" id="line-765"><code>}</code></span>
+<span class="codeline" id="line-766"><code></code></span>
+<span class="codeline" id="line-767"><code>func ensureColon(s jsonParseState, key string) error {</code></span>
+<span class="codeline" id="line-768"><code>	if s != jpsSawColon {</code></span>
+<span class="codeline" id="line-769"><code>		return fmt.Errorf("invalid JSON input: missing colon after key \"%s\"", key)</code></span>
+<span class="codeline" id="line-770"><code>	}</code></span>
+<span class="codeline" id="line-771"><code></code></span>
+<span class="codeline" id="line-772"><code>	return nil</code></span>
+<span class="codeline" id="line-773"><code>}</code></span>
+<span class="codeline" id="line-774"><code></code></span>
+<span class="codeline" id="line-775"><code>func invalidRequestError(s string) error {</code></span>
+<span class="codeline" id="line-776"><code>	return fmt.Errorf("invalid request to read %s", s)</code></span>
+<span class="codeline" id="line-777"><code>}</code></span>
+<span class="codeline" id="line-778"><code></code></span>
+<span class="codeline" id="line-779"><code>func invalidJSONError(expected string) error {</code></span>
+<span class="codeline" id="line-780"><code>	return fmt.Errorf("invalid JSON input; expected %s", expected)</code></span>
+<span class="codeline" id="line-781"><code>}</code></span>
+<span class="codeline" id="line-782"><code></code></span>
+<span class="codeline" id="line-783"><code>func invalidJSONErrorForType(expected string, t bsontype.Type) error {</code></span>
+<span class="codeline" id="line-784"><code>	return fmt.Errorf("invalid JSON input; expected %s for %s", expected, t)</code></span>
+<span class="codeline" id="line-785"><code>}</code></span>
+<span class="codeline" id="line-786"><code></code></span>
+<span class="codeline" id="line-787"><code>func unexpectedTokenError(jt *jsonToken) error {</code></span>
+<span class="codeline" id="line-788"><code>	switch jt.t {</code></span>
+<span class="codeline" id="line-789"><code>	case jttInt32, jttInt64, jttDouble:</code></span>
+<span class="codeline" id="line-790"><code>		return fmt.Errorf("invalid JSON input; unexpected number (%v) at position %d", jt.v, jt.p)</code></span>
+<span class="codeline" id="line-791"><code>	case jttString:</code></span>
+<span class="codeline" id="line-792"><code>		return fmt.Errorf("invalid JSON input; unexpected string (\"%v\") at position %d", jt.v, jt.p)</code></span>
+<span class="codeline" id="line-793"><code>	case jttBool:</code></span>
+<span class="codeline" id="line-794"><code>		return fmt.Errorf("invalid JSON input; unexpected boolean literal (%v) at position %d", jt.v, jt.p)</code></span>
+<span class="codeline" id="line-795"><code>	case jttNull:</code></span>
+<span class="codeline" id="line-796"><code>		return fmt.Errorf("invalid JSON input; unexpected null literal at position %d", jt.p)</code></span>
+<span class="codeline" id="line-797"><code>	case jttEOF:</code></span>
+<span class="codeline" id="line-798"><code>		return fmt.Errorf("invalid JSON input; unexpected end of input at position %d", jt.p)</code></span>
+<span class="codeline" id="line-799"><code>	default:</code></span>
+<span class="codeline" id="line-800"><code>		return fmt.Errorf("invalid JSON input; unexpected %c at position %d", jt.v.(byte), jt.p)</code></span>
+<span class="codeline" id="line-801"><code>	}</code></span>
+<span class="codeline" id="line-802"><code>}</code></span>
+<span class="codeline" id="line-803"><code></code></span>
+<span class="codeline" id="line-804"><code>func nestingDepthError(p, depth int) error {</code></span>
+<span class="codeline" id="line-805"><code>	return fmt.Errorf("invalid JSON input; nesting too deep (%d levels) at position %d", depth, p)</code></span>
+<span class="codeline" id="line-806"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

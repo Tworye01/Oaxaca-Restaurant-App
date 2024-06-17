@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: zero_copy_linux.go in package os</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	zero_copy_linux.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/os.html">os</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2020 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package os</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/poll"</code></span>
+<span class="codeline" id="line-9"><code>	"io"</code></span>
+<span class="codeline" id="line-10"><code>	"syscall"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>var (</code></span>
+<span class="codeline" id="line-14"><code>	pollCopyFileRange = poll.CopyFileRange</code></span>
+<span class="codeline" id="line-15"><code>	pollSplice        = poll.Splice</code></span>
+<span class="codeline" id="line-16"><code>	pollSendFile      = poll.SendFile</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>func (f *File) writeTo(w io.Writer) (written int64, handled bool, err error) {</code></span>
+<span class="codeline" id="line-20"><code>	pfd, network := getPollFDAndNetwork(w)</code></span>
+<span class="codeline" id="line-21"><code>	// TODO(panjf2000): same as File.spliceToFile.</code></span>
+<span class="codeline" id="line-22"><code>	if pfd == nil || !pfd.IsStream || !isUnixOrTCP(string(network)) {</code></span>
+<span class="codeline" id="line-23"><code>		return</code></span>
+<span class="codeline" id="line-24"><code>	}</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>	sc, err := f.SyscallConn()</code></span>
+<span class="codeline" id="line-27"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-28"><code>		return</code></span>
+<span class="codeline" id="line-29"><code>	}</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>	rerr := sc.Read(func(fd uintptr) (done bool) {</code></span>
+<span class="codeline" id="line-32"><code>		written, err, handled = pollSendFile(pfd, int(fd), 1&lt;&lt;63-1)</code></span>
+<span class="codeline" id="line-33"><code>		return true</code></span>
+<span class="codeline" id="line-34"><code>	})</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-37"><code>		err = rerr</code></span>
+<span class="codeline" id="line-38"><code>	}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	return written, handled, wrapSyscallError("sendfile", err)</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>func (f *File) readFrom(r io.Reader) (written int64, handled bool, err error) {</code></span>
+<span class="codeline" id="line-44"><code>	// Neither copy_file_range(2) nor splice(2) supports destinations opened with</code></span>
+<span class="codeline" id="line-45"><code>	// O_APPEND, so don't bother to try zero-copy with these system calls.</code></span>
+<span class="codeline" id="line-46"><code>	//</code></span>
+<span class="codeline" id="line-47"><code>	// Visit https://man7.org/linux/man-pages/man2/copy_file_range.2.html#ERRORS and</code></span>
+<span class="codeline" id="line-48"><code>	// https://man7.org/linux/man-pages/man2/splice.2.html#ERRORS for details.</code></span>
+<span class="codeline" id="line-49"><code>	if f.appendMode {</code></span>
+<span class="codeline" id="line-50"><code>		return 0, false, nil</code></span>
+<span class="codeline" id="line-51"><code>	}</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>	written, handled, err = f.copyFileRange(r)</code></span>
+<span class="codeline" id="line-54"><code>	if handled {</code></span>
+<span class="codeline" id="line-55"><code>		return</code></span>
+<span class="codeline" id="line-56"><code>	}</code></span>
+<span class="codeline" id="line-57"><code>	return f.spliceToFile(r)</code></span>
+<span class="codeline" id="line-58"><code>}</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>func (f *File) spliceToFile(r io.Reader) (written int64, handled bool, err error) {</code></span>
+<span class="codeline" id="line-61"><code>	var (</code></span>
+<span class="codeline" id="line-62"><code>		remain int64</code></span>
+<span class="codeline" id="line-63"><code>		lr     *io.LimitedReader</code></span>
+<span class="codeline" id="line-64"><code>	)</code></span>
+<span class="codeline" id="line-65"><code>	if lr, r, remain = tryLimitedReader(r); remain &lt;= 0 {</code></span>
+<span class="codeline" id="line-66"><code>		return 0, true, nil</code></span>
+<span class="codeline" id="line-67"><code>	}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>	pfd, _ := getPollFDAndNetwork(r)</code></span>
+<span class="codeline" id="line-70"><code>	// TODO(panjf2000): run some tests to see if we should unlock the non-streams for splice.</code></span>
+<span class="codeline" id="line-71"><code>	// Streams benefit the most from the splice(2), non-streams are not even supported in old kernels</code></span>
+<span class="codeline" id="line-72"><code>	// where splice(2) will just return EINVAL; newer kernels support non-streams like UDP, but I really</code></span>
+<span class="codeline" id="line-73"><code>	// doubt that splice(2) could help non-streams, cuz they usually send small frames respectively</code></span>
+<span class="codeline" id="line-74"><code>	// and one splice call would result in one frame.</code></span>
+<span class="codeline" id="line-75"><code>	// splice(2) is suitable for large data but the generation of fragments defeats its edge here.</code></span>
+<span class="codeline" id="line-76"><code>	// Therefore, don't bother to try splice if the r is not a streaming descriptor.</code></span>
+<span class="codeline" id="line-77"><code>	if pfd == nil || !pfd.IsStream {</code></span>
+<span class="codeline" id="line-78"><code>		return</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>	var syscallName string</code></span>
+<span class="codeline" id="line-82"><code>	written, handled, syscallName, err = pollSplice(&amp;f.pfd, pfd, remain)</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>	if lr != nil {</code></span>
+<span class="codeline" id="line-85"><code>		lr.N = remain - written</code></span>
+<span class="codeline" id="line-86"><code>	}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>	return written, handled, wrapSyscallError(syscallName, err)</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>func (f *File) copyFileRange(r io.Reader) (written int64, handled bool, err error) {</code></span>
+<span class="codeline" id="line-92"><code>	var (</code></span>
+<span class="codeline" id="line-93"><code>		remain int64</code></span>
+<span class="codeline" id="line-94"><code>		lr     *io.LimitedReader</code></span>
+<span class="codeline" id="line-95"><code>	)</code></span>
+<span class="codeline" id="line-96"><code>	if lr, r, remain = tryLimitedReader(r); remain &lt;= 0 {</code></span>
+<span class="codeline" id="line-97"><code>		return 0, true, nil</code></span>
+<span class="codeline" id="line-98"><code>	}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>	var src *File</code></span>
+<span class="codeline" id="line-101"><code>	switch v := r.(type) {</code></span>
+<span class="codeline" id="line-102"><code>	case *File:</code></span>
+<span class="codeline" id="line-103"><code>		src = v</code></span>
+<span class="codeline" id="line-104"><code>	case fileWithoutWriteTo:</code></span>
+<span class="codeline" id="line-105"><code>		src = v.File</code></span>
+<span class="codeline" id="line-106"><code>	default:</code></span>
+<span class="codeline" id="line-107"><code>		return 0, false, nil</code></span>
+<span class="codeline" id="line-108"><code>	}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>	if src.checkValid("ReadFrom") != nil {</code></span>
+<span class="codeline" id="line-111"><code>		// Avoid returning the error as we report handled as false,</code></span>
+<span class="codeline" id="line-112"><code>		// leave further error handling as the responsibility of the caller.</code></span>
+<span class="codeline" id="line-113"><code>		return 0, false, nil</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	written, handled, err = pollCopyFileRange(&amp;f.pfd, &amp;src.pfd, remain)</code></span>
+<span class="codeline" id="line-117"><code>	if lr != nil {</code></span>
+<span class="codeline" id="line-118"><code>		lr.N -= written</code></span>
+<span class="codeline" id="line-119"><code>	}</code></span>
+<span class="codeline" id="line-120"><code>	return written, handled, wrapSyscallError("copy_file_range", err)</code></span>
+<span class="codeline" id="line-121"><code>}</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>// getPollFDAndNetwork tries to get the poll.FD and network type from the given interface</code></span>
+<span class="codeline" id="line-124"><code>// by expecting the underlying type of i to be the implementation of syscall.Conn</code></span>
+<span class="codeline" id="line-125"><code>// that contains a *net.rawConn.</code></span>
+<span class="codeline" id="line-126"><code>func getPollFDAndNetwork(i any) (*poll.FD, poll.String) {</code></span>
+<span class="codeline" id="line-127"><code>	sc, ok := i.(syscall.Conn)</code></span>
+<span class="codeline" id="line-128"><code>	if !ok {</code></span>
+<span class="codeline" id="line-129"><code>		return nil, ""</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code>	rc, err := sc.SyscallConn()</code></span>
+<span class="codeline" id="line-132"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-133"><code>		return nil, ""</code></span>
+<span class="codeline" id="line-134"><code>	}</code></span>
+<span class="codeline" id="line-135"><code>	irc, ok := rc.(interface {</code></span>
+<span class="codeline" id="line-136"><code>		PollFD() *poll.FD</code></span>
+<span class="codeline" id="line-137"><code>		Network() poll.String</code></span>
+<span class="codeline" id="line-138"><code>	})</code></span>
+<span class="codeline" id="line-139"><code>	if !ok {</code></span>
+<span class="codeline" id="line-140"><code>		return nil, ""</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code>	return irc.PollFD(), irc.Network()</code></span>
+<span class="codeline" id="line-143"><code>}</code></span>
+<span class="codeline" id="line-144"><code></code></span>
+<span class="codeline" id="line-145"><code>// tryLimitedReader tries to assert the io.Reader to io.LimitedReader, it returns the io.LimitedReader,</code></span>
+<span class="codeline" id="line-146"><code>// the underlying io.Reader and the remaining amount of bytes if the assertion succeeds,</code></span>
+<span class="codeline" id="line-147"><code>// otherwise it just returns the original io.Reader and the theoretical unlimited remaining amount of bytes.</code></span>
+<span class="codeline" id="line-148"><code>func tryLimitedReader(r io.Reader) (*io.LimitedReader, io.Reader, int64) {</code></span>
+<span class="codeline" id="line-149"><code>	var remain int64 = 1&lt;&lt;63 - 1 // by default, copy until EOF</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	lr, ok := r.(*io.LimitedReader)</code></span>
+<span class="codeline" id="line-152"><code>	if !ok {</code></span>
+<span class="codeline" id="line-153"><code>		return nil, r, remain</code></span>
+<span class="codeline" id="line-154"><code>	}</code></span>
+<span class="codeline" id="line-155"><code></code></span>
+<span class="codeline" id="line-156"><code>	remain = lr.N</code></span>
+<span class="codeline" id="line-157"><code>	return lr, lr.R, remain</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>func isUnixOrTCP(network string) bool {</code></span>
+<span class="codeline" id="line-161"><code>	switch network {</code></span>
+<span class="codeline" id="line-162"><code>	case "tcp", "tcp4", "tcp6", "unix":</code></span>
+<span class="codeline" id="line-163"><code>		return true</code></span>
+<span class="codeline" id="line-164"><code>	default:</code></span>
+<span class="codeline" id="line-165"><code>		return false</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

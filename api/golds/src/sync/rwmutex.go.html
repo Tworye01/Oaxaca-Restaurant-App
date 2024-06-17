@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: rwmutex.go in package sync</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	rwmutex.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/sync.html">sync</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package sync</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/race"</code></span>
+<span class="codeline" id="line-9"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-10"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// There is a modified copy of this file in runtime/rwmutex.go.</code></span>
+<span class="codeline" id="line-14"><code>// If you make any changes here, see if you should make them there.</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// A RWMutex is a reader/writer mutual exclusion lock.</code></span>
+<span class="codeline" id="line-17"><code>// The lock can be held by an arbitrary number of readers or a single writer.</code></span>
+<span class="codeline" id="line-18"><code>// The zero value for a RWMutex is an unlocked mutex.</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>// A RWMutex must not be copied after first use.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// If any goroutine calls Lock while the lock is already held by</code></span>
+<span class="codeline" id="line-23"><code>// one or more readers, concurrent calls to RLock will block until</code></span>
+<span class="codeline" id="line-24"><code>// the writer has acquired (and released) the lock, to ensure that</code></span>
+<span class="codeline" id="line-25"><code>// the lock eventually becomes available to the writer.</code></span>
+<span class="codeline" id="line-26"><code>// Note that this prohibits recursive read-locking.</code></span>
+<span class="codeline" id="line-27"><code>//</code></span>
+<span class="codeline" id="line-28"><code>// In the terminology of the Go memory model,</code></span>
+<span class="codeline" id="line-29"><code>// the n'th call to Unlock “synchronizes before” the m'th call to Lock</code></span>
+<span class="codeline" id="line-30"><code>// for any n &lt; m, just as for Mutex.</code></span>
+<span class="codeline" id="line-31"><code>// For any call to RLock, there exists an n such that</code></span>
+<span class="codeline" id="line-32"><code>// the n'th call to Unlock “synchronizes before” that call to RLock,</code></span>
+<span class="codeline" id="line-33"><code>// and the corresponding call to RUnlock “synchronizes before”</code></span>
+<span class="codeline" id="line-34"><code>// the n+1'th call to Lock.</code></span>
+<span class="codeline" id="line-35"><code>type RWMutex struct {</code></span>
+<span class="codeline" id="line-36"><code>	w           Mutex        // held if there are pending writers</code></span>
+<span class="codeline" id="line-37"><code>	writerSem   uint32       // semaphore for writers to wait for completing readers</code></span>
+<span class="codeline" id="line-38"><code>	readerSem   uint32       // semaphore for readers to wait for completing writers</code></span>
+<span class="codeline" id="line-39"><code>	readerCount atomic.Int32 // number of pending readers</code></span>
+<span class="codeline" id="line-40"><code>	readerWait  atomic.Int32 // number of departing readers</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>const rwmutexMaxReaders = 1 &lt;&lt; 30</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>// Happens-before relationships are indicated to the race detector via:</code></span>
+<span class="codeline" id="line-46"><code>// - Unlock  -&gt; Lock:  readerSem</code></span>
+<span class="codeline" id="line-47"><code>// - Unlock  -&gt; RLock: readerSem</code></span>
+<span class="codeline" id="line-48"><code>// - RUnlock -&gt; Lock:  writerSem</code></span>
+<span class="codeline" id="line-49"><code>//</code></span>
+<span class="codeline" id="line-50"><code>// The methods below temporarily disable handling of race synchronization</code></span>
+<span class="codeline" id="line-51"><code>// events in order to provide the more precise model above to the race</code></span>
+<span class="codeline" id="line-52"><code>// detector.</code></span>
+<span class="codeline" id="line-53"><code>//</code></span>
+<span class="codeline" id="line-54"><code>// For example, atomic.AddInt32 in RLock should not appear to provide</code></span>
+<span class="codeline" id="line-55"><code>// acquire-release semantics, which would incorrectly synchronize racing</code></span>
+<span class="codeline" id="line-56"><code>// readers, thus potentially missing races.</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// RLock locks rw for reading.</code></span>
+<span class="codeline" id="line-59"><code>//</code></span>
+<span class="codeline" id="line-60"><code>// It should not be used for recursive read locking; a blocked Lock</code></span>
+<span class="codeline" id="line-61"><code>// call excludes new readers from acquiring the lock. See the</code></span>
+<span class="codeline" id="line-62"><code>// documentation on the RWMutex type.</code></span>
+<span class="codeline" id="line-63"><code>func (rw *RWMutex) RLock() {</code></span>
+<span class="codeline" id="line-64"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-65"><code>		_ = rw.w.state</code></span>
+<span class="codeline" id="line-66"><code>		race.Disable()</code></span>
+<span class="codeline" id="line-67"><code>	}</code></span>
+<span class="codeline" id="line-68"><code>	if rw.readerCount.Add(1) &lt; 0 {</code></span>
+<span class="codeline" id="line-69"><code>		// A writer is pending, wait for it.</code></span>
+<span class="codeline" id="line-70"><code>		runtime_SemacquireRWMutexR(&amp;rw.readerSem, false, 0)</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-73"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-74"><code>		race.Acquire(unsafe.Pointer(&amp;rw.readerSem))</code></span>
+<span class="codeline" id="line-75"><code>	}</code></span>
+<span class="codeline" id="line-76"><code>}</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>// TryRLock tries to lock rw for reading and reports whether it succeeded.</code></span>
+<span class="codeline" id="line-79"><code>//</code></span>
+<span class="codeline" id="line-80"><code>// Note that while correct uses of TryRLock do exist, they are rare,</code></span>
+<span class="codeline" id="line-81"><code>// and use of TryRLock is often a sign of a deeper problem</code></span>
+<span class="codeline" id="line-82"><code>// in a particular use of mutexes.</code></span>
+<span class="codeline" id="line-83"><code>func (rw *RWMutex) TryRLock() bool {</code></span>
+<span class="codeline" id="line-84"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-85"><code>		_ = rw.w.state</code></span>
+<span class="codeline" id="line-86"><code>		race.Disable()</code></span>
+<span class="codeline" id="line-87"><code>	}</code></span>
+<span class="codeline" id="line-88"><code>	for {</code></span>
+<span class="codeline" id="line-89"><code>		c := rw.readerCount.Load()</code></span>
+<span class="codeline" id="line-90"><code>		if c &lt; 0 {</code></span>
+<span class="codeline" id="line-91"><code>			if race.Enabled {</code></span>
+<span class="codeline" id="line-92"><code>				race.Enable()</code></span>
+<span class="codeline" id="line-93"><code>			}</code></span>
+<span class="codeline" id="line-94"><code>			return false</code></span>
+<span class="codeline" id="line-95"><code>		}</code></span>
+<span class="codeline" id="line-96"><code>		if rw.readerCount.CompareAndSwap(c, c+1) {</code></span>
+<span class="codeline" id="line-97"><code>			if race.Enabled {</code></span>
+<span class="codeline" id="line-98"><code>				race.Enable()</code></span>
+<span class="codeline" id="line-99"><code>				race.Acquire(unsafe.Pointer(&amp;rw.readerSem))</code></span>
+<span class="codeline" id="line-100"><code>			}</code></span>
+<span class="codeline" id="line-101"><code>			return true</code></span>
+<span class="codeline" id="line-102"><code>		}</code></span>
+<span class="codeline" id="line-103"><code>	}</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>// RUnlock undoes a single RLock call;</code></span>
+<span class="codeline" id="line-107"><code>// it does not affect other simultaneous readers.</code></span>
+<span class="codeline" id="line-108"><code>// It is a run-time error if rw is not locked for reading</code></span>
+<span class="codeline" id="line-109"><code>// on entry to RUnlock.</code></span>
+<span class="codeline" id="line-110"><code>func (rw *RWMutex) RUnlock() {</code></span>
+<span class="codeline" id="line-111"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-112"><code>		_ = rw.w.state</code></span>
+<span class="codeline" id="line-113"><code>		race.ReleaseMerge(unsafe.Pointer(&amp;rw.writerSem))</code></span>
+<span class="codeline" id="line-114"><code>		race.Disable()</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	if r := rw.readerCount.Add(-1); r &lt; 0 {</code></span>
+<span class="codeline" id="line-117"><code>		// Outlined slow-path to allow the fast-path to be inlined</code></span>
+<span class="codeline" id="line-118"><code>		rw.rUnlockSlow(r)</code></span>
+<span class="codeline" id="line-119"><code>	}</code></span>
+<span class="codeline" id="line-120"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-121"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-122"><code>	}</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>func (rw *RWMutex) rUnlockSlow(r int32) {</code></span>
+<span class="codeline" id="line-126"><code>	if r+1 == 0 || r+1 == -rwmutexMaxReaders {</code></span>
+<span class="codeline" id="line-127"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-128"><code>		fatal("sync: RUnlock of unlocked RWMutex")</code></span>
+<span class="codeline" id="line-129"><code>	}</code></span>
+<span class="codeline" id="line-130"><code>	// A writer is pending.</code></span>
+<span class="codeline" id="line-131"><code>	if rw.readerWait.Add(-1) == 0 {</code></span>
+<span class="codeline" id="line-132"><code>		// The last reader unblocks the writer.</code></span>
+<span class="codeline" id="line-133"><code>		runtime_Semrelease(&amp;rw.writerSem, false, 1)</code></span>
+<span class="codeline" id="line-134"><code>	}</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>// Lock locks rw for writing.</code></span>
+<span class="codeline" id="line-138"><code>// If the lock is already locked for reading or writing,</code></span>
+<span class="codeline" id="line-139"><code>// Lock blocks until the lock is available.</code></span>
+<span class="codeline" id="line-140"><code>func (rw *RWMutex) Lock() {</code></span>
+<span class="codeline" id="line-141"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-142"><code>		_ = rw.w.state</code></span>
+<span class="codeline" id="line-143"><code>		race.Disable()</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code>	// First, resolve competition with other writers.</code></span>
+<span class="codeline" id="line-146"><code>	rw.w.Lock()</code></span>
+<span class="codeline" id="line-147"><code>	// Announce to readers there is a pending writer.</code></span>
+<span class="codeline" id="line-148"><code>	r := rw.readerCount.Add(-rwmutexMaxReaders) + rwmutexMaxReaders</code></span>
+<span class="codeline" id="line-149"><code>	// Wait for active readers.</code></span>
+<span class="codeline" id="line-150"><code>	if r != 0 &amp;&amp; rw.readerWait.Add(r) != 0 {</code></span>
+<span class="codeline" id="line-151"><code>		runtime_SemacquireRWMutex(&amp;rw.writerSem, false, 0)</code></span>
+<span class="codeline" id="line-152"><code>	}</code></span>
+<span class="codeline" id="line-153"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-154"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-155"><code>		race.Acquire(unsafe.Pointer(&amp;rw.readerSem))</code></span>
+<span class="codeline" id="line-156"><code>		race.Acquire(unsafe.Pointer(&amp;rw.writerSem))</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>// TryLock tries to lock rw for writing and reports whether it succeeded.</code></span>
+<span class="codeline" id="line-161"><code>//</code></span>
+<span class="codeline" id="line-162"><code>// Note that while correct uses of TryLock do exist, they are rare,</code></span>
+<span class="codeline" id="line-163"><code>// and use of TryLock is often a sign of a deeper problem</code></span>
+<span class="codeline" id="line-164"><code>// in a particular use of mutexes.</code></span>
+<span class="codeline" id="line-165"><code>func (rw *RWMutex) TryLock() bool {</code></span>
+<span class="codeline" id="line-166"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-167"><code>		_ = rw.w.state</code></span>
+<span class="codeline" id="line-168"><code>		race.Disable()</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code>	if !rw.w.TryLock() {</code></span>
+<span class="codeline" id="line-171"><code>		if race.Enabled {</code></span>
+<span class="codeline" id="line-172"><code>			race.Enable()</code></span>
+<span class="codeline" id="line-173"><code>		}</code></span>
+<span class="codeline" id="line-174"><code>		return false</code></span>
+<span class="codeline" id="line-175"><code>	}</code></span>
+<span class="codeline" id="line-176"><code>	if !rw.readerCount.CompareAndSwap(0, -rwmutexMaxReaders) {</code></span>
+<span class="codeline" id="line-177"><code>		rw.w.Unlock()</code></span>
+<span class="codeline" id="line-178"><code>		if race.Enabled {</code></span>
+<span class="codeline" id="line-179"><code>			race.Enable()</code></span>
+<span class="codeline" id="line-180"><code>		}</code></span>
+<span class="codeline" id="line-181"><code>		return false</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-184"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-185"><code>		race.Acquire(unsafe.Pointer(&amp;rw.readerSem))</code></span>
+<span class="codeline" id="line-186"><code>		race.Acquire(unsafe.Pointer(&amp;rw.writerSem))</code></span>
+<span class="codeline" id="line-187"><code>	}</code></span>
+<span class="codeline" id="line-188"><code>	return true</code></span>
+<span class="codeline" id="line-189"><code>}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>// Unlock unlocks rw for writing. It is a run-time error if rw is</code></span>
+<span class="codeline" id="line-192"><code>// not locked for writing on entry to Unlock.</code></span>
+<span class="codeline" id="line-193"><code>//</code></span>
+<span class="codeline" id="line-194"><code>// As with Mutexes, a locked RWMutex is not associated with a particular</code></span>
+<span class="codeline" id="line-195"><code>// goroutine. One goroutine may RLock (Lock) a RWMutex and then</code></span>
+<span class="codeline" id="line-196"><code>// arrange for another goroutine to RUnlock (Unlock) it.</code></span>
+<span class="codeline" id="line-197"><code>func (rw *RWMutex) Unlock() {</code></span>
+<span class="codeline" id="line-198"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-199"><code>		_ = rw.w.state</code></span>
+<span class="codeline" id="line-200"><code>		race.Release(unsafe.Pointer(&amp;rw.readerSem))</code></span>
+<span class="codeline" id="line-201"><code>		race.Disable()</code></span>
+<span class="codeline" id="line-202"><code>	}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>	// Announce to readers there is no active writer.</code></span>
+<span class="codeline" id="line-205"><code>	r := rw.readerCount.Add(rwmutexMaxReaders)</code></span>
+<span class="codeline" id="line-206"><code>	if r &gt;= rwmutexMaxReaders {</code></span>
+<span class="codeline" id="line-207"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-208"><code>		fatal("sync: Unlock of unlocked RWMutex")</code></span>
+<span class="codeline" id="line-209"><code>	}</code></span>
+<span class="codeline" id="line-210"><code>	// Unblock blocked readers, if any.</code></span>
+<span class="codeline" id="line-211"><code>	for i := 0; i &lt; int(r); i++ {</code></span>
+<span class="codeline" id="line-212"><code>		runtime_Semrelease(&amp;rw.readerSem, false, 0)</code></span>
+<span class="codeline" id="line-213"><code>	}</code></span>
+<span class="codeline" id="line-214"><code>	// Allow other writers to proceed.</code></span>
+<span class="codeline" id="line-215"><code>	rw.w.Unlock()</code></span>
+<span class="codeline" id="line-216"><code>	if race.Enabled {</code></span>
+<span class="codeline" id="line-217"><code>		race.Enable()</code></span>
+<span class="codeline" id="line-218"><code>	}</code></span>
+<span class="codeline" id="line-219"><code>}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>// syscall_hasWaitingReaders reports whether any goroutine is waiting</code></span>
+<span class="codeline" id="line-222"><code>// to acquire a read lock on rw. This exists because syscall.ForkLock</code></span>
+<span class="codeline" id="line-223"><code>// is an RWMutex, and we can't change that without breaking compatibility.</code></span>
+<span class="codeline" id="line-224"><code>// We don't need or want RWMutex semantics for ForkLock, and we use</code></span>
+<span class="codeline" id="line-225"><code>// this private API to avoid having to change the type of ForkLock.</code></span>
+<span class="codeline" id="line-226"><code>// For more details see the syscall package.</code></span>
+<span class="codeline" id="line-227"><code>//</code></span>
+<span class="codeline" id="line-228"><code>//go:linkname syscall_hasWaitingReaders syscall.hasWaitingReaders</code></span>
+<span class="codeline" id="line-229"><code>func syscall_hasWaitingReaders(rw *RWMutex) bool {</code></span>
+<span class="codeline" id="line-230"><code>	r := rw.readerCount.Load()</code></span>
+<span class="codeline" id="line-231"><code>	return r &lt; 0 &amp;&amp; r+rwmutexMaxReaders &gt; 0</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>// RLocker returns a Locker interface that implements</code></span>
+<span class="codeline" id="line-235"><code>// the Lock and Unlock methods by calling rw.RLock and rw.RUnlock.</code></span>
+<span class="codeline" id="line-236"><code>func (rw *RWMutex) RLocker() Locker {</code></span>
+<span class="codeline" id="line-237"><code>	return (*rlocker)(rw)</code></span>
+<span class="codeline" id="line-238"><code>}</code></span>
+<span class="codeline" id="line-239"><code></code></span>
+<span class="codeline" id="line-240"><code>type rlocker RWMutex</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>func (r *rlocker) Lock()   { (*RWMutex)(r).RLock() }</code></span>
+<span class="codeline" id="line-243"><code>func (r *rlocker) Unlock() { (*RWMutex)(r).RUnlock() }</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

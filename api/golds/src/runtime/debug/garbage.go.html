@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: garbage.go in package runtime/debug</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	garbage.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/runtime/debug.html">runtime/debug</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2013 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package debug</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"runtime"</code></span>
+<span class="codeline" id="line-9"><code>	"sort"</code></span>
+<span class="codeline" id="line-10"><code>	"time"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// GCStats collect information about recent garbage collections.</code></span>
+<span class="codeline" id="line-14"><code>type GCStats struct {</code></span>
+<span class="codeline" id="line-15"><code>	LastGC         time.Time       // time of last collection</code></span>
+<span class="codeline" id="line-16"><code>	NumGC          int64           // number of garbage collections</code></span>
+<span class="codeline" id="line-17"><code>	PauseTotal     time.Duration   // total pause for all collections</code></span>
+<span class="codeline" id="line-18"><code>	Pause          []time.Duration // pause history, most recent first</code></span>
+<span class="codeline" id="line-19"><code>	PauseEnd       []time.Time     // pause end times history, most recent first</code></span>
+<span class="codeline" id="line-20"><code>	PauseQuantiles []time.Duration</code></span>
+<span class="codeline" id="line-21"><code>}</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>// ReadGCStats reads statistics about garbage collection into stats.</code></span>
+<span class="codeline" id="line-24"><code>// The number of entries in the pause history is system-dependent;</code></span>
+<span class="codeline" id="line-25"><code>// stats.Pause slice will be reused if large enough, reallocated otherwise.</code></span>
+<span class="codeline" id="line-26"><code>// ReadGCStats may use the full capacity of the stats.Pause slice.</code></span>
+<span class="codeline" id="line-27"><code>// If stats.PauseQuantiles is non-empty, ReadGCStats fills it with quantiles</code></span>
+<span class="codeline" id="line-28"><code>// summarizing the distribution of pause time. For example, if</code></span>
+<span class="codeline" id="line-29"><code>// len(stats.PauseQuantiles) is 5, it will be filled with the minimum,</code></span>
+<span class="codeline" id="line-30"><code>// 25%, 50%, 75%, and maximum pause times.</code></span>
+<span class="codeline" id="line-31"><code>func ReadGCStats(stats *GCStats) {</code></span>
+<span class="codeline" id="line-32"><code>	// Create a buffer with space for at least two copies of the</code></span>
+<span class="codeline" id="line-33"><code>	// pause history tracked by the runtime. One will be returned</code></span>
+<span class="codeline" id="line-34"><code>	// to the caller and the other will be used as transfer buffer</code></span>
+<span class="codeline" id="line-35"><code>	// for end times history and as a temporary buffer for</code></span>
+<span class="codeline" id="line-36"><code>	// computing quantiles.</code></span>
+<span class="codeline" id="line-37"><code>	const maxPause = len(((*runtime.MemStats)(nil)).PauseNs)</code></span>
+<span class="codeline" id="line-38"><code>	if cap(stats.Pause) &lt; 2*maxPause+3 {</code></span>
+<span class="codeline" id="line-39"><code>		stats.Pause = make([]time.Duration, 2*maxPause+3)</code></span>
+<span class="codeline" id="line-40"><code>	}</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>	// readGCStats fills in the pause and end times histories (up to</code></span>
+<span class="codeline" id="line-43"><code>	// maxPause entries) and then three more: Unix ns time of last GC,</code></span>
+<span class="codeline" id="line-44"><code>	// number of GC, and total pause time in nanoseconds. Here we</code></span>
+<span class="codeline" id="line-45"><code>	// depend on the fact that time.Duration's native unit is</code></span>
+<span class="codeline" id="line-46"><code>	// nanoseconds, so the pauses and the total pause time do not need</code></span>
+<span class="codeline" id="line-47"><code>	// any conversion.</code></span>
+<span class="codeline" id="line-48"><code>	readGCStats(&amp;stats.Pause)</code></span>
+<span class="codeline" id="line-49"><code>	n := len(stats.Pause) - 3</code></span>
+<span class="codeline" id="line-50"><code>	stats.LastGC = time.Unix(0, int64(stats.Pause[n]))</code></span>
+<span class="codeline" id="line-51"><code>	stats.NumGC = int64(stats.Pause[n+1])</code></span>
+<span class="codeline" id="line-52"><code>	stats.PauseTotal = stats.Pause[n+2]</code></span>
+<span class="codeline" id="line-53"><code>	n /= 2 // buffer holds pauses and end times</code></span>
+<span class="codeline" id="line-54"><code>	stats.Pause = stats.Pause[:n]</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>	if cap(stats.PauseEnd) &lt; maxPause {</code></span>
+<span class="codeline" id="line-57"><code>		stats.PauseEnd = make([]time.Time, 0, maxPause)</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code>	stats.PauseEnd = stats.PauseEnd[:0]</code></span>
+<span class="codeline" id="line-60"><code>	for _, ns := range stats.Pause[n : n+n] {</code></span>
+<span class="codeline" id="line-61"><code>		stats.PauseEnd = append(stats.PauseEnd, time.Unix(0, int64(ns)))</code></span>
+<span class="codeline" id="line-62"><code>	}</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>	if len(stats.PauseQuantiles) &gt; 0 {</code></span>
+<span class="codeline" id="line-65"><code>		if n == 0 {</code></span>
+<span class="codeline" id="line-66"><code>			for i := range stats.PauseQuantiles {</code></span>
+<span class="codeline" id="line-67"><code>				stats.PauseQuantiles[i] = 0</code></span>
+<span class="codeline" id="line-68"><code>			}</code></span>
+<span class="codeline" id="line-69"><code>		} else {</code></span>
+<span class="codeline" id="line-70"><code>			// There's room for a second copy of the data in stats.Pause.</code></span>
+<span class="codeline" id="line-71"><code>			// See the allocation at the top of the function.</code></span>
+<span class="codeline" id="line-72"><code>			sorted := stats.Pause[n : n+n]</code></span>
+<span class="codeline" id="line-73"><code>			copy(sorted, stats.Pause)</code></span>
+<span class="codeline" id="line-74"><code>			sort.Slice(sorted, func(i, j int) bool { return sorted[i] &lt; sorted[j] })</code></span>
+<span class="codeline" id="line-75"><code>			nq := len(stats.PauseQuantiles) - 1</code></span>
+<span class="codeline" id="line-76"><code>			for i := 0; i &lt; nq; i++ {</code></span>
+<span class="codeline" id="line-77"><code>				stats.PauseQuantiles[i] = sorted[len(sorted)*i/nq]</code></span>
+<span class="codeline" id="line-78"><code>			}</code></span>
+<span class="codeline" id="line-79"><code>			stats.PauseQuantiles[nq] = sorted[len(sorted)-1]</code></span>
+<span class="codeline" id="line-80"><code>		}</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// SetGCPercent sets the garbage collection target percentage:</code></span>
+<span class="codeline" id="line-85"><code>// a collection is triggered when the ratio of freshly allocated data</code></span>
+<span class="codeline" id="line-86"><code>// to live data remaining after the previous collection reaches this percentage.</code></span>
+<span class="codeline" id="line-87"><code>// SetGCPercent returns the previous setting.</code></span>
+<span class="codeline" id="line-88"><code>// The initial setting is the value of the GOGC environment variable</code></span>
+<span class="codeline" id="line-89"><code>// at startup, or 100 if the variable is not set.</code></span>
+<span class="codeline" id="line-90"><code>// This setting may be effectively reduced in order to maintain a memory</code></span>
+<span class="codeline" id="line-91"><code>// limit.</code></span>
+<span class="codeline" id="line-92"><code>// A negative percentage effectively disables garbage collection, unless</code></span>
+<span class="codeline" id="line-93"><code>// the memory limit is reached.</code></span>
+<span class="codeline" id="line-94"><code>// See SetMemoryLimit for more details.</code></span>
+<span class="codeline" id="line-95"><code>func SetGCPercent(percent int) int {</code></span>
+<span class="codeline" id="line-96"><code>	return int(setGCPercent(int32(percent)))</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>// FreeOSMemory forces a garbage collection followed by an</code></span>
+<span class="codeline" id="line-100"><code>// attempt to return as much memory to the operating system</code></span>
+<span class="codeline" id="line-101"><code>// as possible. (Even if this is not called, the runtime gradually</code></span>
+<span class="codeline" id="line-102"><code>// returns memory to the operating system in a background task.)</code></span>
+<span class="codeline" id="line-103"><code>func FreeOSMemory() {</code></span>
+<span class="codeline" id="line-104"><code>	freeOSMemory()</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// SetMaxStack sets the maximum amount of memory that</code></span>
+<span class="codeline" id="line-108"><code>// can be used by a single goroutine stack.</code></span>
+<span class="codeline" id="line-109"><code>// If any goroutine exceeds this limit while growing its stack,</code></span>
+<span class="codeline" id="line-110"><code>// the program crashes.</code></span>
+<span class="codeline" id="line-111"><code>// SetMaxStack returns the previous setting.</code></span>
+<span class="codeline" id="line-112"><code>// The initial setting is 1 GB on 64-bit systems, 250 MB on 32-bit systems.</code></span>
+<span class="codeline" id="line-113"><code>// There may be a system-imposed maximum stack limit regardless</code></span>
+<span class="codeline" id="line-114"><code>// of the value provided to SetMaxStack.</code></span>
+<span class="codeline" id="line-115"><code>//</code></span>
+<span class="codeline" id="line-116"><code>// SetMaxStack is useful mainly for limiting the damage done by</code></span>
+<span class="codeline" id="line-117"><code>// goroutines that enter an infinite recursion. It only limits future</code></span>
+<span class="codeline" id="line-118"><code>// stack growth.</code></span>
+<span class="codeline" id="line-119"><code>func SetMaxStack(bytes int) int {</code></span>
+<span class="codeline" id="line-120"><code>	return setMaxStack(bytes)</code></span>
+<span class="codeline" id="line-121"><code>}</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>// SetMaxThreads sets the maximum number of operating system</code></span>
+<span class="codeline" id="line-124"><code>// threads that the Go program can use. If it attempts to use more than</code></span>
+<span class="codeline" id="line-125"><code>// this many, the program crashes.</code></span>
+<span class="codeline" id="line-126"><code>// SetMaxThreads returns the previous setting.</code></span>
+<span class="codeline" id="line-127"><code>// The initial setting is 10,000 threads.</code></span>
+<span class="codeline" id="line-128"><code>//</code></span>
+<span class="codeline" id="line-129"><code>// The limit controls the number of operating system threads, not the number</code></span>
+<span class="codeline" id="line-130"><code>// of goroutines. A Go program creates a new thread only when a goroutine</code></span>
+<span class="codeline" id="line-131"><code>// is ready to run but all the existing threads are blocked in system calls, cgo calls,</code></span>
+<span class="codeline" id="line-132"><code>// or are locked to other goroutines due to use of runtime.LockOSThread.</code></span>
+<span class="codeline" id="line-133"><code>//</code></span>
+<span class="codeline" id="line-134"><code>// SetMaxThreads is useful mainly for limiting the damage done by</code></span>
+<span class="codeline" id="line-135"><code>// programs that create an unbounded number of threads. The idea is</code></span>
+<span class="codeline" id="line-136"><code>// to take down the program before it takes down the operating system.</code></span>
+<span class="codeline" id="line-137"><code>func SetMaxThreads(threads int) int {</code></span>
+<span class="codeline" id="line-138"><code>	return setMaxThreads(threads)</code></span>
+<span class="codeline" id="line-139"><code>}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>// SetPanicOnFault controls the runtime's behavior when a program faults</code></span>
+<span class="codeline" id="line-142"><code>// at an unexpected (non-nil) address. Such faults are typically caused by</code></span>
+<span class="codeline" id="line-143"><code>// bugs such as runtime memory corruption, so the default response is to crash</code></span>
+<span class="codeline" id="line-144"><code>// the program. Programs working with memory-mapped files or unsafe</code></span>
+<span class="codeline" id="line-145"><code>// manipulation of memory may cause faults at non-nil addresses in less</code></span>
+<span class="codeline" id="line-146"><code>// dramatic situations; SetPanicOnFault allows such programs to request</code></span>
+<span class="codeline" id="line-147"><code>// that the runtime trigger only a panic, not a crash.</code></span>
+<span class="codeline" id="line-148"><code>// The runtime.Error that the runtime panics with may have an additional method:</code></span>
+<span class="codeline" id="line-149"><code>//</code></span>
+<span class="codeline" id="line-150"><code>//	Addr() uintptr</code></span>
+<span class="codeline" id="line-151"><code>//</code></span>
+<span class="codeline" id="line-152"><code>// If that method exists, it returns the memory address which triggered the fault.</code></span>
+<span class="codeline" id="line-153"><code>// The results of Addr are best-effort and the veracity of the result</code></span>
+<span class="codeline" id="line-154"><code>// may depend on the platform.</code></span>
+<span class="codeline" id="line-155"><code>// SetPanicOnFault applies only to the current goroutine.</code></span>
+<span class="codeline" id="line-156"><code>// It returns the previous setting.</code></span>
+<span class="codeline" id="line-157"><code>func SetPanicOnFault(enabled bool) bool {</code></span>
+<span class="codeline" id="line-158"><code>	return setPanicOnFault(enabled)</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>// WriteHeapDump writes a description of the heap and the objects in</code></span>
+<span class="codeline" id="line-162"><code>// it to the given file descriptor.</code></span>
+<span class="codeline" id="line-163"><code>//</code></span>
+<span class="codeline" id="line-164"><code>// WriteHeapDump suspends the execution of all goroutines until the heap</code></span>
+<span class="codeline" id="line-165"><code>// dump is completely written.  Thus, the file descriptor must not be</code></span>
+<span class="codeline" id="line-166"><code>// connected to a pipe or socket whose other end is in the same Go</code></span>
+<span class="codeline" id="line-167"><code>// process; instead, use a temporary file or network socket.</code></span>
+<span class="codeline" id="line-168"><code>//</code></span>
+<span class="codeline" id="line-169"><code>// The heap dump format is defined at https://golang.org/s/go15heapdump.</code></span>
+<span class="codeline" id="line-170"><code>func WriteHeapDump(fd uintptr)</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>// SetTraceback sets the amount of detail printed by the runtime in</code></span>
+<span class="codeline" id="line-173"><code>// the traceback it prints before exiting due to an unrecovered panic</code></span>
+<span class="codeline" id="line-174"><code>// or an internal runtime error.</code></span>
+<span class="codeline" id="line-175"><code>// The level argument takes the same values as the GOTRACEBACK</code></span>
+<span class="codeline" id="line-176"><code>// environment variable. For example, SetTraceback("all") ensure</code></span>
+<span class="codeline" id="line-177"><code>// that the program prints all goroutines when it crashes.</code></span>
+<span class="codeline" id="line-178"><code>// See the package runtime documentation for details.</code></span>
+<span class="codeline" id="line-179"><code>// If SetTraceback is called with a level lower than that of the</code></span>
+<span class="codeline" id="line-180"><code>// environment variable, the call is ignored.</code></span>
+<span class="codeline" id="line-181"><code>func SetTraceback(level string)</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>// SetMemoryLimit provides the runtime with a soft memory limit.</code></span>
+<span class="codeline" id="line-184"><code>//</code></span>
+<span class="codeline" id="line-185"><code>// The runtime undertakes several processes to try to respect this</code></span>
+<span class="codeline" id="line-186"><code>// memory limit, including adjustments to the frequency of garbage</code></span>
+<span class="codeline" id="line-187"><code>// collections and returning memory to the underlying system more</code></span>
+<span class="codeline" id="line-188"><code>// aggressively. This limit will be respected even if GOGC=off (or,</code></span>
+<span class="codeline" id="line-189"><code>// if SetGCPercent(-1) is executed).</code></span>
+<span class="codeline" id="line-190"><code>//</code></span>
+<span class="codeline" id="line-191"><code>// The input limit is provided as bytes, and includes all memory</code></span>
+<span class="codeline" id="line-192"><code>// mapped, managed, and not released by the Go runtime. Notably, it</code></span>
+<span class="codeline" id="line-193"><code>// does not account for space used by the Go binary and memory</code></span>
+<span class="codeline" id="line-194"><code>// external to Go, such as memory managed by the underlying system</code></span>
+<span class="codeline" id="line-195"><code>// on behalf of the process, or memory managed by non-Go code inside</code></span>
+<span class="codeline" id="line-196"><code>// the same process. Examples of excluded memory sources include: OS</code></span>
+<span class="codeline" id="line-197"><code>// kernel memory held on behalf of the process, memory allocated by</code></span>
+<span class="codeline" id="line-198"><code>// C code, and memory mapped by syscall.Mmap (because it is not</code></span>
+<span class="codeline" id="line-199"><code>// managed by the Go runtime).</code></span>
+<span class="codeline" id="line-200"><code>//</code></span>
+<span class="codeline" id="line-201"><code>// More specifically, the following expression accurately reflects</code></span>
+<span class="codeline" id="line-202"><code>// the value the runtime attempts to maintain as the limit:</code></span>
+<span class="codeline" id="line-203"><code>//</code></span>
+<span class="codeline" id="line-204"><code>//	runtime.MemStats.Sys - runtime.MemStats.HeapReleased</code></span>
+<span class="codeline" id="line-205"><code>//</code></span>
+<span class="codeline" id="line-206"><code>// or in terms of the runtime/metrics package:</code></span>
+<span class="codeline" id="line-207"><code>//</code></span>
+<span class="codeline" id="line-208"><code>//	/memory/classes/total:bytes - /memory/classes/heap/released:bytes</code></span>
+<span class="codeline" id="line-209"><code>//</code></span>
+<span class="codeline" id="line-210"><code>// A zero limit or a limit that's lower than the amount of memory</code></span>
+<span class="codeline" id="line-211"><code>// used by the Go runtime may cause the garbage collector to run</code></span>
+<span class="codeline" id="line-212"><code>// nearly continuously. However, the application may still make</code></span>
+<span class="codeline" id="line-213"><code>// progress.</code></span>
+<span class="codeline" id="line-214"><code>//</code></span>
+<span class="codeline" id="line-215"><code>// The memory limit is always respected by the Go runtime, so to</code></span>
+<span class="codeline" id="line-216"><code>// effectively disable this behavior, set the limit very high.</code></span>
+<span class="codeline" id="line-217"><code>// [math.MaxInt64] is the canonical value for disabling the limit,</code></span>
+<span class="codeline" id="line-218"><code>// but values much greater than the available memory on the underlying</code></span>
+<span class="codeline" id="line-219"><code>// system work just as well.</code></span>
+<span class="codeline" id="line-220"><code>//</code></span>
+<span class="codeline" id="line-221"><code>// See https://go.dev/doc/gc-guide for a detailed guide explaining</code></span>
+<span class="codeline" id="line-222"><code>// the soft memory limit in more detail, as well as a variety of common</code></span>
+<span class="codeline" id="line-223"><code>// use-cases and scenarios.</code></span>
+<span class="codeline" id="line-224"><code>//</code></span>
+<span class="codeline" id="line-225"><code>// The initial setting is math.MaxInt64 unless the GOMEMLIMIT</code></span>
+<span class="codeline" id="line-226"><code>// environment variable is set, in which case it provides the initial</code></span>
+<span class="codeline" id="line-227"><code>// setting. GOMEMLIMIT is a numeric value in bytes with an optional</code></span>
+<span class="codeline" id="line-228"><code>// unit suffix. The supported suffixes include B, KiB, MiB, GiB, and</code></span>
+<span class="codeline" id="line-229"><code>// TiB. These suffixes represent quantities of bytes as defined by</code></span>
+<span class="codeline" id="line-230"><code>// the IEC 80000-13 standard. That is, they are based on powers of</code></span>
+<span class="codeline" id="line-231"><code>// two: KiB means 2^10 bytes, MiB means 2^20 bytes, and so on.</code></span>
+<span class="codeline" id="line-232"><code>//</code></span>
+<span class="codeline" id="line-233"><code>// SetMemoryLimit returns the previously set memory limit.</code></span>
+<span class="codeline" id="line-234"><code>// A negative input does not adjust the limit, and allows for</code></span>
+<span class="codeline" id="line-235"><code>// retrieval of the currently set memory limit.</code></span>
+<span class="codeline" id="line-236"><code>func SetMemoryLimit(limit int64) int64 {</code></span>
+<span class="codeline" id="line-237"><code>	return setMemoryLimit(limit)</code></span>
+<span class="codeline" id="line-238"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

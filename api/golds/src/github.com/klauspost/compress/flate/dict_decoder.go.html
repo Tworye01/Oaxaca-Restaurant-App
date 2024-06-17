@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: dict_decoder.go in package github.com/klauspost/compress/flate</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	dict_decoder.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/github.com/klauspost/compress/flate.html">github.com/klauspost/compress/flate</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2016 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package flate</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// dictDecoder implements the LZ77 sliding dictionary as used in decompression.</code></span>
+<span class="codeline" id="line-8"><code>// LZ77 decompresses data through sequences of two forms of commands:</code></span>
+<span class="codeline" id="line-9"><code>//</code></span>
+<span class="codeline" id="line-10"><code>//   - Literal insertions: Runs of one or more symbols are inserted into the data</code></span>
+<span class="codeline" id="line-11"><code>//     stream as is. This is accomplished through the writeByte method for a</code></span>
+<span class="codeline" id="line-12"><code>//     single symbol, or combinations of writeSlice/writeMark for multiple symbols.</code></span>
+<span class="codeline" id="line-13"><code>//     Any valid stream must start with a literal insertion if no preset dictionary</code></span>
+<span class="codeline" id="line-14"><code>//     is used.</code></span>
+<span class="codeline" id="line-15"><code>//</code></span>
+<span class="codeline" id="line-16"><code>//   - Backward copies: Runs of one or more symbols are copied from previously</code></span>
+<span class="codeline" id="line-17"><code>//     emitted data. Backward copies come as the tuple (dist, length) where dist</code></span>
+<span class="codeline" id="line-18"><code>//     determines how far back in the stream to copy from and length determines how</code></span>
+<span class="codeline" id="line-19"><code>//     many bytes to copy. Note that it is valid for the length to be greater than</code></span>
+<span class="codeline" id="line-20"><code>//     the distance. Since LZ77 uses forward copies, that situation is used to</code></span>
+<span class="codeline" id="line-21"><code>//     perform a form of run-length encoding on repeated runs of symbols.</code></span>
+<span class="codeline" id="line-22"><code>//     The writeCopy and tryWriteCopy are used to implement this command.</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>// For performance reasons, this implementation performs little to no sanity</code></span>
+<span class="codeline" id="line-25"><code>// checks about the arguments. As such, the invariants documented for each</code></span>
+<span class="codeline" id="line-26"><code>// method call must be respected.</code></span>
+<span class="codeline" id="line-27"><code>type dictDecoder struct {</code></span>
+<span class="codeline" id="line-28"><code>	hist []byte // Sliding window history</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>	// Invariant: 0 &lt;= rdPos &lt;= wrPos &lt;= len(hist)</code></span>
+<span class="codeline" id="line-31"><code>	wrPos int  // Current output position in buffer</code></span>
+<span class="codeline" id="line-32"><code>	rdPos int  // Have emitted hist[:rdPos] already</code></span>
+<span class="codeline" id="line-33"><code>	full  bool // Has a full window length been written yet?</code></span>
+<span class="codeline" id="line-34"><code>}</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// init initializes dictDecoder to have a sliding window dictionary of the given</code></span>
+<span class="codeline" id="line-37"><code>// size. If a preset dict is provided, it will initialize the dictionary with</code></span>
+<span class="codeline" id="line-38"><code>// the contents of dict.</code></span>
+<span class="codeline" id="line-39"><code>func (dd *dictDecoder) init(size int, dict []byte) {</code></span>
+<span class="codeline" id="line-40"><code>	*dd = dictDecoder{hist: dd.hist}</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>	if cap(dd.hist) &lt; size {</code></span>
+<span class="codeline" id="line-43"><code>		dd.hist = make([]byte, size)</code></span>
+<span class="codeline" id="line-44"><code>	}</code></span>
+<span class="codeline" id="line-45"><code>	dd.hist = dd.hist[:size]</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>	if len(dict) &gt; len(dd.hist) {</code></span>
+<span class="codeline" id="line-48"><code>		dict = dict[len(dict)-len(dd.hist):]</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code>	dd.wrPos = copy(dd.hist, dict)</code></span>
+<span class="codeline" id="line-51"><code>	if dd.wrPos == len(dd.hist) {</code></span>
+<span class="codeline" id="line-52"><code>		dd.wrPos = 0</code></span>
+<span class="codeline" id="line-53"><code>		dd.full = true</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code>	dd.rdPos = dd.wrPos</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// histSize reports the total amount of historical data in the dictionary.</code></span>
+<span class="codeline" id="line-59"><code>func (dd *dictDecoder) histSize() int {</code></span>
+<span class="codeline" id="line-60"><code>	if dd.full {</code></span>
+<span class="codeline" id="line-61"><code>		return len(dd.hist)</code></span>
+<span class="codeline" id="line-62"><code>	}</code></span>
+<span class="codeline" id="line-63"><code>	return dd.wrPos</code></span>
+<span class="codeline" id="line-64"><code>}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>// availRead reports the number of bytes that can be flushed by readFlush.</code></span>
+<span class="codeline" id="line-67"><code>func (dd *dictDecoder) availRead() int {</code></span>
+<span class="codeline" id="line-68"><code>	return dd.wrPos - dd.rdPos</code></span>
+<span class="codeline" id="line-69"><code>}</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>// availWrite reports the available amount of output buffer space.</code></span>
+<span class="codeline" id="line-72"><code>func (dd *dictDecoder) availWrite() int {</code></span>
+<span class="codeline" id="line-73"><code>	return len(dd.hist) - dd.wrPos</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>// writeSlice returns a slice of the available buffer to write data to.</code></span>
+<span class="codeline" id="line-77"><code>//</code></span>
+<span class="codeline" id="line-78"><code>// This invariant will be kept: len(s) &lt;= availWrite()</code></span>
+<span class="codeline" id="line-79"><code>func (dd *dictDecoder) writeSlice() []byte {</code></span>
+<span class="codeline" id="line-80"><code>	return dd.hist[dd.wrPos:]</code></span>
+<span class="codeline" id="line-81"><code>}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>// writeMark advances the writer pointer by cnt.</code></span>
+<span class="codeline" id="line-84"><code>//</code></span>
+<span class="codeline" id="line-85"><code>// This invariant must be kept: 0 &lt;= cnt &lt;= availWrite()</code></span>
+<span class="codeline" id="line-86"><code>func (dd *dictDecoder) writeMark(cnt int) {</code></span>
+<span class="codeline" id="line-87"><code>	dd.wrPos += cnt</code></span>
+<span class="codeline" id="line-88"><code>}</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>// writeByte writes a single byte to the dictionary.</code></span>
+<span class="codeline" id="line-91"><code>//</code></span>
+<span class="codeline" id="line-92"><code>// This invariant must be kept: 0 &lt; availWrite()</code></span>
+<span class="codeline" id="line-93"><code>func (dd *dictDecoder) writeByte(c byte) {</code></span>
+<span class="codeline" id="line-94"><code>	dd.hist[dd.wrPos] = c</code></span>
+<span class="codeline" id="line-95"><code>	dd.wrPos++</code></span>
+<span class="codeline" id="line-96"><code>}</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>// writeCopy copies a string at a given (dist, length) to the output.</code></span>
+<span class="codeline" id="line-99"><code>// This returns the number of bytes copied and may be less than the requested</code></span>
+<span class="codeline" id="line-100"><code>// length if the available space in the output buffer is too small.</code></span>
+<span class="codeline" id="line-101"><code>//</code></span>
+<span class="codeline" id="line-102"><code>// This invariant must be kept: 0 &lt; dist &lt;= histSize()</code></span>
+<span class="codeline" id="line-103"><code>func (dd *dictDecoder) writeCopy(dist, length int) int {</code></span>
+<span class="codeline" id="line-104"><code>	dstBase := dd.wrPos</code></span>
+<span class="codeline" id="line-105"><code>	dstPos := dstBase</code></span>
+<span class="codeline" id="line-106"><code>	srcPos := dstPos - dist</code></span>
+<span class="codeline" id="line-107"><code>	endPos := dstPos + length</code></span>
+<span class="codeline" id="line-108"><code>	if endPos &gt; len(dd.hist) {</code></span>
+<span class="codeline" id="line-109"><code>		endPos = len(dd.hist)</code></span>
+<span class="codeline" id="line-110"><code>	}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	// Copy non-overlapping section after destination position.</code></span>
+<span class="codeline" id="line-113"><code>	//</code></span>
+<span class="codeline" id="line-114"><code>	// This section is non-overlapping in that the copy length for this section</code></span>
+<span class="codeline" id="line-115"><code>	// is always less than or equal to the backwards distance. This can occur</code></span>
+<span class="codeline" id="line-116"><code>	// if a distance refers to data that wraps-around in the buffer.</code></span>
+<span class="codeline" id="line-117"><code>	// Thus, a backwards copy is performed here; that is, the exact bytes in</code></span>
+<span class="codeline" id="line-118"><code>	// the source prior to the copy is placed in the destination.</code></span>
+<span class="codeline" id="line-119"><code>	if srcPos &lt; 0 {</code></span>
+<span class="codeline" id="line-120"><code>		srcPos += len(dd.hist)</code></span>
+<span class="codeline" id="line-121"><code>		dstPos += copy(dd.hist[dstPos:endPos], dd.hist[srcPos:])</code></span>
+<span class="codeline" id="line-122"><code>		srcPos = 0</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>	// Copy possibly overlapping section before destination position.</code></span>
+<span class="codeline" id="line-126"><code>	//</code></span>
+<span class="codeline" id="line-127"><code>	// This section can overlap if the copy length for this section is larger</code></span>
+<span class="codeline" id="line-128"><code>	// than the backwards distance. This is allowed by LZ77 so that repeated</code></span>
+<span class="codeline" id="line-129"><code>	// strings can be succinctly represented using (dist, length) pairs.</code></span>
+<span class="codeline" id="line-130"><code>	// Thus, a forwards copy is performed here; that is, the bytes copied is</code></span>
+<span class="codeline" id="line-131"><code>	// possibly dependent on the resulting bytes in the destination as the copy</code></span>
+<span class="codeline" id="line-132"><code>	// progresses along. This is functionally equivalent to the following:</code></span>
+<span class="codeline" id="line-133"><code>	//</code></span>
+<span class="codeline" id="line-134"><code>	//	for i := 0; i &lt; endPos-dstPos; i++ {</code></span>
+<span class="codeline" id="line-135"><code>	//		dd.hist[dstPos+i] = dd.hist[srcPos+i]</code></span>
+<span class="codeline" id="line-136"><code>	//	}</code></span>
+<span class="codeline" id="line-137"><code>	//	dstPos = endPos</code></span>
+<span class="codeline" id="line-138"><code>	//</code></span>
+<span class="codeline" id="line-139"><code>	for dstPos &lt; endPos {</code></span>
+<span class="codeline" id="line-140"><code>		dstPos += copy(dd.hist[dstPos:endPos], dd.hist[srcPos:dstPos])</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>	dd.wrPos = dstPos</code></span>
+<span class="codeline" id="line-144"><code>	return dstPos - dstBase</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>// tryWriteCopy tries to copy a string at a given (distance, length) to the</code></span>
+<span class="codeline" id="line-148"><code>// output. This specialized version is optimized for short distances.</code></span>
+<span class="codeline" id="line-149"><code>//</code></span>
+<span class="codeline" id="line-150"><code>// This method is designed to be inlined for performance reasons.</code></span>
+<span class="codeline" id="line-151"><code>//</code></span>
+<span class="codeline" id="line-152"><code>// This invariant must be kept: 0 &lt; dist &lt;= histSize()</code></span>
+<span class="codeline" id="line-153"><code>func (dd *dictDecoder) tryWriteCopy(dist, length int) int {</code></span>
+<span class="codeline" id="line-154"><code>	dstPos := dd.wrPos</code></span>
+<span class="codeline" id="line-155"><code>	endPos := dstPos + length</code></span>
+<span class="codeline" id="line-156"><code>	if dstPos &lt; dist || endPos &gt; len(dd.hist) {</code></span>
+<span class="codeline" id="line-157"><code>		return 0</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>	dstBase := dstPos</code></span>
+<span class="codeline" id="line-160"><code>	srcPos := dstPos - dist</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>	// Copy possibly overlapping section before destination position.</code></span>
+<span class="codeline" id="line-163"><code>loop:</code></span>
+<span class="codeline" id="line-164"><code>	dstPos += copy(dd.hist[dstPos:endPos], dd.hist[srcPos:dstPos])</code></span>
+<span class="codeline" id="line-165"><code>	if dstPos &lt; endPos {</code></span>
+<span class="codeline" id="line-166"><code>		goto loop // Avoid for-loop so that this function can be inlined</code></span>
+<span class="codeline" id="line-167"><code>	}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>	dd.wrPos = dstPos</code></span>
+<span class="codeline" id="line-170"><code>	return dstPos - dstBase</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>// readFlush returns a slice of the historical buffer that is ready to be</code></span>
+<span class="codeline" id="line-174"><code>// emitted to the user. The data returned by readFlush must be fully consumed</code></span>
+<span class="codeline" id="line-175"><code>// before calling any other dictDecoder methods.</code></span>
+<span class="codeline" id="line-176"><code>func (dd *dictDecoder) readFlush() []byte {</code></span>
+<span class="codeline" id="line-177"><code>	toRead := dd.hist[dd.rdPos:dd.wrPos]</code></span>
+<span class="codeline" id="line-178"><code>	dd.rdPos = dd.wrPos</code></span>
+<span class="codeline" id="line-179"><code>	if dd.wrPos == len(dd.hist) {</code></span>
+<span class="codeline" id="line-180"><code>		dd.wrPos, dd.rdPos = 0, 0</code></span>
+<span class="codeline" id="line-181"><code>		dd.full = true</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	return toRead</code></span>
+<span class="codeline" id="line-184"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

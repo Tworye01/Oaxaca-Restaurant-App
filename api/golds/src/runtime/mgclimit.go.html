@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: mgclimit.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	mgclimit.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2022 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import "runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// gcCPULimiter is a mechanism to limit GC CPU utilization in situations</code></span>
+<span class="codeline" id="line-10"><code>// where it might become excessive and inhibit application progress (e.g.</code></span>
+<span class="codeline" id="line-11"><code>// a death spiral).</code></span>
+<span class="codeline" id="line-12"><code>//</code></span>
+<span class="codeline" id="line-13"><code>// The core of the limiter is a leaky bucket mechanism that fills with GC</code></span>
+<span class="codeline" id="line-14"><code>// CPU time and drains with mutator time. Because the bucket fills and</code></span>
+<span class="codeline" id="line-15"><code>// drains with time directly (i.e. without any weighting), this effectively</code></span>
+<span class="codeline" id="line-16"><code>// sets a very conservative limit of 50%. This limit could be enforced directly,</code></span>
+<span class="codeline" id="line-17"><code>// however, but the purpose of the bucket is to accommodate spikes in GC CPU</code></span>
+<span class="codeline" id="line-18"><code>// utilization without hurting throughput.</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>// Note that the bucket in the leaky bucket mechanism can never go negative,</code></span>
+<span class="codeline" id="line-21"><code>// so the GC never gets credit for a lot of CPU time spent without the GC</code></span>
+<span class="codeline" id="line-22"><code>// running. This is intentional, as an application that stays idle for, say,</code></span>
+<span class="codeline" id="line-23"><code>// an entire day, could build up enough credit to fail to prevent a death</code></span>
+<span class="codeline" id="line-24"><code>// spiral the following day. The bucket's capacity is the GC's only leeway.</code></span>
+<span class="codeline" id="line-25"><code>//</code></span>
+<span class="codeline" id="line-26"><code>// The capacity thus also sets the window the limiter considers. For example,</code></span>
+<span class="codeline" id="line-27"><code>// if the capacity of the bucket is 1 cpu-second, then the limiter will not</code></span>
+<span class="codeline" id="line-28"><code>// kick in until at least 1 full cpu-second in the last 2 cpu-second window</code></span>
+<span class="codeline" id="line-29"><code>// is spent on GC CPU time.</code></span>
+<span class="codeline" id="line-30"><code>var gcCPULimiter gcCPULimiterState</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>type gcCPULimiterState struct {</code></span>
+<span class="codeline" id="line-33"><code>	lock atomic.Uint32</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>	enabled atomic.Bool</code></span>
+<span class="codeline" id="line-36"><code>	bucket  struct {</code></span>
+<span class="codeline" id="line-37"><code>		// Invariants:</code></span>
+<span class="codeline" id="line-38"><code>		// - fill &gt;= 0</code></span>
+<span class="codeline" id="line-39"><code>		// - capacity &gt;= 0</code></span>
+<span class="codeline" id="line-40"><code>		// - fill &lt;= capacity</code></span>
+<span class="codeline" id="line-41"><code>		fill, capacity uint64</code></span>
+<span class="codeline" id="line-42"><code>	}</code></span>
+<span class="codeline" id="line-43"><code>	// overflow is the cumulative amount of GC CPU time that we tried to fill the</code></span>
+<span class="codeline" id="line-44"><code>	// bucket with but exceeded its capacity.</code></span>
+<span class="codeline" id="line-45"><code>	overflow uint64</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>	// gcEnabled is an internal copy of gcBlackenEnabled that determines</code></span>
+<span class="codeline" id="line-48"><code>	// whether the limiter tracks total assist time.</code></span>
+<span class="codeline" id="line-49"><code>	//</code></span>
+<span class="codeline" id="line-50"><code>	// gcBlackenEnabled isn't used directly so as to keep this structure</code></span>
+<span class="codeline" id="line-51"><code>	// unit-testable.</code></span>
+<span class="codeline" id="line-52"><code>	gcEnabled bool</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>	// transitioning is true when the GC is in a STW and transitioning between</code></span>
+<span class="codeline" id="line-55"><code>	// the mark and sweep phases.</code></span>
+<span class="codeline" id="line-56"><code>	transitioning bool</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>	// assistTimePool is the accumulated assist time since the last update.</code></span>
+<span class="codeline" id="line-59"><code>	assistTimePool atomic.Int64</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>	// idleMarkTimePool is the accumulated idle mark time since the last update.</code></span>
+<span class="codeline" id="line-62"><code>	idleMarkTimePool atomic.Int64</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>	// idleTimePool is the accumulated time Ps spent on the idle list since the last update.</code></span>
+<span class="codeline" id="line-65"><code>	idleTimePool atomic.Int64</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>	// lastUpdate is the nanotime timestamp of the last time update was called.</code></span>
+<span class="codeline" id="line-68"><code>	//</code></span>
+<span class="codeline" id="line-69"><code>	// Updated under lock, but may be read concurrently.</code></span>
+<span class="codeline" id="line-70"><code>	lastUpdate atomic.Int64</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	// lastEnabledCycle is the GC cycle that last had the limiter enabled.</code></span>
+<span class="codeline" id="line-73"><code>	lastEnabledCycle atomic.Uint32</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>	// nprocs is an internal copy of gomaxprocs, used to determine total available</code></span>
+<span class="codeline" id="line-76"><code>	// CPU time.</code></span>
+<span class="codeline" id="line-77"><code>	//</code></span>
+<span class="codeline" id="line-78"><code>	// gomaxprocs isn't used directly so as to keep this structure unit-testable.</code></span>
+<span class="codeline" id="line-79"><code>	nprocs int32</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>	// test indicates whether this instance of the struct was made for testing purposes.</code></span>
+<span class="codeline" id="line-82"><code>	test bool</code></span>
+<span class="codeline" id="line-83"><code>}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>// limiting returns true if the CPU limiter is currently enabled, meaning the Go GC</code></span>
+<span class="codeline" id="line-86"><code>// should take action to limit CPU utilization.</code></span>
+<span class="codeline" id="line-87"><code>//</code></span>
+<span class="codeline" id="line-88"><code>// It is safe to call concurrently with other operations.</code></span>
+<span class="codeline" id="line-89"><code>func (l *gcCPULimiterState) limiting() bool {</code></span>
+<span class="codeline" id="line-90"><code>	return l.enabled.Load()</code></span>
+<span class="codeline" id="line-91"><code>}</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>// startGCTransition notifies the limiter of a GC transition.</code></span>
+<span class="codeline" id="line-94"><code>//</code></span>
+<span class="codeline" id="line-95"><code>// This call takes ownership of the limiter and disables all other means of</code></span>
+<span class="codeline" id="line-96"><code>// updating the limiter. Release ownership by calling finishGCTransition.</code></span>
+<span class="codeline" id="line-97"><code>//</code></span>
+<span class="codeline" id="line-98"><code>// It is safe to call concurrently with other operations.</code></span>
+<span class="codeline" id="line-99"><code>func (l *gcCPULimiterState) startGCTransition(enableGC bool, now int64) {</code></span>
+<span class="codeline" id="line-100"><code>	if !l.tryLock() {</code></span>
+<span class="codeline" id="line-101"><code>		// This must happen during a STW, so we can't fail to acquire the lock.</code></span>
+<span class="codeline" id="line-102"><code>		// If we did, something went wrong. Throw.</code></span>
+<span class="codeline" id="line-103"><code>		throw("failed to acquire lock to start a GC transition")</code></span>
+<span class="codeline" id="line-104"><code>	}</code></span>
+<span class="codeline" id="line-105"><code>	if l.gcEnabled == enableGC {</code></span>
+<span class="codeline" id="line-106"><code>		throw("transitioning GC to the same state as before?")</code></span>
+<span class="codeline" id="line-107"><code>	}</code></span>
+<span class="codeline" id="line-108"><code>	// Flush whatever was left between the last update and now.</code></span>
+<span class="codeline" id="line-109"><code>	l.updateLocked(now)</code></span>
+<span class="codeline" id="line-110"><code>	l.gcEnabled = enableGC</code></span>
+<span class="codeline" id="line-111"><code>	l.transitioning = true</code></span>
+<span class="codeline" id="line-112"><code>	// N.B. finishGCTransition releases the lock.</code></span>
+<span class="codeline" id="line-113"><code>	//</code></span>
+<span class="codeline" id="line-114"><code>	// We don't release here to increase the chance that if there's a failure</code></span>
+<span class="codeline" id="line-115"><code>	// to finish the transition, that we throw on failing to acquire the lock.</code></span>
+<span class="codeline" id="line-116"><code>}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>// finishGCTransition notifies the limiter that the GC transition is complete</code></span>
+<span class="codeline" id="line-119"><code>// and releases ownership of it. It also accumulates STW time in the bucket.</code></span>
+<span class="codeline" id="line-120"><code>// now must be the timestamp from the end of the STW pause.</code></span>
+<span class="codeline" id="line-121"><code>func (l *gcCPULimiterState) finishGCTransition(now int64) {</code></span>
+<span class="codeline" id="line-122"><code>	if !l.transitioning {</code></span>
+<span class="codeline" id="line-123"><code>		throw("finishGCTransition called without starting one?")</code></span>
+<span class="codeline" id="line-124"><code>	}</code></span>
+<span class="codeline" id="line-125"><code>	// Count the full nprocs set of CPU time because the world is stopped</code></span>
+<span class="codeline" id="line-126"><code>	// between startGCTransition and finishGCTransition. Even though the GC</code></span>
+<span class="codeline" id="line-127"><code>	// isn't running on all CPUs, it is preventing user code from doing so,</code></span>
+<span class="codeline" id="line-128"><code>	// so it might as well be.</code></span>
+<span class="codeline" id="line-129"><code>	if lastUpdate := l.lastUpdate.Load(); now &gt;= lastUpdate {</code></span>
+<span class="codeline" id="line-130"><code>		l.accumulate(0, (now-lastUpdate)*int64(l.nprocs))</code></span>
+<span class="codeline" id="line-131"><code>	}</code></span>
+<span class="codeline" id="line-132"><code>	l.lastUpdate.Store(now)</code></span>
+<span class="codeline" id="line-133"><code>	l.transitioning = false</code></span>
+<span class="codeline" id="line-134"><code>	l.unlock()</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>// gcCPULimiterUpdatePeriod dictates the maximum amount of wall-clock time</code></span>
+<span class="codeline" id="line-138"><code>// we can go before updating the limiter.</code></span>
+<span class="codeline" id="line-139"><code>const gcCPULimiterUpdatePeriod = 10e6 // 10ms</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>// needUpdate returns true if the limiter's maximum update period has been</code></span>
+<span class="codeline" id="line-142"><code>// exceeded, and so would benefit from an update.</code></span>
+<span class="codeline" id="line-143"><code>func (l *gcCPULimiterState) needUpdate(now int64) bool {</code></span>
+<span class="codeline" id="line-144"><code>	return now-l.lastUpdate.Load() &gt; gcCPULimiterUpdatePeriod</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>// addAssistTime notifies the limiter of additional assist time. It will be</code></span>
+<span class="codeline" id="line-148"><code>// included in the next update.</code></span>
+<span class="codeline" id="line-149"><code>func (l *gcCPULimiterState) addAssistTime(t int64) {</code></span>
+<span class="codeline" id="line-150"><code>	l.assistTimePool.Add(t)</code></span>
+<span class="codeline" id="line-151"><code>}</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>// addIdleTime notifies the limiter of additional time a P spent on the idle list. It will be</code></span>
+<span class="codeline" id="line-154"><code>// subtracted from the total CPU time in the next update.</code></span>
+<span class="codeline" id="line-155"><code>func (l *gcCPULimiterState) addIdleTime(t int64) {</code></span>
+<span class="codeline" id="line-156"><code>	l.idleTimePool.Add(t)</code></span>
+<span class="codeline" id="line-157"><code>}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>// update updates the bucket given runtime-specific information. now is the</code></span>
+<span class="codeline" id="line-160"><code>// current monotonic time in nanoseconds.</code></span>
+<span class="codeline" id="line-161"><code>//</code></span>
+<span class="codeline" id="line-162"><code>// This is safe to call concurrently with other operations, except *GCTransition.</code></span>
+<span class="codeline" id="line-163"><code>func (l *gcCPULimiterState) update(now int64) {</code></span>
+<span class="codeline" id="line-164"><code>	if !l.tryLock() {</code></span>
+<span class="codeline" id="line-165"><code>		// We failed to acquire the lock, which means something else is currently</code></span>
+<span class="codeline" id="line-166"><code>		// updating. Just drop our update, the next one to update will include</code></span>
+<span class="codeline" id="line-167"><code>		// our total assist time.</code></span>
+<span class="codeline" id="line-168"><code>		return</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code>	if l.transitioning {</code></span>
+<span class="codeline" id="line-171"><code>		throw("update during transition")</code></span>
+<span class="codeline" id="line-172"><code>	}</code></span>
+<span class="codeline" id="line-173"><code>	l.updateLocked(now)</code></span>
+<span class="codeline" id="line-174"><code>	l.unlock()</code></span>
+<span class="codeline" id="line-175"><code>}</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>// updateLocked is the implementation of update. l.lock must be held.</code></span>
+<span class="codeline" id="line-178"><code>func (l *gcCPULimiterState) updateLocked(now int64) {</code></span>
+<span class="codeline" id="line-179"><code>	lastUpdate := l.lastUpdate.Load()</code></span>
+<span class="codeline" id="line-180"><code>	if now &lt; lastUpdate {</code></span>
+<span class="codeline" id="line-181"><code>		// Defensively avoid overflow. This isn't even the latest update anyway.</code></span>
+<span class="codeline" id="line-182"><code>		return</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code>	windowTotalTime := (now - lastUpdate) * int64(l.nprocs)</code></span>
+<span class="codeline" id="line-185"><code>	l.lastUpdate.Store(now)</code></span>
+<span class="codeline" id="line-186"><code></code></span>
+<span class="codeline" id="line-187"><code>	// Drain the pool of assist time.</code></span>
+<span class="codeline" id="line-188"><code>	assistTime := l.assistTimePool.Load()</code></span>
+<span class="codeline" id="line-189"><code>	if assistTime != 0 {</code></span>
+<span class="codeline" id="line-190"><code>		l.assistTimePool.Add(-assistTime)</code></span>
+<span class="codeline" id="line-191"><code>	}</code></span>
+<span class="codeline" id="line-192"><code></code></span>
+<span class="codeline" id="line-193"><code>	// Drain the pool of idle time.</code></span>
+<span class="codeline" id="line-194"><code>	idleTime := l.idleTimePool.Load()</code></span>
+<span class="codeline" id="line-195"><code>	if idleTime != 0 {</code></span>
+<span class="codeline" id="line-196"><code>		l.idleTimePool.Add(-idleTime)</code></span>
+<span class="codeline" id="line-197"><code>	}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>	if !l.test {</code></span>
+<span class="codeline" id="line-200"><code>		// Consume time from in-flight events. Make sure we're not preemptible so allp can't change.</code></span>
+<span class="codeline" id="line-201"><code>		//</code></span>
+<span class="codeline" id="line-202"><code>		// The reason we do this instead of just waiting for those events to finish and push updates</code></span>
+<span class="codeline" id="line-203"><code>		// is to ensure that all the time we're accounting for happened sometime between lastUpdate</code></span>
+<span class="codeline" id="line-204"><code>		// and now. This dramatically simplifies reasoning about the limiter because we're not at</code></span>
+<span class="codeline" id="line-205"><code>		// risk of extra time being accounted for in this window than actually happened in this window,</code></span>
+<span class="codeline" id="line-206"><code>		// leading to all sorts of weird transient behavior.</code></span>
+<span class="codeline" id="line-207"><code>		mp := acquirem()</code></span>
+<span class="codeline" id="line-208"><code>		for _, pp := range allp {</code></span>
+<span class="codeline" id="line-209"><code>			typ, duration := pp.limiterEvent.consume(now)</code></span>
+<span class="codeline" id="line-210"><code>			switch typ {</code></span>
+<span class="codeline" id="line-211"><code>			case limiterEventIdleMarkWork:</code></span>
+<span class="codeline" id="line-212"><code>				fallthrough</code></span>
+<span class="codeline" id="line-213"><code>			case limiterEventIdle:</code></span>
+<span class="codeline" id="line-214"><code>				idleTime += duration</code></span>
+<span class="codeline" id="line-215"><code>				sched.idleTime.Add(duration)</code></span>
+<span class="codeline" id="line-216"><code>			case limiterEventMarkAssist:</code></span>
+<span class="codeline" id="line-217"><code>				fallthrough</code></span>
+<span class="codeline" id="line-218"><code>			case limiterEventScavengeAssist:</code></span>
+<span class="codeline" id="line-219"><code>				assistTime += duration</code></span>
+<span class="codeline" id="line-220"><code>			case limiterEventNone:</code></span>
+<span class="codeline" id="line-221"><code>				break</code></span>
+<span class="codeline" id="line-222"><code>			default:</code></span>
+<span class="codeline" id="line-223"><code>				throw("invalid limiter event type found")</code></span>
+<span class="codeline" id="line-224"><code>			}</code></span>
+<span class="codeline" id="line-225"><code>		}</code></span>
+<span class="codeline" id="line-226"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-227"><code>	}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>	// Compute total GC time.</code></span>
+<span class="codeline" id="line-230"><code>	windowGCTime := assistTime</code></span>
+<span class="codeline" id="line-231"><code>	if l.gcEnabled {</code></span>
+<span class="codeline" id="line-232"><code>		windowGCTime += int64(float64(windowTotalTime) * gcBackgroundUtilization)</code></span>
+<span class="codeline" id="line-233"><code>	}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>	// Subtract out all idle time from the total time. Do this after computing</code></span>
+<span class="codeline" id="line-236"><code>	// GC time, because the background utilization is dependent on the *real*</code></span>
+<span class="codeline" id="line-237"><code>	// total time, not the total time after idle time is subtracted.</code></span>
+<span class="codeline" id="line-238"><code>	//</code></span>
+<span class="codeline" id="line-239"><code>	// Idle time is counted as any time that a P is on the P idle list plus idle mark</code></span>
+<span class="codeline" id="line-240"><code>	// time. Idle mark workers soak up time that the application spends idle.</code></span>
+<span class="codeline" id="line-241"><code>	//</code></span>
+<span class="codeline" id="line-242"><code>	// On a heavily undersubscribed system, any additional idle time can skew GC CPU</code></span>
+<span class="codeline" id="line-243"><code>	// utilization, because the GC might be executing continuously and thrashing,</code></span>
+<span class="codeline" id="line-244"><code>	// yet the CPU utilization with respect to GOMAXPROCS will be quite low, so</code></span>
+<span class="codeline" id="line-245"><code>	// the limiter fails to turn on. By subtracting idle time, we're removing time that</code></span>
+<span class="codeline" id="line-246"><code>	// we know the application was idle giving a more accurate picture of whether</code></span>
+<span class="codeline" id="line-247"><code>	// the GC is thrashing.</code></span>
+<span class="codeline" id="line-248"><code>	//</code></span>
+<span class="codeline" id="line-249"><code>	// Note that this can cause the limiter to turn on even if it's not needed. For</code></span>
+<span class="codeline" id="line-250"><code>	// instance, on a system with 32 Ps but only 1 running goroutine, each GC will have</code></span>
+<span class="codeline" id="line-251"><code>	// 8 dedicated GC workers. Assuming the GC cycle is half mark phase and half sweep</code></span>
+<span class="codeline" id="line-252"><code>	// phase, then the GC CPU utilization over that cycle, with idle time removed, will</code></span>
+<span class="codeline" id="line-253"><code>	// be 8/(8+2) = 80%. Even though the limiter turns on, though, assist should be</code></span>
+<span class="codeline" id="line-254"><code>	// unnecessary, as the GC has way more CPU time to outpace the 1 goroutine that's</code></span>
+<span class="codeline" id="line-255"><code>	// running.</code></span>
+<span class="codeline" id="line-256"><code>	windowTotalTime -= idleTime</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>	l.accumulate(windowTotalTime-windowGCTime, windowGCTime)</code></span>
+<span class="codeline" id="line-259"><code>}</code></span>
+<span class="codeline" id="line-260"><code></code></span>
+<span class="codeline" id="line-261"><code>// accumulate adds time to the bucket and signals whether the limiter is enabled.</code></span>
+<span class="codeline" id="line-262"><code>//</code></span>
+<span class="codeline" id="line-263"><code>// This is an internal function that deals just with the bucket. Prefer update.</code></span>
+<span class="codeline" id="line-264"><code>// l.lock must be held.</code></span>
+<span class="codeline" id="line-265"><code>func (l *gcCPULimiterState) accumulate(mutatorTime, gcTime int64) {</code></span>
+<span class="codeline" id="line-266"><code>	headroom := l.bucket.capacity - l.bucket.fill</code></span>
+<span class="codeline" id="line-267"><code>	enabled := headroom == 0</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>	// Let's be careful about three things here:</code></span>
+<span class="codeline" id="line-270"><code>	// 1. The addition and subtraction, for the invariants.</code></span>
+<span class="codeline" id="line-271"><code>	// 2. Overflow.</code></span>
+<span class="codeline" id="line-272"><code>	// 3. Excessive mutation of l.enabled, which is accessed</code></span>
+<span class="codeline" id="line-273"><code>	//    by all assists, potentially more than once.</code></span>
+<span class="codeline" id="line-274"><code>	change := gcTime - mutatorTime</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>	// Handle limiting case.</code></span>
+<span class="codeline" id="line-277"><code>	if change &gt; 0 &amp;&amp; headroom &lt;= uint64(change) {</code></span>
+<span class="codeline" id="line-278"><code>		l.overflow += uint64(change) - headroom</code></span>
+<span class="codeline" id="line-279"><code>		l.bucket.fill = l.bucket.capacity</code></span>
+<span class="codeline" id="line-280"><code>		if !enabled {</code></span>
+<span class="codeline" id="line-281"><code>			l.enabled.Store(true)</code></span>
+<span class="codeline" id="line-282"><code>			l.lastEnabledCycle.Store(memstats.numgc + 1)</code></span>
+<span class="codeline" id="line-283"><code>		}</code></span>
+<span class="codeline" id="line-284"><code>		return</code></span>
+<span class="codeline" id="line-285"><code>	}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>	// Handle non-limiting cases.</code></span>
+<span class="codeline" id="line-288"><code>	if change &lt; 0 &amp;&amp; l.bucket.fill &lt;= uint64(-change) {</code></span>
+<span class="codeline" id="line-289"><code>		// Bucket emptied.</code></span>
+<span class="codeline" id="line-290"><code>		l.bucket.fill = 0</code></span>
+<span class="codeline" id="line-291"><code>	} else {</code></span>
+<span class="codeline" id="line-292"><code>		// All other cases.</code></span>
+<span class="codeline" id="line-293"><code>		l.bucket.fill -= uint64(-change)</code></span>
+<span class="codeline" id="line-294"><code>	}</code></span>
+<span class="codeline" id="line-295"><code>	if change != 0 &amp;&amp; enabled {</code></span>
+<span class="codeline" id="line-296"><code>		l.enabled.Store(false)</code></span>
+<span class="codeline" id="line-297"><code>	}</code></span>
+<span class="codeline" id="line-298"><code>}</code></span>
+<span class="codeline" id="line-299"><code></code></span>
+<span class="codeline" id="line-300"><code>// tryLock attempts to lock l. Returns true on success.</code></span>
+<span class="codeline" id="line-301"><code>func (l *gcCPULimiterState) tryLock() bool {</code></span>
+<span class="codeline" id="line-302"><code>	return l.lock.CompareAndSwap(0, 1)</code></span>
+<span class="codeline" id="line-303"><code>}</code></span>
+<span class="codeline" id="line-304"><code></code></span>
+<span class="codeline" id="line-305"><code>// unlock releases the lock on l. Must be called if tryLock returns true.</code></span>
+<span class="codeline" id="line-306"><code>func (l *gcCPULimiterState) unlock() {</code></span>
+<span class="codeline" id="line-307"><code>	old := l.lock.Swap(0)</code></span>
+<span class="codeline" id="line-308"><code>	if old != 1 {</code></span>
+<span class="codeline" id="line-309"><code>		throw("double unlock")</code></span>
+<span class="codeline" id="line-310"><code>	}</code></span>
+<span class="codeline" id="line-311"><code>}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>// capacityPerProc is the limiter's bucket capacity for each P in GOMAXPROCS.</code></span>
+<span class="codeline" id="line-314"><code>const capacityPerProc = 1e9 // 1 second in nanoseconds</code></span>
+<span class="codeline" id="line-315"><code></code></span>
+<span class="codeline" id="line-316"><code>// resetCapacity updates the capacity based on GOMAXPROCS. Must not be called</code></span>
+<span class="codeline" id="line-317"><code>// while the GC is enabled.</code></span>
+<span class="codeline" id="line-318"><code>//</code></span>
+<span class="codeline" id="line-319"><code>// It is safe to call concurrently with other operations.</code></span>
+<span class="codeline" id="line-320"><code>func (l *gcCPULimiterState) resetCapacity(now int64, nprocs int32) {</code></span>
+<span class="codeline" id="line-321"><code>	if !l.tryLock() {</code></span>
+<span class="codeline" id="line-322"><code>		// This must happen during a STW, so we can't fail to acquire the lock.</code></span>
+<span class="codeline" id="line-323"><code>		// If we did, something went wrong. Throw.</code></span>
+<span class="codeline" id="line-324"><code>		throw("failed to acquire lock to reset capacity")</code></span>
+<span class="codeline" id="line-325"><code>	}</code></span>
+<span class="codeline" id="line-326"><code>	// Flush the rest of the time for this period.</code></span>
+<span class="codeline" id="line-327"><code>	l.updateLocked(now)</code></span>
+<span class="codeline" id="line-328"><code>	l.nprocs = nprocs</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>	l.bucket.capacity = uint64(nprocs) * capacityPerProc</code></span>
+<span class="codeline" id="line-331"><code>	if l.bucket.fill &gt; l.bucket.capacity {</code></span>
+<span class="codeline" id="line-332"><code>		l.bucket.fill = l.bucket.capacity</code></span>
+<span class="codeline" id="line-333"><code>		l.enabled.Store(true)</code></span>
+<span class="codeline" id="line-334"><code>		l.lastEnabledCycle.Store(memstats.numgc + 1)</code></span>
+<span class="codeline" id="line-335"><code>	} else if l.bucket.fill &lt; l.bucket.capacity {</code></span>
+<span class="codeline" id="line-336"><code>		l.enabled.Store(false)</code></span>
+<span class="codeline" id="line-337"><code>	}</code></span>
+<span class="codeline" id="line-338"><code>	l.unlock()</code></span>
+<span class="codeline" id="line-339"><code>}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>// limiterEventType indicates the type of an event occurring on some P.</code></span>
+<span class="codeline" id="line-342"><code>//</code></span>
+<span class="codeline" id="line-343"><code>// These events represent the full set of events that the GC CPU limiter tracks</code></span>
+<span class="codeline" id="line-344"><code>// to execute its function.</code></span>
+<span class="codeline" id="line-345"><code>//</code></span>
+<span class="codeline" id="line-346"><code>// This type may use no more than limiterEventBits bits of information.</code></span>
+<span class="codeline" id="line-347"><code>type limiterEventType uint8</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>const (</code></span>
+<span class="codeline" id="line-350"><code>	limiterEventNone           limiterEventType = iota // None of the following events.</code></span>
+<span class="codeline" id="line-351"><code>	limiterEventIdleMarkWork                           // Refers to an idle mark worker (see gcMarkWorkerMode).</code></span>
+<span class="codeline" id="line-352"><code>	limiterEventMarkAssist                             // Refers to mark assist (see gcAssistAlloc).</code></span>
+<span class="codeline" id="line-353"><code>	limiterEventScavengeAssist                         // Refers to a scavenge assist (see allocSpan).</code></span>
+<span class="codeline" id="line-354"><code>	limiterEventIdle                                   // Refers to time a P spent on the idle list.</code></span>
+<span class="codeline" id="line-355"><code></code></span>
+<span class="codeline" id="line-356"><code>	limiterEventBits = 3</code></span>
+<span class="codeline" id="line-357"><code>)</code></span>
+<span class="codeline" id="line-358"><code></code></span>
+<span class="codeline" id="line-359"><code>// limiterEventTypeMask is a mask for the bits in p.limiterEventStart that represent</code></span>
+<span class="codeline" id="line-360"><code>// the event type. The rest of the bits of that field represent a timestamp.</code></span>
+<span class="codeline" id="line-361"><code>const (</code></span>
+<span class="codeline" id="line-362"><code>	limiterEventTypeMask  = uint64((1&lt;&lt;limiterEventBits)-1) &lt;&lt; (64 - limiterEventBits)</code></span>
+<span class="codeline" id="line-363"><code>	limiterEventStampNone = limiterEventStamp(0)</code></span>
+<span class="codeline" id="line-364"><code>)</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>// limiterEventStamp is a nanotime timestamp packed with a limiterEventType.</code></span>
+<span class="codeline" id="line-367"><code>type limiterEventStamp uint64</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>// makeLimiterEventStamp creates a new stamp from the event type and the current timestamp.</code></span>
+<span class="codeline" id="line-370"><code>func makeLimiterEventStamp(typ limiterEventType, now int64) limiterEventStamp {</code></span>
+<span class="codeline" id="line-371"><code>	return limiterEventStamp(uint64(typ)&lt;&lt;(64-limiterEventBits) | (uint64(now) &amp;^ limiterEventTypeMask))</code></span>
+<span class="codeline" id="line-372"><code>}</code></span>
+<span class="codeline" id="line-373"><code></code></span>
+<span class="codeline" id="line-374"><code>// duration computes the difference between now and the start time stored in the stamp.</code></span>
+<span class="codeline" id="line-375"><code>//</code></span>
+<span class="codeline" id="line-376"><code>// Returns 0 if the difference is negative, which may happen if now is stale or if the</code></span>
+<span class="codeline" id="line-377"><code>// before and after timestamps cross a 2^(64-limiterEventBits) boundary.</code></span>
+<span class="codeline" id="line-378"><code>func (s limiterEventStamp) duration(now int64) int64 {</code></span>
+<span class="codeline" id="line-379"><code>	// The top limiterEventBits bits of the timestamp are derived from the current time</code></span>
+<span class="codeline" id="line-380"><code>	// when computing a duration.</code></span>
+<span class="codeline" id="line-381"><code>	start := int64((uint64(now) &amp; limiterEventTypeMask) | (uint64(s) &amp;^ limiterEventTypeMask))</code></span>
+<span class="codeline" id="line-382"><code>	if now &lt; start {</code></span>
+<span class="codeline" id="line-383"><code>		return 0</code></span>
+<span class="codeline" id="line-384"><code>	}</code></span>
+<span class="codeline" id="line-385"><code>	return now - start</code></span>
+<span class="codeline" id="line-386"><code>}</code></span>
+<span class="codeline" id="line-387"><code></code></span>
+<span class="codeline" id="line-388"><code>// type extracts the event type from the stamp.</code></span>
+<span class="codeline" id="line-389"><code>func (s limiterEventStamp) typ() limiterEventType {</code></span>
+<span class="codeline" id="line-390"><code>	return limiterEventType(s &gt;&gt; (64 - limiterEventBits))</code></span>
+<span class="codeline" id="line-391"><code>}</code></span>
+<span class="codeline" id="line-392"><code></code></span>
+<span class="codeline" id="line-393"><code>// limiterEvent represents tracking state for an event tracked by the GC CPU limiter.</code></span>
+<span class="codeline" id="line-394"><code>type limiterEvent struct {</code></span>
+<span class="codeline" id="line-395"><code>	stamp atomic.Uint64 // Stores a limiterEventStamp.</code></span>
+<span class="codeline" id="line-396"><code>}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>// start begins tracking a new limiter event of the current type. If an event</code></span>
+<span class="codeline" id="line-399"><code>// is already in flight, then a new event cannot begin because the current time is</code></span>
+<span class="codeline" id="line-400"><code>// already being attributed to that event. In this case, this function returns false.</code></span>
+<span class="codeline" id="line-401"><code>// Otherwise, it returns true.</code></span>
+<span class="codeline" id="line-402"><code>//</code></span>
+<span class="codeline" id="line-403"><code>// The caller must be non-preemptible until at least stop is called or this function</code></span>
+<span class="codeline" id="line-404"><code>// returns false. Because this is trying to measure "on-CPU" time of some event, getting</code></span>
+<span class="codeline" id="line-405"><code>// scheduled away during it can mean that whatever we're measuring isn't a reflection</code></span>
+<span class="codeline" id="line-406"><code>// of "on-CPU" time. The OS could deschedule us at any time, but we want to maintain as</code></span>
+<span class="codeline" id="line-407"><code>// close of an approximation as we can.</code></span>
+<span class="codeline" id="line-408"><code>func (e *limiterEvent) start(typ limiterEventType, now int64) bool {</code></span>
+<span class="codeline" id="line-409"><code>	if limiterEventStamp(e.stamp.Load()).typ() != limiterEventNone {</code></span>
+<span class="codeline" id="line-410"><code>		return false</code></span>
+<span class="codeline" id="line-411"><code>	}</code></span>
+<span class="codeline" id="line-412"><code>	e.stamp.Store(uint64(makeLimiterEventStamp(typ, now)))</code></span>
+<span class="codeline" id="line-413"><code>	return true</code></span>
+<span class="codeline" id="line-414"><code>}</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>// consume acquires the partial event CPU time from any in-flight event.</code></span>
+<span class="codeline" id="line-417"><code>// It achieves this by storing the current time as the new event time.</code></span>
+<span class="codeline" id="line-418"><code>//</code></span>
+<span class="codeline" id="line-419"><code>// Returns the type of the in-flight event, as well as how long it's currently been</code></span>
+<span class="codeline" id="line-420"><code>// executing for. Returns limiterEventNone if no event is active.</code></span>
+<span class="codeline" id="line-421"><code>func (e *limiterEvent) consume(now int64) (typ limiterEventType, duration int64) {</code></span>
+<span class="codeline" id="line-422"><code>	// Read the limiter event timestamp and update it to now.</code></span>
+<span class="codeline" id="line-423"><code>	for {</code></span>
+<span class="codeline" id="line-424"><code>		old := limiterEventStamp(e.stamp.Load())</code></span>
+<span class="codeline" id="line-425"><code>		typ = old.typ()</code></span>
+<span class="codeline" id="line-426"><code>		if typ == limiterEventNone {</code></span>
+<span class="codeline" id="line-427"><code>			// There's no in-flight event, so just push that up.</code></span>
+<span class="codeline" id="line-428"><code>			return</code></span>
+<span class="codeline" id="line-429"><code>		}</code></span>
+<span class="codeline" id="line-430"><code>		duration = old.duration(now)</code></span>
+<span class="codeline" id="line-431"><code>		if duration == 0 {</code></span>
+<span class="codeline" id="line-432"><code>			// We might have a stale now value, or this crossed the</code></span>
+<span class="codeline" id="line-433"><code>			// 2^(64-limiterEventBits) boundary in the clock readings.</code></span>
+<span class="codeline" id="line-434"><code>			// Just ignore it.</code></span>
+<span class="codeline" id="line-435"><code>			return limiterEventNone, 0</code></span>
+<span class="codeline" id="line-436"><code>		}</code></span>
+<span class="codeline" id="line-437"><code>		new := makeLimiterEventStamp(typ, now)</code></span>
+<span class="codeline" id="line-438"><code>		if e.stamp.CompareAndSwap(uint64(old), uint64(new)) {</code></span>
+<span class="codeline" id="line-439"><code>			break</code></span>
+<span class="codeline" id="line-440"><code>		}</code></span>
+<span class="codeline" id="line-441"><code>	}</code></span>
+<span class="codeline" id="line-442"><code>	return</code></span>
+<span class="codeline" id="line-443"><code>}</code></span>
+<span class="codeline" id="line-444"><code></code></span>
+<span class="codeline" id="line-445"><code>// stop stops the active limiter event. Throws if the</code></span>
+<span class="codeline" id="line-446"><code>//</code></span>
+<span class="codeline" id="line-447"><code>// The caller must be non-preemptible across the event. See start as to why.</code></span>
+<span class="codeline" id="line-448"><code>func (e *limiterEvent) stop(typ limiterEventType, now int64) {</code></span>
+<span class="codeline" id="line-449"><code>	var stamp limiterEventStamp</code></span>
+<span class="codeline" id="line-450"><code>	for {</code></span>
+<span class="codeline" id="line-451"><code>		stamp = limiterEventStamp(e.stamp.Load())</code></span>
+<span class="codeline" id="line-452"><code>		if stamp.typ() != typ {</code></span>
+<span class="codeline" id="line-453"><code>			print("runtime: want=", typ, " got=", stamp.typ(), "\n")</code></span>
+<span class="codeline" id="line-454"><code>			throw("limiterEvent.stop: found wrong event in p's limiter event slot")</code></span>
+<span class="codeline" id="line-455"><code>		}</code></span>
+<span class="codeline" id="line-456"><code>		if e.stamp.CompareAndSwap(uint64(stamp), uint64(limiterEventStampNone)) {</code></span>
+<span class="codeline" id="line-457"><code>			break</code></span>
+<span class="codeline" id="line-458"><code>		}</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	duration := stamp.duration(now)</code></span>
+<span class="codeline" id="line-461"><code>	if duration == 0 {</code></span>
+<span class="codeline" id="line-462"><code>		// It's possible that we're missing time because we crossed a</code></span>
+<span class="codeline" id="line-463"><code>		// 2^(64-limiterEventBits) boundary between the start and end.</code></span>
+<span class="codeline" id="line-464"><code>		// In this case, we're dropping that information. This is OK because</code></span>
+<span class="codeline" id="line-465"><code>		// at worst it'll cause a transient hiccup that will quickly resolve</code></span>
+<span class="codeline" id="line-466"><code>		// itself as all new timestamps begin on the other side of the boundary.</code></span>
+<span class="codeline" id="line-467"><code>		// Such a hiccup should be incredibly rare.</code></span>
+<span class="codeline" id="line-468"><code>		return</code></span>
+<span class="codeline" id="line-469"><code>	}</code></span>
+<span class="codeline" id="line-470"><code>	// Account for the event.</code></span>
+<span class="codeline" id="line-471"><code>	switch typ {</code></span>
+<span class="codeline" id="line-472"><code>	case limiterEventIdleMarkWork:</code></span>
+<span class="codeline" id="line-473"><code>		gcCPULimiter.addIdleTime(duration)</code></span>
+<span class="codeline" id="line-474"><code>	case limiterEventIdle:</code></span>
+<span class="codeline" id="line-475"><code>		gcCPULimiter.addIdleTime(duration)</code></span>
+<span class="codeline" id="line-476"><code>		sched.idleTime.Add(duration)</code></span>
+<span class="codeline" id="line-477"><code>	case limiterEventMarkAssist:</code></span>
+<span class="codeline" id="line-478"><code>		fallthrough</code></span>
+<span class="codeline" id="line-479"><code>	case limiterEventScavengeAssist:</code></span>
+<span class="codeline" id="line-480"><code>		gcCPULimiter.addAssistTime(duration)</code></span>
+<span class="codeline" id="line-481"><code>	default:</code></span>
+<span class="codeline" id="line-482"><code>		throw("limiterEvent.stop: invalid limiter event type found")</code></span>
+<span class="codeline" id="line-483"><code>	}</code></span>
+<span class="codeline" id="line-484"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

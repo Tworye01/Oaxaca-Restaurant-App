@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: deflatefast.go in package compress/flate</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	deflatefast.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/compress/flate.html">compress/flate</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2016 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package flate</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import "math"</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// This encoding algorithm, which prioritizes speed over output size, is</code></span>
+<span class="codeline" id="line-10"><code>// based on Snappy's LZ77-style encoder: github.com/golang/snappy</code></span>
+<span class="codeline" id="line-11"><code></code></span>
+<span class="codeline" id="line-12"><code>const (</code></span>
+<span class="codeline" id="line-13"><code>	tableBits  = 14             // Bits used in the table.</code></span>
+<span class="codeline" id="line-14"><code>	tableSize  = 1 &lt;&lt; tableBits // Size of the table.</code></span>
+<span class="codeline" id="line-15"><code>	tableMask  = tableSize - 1  // Mask for table indices. Redundant, but can eliminate bounds checks.</code></span>
+<span class="codeline" id="line-16"><code>	tableShift = 32 - tableBits // Right-shift to get the tableBits most significant bits of a uint32.</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>	// Reset the buffer offset when reaching this.</code></span>
+<span class="codeline" id="line-19"><code>	// Offsets are stored between blocks as int32 values.</code></span>
+<span class="codeline" id="line-20"><code>	// Since the offset we are checking against is at the beginning</code></span>
+<span class="codeline" id="line-21"><code>	// of the buffer, we need to subtract the current and input</code></span>
+<span class="codeline" id="line-22"><code>	// buffer to not risk overflowing the int32.</code></span>
+<span class="codeline" id="line-23"><code>	bufferReset = math.MaxInt32 - maxStoreBlockSize*2</code></span>
+<span class="codeline" id="line-24"><code>)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>func load32(b []byte, i int32) uint32 {</code></span>
+<span class="codeline" id="line-27"><code>	b = b[i : i+4 : len(b)] // Help the compiler eliminate bounds checks on the next line.</code></span>
+<span class="codeline" id="line-28"><code>	return uint32(b[0]) | uint32(b[1])&lt;&lt;8 | uint32(b[2])&lt;&lt;16 | uint32(b[3])&lt;&lt;24</code></span>
+<span class="codeline" id="line-29"><code>}</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>func load64(b []byte, i int32) uint64 {</code></span>
+<span class="codeline" id="line-32"><code>	b = b[i : i+8 : len(b)] // Help the compiler eliminate bounds checks on the next line.</code></span>
+<span class="codeline" id="line-33"><code>	return uint64(b[0]) | uint64(b[1])&lt;&lt;8 | uint64(b[2])&lt;&lt;16 | uint64(b[3])&lt;&lt;24 |</code></span>
+<span class="codeline" id="line-34"><code>		uint64(b[4])&lt;&lt;32 | uint64(b[5])&lt;&lt;40 | uint64(b[6])&lt;&lt;48 | uint64(b[7])&lt;&lt;56</code></span>
+<span class="codeline" id="line-35"><code>}</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>func hash(u uint32) uint32 {</code></span>
+<span class="codeline" id="line-38"><code>	return (u * 0x1e35a7bd) &gt;&gt; tableShift</code></span>
+<span class="codeline" id="line-39"><code>}</code></span>
+<span class="codeline" id="line-40"><code></code></span>
+<span class="codeline" id="line-41"><code>// These constants are defined by the Snappy implementation so that its</code></span>
+<span class="codeline" id="line-42"><code>// assembly implementation can fast-path some 16-bytes-at-a-time copies. They</code></span>
+<span class="codeline" id="line-43"><code>// aren't necessary in the pure Go implementation, as we don't use those same</code></span>
+<span class="codeline" id="line-44"><code>// optimizations, but using the same thresholds doesn't really hurt.</code></span>
+<span class="codeline" id="line-45"><code>const (</code></span>
+<span class="codeline" id="line-46"><code>	inputMargin            = 16 - 1</code></span>
+<span class="codeline" id="line-47"><code>	minNonLiteralBlockSize = 1 + 1 + inputMargin</code></span>
+<span class="codeline" id="line-48"><code>)</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>type tableEntry struct {</code></span>
+<span class="codeline" id="line-51"><code>	val    uint32 // Value at destination</code></span>
+<span class="codeline" id="line-52"><code>	offset int32</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>// deflateFast maintains the table for matches,</code></span>
+<span class="codeline" id="line-56"><code>// and the previous byte block for cross block matching.</code></span>
+<span class="codeline" id="line-57"><code>type deflateFast struct {</code></span>
+<span class="codeline" id="line-58"><code>	table [tableSize]tableEntry</code></span>
+<span class="codeline" id="line-59"><code>	prev  []byte // Previous block, zero length if unknown.</code></span>
+<span class="codeline" id="line-60"><code>	cur   int32  // Current match offset.</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>func newDeflateFast() *deflateFast {</code></span>
+<span class="codeline" id="line-64"><code>	return &amp;deflateFast{cur: maxStoreBlockSize, prev: make([]byte, 0, maxStoreBlockSize)}</code></span>
+<span class="codeline" id="line-65"><code>}</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// encode encodes a block given in src and appends tokens</code></span>
+<span class="codeline" id="line-68"><code>// to dst and returns the result.</code></span>
+<span class="codeline" id="line-69"><code>func (e *deflateFast) encode(dst []token, src []byte) []token {</code></span>
+<span class="codeline" id="line-70"><code>	// Ensure that e.cur doesn't wrap.</code></span>
+<span class="codeline" id="line-71"><code>	if e.cur &gt;= bufferReset {</code></span>
+<span class="codeline" id="line-72"><code>		e.shiftOffsets()</code></span>
+<span class="codeline" id="line-73"><code>	}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>	// This check isn't in the Snappy implementation, but there, the caller</code></span>
+<span class="codeline" id="line-76"><code>	// instead of the callee handles this case.</code></span>
+<span class="codeline" id="line-77"><code>	if len(src) &lt; minNonLiteralBlockSize {</code></span>
+<span class="codeline" id="line-78"><code>		e.cur += maxStoreBlockSize</code></span>
+<span class="codeline" id="line-79"><code>		e.prev = e.prev[:0]</code></span>
+<span class="codeline" id="line-80"><code>		return emitLiteral(dst, src)</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	// sLimit is when to stop looking for offset/length copies. The inputMargin</code></span>
+<span class="codeline" id="line-84"><code>	// lets us use a fast path for emitLiteral in the main loop, while we are</code></span>
+<span class="codeline" id="line-85"><code>	// looking for copies.</code></span>
+<span class="codeline" id="line-86"><code>	sLimit := int32(len(src) - inputMargin)</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>	// nextEmit is where in src the next emitLiteral should start from.</code></span>
+<span class="codeline" id="line-89"><code>	nextEmit := int32(0)</code></span>
+<span class="codeline" id="line-90"><code>	s := int32(0)</code></span>
+<span class="codeline" id="line-91"><code>	cv := load32(src, s)</code></span>
+<span class="codeline" id="line-92"><code>	nextHash := hash(cv)</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>	for {</code></span>
+<span class="codeline" id="line-95"><code>		// Copied from the C++ snappy implementation:</code></span>
+<span class="codeline" id="line-96"><code>		//</code></span>
+<span class="codeline" id="line-97"><code>		// Heuristic match skipping: If 32 bytes are scanned with no matches</code></span>
+<span class="codeline" id="line-98"><code>		// found, start looking only at every other byte. If 32 more bytes are</code></span>
+<span class="codeline" id="line-99"><code>		// scanned (or skipped), look at every third byte, etc.. When a match</code></span>
+<span class="codeline" id="line-100"><code>		// is found, immediately go back to looking at every byte. This is a</code></span>
+<span class="codeline" id="line-101"><code>		// small loss (~5% performance, ~0.1% density) for compressible data</code></span>
+<span class="codeline" id="line-102"><code>		// due to more bookkeeping, but for non-compressible data (such as</code></span>
+<span class="codeline" id="line-103"><code>		// JPEG) it's a huge win since the compressor quickly "realizes" the</code></span>
+<span class="codeline" id="line-104"><code>		// data is incompressible and doesn't bother looking for matches</code></span>
+<span class="codeline" id="line-105"><code>		// everywhere.</code></span>
+<span class="codeline" id="line-106"><code>		//</code></span>
+<span class="codeline" id="line-107"><code>		// The "skip" variable keeps track of how many bytes there are since</code></span>
+<span class="codeline" id="line-108"><code>		// the last match; dividing it by 32 (ie. right-shifting by five) gives</code></span>
+<span class="codeline" id="line-109"><code>		// the number of bytes to move ahead for each iteration.</code></span>
+<span class="codeline" id="line-110"><code>		skip := int32(32)</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>		nextS := s</code></span>
+<span class="codeline" id="line-113"><code>		var candidate tableEntry</code></span>
+<span class="codeline" id="line-114"><code>		for {</code></span>
+<span class="codeline" id="line-115"><code>			s = nextS</code></span>
+<span class="codeline" id="line-116"><code>			bytesBetweenHashLookups := skip &gt;&gt; 5</code></span>
+<span class="codeline" id="line-117"><code>			nextS = s + bytesBetweenHashLookups</code></span>
+<span class="codeline" id="line-118"><code>			skip += bytesBetweenHashLookups</code></span>
+<span class="codeline" id="line-119"><code>			if nextS &gt; sLimit {</code></span>
+<span class="codeline" id="line-120"><code>				goto emitRemainder</code></span>
+<span class="codeline" id="line-121"><code>			}</code></span>
+<span class="codeline" id="line-122"><code>			candidate = e.table[nextHash&amp;tableMask]</code></span>
+<span class="codeline" id="line-123"><code>			now := load32(src, nextS)</code></span>
+<span class="codeline" id="line-124"><code>			e.table[nextHash&amp;tableMask] = tableEntry{offset: s + e.cur, val: cv}</code></span>
+<span class="codeline" id="line-125"><code>			nextHash = hash(now)</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>			offset := s - (candidate.offset - e.cur)</code></span>
+<span class="codeline" id="line-128"><code>			if offset &gt; maxMatchOffset || cv != candidate.val {</code></span>
+<span class="codeline" id="line-129"><code>				// Out of range or not matched.</code></span>
+<span class="codeline" id="line-130"><code>				cv = now</code></span>
+<span class="codeline" id="line-131"><code>				continue</code></span>
+<span class="codeline" id="line-132"><code>			}</code></span>
+<span class="codeline" id="line-133"><code>			break</code></span>
+<span class="codeline" id="line-134"><code>		}</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>		// A 4-byte match has been found. We'll later see if more than 4 bytes</code></span>
+<span class="codeline" id="line-137"><code>		// match. But, prior to the match, src[nextEmit:s] are unmatched. Emit</code></span>
+<span class="codeline" id="line-138"><code>		// them as literal bytes.</code></span>
+<span class="codeline" id="line-139"><code>		dst = emitLiteral(dst, src[nextEmit:s])</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>		// Call emitCopy, and then see if another emitCopy could be our next</code></span>
+<span class="codeline" id="line-142"><code>		// move. Repeat until we find no match for the input immediately after</code></span>
+<span class="codeline" id="line-143"><code>		// what was consumed by the last emitCopy call.</code></span>
+<span class="codeline" id="line-144"><code>		//</code></span>
+<span class="codeline" id="line-145"><code>		// If we exit this loop normally then we need to call emitLiteral next,</code></span>
+<span class="codeline" id="line-146"><code>		// though we don't yet know how big the literal will be. We handle that</code></span>
+<span class="codeline" id="line-147"><code>		// by proceeding to the next iteration of the main loop. We also can</code></span>
+<span class="codeline" id="line-148"><code>		// exit this loop via goto if we get close to exhausting the input.</code></span>
+<span class="codeline" id="line-149"><code>		for {</code></span>
+<span class="codeline" id="line-150"><code>			// Invariant: we have a 4-byte match at s, and no need to emit any</code></span>
+<span class="codeline" id="line-151"><code>			// literal bytes prior to s.</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>			// Extend the 4-byte match as long as possible.</code></span>
+<span class="codeline" id="line-154"><code>			//</code></span>
+<span class="codeline" id="line-155"><code>			s += 4</code></span>
+<span class="codeline" id="line-156"><code>			t := candidate.offset - e.cur + 4</code></span>
+<span class="codeline" id="line-157"><code>			l := e.matchLen(s, t, src)</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>			// matchToken is flate's equivalent of Snappy's emitCopy. (length,offset)</code></span>
+<span class="codeline" id="line-160"><code>			dst = append(dst, matchToken(uint32(l+4-baseMatchLength), uint32(s-t-baseMatchOffset)))</code></span>
+<span class="codeline" id="line-161"><code>			s += l</code></span>
+<span class="codeline" id="line-162"><code>			nextEmit = s</code></span>
+<span class="codeline" id="line-163"><code>			if s &gt;= sLimit {</code></span>
+<span class="codeline" id="line-164"><code>				goto emitRemainder</code></span>
+<span class="codeline" id="line-165"><code>			}</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>			// We could immediately start working at s now, but to improve</code></span>
+<span class="codeline" id="line-168"><code>			// compression we first update the hash table at s-1 and at s. If</code></span>
+<span class="codeline" id="line-169"><code>			// another emitCopy is not our next move, also calculate nextHash</code></span>
+<span class="codeline" id="line-170"><code>			// at s+1. At least on GOARCH=amd64, these three hash calculations</code></span>
+<span class="codeline" id="line-171"><code>			// are faster as one load64 call (with some shifts) instead of</code></span>
+<span class="codeline" id="line-172"><code>			// three load32 calls.</code></span>
+<span class="codeline" id="line-173"><code>			x := load64(src, s-1)</code></span>
+<span class="codeline" id="line-174"><code>			prevHash := hash(uint32(x))</code></span>
+<span class="codeline" id="line-175"><code>			e.table[prevHash&amp;tableMask] = tableEntry{offset: e.cur + s - 1, val: uint32(x)}</code></span>
+<span class="codeline" id="line-176"><code>			x &gt;&gt;= 8</code></span>
+<span class="codeline" id="line-177"><code>			currHash := hash(uint32(x))</code></span>
+<span class="codeline" id="line-178"><code>			candidate = e.table[currHash&amp;tableMask]</code></span>
+<span class="codeline" id="line-179"><code>			e.table[currHash&amp;tableMask] = tableEntry{offset: e.cur + s, val: uint32(x)}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>			offset := s - (candidate.offset - e.cur)</code></span>
+<span class="codeline" id="line-182"><code>			if offset &gt; maxMatchOffset || uint32(x) != candidate.val {</code></span>
+<span class="codeline" id="line-183"><code>				cv = uint32(x &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-184"><code>				nextHash = hash(cv)</code></span>
+<span class="codeline" id="line-185"><code>				s++</code></span>
+<span class="codeline" id="line-186"><code>				break</code></span>
+<span class="codeline" id="line-187"><code>			}</code></span>
+<span class="codeline" id="line-188"><code>		}</code></span>
+<span class="codeline" id="line-189"><code>	}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>emitRemainder:</code></span>
+<span class="codeline" id="line-192"><code>	if int(nextEmit) &lt; len(src) {</code></span>
+<span class="codeline" id="line-193"><code>		dst = emitLiteral(dst, src[nextEmit:])</code></span>
+<span class="codeline" id="line-194"><code>	}</code></span>
+<span class="codeline" id="line-195"><code>	e.cur += int32(len(src))</code></span>
+<span class="codeline" id="line-196"><code>	e.prev = e.prev[:len(src)]</code></span>
+<span class="codeline" id="line-197"><code>	copy(e.prev, src)</code></span>
+<span class="codeline" id="line-198"><code>	return dst</code></span>
+<span class="codeline" id="line-199"><code>}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>func emitLiteral(dst []token, lit []byte) []token {</code></span>
+<span class="codeline" id="line-202"><code>	for _, v := range lit {</code></span>
+<span class="codeline" id="line-203"><code>		dst = append(dst, literalToken(uint32(v)))</code></span>
+<span class="codeline" id="line-204"><code>	}</code></span>
+<span class="codeline" id="line-205"><code>	return dst</code></span>
+<span class="codeline" id="line-206"><code>}</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>// matchLen returns the match length between src[s:] and src[t:].</code></span>
+<span class="codeline" id="line-209"><code>// t can be negative to indicate the match is starting in e.prev.</code></span>
+<span class="codeline" id="line-210"><code>// We assume that src[s-4:s] and src[t-4:t] already match.</code></span>
+<span class="codeline" id="line-211"><code>func (e *deflateFast) matchLen(s, t int32, src []byte) int32 {</code></span>
+<span class="codeline" id="line-212"><code>	s1 := int(s) + maxMatchLength - 4</code></span>
+<span class="codeline" id="line-213"><code>	if s1 &gt; len(src) {</code></span>
+<span class="codeline" id="line-214"><code>		s1 = len(src)</code></span>
+<span class="codeline" id="line-215"><code>	}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>	// If we are inside the current block</code></span>
+<span class="codeline" id="line-218"><code>	if t &gt;= 0 {</code></span>
+<span class="codeline" id="line-219"><code>		b := src[t:]</code></span>
+<span class="codeline" id="line-220"><code>		a := src[s:s1]</code></span>
+<span class="codeline" id="line-221"><code>		b = b[:len(a)]</code></span>
+<span class="codeline" id="line-222"><code>		// Extend the match to be as long as possible.</code></span>
+<span class="codeline" id="line-223"><code>		for i := range a {</code></span>
+<span class="codeline" id="line-224"><code>			if a[i] != b[i] {</code></span>
+<span class="codeline" id="line-225"><code>				return int32(i)</code></span>
+<span class="codeline" id="line-226"><code>			}</code></span>
+<span class="codeline" id="line-227"><code>		}</code></span>
+<span class="codeline" id="line-228"><code>		return int32(len(a))</code></span>
+<span class="codeline" id="line-229"><code>	}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>	// We found a match in the previous block.</code></span>
+<span class="codeline" id="line-232"><code>	tp := int32(len(e.prev)) + t</code></span>
+<span class="codeline" id="line-233"><code>	if tp &lt; 0 {</code></span>
+<span class="codeline" id="line-234"><code>		return 0</code></span>
+<span class="codeline" id="line-235"><code>	}</code></span>
+<span class="codeline" id="line-236"><code></code></span>
+<span class="codeline" id="line-237"><code>	// Extend the match to be as long as possible.</code></span>
+<span class="codeline" id="line-238"><code>	a := src[s:s1]</code></span>
+<span class="codeline" id="line-239"><code>	b := e.prev[tp:]</code></span>
+<span class="codeline" id="line-240"><code>	if len(b) &gt; len(a) {</code></span>
+<span class="codeline" id="line-241"><code>		b = b[:len(a)]</code></span>
+<span class="codeline" id="line-242"><code>	}</code></span>
+<span class="codeline" id="line-243"><code>	a = a[:len(b)]</code></span>
+<span class="codeline" id="line-244"><code>	for i := range b {</code></span>
+<span class="codeline" id="line-245"><code>		if a[i] != b[i] {</code></span>
+<span class="codeline" id="line-246"><code>			return int32(i)</code></span>
+<span class="codeline" id="line-247"><code>		}</code></span>
+<span class="codeline" id="line-248"><code>	}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>	// If we reached our limit, we matched everything we are</code></span>
+<span class="codeline" id="line-251"><code>	// allowed to in the previous block and we return.</code></span>
+<span class="codeline" id="line-252"><code>	n := int32(len(b))</code></span>
+<span class="codeline" id="line-253"><code>	if int(s+n) == s1 {</code></span>
+<span class="codeline" id="line-254"><code>		return n</code></span>
+<span class="codeline" id="line-255"><code>	}</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>	// Continue looking for more matches in the current block.</code></span>
+<span class="codeline" id="line-258"><code>	a = src[s+n : s1]</code></span>
+<span class="codeline" id="line-259"><code>	b = src[:len(a)]</code></span>
+<span class="codeline" id="line-260"><code>	for i := range a {</code></span>
+<span class="codeline" id="line-261"><code>		if a[i] != b[i] {</code></span>
+<span class="codeline" id="line-262"><code>			return int32(i) + n</code></span>
+<span class="codeline" id="line-263"><code>		}</code></span>
+<span class="codeline" id="line-264"><code>	}</code></span>
+<span class="codeline" id="line-265"><code>	return int32(len(a)) + n</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// Reset resets the encoding history.</code></span>
+<span class="codeline" id="line-269"><code>// This ensures that no matches are made to the previous block.</code></span>
+<span class="codeline" id="line-270"><code>func (e *deflateFast) reset() {</code></span>
+<span class="codeline" id="line-271"><code>	e.prev = e.prev[:0]</code></span>
+<span class="codeline" id="line-272"><code>	// Bump the offset, so all matches will fail distance check.</code></span>
+<span class="codeline" id="line-273"><code>	// Nothing should be &gt;= e.cur in the table.</code></span>
+<span class="codeline" id="line-274"><code>	e.cur += maxMatchOffset</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>	// Protect against e.cur wraparound.</code></span>
+<span class="codeline" id="line-277"><code>	if e.cur &gt;= bufferReset {</code></span>
+<span class="codeline" id="line-278"><code>		e.shiftOffsets()</code></span>
+<span class="codeline" id="line-279"><code>	}</code></span>
+<span class="codeline" id="line-280"><code>}</code></span>
+<span class="codeline" id="line-281"><code></code></span>
+<span class="codeline" id="line-282"><code>// shiftOffsets will shift down all match offset.</code></span>
+<span class="codeline" id="line-283"><code>// This is only called in rare situations to prevent integer overflow.</code></span>
+<span class="codeline" id="line-284"><code>//</code></span>
+<span class="codeline" id="line-285"><code>// See https://golang.org/issue/18636 and https://github.com/golang/go/issues/34121.</code></span>
+<span class="codeline" id="line-286"><code>func (e *deflateFast) shiftOffsets() {</code></span>
+<span class="codeline" id="line-287"><code>	if len(e.prev) == 0 {</code></span>
+<span class="codeline" id="line-288"><code>		// We have no history; just clear the table.</code></span>
+<span class="codeline" id="line-289"><code>		for i := range e.table[:] {</code></span>
+<span class="codeline" id="line-290"><code>			e.table[i] = tableEntry{}</code></span>
+<span class="codeline" id="line-291"><code>		}</code></span>
+<span class="codeline" id="line-292"><code>		e.cur = maxMatchOffset + 1</code></span>
+<span class="codeline" id="line-293"><code>		return</code></span>
+<span class="codeline" id="line-294"><code>	}</code></span>
+<span class="codeline" id="line-295"><code></code></span>
+<span class="codeline" id="line-296"><code>	// Shift down everything in the table that isn't already too far away.</code></span>
+<span class="codeline" id="line-297"><code>	for i := range e.table[:] {</code></span>
+<span class="codeline" id="line-298"><code>		v := e.table[i].offset - e.cur + maxMatchOffset + 1</code></span>
+<span class="codeline" id="line-299"><code>		if v &lt; 0 {</code></span>
+<span class="codeline" id="line-300"><code>			// We want to reset e.cur to maxMatchOffset + 1, so we need to shift</code></span>
+<span class="codeline" id="line-301"><code>			// all table entries down by (e.cur - (maxMatchOffset + 1)).</code></span>
+<span class="codeline" id="line-302"><code>			// Because we ignore matches &gt; maxMatchOffset, we can cap</code></span>
+<span class="codeline" id="line-303"><code>			// any negative offsets at 0.</code></span>
+<span class="codeline" id="line-304"><code>			v = 0</code></span>
+<span class="codeline" id="line-305"><code>		}</code></span>
+<span class="codeline" id="line-306"><code>		e.table[i].offset = v</code></span>
+<span class="codeline" id="line-307"><code>	}</code></span>
+<span class="codeline" id="line-308"><code>	e.cur = maxMatchOffset + 1</code></span>
+<span class="codeline" id="line-309"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

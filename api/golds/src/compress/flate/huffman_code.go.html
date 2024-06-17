@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: huffman_code.go in package compress/flate</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	huffman_code.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/compress/flate.html">compress/flate</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package flate</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"math"</code></span>
+<span class="codeline" id="line-9"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-10"><code>	"sort"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// hcode is a huffman code with a bit code and bit length.</code></span>
+<span class="codeline" id="line-14"><code>type hcode struct {</code></span>
+<span class="codeline" id="line-15"><code>	code, len uint16</code></span>
+<span class="codeline" id="line-16"><code>}</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>type huffmanEncoder struct {</code></span>
+<span class="codeline" id="line-19"><code>	codes     []hcode</code></span>
+<span class="codeline" id="line-20"><code>	freqcache []literalNode</code></span>
+<span class="codeline" id="line-21"><code>	bitCount  [17]int32</code></span>
+<span class="codeline" id="line-22"><code>	lns       byLiteral // stored to avoid repeated allocation in generate</code></span>
+<span class="codeline" id="line-23"><code>	lfs       byFreq    // stored to avoid repeated allocation in generate</code></span>
+<span class="codeline" id="line-24"><code>}</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>type literalNode struct {</code></span>
+<span class="codeline" id="line-27"><code>	literal uint16</code></span>
+<span class="codeline" id="line-28"><code>	freq    int32</code></span>
+<span class="codeline" id="line-29"><code>}</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>// A levelInfo describes the state of the constructed tree for a given depth.</code></span>
+<span class="codeline" id="line-32"><code>type levelInfo struct {</code></span>
+<span class="codeline" id="line-33"><code>	// Our level.  for better printing</code></span>
+<span class="codeline" id="line-34"><code>	level int32</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>	// The frequency of the last node at this level</code></span>
+<span class="codeline" id="line-37"><code>	lastFreq int32</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>	// The frequency of the next character to add to this level</code></span>
+<span class="codeline" id="line-40"><code>	nextCharFreq int32</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>	// The frequency of the next pair (from level below) to add to this level.</code></span>
+<span class="codeline" id="line-43"><code>	// Only valid if the "needed" value of the next lower level is 0.</code></span>
+<span class="codeline" id="line-44"><code>	nextPairFreq int32</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>	// The number of chains remaining to generate for this level before moving</code></span>
+<span class="codeline" id="line-47"><code>	// up to the next level</code></span>
+<span class="codeline" id="line-48"><code>	needed int32</code></span>
+<span class="codeline" id="line-49"><code>}</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>// set sets the code and length of an hcode.</code></span>
+<span class="codeline" id="line-52"><code>func (h *hcode) set(code uint16, length uint16) {</code></span>
+<span class="codeline" id="line-53"><code>	h.len = length</code></span>
+<span class="codeline" id="line-54"><code>	h.code = code</code></span>
+<span class="codeline" id="line-55"><code>}</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>func maxNode() literalNode { return literalNode{math.MaxUint16, math.MaxInt32} }</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>func newHuffmanEncoder(size int) *huffmanEncoder {</code></span>
+<span class="codeline" id="line-60"><code>	return &amp;huffmanEncoder{codes: make([]hcode, size)}</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// Generates a HuffmanCode corresponding to the fixed literal table.</code></span>
+<span class="codeline" id="line-64"><code>func generateFixedLiteralEncoding() *huffmanEncoder {</code></span>
+<span class="codeline" id="line-65"><code>	h := newHuffmanEncoder(maxNumLit)</code></span>
+<span class="codeline" id="line-66"><code>	codes := h.codes</code></span>
+<span class="codeline" id="line-67"><code>	var ch uint16</code></span>
+<span class="codeline" id="line-68"><code>	for ch = 0; ch &lt; maxNumLit; ch++ {</code></span>
+<span class="codeline" id="line-69"><code>		var bits uint16</code></span>
+<span class="codeline" id="line-70"><code>		var size uint16</code></span>
+<span class="codeline" id="line-71"><code>		switch {</code></span>
+<span class="codeline" id="line-72"><code>		case ch &lt; 144:</code></span>
+<span class="codeline" id="line-73"><code>			// size 8, 000110000  .. 10111111</code></span>
+<span class="codeline" id="line-74"><code>			bits = ch + 48</code></span>
+<span class="codeline" id="line-75"><code>			size = 8</code></span>
+<span class="codeline" id="line-76"><code>		case ch &lt; 256:</code></span>
+<span class="codeline" id="line-77"><code>			// size 9, 110010000 .. 111111111</code></span>
+<span class="codeline" id="line-78"><code>			bits = ch + 400 - 144</code></span>
+<span class="codeline" id="line-79"><code>			size = 9</code></span>
+<span class="codeline" id="line-80"><code>		case ch &lt; 280:</code></span>
+<span class="codeline" id="line-81"><code>			// size 7, 0000000 .. 0010111</code></span>
+<span class="codeline" id="line-82"><code>			bits = ch - 256</code></span>
+<span class="codeline" id="line-83"><code>			size = 7</code></span>
+<span class="codeline" id="line-84"><code>		default:</code></span>
+<span class="codeline" id="line-85"><code>			// size 8, 11000000 .. 11000111</code></span>
+<span class="codeline" id="line-86"><code>			bits = ch + 192 - 280</code></span>
+<span class="codeline" id="line-87"><code>			size = 8</code></span>
+<span class="codeline" id="line-88"><code>		}</code></span>
+<span class="codeline" id="line-89"><code>		codes[ch] = hcode{code: reverseBits(bits, byte(size)), len: size}</code></span>
+<span class="codeline" id="line-90"><code>	}</code></span>
+<span class="codeline" id="line-91"><code>	return h</code></span>
+<span class="codeline" id="line-92"><code>}</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>func generateFixedOffsetEncoding() *huffmanEncoder {</code></span>
+<span class="codeline" id="line-95"><code>	h := newHuffmanEncoder(30)</code></span>
+<span class="codeline" id="line-96"><code>	codes := h.codes</code></span>
+<span class="codeline" id="line-97"><code>	for ch := range codes {</code></span>
+<span class="codeline" id="line-98"><code>		codes[ch] = hcode{code: reverseBits(uint16(ch), 5), len: 5}</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	return h</code></span>
+<span class="codeline" id="line-101"><code>}</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>var fixedLiteralEncoding *huffmanEncoder = generateFixedLiteralEncoding()</code></span>
+<span class="codeline" id="line-104"><code>var fixedOffsetEncoding *huffmanEncoder = generateFixedOffsetEncoding()</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>func (h *huffmanEncoder) bitLength(freq []int32) int {</code></span>
+<span class="codeline" id="line-107"><code>	var total int</code></span>
+<span class="codeline" id="line-108"><code>	for i, f := range freq {</code></span>
+<span class="codeline" id="line-109"><code>		if f != 0 {</code></span>
+<span class="codeline" id="line-110"><code>			total += int(f) * int(h.codes[i].len)</code></span>
+<span class="codeline" id="line-111"><code>		}</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code>	return total</code></span>
+<span class="codeline" id="line-114"><code>}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>const maxBitsLimit = 16</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>// bitCounts computes the number of literals assigned to each bit size in the Huffman encoding.</code></span>
+<span class="codeline" id="line-119"><code>// It is only called when list.length &gt;= 3.</code></span>
+<span class="codeline" id="line-120"><code>// The cases of 0, 1, and 2 literals are handled by special case code.</code></span>
+<span class="codeline" id="line-121"><code>//</code></span>
+<span class="codeline" id="line-122"><code>// list is an array of the literals with non-zero frequencies</code></span>
+<span class="codeline" id="line-123"><code>// and their associated frequencies. The array is in order of increasing</code></span>
+<span class="codeline" id="line-124"><code>// frequency and has as its last element a special element with frequency</code></span>
+<span class="codeline" id="line-125"><code>// MaxInt32.</code></span>
+<span class="codeline" id="line-126"><code>//</code></span>
+<span class="codeline" id="line-127"><code>// maxBits is the maximum number of bits that should be used to encode any literal.</code></span>
+<span class="codeline" id="line-128"><code>// It must be less than 16.</code></span>
+<span class="codeline" id="line-129"><code>//</code></span>
+<span class="codeline" id="line-130"><code>// bitCounts returns an integer slice in which slice[i] indicates the number of literals</code></span>
+<span class="codeline" id="line-131"><code>// that should be encoded in i bits.</code></span>
+<span class="codeline" id="line-132"><code>func (h *huffmanEncoder) bitCounts(list []literalNode, maxBits int32) []int32 {</code></span>
+<span class="codeline" id="line-133"><code>	if maxBits &gt;= maxBitsLimit {</code></span>
+<span class="codeline" id="line-134"><code>		panic("flate: maxBits too large")</code></span>
+<span class="codeline" id="line-135"><code>	}</code></span>
+<span class="codeline" id="line-136"><code>	n := int32(len(list))</code></span>
+<span class="codeline" id="line-137"><code>	list = list[0 : n+1]</code></span>
+<span class="codeline" id="line-138"><code>	list[n] = maxNode()</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>	// The tree can't have greater depth than n - 1, no matter what. This</code></span>
+<span class="codeline" id="line-141"><code>	// saves a little bit of work in some small cases</code></span>
+<span class="codeline" id="line-142"><code>	if maxBits &gt; n-1 {</code></span>
+<span class="codeline" id="line-143"><code>		maxBits = n - 1</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	// Create information about each of the levels.</code></span>
+<span class="codeline" id="line-147"><code>	// A bogus "Level 0" whose sole purpose is so that</code></span>
+<span class="codeline" id="line-148"><code>	// level1.prev.needed==0.  This makes level1.nextPairFreq</code></span>
+<span class="codeline" id="line-149"><code>	// be a legitimate value that never gets chosen.</code></span>
+<span class="codeline" id="line-150"><code>	var levels [maxBitsLimit]levelInfo</code></span>
+<span class="codeline" id="line-151"><code>	// leafCounts[i] counts the number of literals at the left</code></span>
+<span class="codeline" id="line-152"><code>	// of ancestors of the rightmost node at level i.</code></span>
+<span class="codeline" id="line-153"><code>	// leafCounts[i][j] is the number of literals at the left</code></span>
+<span class="codeline" id="line-154"><code>	// of the level j ancestor.</code></span>
+<span class="codeline" id="line-155"><code>	var leafCounts [maxBitsLimit][maxBitsLimit]int32</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>	for level := int32(1); level &lt;= maxBits; level++ {</code></span>
+<span class="codeline" id="line-158"><code>		// For every level, the first two items are the first two characters.</code></span>
+<span class="codeline" id="line-159"><code>		// We initialize the levels as if we had already figured this out.</code></span>
+<span class="codeline" id="line-160"><code>		levels[level] = levelInfo{</code></span>
+<span class="codeline" id="line-161"><code>			level:        level,</code></span>
+<span class="codeline" id="line-162"><code>			lastFreq:     list[1].freq,</code></span>
+<span class="codeline" id="line-163"><code>			nextCharFreq: list[2].freq,</code></span>
+<span class="codeline" id="line-164"><code>			nextPairFreq: list[0].freq + list[1].freq,</code></span>
+<span class="codeline" id="line-165"><code>		}</code></span>
+<span class="codeline" id="line-166"><code>		leafCounts[level][level] = 2</code></span>
+<span class="codeline" id="line-167"><code>		if level == 1 {</code></span>
+<span class="codeline" id="line-168"><code>			levels[level].nextPairFreq = math.MaxInt32</code></span>
+<span class="codeline" id="line-169"><code>		}</code></span>
+<span class="codeline" id="line-170"><code>	}</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>	// We need a total of 2*n - 2 items at top level and have already generated 2.</code></span>
+<span class="codeline" id="line-173"><code>	levels[maxBits].needed = 2*n - 4</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>	level := maxBits</code></span>
+<span class="codeline" id="line-176"><code>	for {</code></span>
+<span class="codeline" id="line-177"><code>		l := &amp;levels[level]</code></span>
+<span class="codeline" id="line-178"><code>		if l.nextPairFreq == math.MaxInt32 &amp;&amp; l.nextCharFreq == math.MaxInt32 {</code></span>
+<span class="codeline" id="line-179"><code>			// We've run out of both leafs and pairs.</code></span>
+<span class="codeline" id="line-180"><code>			// End all calculations for this level.</code></span>
+<span class="codeline" id="line-181"><code>			// To make sure we never come back to this level or any lower level,</code></span>
+<span class="codeline" id="line-182"><code>			// set nextPairFreq impossibly large.</code></span>
+<span class="codeline" id="line-183"><code>			l.needed = 0</code></span>
+<span class="codeline" id="line-184"><code>			levels[level+1].nextPairFreq = math.MaxInt32</code></span>
+<span class="codeline" id="line-185"><code>			level++</code></span>
+<span class="codeline" id="line-186"><code>			continue</code></span>
+<span class="codeline" id="line-187"><code>		}</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>		prevFreq := l.lastFreq</code></span>
+<span class="codeline" id="line-190"><code>		if l.nextCharFreq &lt; l.nextPairFreq {</code></span>
+<span class="codeline" id="line-191"><code>			// The next item on this row is a leaf node.</code></span>
+<span class="codeline" id="line-192"><code>			n := leafCounts[level][level] + 1</code></span>
+<span class="codeline" id="line-193"><code>			l.lastFreq = l.nextCharFreq</code></span>
+<span class="codeline" id="line-194"><code>			// Lower leafCounts are the same of the previous node.</code></span>
+<span class="codeline" id="line-195"><code>			leafCounts[level][level] = n</code></span>
+<span class="codeline" id="line-196"><code>			l.nextCharFreq = list[n].freq</code></span>
+<span class="codeline" id="line-197"><code>		} else {</code></span>
+<span class="codeline" id="line-198"><code>			// The next item on this row is a pair from the previous row.</code></span>
+<span class="codeline" id="line-199"><code>			// nextPairFreq isn't valid until we generate two</code></span>
+<span class="codeline" id="line-200"><code>			// more values in the level below</code></span>
+<span class="codeline" id="line-201"><code>			l.lastFreq = l.nextPairFreq</code></span>
+<span class="codeline" id="line-202"><code>			// Take leaf counts from the lower level, except counts[level] remains the same.</code></span>
+<span class="codeline" id="line-203"><code>			copy(leafCounts[level][:level], leafCounts[level-1][:level])</code></span>
+<span class="codeline" id="line-204"><code>			levels[l.level-1].needed = 2</code></span>
+<span class="codeline" id="line-205"><code>		}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>		if l.needed--; l.needed == 0 {</code></span>
+<span class="codeline" id="line-208"><code>			// We've done everything we need to do for this level.</code></span>
+<span class="codeline" id="line-209"><code>			// Continue calculating one level up. Fill in nextPairFreq</code></span>
+<span class="codeline" id="line-210"><code>			// of that level with the sum of the two nodes we've just calculated on</code></span>
+<span class="codeline" id="line-211"><code>			// this level.</code></span>
+<span class="codeline" id="line-212"><code>			if l.level == maxBits {</code></span>
+<span class="codeline" id="line-213"><code>				// All done!</code></span>
+<span class="codeline" id="line-214"><code>				break</code></span>
+<span class="codeline" id="line-215"><code>			}</code></span>
+<span class="codeline" id="line-216"><code>			levels[l.level+1].nextPairFreq = prevFreq + l.lastFreq</code></span>
+<span class="codeline" id="line-217"><code>			level++</code></span>
+<span class="codeline" id="line-218"><code>		} else {</code></span>
+<span class="codeline" id="line-219"><code>			// If we stole from below, move down temporarily to replenish it.</code></span>
+<span class="codeline" id="line-220"><code>			for levels[level-1].needed &gt; 0 {</code></span>
+<span class="codeline" id="line-221"><code>				level--</code></span>
+<span class="codeline" id="line-222"><code>			}</code></span>
+<span class="codeline" id="line-223"><code>		}</code></span>
+<span class="codeline" id="line-224"><code>	}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>	// Somethings is wrong if at the end, the top level is null or hasn't used</code></span>
+<span class="codeline" id="line-227"><code>	// all of the leaves.</code></span>
+<span class="codeline" id="line-228"><code>	if leafCounts[maxBits][maxBits] != n {</code></span>
+<span class="codeline" id="line-229"><code>		panic("leafCounts[maxBits][maxBits] != n")</code></span>
+<span class="codeline" id="line-230"><code>	}</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>	bitCount := h.bitCount[:maxBits+1]</code></span>
+<span class="codeline" id="line-233"><code>	bits := 1</code></span>
+<span class="codeline" id="line-234"><code>	counts := &amp;leafCounts[maxBits]</code></span>
+<span class="codeline" id="line-235"><code>	for level := maxBits; level &gt; 0; level-- {</code></span>
+<span class="codeline" id="line-236"><code>		// chain.leafCount gives the number of literals requiring at least "bits"</code></span>
+<span class="codeline" id="line-237"><code>		// bits to encode.</code></span>
+<span class="codeline" id="line-238"><code>		bitCount[bits] = counts[level] - counts[level-1]</code></span>
+<span class="codeline" id="line-239"><code>		bits++</code></span>
+<span class="codeline" id="line-240"><code>	}</code></span>
+<span class="codeline" id="line-241"><code>	return bitCount</code></span>
+<span class="codeline" id="line-242"><code>}</code></span>
+<span class="codeline" id="line-243"><code></code></span>
+<span class="codeline" id="line-244"><code>// Look at the leaves and assign them a bit count and an encoding as specified</code></span>
+<span class="codeline" id="line-245"><code>// in RFC 1951 3.2.2</code></span>
+<span class="codeline" id="line-246"><code>func (h *huffmanEncoder) assignEncodingAndSize(bitCount []int32, list []literalNode) {</code></span>
+<span class="codeline" id="line-247"><code>	code := uint16(0)</code></span>
+<span class="codeline" id="line-248"><code>	for n, bits := range bitCount {</code></span>
+<span class="codeline" id="line-249"><code>		code &lt;&lt;= 1</code></span>
+<span class="codeline" id="line-250"><code>		if n == 0 || bits == 0 {</code></span>
+<span class="codeline" id="line-251"><code>			continue</code></span>
+<span class="codeline" id="line-252"><code>		}</code></span>
+<span class="codeline" id="line-253"><code>		// The literals list[len(list)-bits] .. list[len(list)-bits]</code></span>
+<span class="codeline" id="line-254"><code>		// are encoded using "bits" bits, and get the values</code></span>
+<span class="codeline" id="line-255"><code>		// code, code + 1, ....  The code values are</code></span>
+<span class="codeline" id="line-256"><code>		// assigned in literal order (not frequency order).</code></span>
+<span class="codeline" id="line-257"><code>		chunk := list[len(list)-int(bits):]</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>		h.lns.sort(chunk)</code></span>
+<span class="codeline" id="line-260"><code>		for _, node := range chunk {</code></span>
+<span class="codeline" id="line-261"><code>			h.codes[node.literal] = hcode{code: reverseBits(code, uint8(n)), len: uint16(n)}</code></span>
+<span class="codeline" id="line-262"><code>			code++</code></span>
+<span class="codeline" id="line-263"><code>		}</code></span>
+<span class="codeline" id="line-264"><code>		list = list[0 : len(list)-int(bits)]</code></span>
+<span class="codeline" id="line-265"><code>	}</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// Update this Huffman Code object to be the minimum code for the specified frequency count.</code></span>
+<span class="codeline" id="line-269"><code>//</code></span>
+<span class="codeline" id="line-270"><code>// freq is an array of frequencies, in which freq[i] gives the frequency of literal i.</code></span>
+<span class="codeline" id="line-271"><code>// maxBits  The maximum number of bits to use for any literal.</code></span>
+<span class="codeline" id="line-272"><code>func (h *huffmanEncoder) generate(freq []int32, maxBits int32) {</code></span>
+<span class="codeline" id="line-273"><code>	if h.freqcache == nil {</code></span>
+<span class="codeline" id="line-274"><code>		// Allocate a reusable buffer with the longest possible frequency table.</code></span>
+<span class="codeline" id="line-275"><code>		// Possible lengths are codegenCodeCount, offsetCodeCount and maxNumLit.</code></span>
+<span class="codeline" id="line-276"><code>		// The largest of these is maxNumLit, so we allocate for that case.</code></span>
+<span class="codeline" id="line-277"><code>		h.freqcache = make([]literalNode, maxNumLit+1)</code></span>
+<span class="codeline" id="line-278"><code>	}</code></span>
+<span class="codeline" id="line-279"><code>	list := h.freqcache[:len(freq)+1]</code></span>
+<span class="codeline" id="line-280"><code>	// Number of non-zero literals</code></span>
+<span class="codeline" id="line-281"><code>	count := 0</code></span>
+<span class="codeline" id="line-282"><code>	// Set list to be the set of all non-zero literals and their frequencies</code></span>
+<span class="codeline" id="line-283"><code>	for i, f := range freq {</code></span>
+<span class="codeline" id="line-284"><code>		if f != 0 {</code></span>
+<span class="codeline" id="line-285"><code>			list[count] = literalNode{uint16(i), f}</code></span>
+<span class="codeline" id="line-286"><code>			count++</code></span>
+<span class="codeline" id="line-287"><code>		} else {</code></span>
+<span class="codeline" id="line-288"><code>			h.codes[i].len = 0</code></span>
+<span class="codeline" id="line-289"><code>		}</code></span>
+<span class="codeline" id="line-290"><code>	}</code></span>
+<span class="codeline" id="line-291"><code></code></span>
+<span class="codeline" id="line-292"><code>	list = list[:count]</code></span>
+<span class="codeline" id="line-293"><code>	if count &lt;= 2 {</code></span>
+<span class="codeline" id="line-294"><code>		// Handle the small cases here, because they are awkward for the general case code. With</code></span>
+<span class="codeline" id="line-295"><code>		// two or fewer literals, everything has bit length 1.</code></span>
+<span class="codeline" id="line-296"><code>		for i, node := range list {</code></span>
+<span class="codeline" id="line-297"><code>			// "list" is in order of increasing literal value.</code></span>
+<span class="codeline" id="line-298"><code>			h.codes[node.literal].set(uint16(i), 1)</code></span>
+<span class="codeline" id="line-299"><code>		}</code></span>
+<span class="codeline" id="line-300"><code>		return</code></span>
+<span class="codeline" id="line-301"><code>	}</code></span>
+<span class="codeline" id="line-302"><code>	h.lfs.sort(list)</code></span>
+<span class="codeline" id="line-303"><code></code></span>
+<span class="codeline" id="line-304"><code>	// Get the number of literals for each bit count</code></span>
+<span class="codeline" id="line-305"><code>	bitCount := h.bitCounts(list, maxBits)</code></span>
+<span class="codeline" id="line-306"><code>	// And do the assignment</code></span>
+<span class="codeline" id="line-307"><code>	h.assignEncodingAndSize(bitCount, list)</code></span>
+<span class="codeline" id="line-308"><code>}</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>type byLiteral []literalNode</code></span>
+<span class="codeline" id="line-311"><code></code></span>
+<span class="codeline" id="line-312"><code>func (s *byLiteral) sort(a []literalNode) {</code></span>
+<span class="codeline" id="line-313"><code>	*s = byLiteral(a)</code></span>
+<span class="codeline" id="line-314"><code>	sort.Sort(s)</code></span>
+<span class="codeline" id="line-315"><code>}</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>func (s byLiteral) Len() int { return len(s) }</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>func (s byLiteral) Less(i, j int) bool {</code></span>
+<span class="codeline" id="line-320"><code>	return s[i].literal &lt; s[j].literal</code></span>
+<span class="codeline" id="line-321"><code>}</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>func (s byLiteral) Swap(i, j int) { s[i], s[j] = s[j], s[i] }</code></span>
+<span class="codeline" id="line-324"><code></code></span>
+<span class="codeline" id="line-325"><code>type byFreq []literalNode</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>func (s *byFreq) sort(a []literalNode) {</code></span>
+<span class="codeline" id="line-328"><code>	*s = byFreq(a)</code></span>
+<span class="codeline" id="line-329"><code>	sort.Sort(s)</code></span>
+<span class="codeline" id="line-330"><code>}</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>func (s byFreq) Len() int { return len(s) }</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>func (s byFreq) Less(i, j int) bool {</code></span>
+<span class="codeline" id="line-335"><code>	if s[i].freq == s[j].freq {</code></span>
+<span class="codeline" id="line-336"><code>		return s[i].literal &lt; s[j].literal</code></span>
+<span class="codeline" id="line-337"><code>	}</code></span>
+<span class="codeline" id="line-338"><code>	return s[i].freq &lt; s[j].freq</code></span>
+<span class="codeline" id="line-339"><code>}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>func (s byFreq) Swap(i, j int) { s[i], s[j] = s[j], s[i] }</code></span>
+<span class="codeline" id="line-342"><code></code></span>
+<span class="codeline" id="line-343"><code>func reverseBits(number uint16, bitLength byte) uint16 {</code></span>
+<span class="codeline" id="line-344"><code>	return bits.Reverse16(number &lt;&lt; (16 - bitLength))</code></span>
+<span class="codeline" id="line-345"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

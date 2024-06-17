@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: compress.go in package github.com/valyala/fasthttp</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	compress.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/valyala/fasthttp.html">github.com/valyala/fasthttp</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package fasthttp</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"bytes"</code></span>
+<span class="codeline" id="line-5"><code>	"fmt"</code></span>
+<span class="codeline" id="line-6"><code>	"io"</code></span>
+<span class="codeline" id="line-7"><code>	"io/fs"</code></span>
+<span class="codeline" id="line-8"><code>	"sync"</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>	"github.com/klauspost/compress/flate"</code></span>
+<span class="codeline" id="line-11"><code>	"github.com/klauspost/compress/gzip"</code></span>
+<span class="codeline" id="line-12"><code>	"github.com/klauspost/compress/zlib"</code></span>
+<span class="codeline" id="line-13"><code>	"github.com/valyala/bytebufferpool"</code></span>
+<span class="codeline" id="line-14"><code>	"github.com/valyala/fasthttp/stackless"</code></span>
+<span class="codeline" id="line-15"><code>)</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>// Supported compression levels.</code></span>
+<span class="codeline" id="line-18"><code>const (</code></span>
+<span class="codeline" id="line-19"><code>	CompressNoCompression      = flate.NoCompression</code></span>
+<span class="codeline" id="line-20"><code>	CompressBestSpeed          = flate.BestSpeed</code></span>
+<span class="codeline" id="line-21"><code>	CompressBestCompression    = flate.BestCompression</code></span>
+<span class="codeline" id="line-22"><code>	CompressDefaultCompression = 6  // flate.DefaultCompression</code></span>
+<span class="codeline" id="line-23"><code>	CompressHuffmanOnly        = -2 // flate.HuffmanOnly</code></span>
+<span class="codeline" id="line-24"><code>)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>func acquireGzipReader(r io.Reader) (*gzip.Reader, error) {</code></span>
+<span class="codeline" id="line-27"><code>	v := gzipReaderPool.Get()</code></span>
+<span class="codeline" id="line-28"><code>	if v == nil {</code></span>
+<span class="codeline" id="line-29"><code>		return gzip.NewReader(r)</code></span>
+<span class="codeline" id="line-30"><code>	}</code></span>
+<span class="codeline" id="line-31"><code>	zr := v.(*gzip.Reader)</code></span>
+<span class="codeline" id="line-32"><code>	if err := zr.Reset(r); err != nil {</code></span>
+<span class="codeline" id="line-33"><code>		return nil, err</code></span>
+<span class="codeline" id="line-34"><code>	}</code></span>
+<span class="codeline" id="line-35"><code>	return zr, nil</code></span>
+<span class="codeline" id="line-36"><code>}</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>func releaseGzipReader(zr *gzip.Reader) {</code></span>
+<span class="codeline" id="line-39"><code>	zr.Close()</code></span>
+<span class="codeline" id="line-40"><code>	gzipReaderPool.Put(zr)</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>var gzipReaderPool sync.Pool</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>func acquireFlateReader(r io.Reader) (io.ReadCloser, error) {</code></span>
+<span class="codeline" id="line-46"><code>	v := flateReaderPool.Get()</code></span>
+<span class="codeline" id="line-47"><code>	if v == nil {</code></span>
+<span class="codeline" id="line-48"><code>		zr, err := zlib.NewReader(r)</code></span>
+<span class="codeline" id="line-49"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-50"><code>			return nil, err</code></span>
+<span class="codeline" id="line-51"><code>		}</code></span>
+<span class="codeline" id="line-52"><code>		return zr, nil</code></span>
+<span class="codeline" id="line-53"><code>	}</code></span>
+<span class="codeline" id="line-54"><code>	zr := v.(io.ReadCloser)</code></span>
+<span class="codeline" id="line-55"><code>	if err := resetFlateReader(zr, r); err != nil {</code></span>
+<span class="codeline" id="line-56"><code>		return nil, err</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	return zr, nil</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>func releaseFlateReader(zr io.ReadCloser) {</code></span>
+<span class="codeline" id="line-62"><code>	zr.Close()</code></span>
+<span class="codeline" id="line-63"><code>	flateReaderPool.Put(zr)</code></span>
+<span class="codeline" id="line-64"><code>}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>func resetFlateReader(zr io.ReadCloser, r io.Reader) error {</code></span>
+<span class="codeline" id="line-67"><code>	zrr, ok := zr.(zlib.Resetter)</code></span>
+<span class="codeline" id="line-68"><code>	if !ok {</code></span>
+<span class="codeline" id="line-69"><code>		// sanity check. should only be called with a zlib.Reader</code></span>
+<span class="codeline" id="line-70"><code>		panic("BUG: zlib.Reader doesn't implement zlib.Resetter???")</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code>	return zrr.Reset(r, nil)</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>var flateReaderPool sync.Pool</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>func acquireStacklessGzipWriter(w io.Writer, level int) stackless.Writer {</code></span>
+<span class="codeline" id="line-78"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-79"><code>	p := stacklessGzipWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-80"><code>	v := p.Get()</code></span>
+<span class="codeline" id="line-81"><code>	if v == nil {</code></span>
+<span class="codeline" id="line-82"><code>		return stackless.NewWriter(w, func(w io.Writer) stackless.Writer {</code></span>
+<span class="codeline" id="line-83"><code>			return acquireRealGzipWriter(w, level)</code></span>
+<span class="codeline" id="line-84"><code>		})</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code>	sw := v.(stackless.Writer)</code></span>
+<span class="codeline" id="line-87"><code>	sw.Reset(w)</code></span>
+<span class="codeline" id="line-88"><code>	return sw</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>func releaseStacklessGzipWriter(sw stackless.Writer, level int) {</code></span>
+<span class="codeline" id="line-92"><code>	sw.Close()</code></span>
+<span class="codeline" id="line-93"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-94"><code>	p := stacklessGzipWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-95"><code>	p.Put(sw)</code></span>
+<span class="codeline" id="line-96"><code>}</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>func acquireRealGzipWriter(w io.Writer, level int) *gzip.Writer {</code></span>
+<span class="codeline" id="line-99"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-100"><code>	p := realGzipWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-101"><code>	v := p.Get()</code></span>
+<span class="codeline" id="line-102"><code>	if v == nil {</code></span>
+<span class="codeline" id="line-103"><code>		zw, err := gzip.NewWriterLevel(w, level)</code></span>
+<span class="codeline" id="line-104"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-105"><code>			// gzip.NewWriterLevel only errors for invalid</code></span>
+<span class="codeline" id="line-106"><code>			// compression levels. Clamp it to be min or max.</code></span>
+<span class="codeline" id="line-107"><code>			if level &lt; gzip.HuffmanOnly {</code></span>
+<span class="codeline" id="line-108"><code>				level = gzip.HuffmanOnly</code></span>
+<span class="codeline" id="line-109"><code>			} else {</code></span>
+<span class="codeline" id="line-110"><code>				level = gzip.BestCompression</code></span>
+<span class="codeline" id="line-111"><code>			}</code></span>
+<span class="codeline" id="line-112"><code>			zw, _ = gzip.NewWriterLevel(w, level)</code></span>
+<span class="codeline" id="line-113"><code>		}</code></span>
+<span class="codeline" id="line-114"><code>		return zw</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	zw := v.(*gzip.Writer)</code></span>
+<span class="codeline" id="line-117"><code>	zw.Reset(w)</code></span>
+<span class="codeline" id="line-118"><code>	return zw</code></span>
+<span class="codeline" id="line-119"><code>}</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>func releaseRealGzipWriter(zw *gzip.Writer, level int) {</code></span>
+<span class="codeline" id="line-122"><code>	zw.Close()</code></span>
+<span class="codeline" id="line-123"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-124"><code>	p := realGzipWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-125"><code>	p.Put(zw)</code></span>
+<span class="codeline" id="line-126"><code>}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>var (</code></span>
+<span class="codeline" id="line-129"><code>	stacklessGzipWriterPoolMap = newCompressWriterPoolMap()</code></span>
+<span class="codeline" id="line-130"><code>	realGzipWriterPoolMap      = newCompressWriterPoolMap()</code></span>
+<span class="codeline" id="line-131"><code>)</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>// AppendGzipBytesLevel appends gzipped src to dst using the given</code></span>
+<span class="codeline" id="line-134"><code>// compression level and returns the resulting dst.</code></span>
+<span class="codeline" id="line-135"><code>//</code></span>
+<span class="codeline" id="line-136"><code>// Supported compression levels are:</code></span>
+<span class="codeline" id="line-137"><code>//</code></span>
+<span class="codeline" id="line-138"><code>//   - CompressNoCompression</code></span>
+<span class="codeline" id="line-139"><code>//   - CompressBestSpeed</code></span>
+<span class="codeline" id="line-140"><code>//   - CompressBestCompression</code></span>
+<span class="codeline" id="line-141"><code>//   - CompressDefaultCompression</code></span>
+<span class="codeline" id="line-142"><code>//   - CompressHuffmanOnly</code></span>
+<span class="codeline" id="line-143"><code>func AppendGzipBytesLevel(dst, src []byte, level int) []byte {</code></span>
+<span class="codeline" id="line-144"><code>	w := &amp;byteSliceWriter{dst}</code></span>
+<span class="codeline" id="line-145"><code>	WriteGzipLevel(w, src, level) //nolint:errcheck</code></span>
+<span class="codeline" id="line-146"><code>	return w.b</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>// WriteGzipLevel writes gzipped p to w using the given compression level</code></span>
+<span class="codeline" id="line-150"><code>// and returns the number of compressed bytes written to w.</code></span>
+<span class="codeline" id="line-151"><code>//</code></span>
+<span class="codeline" id="line-152"><code>// Supported compression levels are:</code></span>
+<span class="codeline" id="line-153"><code>//</code></span>
+<span class="codeline" id="line-154"><code>//   - CompressNoCompression</code></span>
+<span class="codeline" id="line-155"><code>//   - CompressBestSpeed</code></span>
+<span class="codeline" id="line-156"><code>//   - CompressBestCompression</code></span>
+<span class="codeline" id="line-157"><code>//   - CompressDefaultCompression</code></span>
+<span class="codeline" id="line-158"><code>//   - CompressHuffmanOnly</code></span>
+<span class="codeline" id="line-159"><code>func WriteGzipLevel(w io.Writer, p []byte, level int) (int, error) {</code></span>
+<span class="codeline" id="line-160"><code>	switch w.(type) {</code></span>
+<span class="codeline" id="line-161"><code>	case *byteSliceWriter,</code></span>
+<span class="codeline" id="line-162"><code>		*bytes.Buffer,</code></span>
+<span class="codeline" id="line-163"><code>		*bytebufferpool.ByteBuffer:</code></span>
+<span class="codeline" id="line-164"><code>		// These writers don't block, so we can just use stacklessWriteGzip</code></span>
+<span class="codeline" id="line-165"><code>		ctx := &amp;compressCtx{</code></span>
+<span class="codeline" id="line-166"><code>			w:     w,</code></span>
+<span class="codeline" id="line-167"><code>			p:     p,</code></span>
+<span class="codeline" id="line-168"><code>			level: level,</code></span>
+<span class="codeline" id="line-169"><code>		}</code></span>
+<span class="codeline" id="line-170"><code>		stacklessWriteGzip(ctx)</code></span>
+<span class="codeline" id="line-171"><code>		return len(p), nil</code></span>
+<span class="codeline" id="line-172"><code>	default:</code></span>
+<span class="codeline" id="line-173"><code>		zw := acquireStacklessGzipWriter(w, level)</code></span>
+<span class="codeline" id="line-174"><code>		n, err := zw.Write(p)</code></span>
+<span class="codeline" id="line-175"><code>		releaseStacklessGzipWriter(zw, level)</code></span>
+<span class="codeline" id="line-176"><code>		return n, err</code></span>
+<span class="codeline" id="line-177"><code>	}</code></span>
+<span class="codeline" id="line-178"><code>}</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>var (</code></span>
+<span class="codeline" id="line-181"><code>	stacklessWriteGzipOnce sync.Once</code></span>
+<span class="codeline" id="line-182"><code>	stacklessWriteGzipFunc func(ctx any) bool</code></span>
+<span class="codeline" id="line-183"><code>)</code></span>
+<span class="codeline" id="line-184"><code></code></span>
+<span class="codeline" id="line-185"><code>func stacklessWriteGzip(ctx any) {</code></span>
+<span class="codeline" id="line-186"><code>	stacklessWriteGzipOnce.Do(func() {</code></span>
+<span class="codeline" id="line-187"><code>		stacklessWriteGzipFunc = stackless.NewFunc(nonblockingWriteGzip)</code></span>
+<span class="codeline" id="line-188"><code>	})</code></span>
+<span class="codeline" id="line-189"><code>	stacklessWriteGzipFunc(ctx)</code></span>
+<span class="codeline" id="line-190"><code>}</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>func nonblockingWriteGzip(ctxv any) {</code></span>
+<span class="codeline" id="line-193"><code>	ctx := ctxv.(*compressCtx)</code></span>
+<span class="codeline" id="line-194"><code>	zw := acquireRealGzipWriter(ctx.w, ctx.level)</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>	zw.Write(ctx.p) //nolint:errcheck // no way to handle this error anyway</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>	releaseRealGzipWriter(zw, ctx.level)</code></span>
+<span class="codeline" id="line-199"><code>}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>// WriteGzip writes gzipped p to w and returns the number of compressed</code></span>
+<span class="codeline" id="line-202"><code>// bytes written to w.</code></span>
+<span class="codeline" id="line-203"><code>func WriteGzip(w io.Writer, p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-204"><code>	return WriteGzipLevel(w, p, CompressDefaultCompression)</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>// AppendGzipBytes appends gzipped src to dst and returns the resulting dst.</code></span>
+<span class="codeline" id="line-208"><code>func AppendGzipBytes(dst, src []byte) []byte {</code></span>
+<span class="codeline" id="line-209"><code>	return AppendGzipBytesLevel(dst, src, CompressDefaultCompression)</code></span>
+<span class="codeline" id="line-210"><code>}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>// WriteGunzip writes ungzipped p to w and returns the number of uncompressed</code></span>
+<span class="codeline" id="line-213"><code>// bytes written to w.</code></span>
+<span class="codeline" id="line-214"><code>func WriteGunzip(w io.Writer, p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-215"><code>	r := &amp;byteSliceReader{p}</code></span>
+<span class="codeline" id="line-216"><code>	zr, err := acquireGzipReader(r)</code></span>
+<span class="codeline" id="line-217"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-218"><code>		return 0, err</code></span>
+<span class="codeline" id="line-219"><code>	}</code></span>
+<span class="codeline" id="line-220"><code>	n, err := copyZeroAlloc(w, zr)</code></span>
+<span class="codeline" id="line-221"><code>	releaseGzipReader(zr)</code></span>
+<span class="codeline" id="line-222"><code>	nn := int(n)</code></span>
+<span class="codeline" id="line-223"><code>	if int64(nn) != n {</code></span>
+<span class="codeline" id="line-224"><code>		return 0, fmt.Errorf("too much data gunzipped: %d", n)</code></span>
+<span class="codeline" id="line-225"><code>	}</code></span>
+<span class="codeline" id="line-226"><code>	return nn, err</code></span>
+<span class="codeline" id="line-227"><code>}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>// AppendGunzipBytes appends gunzipped src to dst and returns the resulting dst.</code></span>
+<span class="codeline" id="line-230"><code>func AppendGunzipBytes(dst, src []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-231"><code>	w := &amp;byteSliceWriter{dst}</code></span>
+<span class="codeline" id="line-232"><code>	_, err := WriteGunzip(w, src)</code></span>
+<span class="codeline" id="line-233"><code>	return w.b, err</code></span>
+<span class="codeline" id="line-234"><code>}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>// AppendDeflateBytesLevel appends deflated src to dst using the given</code></span>
+<span class="codeline" id="line-237"><code>// compression level and returns the resulting dst.</code></span>
+<span class="codeline" id="line-238"><code>//</code></span>
+<span class="codeline" id="line-239"><code>// Supported compression levels are:</code></span>
+<span class="codeline" id="line-240"><code>//</code></span>
+<span class="codeline" id="line-241"><code>//   - CompressNoCompression</code></span>
+<span class="codeline" id="line-242"><code>//   - CompressBestSpeed</code></span>
+<span class="codeline" id="line-243"><code>//   - CompressBestCompression</code></span>
+<span class="codeline" id="line-244"><code>//   - CompressDefaultCompression</code></span>
+<span class="codeline" id="line-245"><code>//   - CompressHuffmanOnly</code></span>
+<span class="codeline" id="line-246"><code>func AppendDeflateBytesLevel(dst, src []byte, level int) []byte {</code></span>
+<span class="codeline" id="line-247"><code>	w := &amp;byteSliceWriter{dst}</code></span>
+<span class="codeline" id="line-248"><code>	WriteDeflateLevel(w, src, level) //nolint:errcheck</code></span>
+<span class="codeline" id="line-249"><code>	return w.b</code></span>
+<span class="codeline" id="line-250"><code>}</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>// WriteDeflateLevel writes deflated p to w using the given compression level</code></span>
+<span class="codeline" id="line-253"><code>// and returns the number of compressed bytes written to w.</code></span>
+<span class="codeline" id="line-254"><code>//</code></span>
+<span class="codeline" id="line-255"><code>// Supported compression levels are:</code></span>
+<span class="codeline" id="line-256"><code>//</code></span>
+<span class="codeline" id="line-257"><code>//   - CompressNoCompression</code></span>
+<span class="codeline" id="line-258"><code>//   - CompressBestSpeed</code></span>
+<span class="codeline" id="line-259"><code>//   - CompressBestCompression</code></span>
+<span class="codeline" id="line-260"><code>//   - CompressDefaultCompression</code></span>
+<span class="codeline" id="line-261"><code>//   - CompressHuffmanOnly</code></span>
+<span class="codeline" id="line-262"><code>func WriteDeflateLevel(w io.Writer, p []byte, level int) (int, error) {</code></span>
+<span class="codeline" id="line-263"><code>	switch w.(type) {</code></span>
+<span class="codeline" id="line-264"><code>	case *byteSliceWriter,</code></span>
+<span class="codeline" id="line-265"><code>		*bytes.Buffer,</code></span>
+<span class="codeline" id="line-266"><code>		*bytebufferpool.ByteBuffer:</code></span>
+<span class="codeline" id="line-267"><code>		// These writers don't block, so we can just use stacklessWriteDeflate</code></span>
+<span class="codeline" id="line-268"><code>		ctx := &amp;compressCtx{</code></span>
+<span class="codeline" id="line-269"><code>			w:     w,</code></span>
+<span class="codeline" id="line-270"><code>			p:     p,</code></span>
+<span class="codeline" id="line-271"><code>			level: level,</code></span>
+<span class="codeline" id="line-272"><code>		}</code></span>
+<span class="codeline" id="line-273"><code>		stacklessWriteDeflate(ctx)</code></span>
+<span class="codeline" id="line-274"><code>		return len(p), nil</code></span>
+<span class="codeline" id="line-275"><code>	default:</code></span>
+<span class="codeline" id="line-276"><code>		zw := acquireStacklessDeflateWriter(w, level)</code></span>
+<span class="codeline" id="line-277"><code>		n, err := zw.Write(p)</code></span>
+<span class="codeline" id="line-278"><code>		releaseStacklessDeflateWriter(zw, level)</code></span>
+<span class="codeline" id="line-279"><code>		return n, err</code></span>
+<span class="codeline" id="line-280"><code>	}</code></span>
+<span class="codeline" id="line-281"><code>}</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>var (</code></span>
+<span class="codeline" id="line-284"><code>	stacklessWriteDeflateOnce sync.Once</code></span>
+<span class="codeline" id="line-285"><code>	stacklessWriteDeflateFunc func(ctx any) bool</code></span>
+<span class="codeline" id="line-286"><code>)</code></span>
+<span class="codeline" id="line-287"><code></code></span>
+<span class="codeline" id="line-288"><code>func stacklessWriteDeflate(ctx any) {</code></span>
+<span class="codeline" id="line-289"><code>	stacklessWriteDeflateOnce.Do(func() {</code></span>
+<span class="codeline" id="line-290"><code>		stacklessWriteDeflateFunc = stackless.NewFunc(nonblockingWriteDeflate)</code></span>
+<span class="codeline" id="line-291"><code>	})</code></span>
+<span class="codeline" id="line-292"><code>	stacklessWriteDeflateFunc(ctx)</code></span>
+<span class="codeline" id="line-293"><code>}</code></span>
+<span class="codeline" id="line-294"><code></code></span>
+<span class="codeline" id="line-295"><code>func nonblockingWriteDeflate(ctxv any) {</code></span>
+<span class="codeline" id="line-296"><code>	ctx := ctxv.(*compressCtx)</code></span>
+<span class="codeline" id="line-297"><code>	zw := acquireRealDeflateWriter(ctx.w, ctx.level)</code></span>
+<span class="codeline" id="line-298"><code></code></span>
+<span class="codeline" id="line-299"><code>	zw.Write(ctx.p) //nolint:errcheck // no way to handle this error anyway</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>	releaseRealDeflateWriter(zw, ctx.level)</code></span>
+<span class="codeline" id="line-302"><code>}</code></span>
+<span class="codeline" id="line-303"><code></code></span>
+<span class="codeline" id="line-304"><code>type compressCtx struct {</code></span>
+<span class="codeline" id="line-305"><code>	w     io.Writer</code></span>
+<span class="codeline" id="line-306"><code>	p     []byte</code></span>
+<span class="codeline" id="line-307"><code>	level int</code></span>
+<span class="codeline" id="line-308"><code>}</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>// WriteDeflate writes deflated p to w and returns the number of compressed</code></span>
+<span class="codeline" id="line-311"><code>// bytes written to w.</code></span>
+<span class="codeline" id="line-312"><code>func WriteDeflate(w io.Writer, p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-313"><code>	return WriteDeflateLevel(w, p, CompressDefaultCompression)</code></span>
+<span class="codeline" id="line-314"><code>}</code></span>
+<span class="codeline" id="line-315"><code></code></span>
+<span class="codeline" id="line-316"><code>// AppendDeflateBytes appends deflated src to dst and returns the resulting dst.</code></span>
+<span class="codeline" id="line-317"><code>func AppendDeflateBytes(dst, src []byte) []byte {</code></span>
+<span class="codeline" id="line-318"><code>	return AppendDeflateBytesLevel(dst, src, CompressDefaultCompression)</code></span>
+<span class="codeline" id="line-319"><code>}</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>// WriteInflate writes inflated p to w and returns the number of uncompressed</code></span>
+<span class="codeline" id="line-322"><code>// bytes written to w.</code></span>
+<span class="codeline" id="line-323"><code>func WriteInflate(w io.Writer, p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-324"><code>	r := &amp;byteSliceReader{p}</code></span>
+<span class="codeline" id="line-325"><code>	zr, err := acquireFlateReader(r)</code></span>
+<span class="codeline" id="line-326"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-327"><code>		return 0, err</code></span>
+<span class="codeline" id="line-328"><code>	}</code></span>
+<span class="codeline" id="line-329"><code>	n, err := copyZeroAlloc(w, zr)</code></span>
+<span class="codeline" id="line-330"><code>	releaseFlateReader(zr)</code></span>
+<span class="codeline" id="line-331"><code>	nn := int(n)</code></span>
+<span class="codeline" id="line-332"><code>	if int64(nn) != n {</code></span>
+<span class="codeline" id="line-333"><code>		return 0, fmt.Errorf("too much data inflated: %d", n)</code></span>
+<span class="codeline" id="line-334"><code>	}</code></span>
+<span class="codeline" id="line-335"><code>	return nn, err</code></span>
+<span class="codeline" id="line-336"><code>}</code></span>
+<span class="codeline" id="line-337"><code></code></span>
+<span class="codeline" id="line-338"><code>// AppendInflateBytes appends inflated src to dst and returns the resulting dst.</code></span>
+<span class="codeline" id="line-339"><code>func AppendInflateBytes(dst, src []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-340"><code>	w := &amp;byteSliceWriter{dst}</code></span>
+<span class="codeline" id="line-341"><code>	_, err := WriteInflate(w, src)</code></span>
+<span class="codeline" id="line-342"><code>	return w.b, err</code></span>
+<span class="codeline" id="line-343"><code>}</code></span>
+<span class="codeline" id="line-344"><code></code></span>
+<span class="codeline" id="line-345"><code>type byteSliceWriter struct {</code></span>
+<span class="codeline" id="line-346"><code>	b []byte</code></span>
+<span class="codeline" id="line-347"><code>}</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>func (w *byteSliceWriter) Write(p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-350"><code>	w.b = append(w.b, p...)</code></span>
+<span class="codeline" id="line-351"><code>	return len(p), nil</code></span>
+<span class="codeline" id="line-352"><code>}</code></span>
+<span class="codeline" id="line-353"><code></code></span>
+<span class="codeline" id="line-354"><code>type byteSliceReader struct {</code></span>
+<span class="codeline" id="line-355"><code>	b []byte</code></span>
+<span class="codeline" id="line-356"><code>}</code></span>
+<span class="codeline" id="line-357"><code></code></span>
+<span class="codeline" id="line-358"><code>func (r *byteSliceReader) Read(p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-359"><code>	if len(r.b) == 0 {</code></span>
+<span class="codeline" id="line-360"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-361"><code>	}</code></span>
+<span class="codeline" id="line-362"><code>	n := copy(p, r.b)</code></span>
+<span class="codeline" id="line-363"><code>	r.b = r.b[n:]</code></span>
+<span class="codeline" id="line-364"><code>	return n, nil</code></span>
+<span class="codeline" id="line-365"><code>}</code></span>
+<span class="codeline" id="line-366"><code></code></span>
+<span class="codeline" id="line-367"><code>func (r *byteSliceReader) ReadByte() (byte, error) {</code></span>
+<span class="codeline" id="line-368"><code>	if len(r.b) == 0 {</code></span>
+<span class="codeline" id="line-369"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-370"><code>	}</code></span>
+<span class="codeline" id="line-371"><code>	n := r.b[0]</code></span>
+<span class="codeline" id="line-372"><code>	r.b = r.b[1:]</code></span>
+<span class="codeline" id="line-373"><code>	return n, nil</code></span>
+<span class="codeline" id="line-374"><code>}</code></span>
+<span class="codeline" id="line-375"><code></code></span>
+<span class="codeline" id="line-376"><code>func acquireStacklessDeflateWriter(w io.Writer, level int) stackless.Writer {</code></span>
+<span class="codeline" id="line-377"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-378"><code>	p := stacklessDeflateWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-379"><code>	v := p.Get()</code></span>
+<span class="codeline" id="line-380"><code>	if v == nil {</code></span>
+<span class="codeline" id="line-381"><code>		return stackless.NewWriter(w, func(w io.Writer) stackless.Writer {</code></span>
+<span class="codeline" id="line-382"><code>			return acquireRealDeflateWriter(w, level)</code></span>
+<span class="codeline" id="line-383"><code>		})</code></span>
+<span class="codeline" id="line-384"><code>	}</code></span>
+<span class="codeline" id="line-385"><code>	sw := v.(stackless.Writer)</code></span>
+<span class="codeline" id="line-386"><code>	sw.Reset(w)</code></span>
+<span class="codeline" id="line-387"><code>	return sw</code></span>
+<span class="codeline" id="line-388"><code>}</code></span>
+<span class="codeline" id="line-389"><code></code></span>
+<span class="codeline" id="line-390"><code>func releaseStacklessDeflateWriter(sw stackless.Writer, level int) {</code></span>
+<span class="codeline" id="line-391"><code>	sw.Close()</code></span>
+<span class="codeline" id="line-392"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-393"><code>	p := stacklessDeflateWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-394"><code>	p.Put(sw)</code></span>
+<span class="codeline" id="line-395"><code>}</code></span>
+<span class="codeline" id="line-396"><code></code></span>
+<span class="codeline" id="line-397"><code>func acquireRealDeflateWriter(w io.Writer, level int) *zlib.Writer {</code></span>
+<span class="codeline" id="line-398"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-399"><code>	p := realDeflateWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-400"><code>	v := p.Get()</code></span>
+<span class="codeline" id="line-401"><code>	if v == nil {</code></span>
+<span class="codeline" id="line-402"><code>		zw, err := zlib.NewWriterLevel(w, level)</code></span>
+<span class="codeline" id="line-403"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-404"><code>			// zlib.NewWriterLevel only errors for invalid</code></span>
+<span class="codeline" id="line-405"><code>			// compression levels. Clamp it to be min or max.</code></span>
+<span class="codeline" id="line-406"><code>			if level &lt; zlib.HuffmanOnly {</code></span>
+<span class="codeline" id="line-407"><code>				level = zlib.HuffmanOnly</code></span>
+<span class="codeline" id="line-408"><code>			} else {</code></span>
+<span class="codeline" id="line-409"><code>				level = zlib.BestCompression</code></span>
+<span class="codeline" id="line-410"><code>			}</code></span>
+<span class="codeline" id="line-411"><code>			zw, _ = zlib.NewWriterLevel(w, level)</code></span>
+<span class="codeline" id="line-412"><code>		}</code></span>
+<span class="codeline" id="line-413"><code>		return zw</code></span>
+<span class="codeline" id="line-414"><code>	}</code></span>
+<span class="codeline" id="line-415"><code>	zw := v.(*zlib.Writer)</code></span>
+<span class="codeline" id="line-416"><code>	zw.Reset(w)</code></span>
+<span class="codeline" id="line-417"><code>	return zw</code></span>
+<span class="codeline" id="line-418"><code>}</code></span>
+<span class="codeline" id="line-419"><code></code></span>
+<span class="codeline" id="line-420"><code>func releaseRealDeflateWriter(zw *zlib.Writer, level int) {</code></span>
+<span class="codeline" id="line-421"><code>	zw.Close()</code></span>
+<span class="codeline" id="line-422"><code>	nLevel := normalizeCompressLevel(level)</code></span>
+<span class="codeline" id="line-423"><code>	p := realDeflateWriterPoolMap[nLevel]</code></span>
+<span class="codeline" id="line-424"><code>	p.Put(zw)</code></span>
+<span class="codeline" id="line-425"><code>}</code></span>
+<span class="codeline" id="line-426"><code></code></span>
+<span class="codeline" id="line-427"><code>var (</code></span>
+<span class="codeline" id="line-428"><code>	stacklessDeflateWriterPoolMap = newCompressWriterPoolMap()</code></span>
+<span class="codeline" id="line-429"><code>	realDeflateWriterPoolMap      = newCompressWriterPoolMap()</code></span>
+<span class="codeline" id="line-430"><code>)</code></span>
+<span class="codeline" id="line-431"><code></code></span>
+<span class="codeline" id="line-432"><code>func newCompressWriterPoolMap() []*sync.Pool {</code></span>
+<span class="codeline" id="line-433"><code>	// Initialize pools for all the compression levels defined</code></span>
+<span class="codeline" id="line-434"><code>	// in https://pkg.go.dev/compress/flate#pkg-constants .</code></span>
+<span class="codeline" id="line-435"><code>	// Compression levels are normalized with normalizeCompressLevel,</code></span>
+<span class="codeline" id="line-436"><code>	// so the fit [0..11].</code></span>
+<span class="codeline" id="line-437"><code>	var m []*sync.Pool</code></span>
+<span class="codeline" id="line-438"><code>	for i := 0; i &lt; 12; i++ {</code></span>
+<span class="codeline" id="line-439"><code>		m = append(m, &amp;sync.Pool{})</code></span>
+<span class="codeline" id="line-440"><code>	}</code></span>
+<span class="codeline" id="line-441"><code>	return m</code></span>
+<span class="codeline" id="line-442"><code>}</code></span>
+<span class="codeline" id="line-443"><code></code></span>
+<span class="codeline" id="line-444"><code>func isFileCompressible(f fs.File, minCompressRatio float64) bool {</code></span>
+<span class="codeline" id="line-445"><code>	// Try compressing the first 4kb of the file</code></span>
+<span class="codeline" id="line-446"><code>	// and see if it can be compressed by more than</code></span>
+<span class="codeline" id="line-447"><code>	// the given minCompressRatio.</code></span>
+<span class="codeline" id="line-448"><code>	b := bytebufferpool.Get()</code></span>
+<span class="codeline" id="line-449"><code>	zw := acquireStacklessGzipWriter(b, CompressDefaultCompression)</code></span>
+<span class="codeline" id="line-450"><code>	lr := &amp;io.LimitedReader{</code></span>
+<span class="codeline" id="line-451"><code>		R: f,</code></span>
+<span class="codeline" id="line-452"><code>		N: 4096,</code></span>
+<span class="codeline" id="line-453"><code>	}</code></span>
+<span class="codeline" id="line-454"><code>	_, err := copyZeroAlloc(zw, lr)</code></span>
+<span class="codeline" id="line-455"><code>	releaseStacklessGzipWriter(zw, CompressDefaultCompression)</code></span>
+<span class="codeline" id="line-456"><code>	seeker, ok := f.(io.Seeker)</code></span>
+<span class="codeline" id="line-457"><code>	if !ok {</code></span>
+<span class="codeline" id="line-458"><code>		return false</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	seeker.Seek(0, io.SeekStart) //nolint:errcheck</code></span>
+<span class="codeline" id="line-461"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-462"><code>		return false</code></span>
+<span class="codeline" id="line-463"><code>	}</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>	n := 4096 - lr.N</code></span>
+<span class="codeline" id="line-466"><code>	zn := len(b.B)</code></span>
+<span class="codeline" id="line-467"><code>	bytebufferpool.Put(b)</code></span>
+<span class="codeline" id="line-468"><code>	return float64(zn) &lt; float64(n)*minCompressRatio</code></span>
+<span class="codeline" id="line-469"><code>}</code></span>
+<span class="codeline" id="line-470"><code></code></span>
+<span class="codeline" id="line-471"><code>// normalizes compression level into [0..11], so it could be used as an index</code></span>
+<span class="codeline" id="line-472"><code>// in *PoolMap.</code></span>
+<span class="codeline" id="line-473"><code>func normalizeCompressLevel(level int) int {</code></span>
+<span class="codeline" id="line-474"><code>	// -2 is the lowest compression level - CompressHuffmanOnly</code></span>
+<span class="codeline" id="line-475"><code>	// 9 is the highest compression level - CompressBestCompression</code></span>
+<span class="codeline" id="line-476"><code>	if level &lt; -2 || level &gt; 9 {</code></span>
+<span class="codeline" id="line-477"><code>		level = CompressDefaultCompression</code></span>
+<span class="codeline" id="line-478"><code>	}</code></span>
+<span class="codeline" id="line-479"><code>	return level + 2</code></span>
+<span class="codeline" id="line-480"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

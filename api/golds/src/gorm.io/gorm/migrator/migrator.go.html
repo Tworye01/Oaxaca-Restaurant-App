@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: migrator.go in package gorm.io/gorm/migrator</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	migrator.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/gorm.io/gorm/migrator.html">gorm.io/gorm/migrator</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package migrator</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"context"</code></span>
+<span class="codeline" id="line-5"><code>	"database/sql"</code></span>
+<span class="codeline" id="line-6"><code>	"errors"</code></span>
+<span class="codeline" id="line-7"><code>	"fmt"</code></span>
+<span class="codeline" id="line-8"><code>	"reflect"</code></span>
+<span class="codeline" id="line-9"><code>	"regexp"</code></span>
+<span class="codeline" id="line-10"><code>	"strings"</code></span>
+<span class="codeline" id="line-11"><code>	"time"</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>	"gorm.io/gorm"</code></span>
+<span class="codeline" id="line-14"><code>	"gorm.io/gorm/clause"</code></span>
+<span class="codeline" id="line-15"><code>	"gorm.io/gorm/logger"</code></span>
+<span class="codeline" id="line-16"><code>	"gorm.io/gorm/schema"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// This regular expression seeks to find a sequence of digits (\d+) among zero or more non-digit characters (\D*),</code></span>
+<span class="codeline" id="line-20"><code>// with a possible trailing non-digit character (\D?).</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>// For example, values that can pass this regular expression are:</code></span>
+<span class="codeline" id="line-23"><code>// - "123"</code></span>
+<span class="codeline" id="line-24"><code>// - "abc456"</code></span>
+<span class="codeline" id="line-25"><code>// -"%$#@789"</code></span>
+<span class="codeline" id="line-26"><code>var regFullDataType = regexp.MustCompile(`\D*(\d+)\D?`)</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// TODO:? Create const vars for raw sql queries ?</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>var _ gorm.Migrator = (*Migrator)(nil)</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// Migrator m struct</code></span>
+<span class="codeline" id="line-33"><code>type Migrator struct {</code></span>
+<span class="codeline" id="line-34"><code>	Config</code></span>
+<span class="codeline" id="line-35"><code>}</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// Config schema config</code></span>
+<span class="codeline" id="line-38"><code>type Config struct {</code></span>
+<span class="codeline" id="line-39"><code>	CreateIndexAfterCreateTable bool</code></span>
+<span class="codeline" id="line-40"><code>	DB                          *gorm.DB</code></span>
+<span class="codeline" id="line-41"><code>	gorm.Dialector</code></span>
+<span class="codeline" id="line-42"><code>}</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>type printSQLLogger struct {</code></span>
+<span class="codeline" id="line-45"><code>	logger.Interface</code></span>
+<span class="codeline" id="line-46"><code>}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>func (l *printSQLLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {</code></span>
+<span class="codeline" id="line-49"><code>	sql, _ := fc()</code></span>
+<span class="codeline" id="line-50"><code>	fmt.Println(sql + ";")</code></span>
+<span class="codeline" id="line-51"><code>	l.Interface.Trace(ctx, begin, fc, err)</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>// GormDataTypeInterface gorm data type interface</code></span>
+<span class="codeline" id="line-55"><code>type GormDataTypeInterface interface {</code></span>
+<span class="codeline" id="line-56"><code>	GormDBDataType(*gorm.DB, *schema.Field) string</code></span>
+<span class="codeline" id="line-57"><code>}</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>// RunWithValue run migration with statement value</code></span>
+<span class="codeline" id="line-60"><code>func (m Migrator) RunWithValue(value interface{}, fc func(*gorm.Statement) error) error {</code></span>
+<span class="codeline" id="line-61"><code>	stmt := &amp;gorm.Statement{DB: m.DB}</code></span>
+<span class="codeline" id="line-62"><code>	if m.DB.Statement != nil {</code></span>
+<span class="codeline" id="line-63"><code>		stmt.Table = m.DB.Statement.Table</code></span>
+<span class="codeline" id="line-64"><code>		stmt.TableExpr = m.DB.Statement.TableExpr</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>	if table, ok := value.(string); ok {</code></span>
+<span class="codeline" id="line-68"><code>		stmt.Table = table</code></span>
+<span class="codeline" id="line-69"><code>	} else if err := stmt.ParseWithSpecialTableName(value, stmt.Table); err != nil {</code></span>
+<span class="codeline" id="line-70"><code>		return err</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>	return fc(stmt)</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>// DataTypeOf return field's db data type</code></span>
+<span class="codeline" id="line-77"><code>func (m Migrator) DataTypeOf(field *schema.Field) string {</code></span>
+<span class="codeline" id="line-78"><code>	fieldValue := reflect.New(field.IndirectFieldType)</code></span>
+<span class="codeline" id="line-79"><code>	if dataTyper, ok := fieldValue.Interface().(GormDataTypeInterface); ok {</code></span>
+<span class="codeline" id="line-80"><code>		if dataType := dataTyper.GormDBDataType(m.DB, field); dataType != "" {</code></span>
+<span class="codeline" id="line-81"><code>			return dataType</code></span>
+<span class="codeline" id="line-82"><code>		}</code></span>
+<span class="codeline" id="line-83"><code>	}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>	return m.Dialector.DataTypeOf(field)</code></span>
+<span class="codeline" id="line-86"><code>}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>// FullDataTypeOf returns field's db full data type</code></span>
+<span class="codeline" id="line-89"><code>func (m Migrator) FullDataTypeOf(field *schema.Field) (expr clause.Expr) {</code></span>
+<span class="codeline" id="line-90"><code>	expr.SQL = m.DataTypeOf(field)</code></span>
+<span class="codeline" id="line-91"><code></code></span>
+<span class="codeline" id="line-92"><code>	if field.NotNull {</code></span>
+<span class="codeline" id="line-93"><code>		expr.SQL += " NOT NULL"</code></span>
+<span class="codeline" id="line-94"><code>	}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>	if field.HasDefaultValue &amp;&amp; (field.DefaultValueInterface != nil || field.DefaultValue != "") {</code></span>
+<span class="codeline" id="line-97"><code>		if field.DefaultValueInterface != nil {</code></span>
+<span class="codeline" id="line-98"><code>			defaultStmt := &amp;gorm.Statement{Vars: []interface{}{field.DefaultValueInterface}}</code></span>
+<span class="codeline" id="line-99"><code>			m.Dialector.BindVarTo(defaultStmt, defaultStmt, field.DefaultValueInterface)</code></span>
+<span class="codeline" id="line-100"><code>			expr.SQL += " DEFAULT " + m.Dialector.Explain(defaultStmt.SQL.String(), field.DefaultValueInterface)</code></span>
+<span class="codeline" id="line-101"><code>		} else if field.DefaultValue != "(-)" {</code></span>
+<span class="codeline" id="line-102"><code>			expr.SQL += " DEFAULT " + field.DefaultValue</code></span>
+<span class="codeline" id="line-103"><code>		}</code></span>
+<span class="codeline" id="line-104"><code>	}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>	return</code></span>
+<span class="codeline" id="line-107"><code>}</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>func (m Migrator) GetQueryAndExecTx() (queryTx, execTx *gorm.DB) {</code></span>
+<span class="codeline" id="line-110"><code>	queryTx = m.DB.Session(&amp;gorm.Session{})</code></span>
+<span class="codeline" id="line-111"><code>	execTx = queryTx</code></span>
+<span class="codeline" id="line-112"><code>	if m.DB.DryRun {</code></span>
+<span class="codeline" id="line-113"><code>		queryTx.DryRun = false</code></span>
+<span class="codeline" id="line-114"><code>		execTx = m.DB.Session(&amp;gorm.Session{Logger: &amp;printSQLLogger{Interface: m.DB.Logger}})</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	return queryTx, execTx</code></span>
+<span class="codeline" id="line-117"><code>}</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>// AutoMigrate auto migrate values</code></span>
+<span class="codeline" id="line-120"><code>func (m Migrator) AutoMigrate(values ...interface{}) error {</code></span>
+<span class="codeline" id="line-121"><code>	for _, value := range m.ReorderModels(values, true) {</code></span>
+<span class="codeline" id="line-122"><code>		queryTx, execTx := m.GetQueryAndExecTx()</code></span>
+<span class="codeline" id="line-123"><code>		if !queryTx.Migrator().HasTable(value) {</code></span>
+<span class="codeline" id="line-124"><code>			if err := execTx.Migrator().CreateTable(value); err != nil {</code></span>
+<span class="codeline" id="line-125"><code>				return err</code></span>
+<span class="codeline" id="line-126"><code>			}</code></span>
+<span class="codeline" id="line-127"><code>		} else {</code></span>
+<span class="codeline" id="line-128"><code>			if err := m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-129"><code>				columnTypes, err := queryTx.Migrator().ColumnTypes(value)</code></span>
+<span class="codeline" id="line-130"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-131"><code>					return err</code></span>
+<span class="codeline" id="line-132"><code>				}</code></span>
+<span class="codeline" id="line-133"><code>				var (</code></span>
+<span class="codeline" id="line-134"><code>					parseIndexes          = stmt.Schema.ParseIndexes()</code></span>
+<span class="codeline" id="line-135"><code>					parseCheckConstraints = stmt.Schema.ParseCheckConstraints()</code></span>
+<span class="codeline" id="line-136"><code>				)</code></span>
+<span class="codeline" id="line-137"><code>				for _, dbName := range stmt.Schema.DBNames {</code></span>
+<span class="codeline" id="line-138"><code>					var foundColumn gorm.ColumnType</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>					for _, columnType := range columnTypes {</code></span>
+<span class="codeline" id="line-141"><code>						if columnType.Name() == dbName {</code></span>
+<span class="codeline" id="line-142"><code>							foundColumn = columnType</code></span>
+<span class="codeline" id="line-143"><code>							break</code></span>
+<span class="codeline" id="line-144"><code>						}</code></span>
+<span class="codeline" id="line-145"><code>					}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>					if foundColumn == nil {</code></span>
+<span class="codeline" id="line-148"><code>						// not found, add column</code></span>
+<span class="codeline" id="line-149"><code>						if err = execTx.Migrator().AddColumn(value, dbName); err != nil {</code></span>
+<span class="codeline" id="line-150"><code>							return err</code></span>
+<span class="codeline" id="line-151"><code>						}</code></span>
+<span class="codeline" id="line-152"><code>					} else {</code></span>
+<span class="codeline" id="line-153"><code>						// found, smartly migrate</code></span>
+<span class="codeline" id="line-154"><code>						field := stmt.Schema.FieldsByDBName[dbName]</code></span>
+<span class="codeline" id="line-155"><code>						if err = execTx.Migrator().MigrateColumn(value, field, foundColumn); err != nil {</code></span>
+<span class="codeline" id="line-156"><code>							return err</code></span>
+<span class="codeline" id="line-157"><code>						}</code></span>
+<span class="codeline" id="line-158"><code>					}</code></span>
+<span class="codeline" id="line-159"><code>				}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>				if !m.DB.DisableForeignKeyConstraintWhenMigrating &amp;&amp; !m.DB.IgnoreRelationshipsWhenMigrating {</code></span>
+<span class="codeline" id="line-162"><code>					for _, rel := range stmt.Schema.Relationships.Relations {</code></span>
+<span class="codeline" id="line-163"><code>						if rel.Field.IgnoreMigration {</code></span>
+<span class="codeline" id="line-164"><code>							continue</code></span>
+<span class="codeline" id="line-165"><code>						}</code></span>
+<span class="codeline" id="line-166"><code>						if constraint := rel.ParseConstraint(); constraint != nil &amp;&amp;</code></span>
+<span class="codeline" id="line-167"><code>							constraint.Schema == stmt.Schema &amp;&amp; !queryTx.Migrator().HasConstraint(value, constraint.Name) {</code></span>
+<span class="codeline" id="line-168"><code>							if err := execTx.Migrator().CreateConstraint(value, constraint.Name); err != nil {</code></span>
+<span class="codeline" id="line-169"><code>								return err</code></span>
+<span class="codeline" id="line-170"><code>							}</code></span>
+<span class="codeline" id="line-171"><code>						}</code></span>
+<span class="codeline" id="line-172"><code>					}</code></span>
+<span class="codeline" id="line-173"><code>				}</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>				for _, chk := range parseCheckConstraints {</code></span>
+<span class="codeline" id="line-176"><code>					if !queryTx.Migrator().HasConstraint(value, chk.Name) {</code></span>
+<span class="codeline" id="line-177"><code>						if err := execTx.Migrator().CreateConstraint(value, chk.Name); err != nil {</code></span>
+<span class="codeline" id="line-178"><code>							return err</code></span>
+<span class="codeline" id="line-179"><code>						}</code></span>
+<span class="codeline" id="line-180"><code>					}</code></span>
+<span class="codeline" id="line-181"><code>				}</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>				for _, idx := range parseIndexes {</code></span>
+<span class="codeline" id="line-184"><code>					if !queryTx.Migrator().HasIndex(value, idx.Name) {</code></span>
+<span class="codeline" id="line-185"><code>						if err := execTx.Migrator().CreateIndex(value, idx.Name); err != nil {</code></span>
+<span class="codeline" id="line-186"><code>							return err</code></span>
+<span class="codeline" id="line-187"><code>						}</code></span>
+<span class="codeline" id="line-188"><code>					}</code></span>
+<span class="codeline" id="line-189"><code>				}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>				return nil</code></span>
+<span class="codeline" id="line-192"><code>			}); err != nil {</code></span>
+<span class="codeline" id="line-193"><code>				return err</code></span>
+<span class="codeline" id="line-194"><code>			}</code></span>
+<span class="codeline" id="line-195"><code>		}</code></span>
+<span class="codeline" id="line-196"><code>	}</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>	return nil</code></span>
+<span class="codeline" id="line-199"><code>}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>// GetTables returns tables</code></span>
+<span class="codeline" id="line-202"><code>func (m Migrator) GetTables() (tableList []string, err error) {</code></span>
+<span class="codeline" id="line-203"><code>	err = m.DB.Raw("SELECT TABLE_NAME FROM information_schema.tables where TABLE_SCHEMA=?", m.CurrentDatabase()).</code></span>
+<span class="codeline" id="line-204"><code>		Scan(&amp;tableList).Error</code></span>
+<span class="codeline" id="line-205"><code>	return</code></span>
+<span class="codeline" id="line-206"><code>}</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>// CreateTable create table in database for values</code></span>
+<span class="codeline" id="line-209"><code>func (m Migrator) CreateTable(values ...interface{}) error {</code></span>
+<span class="codeline" id="line-210"><code>	for _, value := range m.ReorderModels(values, false) {</code></span>
+<span class="codeline" id="line-211"><code>		tx := m.DB.Session(&amp;gorm.Session{})</code></span>
+<span class="codeline" id="line-212"><code>		if err := m.RunWithValue(value, func(stmt *gorm.Statement) (err error) {</code></span>
+<span class="codeline" id="line-213"><code>			var (</code></span>
+<span class="codeline" id="line-214"><code>				createTableSQL          = "CREATE TABLE ? ("</code></span>
+<span class="codeline" id="line-215"><code>				values                  = []interface{}{m.CurrentTable(stmt)}</code></span>
+<span class="codeline" id="line-216"><code>				hasPrimaryKeyInDataType bool</code></span>
+<span class="codeline" id="line-217"><code>			)</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>			for _, dbName := range stmt.Schema.DBNames {</code></span>
+<span class="codeline" id="line-220"><code>				field := stmt.Schema.FieldsByDBName[dbName]</code></span>
+<span class="codeline" id="line-221"><code>				if !field.IgnoreMigration {</code></span>
+<span class="codeline" id="line-222"><code>					createTableSQL += "? ?"</code></span>
+<span class="codeline" id="line-223"><code>					hasPrimaryKeyInDataType = hasPrimaryKeyInDataType || strings.Contains(strings.ToUpper(m.DataTypeOf(field)), "PRIMARY KEY")</code></span>
+<span class="codeline" id="line-224"><code>					values = append(values, clause.Column{Name: dbName}, m.DB.Migrator().FullDataTypeOf(field))</code></span>
+<span class="codeline" id="line-225"><code>					createTableSQL += ","</code></span>
+<span class="codeline" id="line-226"><code>				}</code></span>
+<span class="codeline" id="line-227"><code>			}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>			if !hasPrimaryKeyInDataType &amp;&amp; len(stmt.Schema.PrimaryFields) &gt; 0 {</code></span>
+<span class="codeline" id="line-230"><code>				createTableSQL += "PRIMARY KEY ?,"</code></span>
+<span class="codeline" id="line-231"><code>				primaryKeys := make([]interface{}, 0, len(stmt.Schema.PrimaryFields))</code></span>
+<span class="codeline" id="line-232"><code>				for _, field := range stmt.Schema.PrimaryFields {</code></span>
+<span class="codeline" id="line-233"><code>					primaryKeys = append(primaryKeys, clause.Column{Name: field.DBName})</code></span>
+<span class="codeline" id="line-234"><code>				}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>				values = append(values, primaryKeys)</code></span>
+<span class="codeline" id="line-237"><code>			}</code></span>
+<span class="codeline" id="line-238"><code></code></span>
+<span class="codeline" id="line-239"><code>			for _, idx := range stmt.Schema.ParseIndexes() {</code></span>
+<span class="codeline" id="line-240"><code>				if m.CreateIndexAfterCreateTable {</code></span>
+<span class="codeline" id="line-241"><code>					defer func(value interface{}, name string) {</code></span>
+<span class="codeline" id="line-242"><code>						if err == nil {</code></span>
+<span class="codeline" id="line-243"><code>							err = tx.Migrator().CreateIndex(value, name)</code></span>
+<span class="codeline" id="line-244"><code>						}</code></span>
+<span class="codeline" id="line-245"><code>					}(value, idx.Name)</code></span>
+<span class="codeline" id="line-246"><code>				} else {</code></span>
+<span class="codeline" id="line-247"><code>					if idx.Class != "" {</code></span>
+<span class="codeline" id="line-248"><code>						createTableSQL += idx.Class + " "</code></span>
+<span class="codeline" id="line-249"><code>					}</code></span>
+<span class="codeline" id="line-250"><code>					createTableSQL += "INDEX ? ?"</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>					if idx.Comment != "" {</code></span>
+<span class="codeline" id="line-253"><code>						createTableSQL += fmt.Sprintf(" COMMENT '%s'", idx.Comment)</code></span>
+<span class="codeline" id="line-254"><code>					}</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>					if idx.Option != "" {</code></span>
+<span class="codeline" id="line-257"><code>						createTableSQL += " " + idx.Option</code></span>
+<span class="codeline" id="line-258"><code>					}</code></span>
+<span class="codeline" id="line-259"><code></code></span>
+<span class="codeline" id="line-260"><code>					createTableSQL += ","</code></span>
+<span class="codeline" id="line-261"><code>					values = append(values, clause.Column{Name: idx.Name}, tx.Migrator().(BuildIndexOptionsInterface).BuildIndexOptions(idx.Fields, stmt))</code></span>
+<span class="codeline" id="line-262"><code>				}</code></span>
+<span class="codeline" id="line-263"><code>			}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>			if !m.DB.DisableForeignKeyConstraintWhenMigrating &amp;&amp; !m.DB.IgnoreRelationshipsWhenMigrating {</code></span>
+<span class="codeline" id="line-266"><code>				for _, rel := range stmt.Schema.Relationships.Relations {</code></span>
+<span class="codeline" id="line-267"><code>					if rel.Field.IgnoreMigration {</code></span>
+<span class="codeline" id="line-268"><code>						continue</code></span>
+<span class="codeline" id="line-269"><code>					}</code></span>
+<span class="codeline" id="line-270"><code>					if constraint := rel.ParseConstraint(); constraint != nil {</code></span>
+<span class="codeline" id="line-271"><code>						if constraint.Schema == stmt.Schema {</code></span>
+<span class="codeline" id="line-272"><code>							sql, vars := constraint.Build()</code></span>
+<span class="codeline" id="line-273"><code>							createTableSQL += sql + ","</code></span>
+<span class="codeline" id="line-274"><code>							values = append(values, vars...)</code></span>
+<span class="codeline" id="line-275"><code>						}</code></span>
+<span class="codeline" id="line-276"><code>					}</code></span>
+<span class="codeline" id="line-277"><code>				}</code></span>
+<span class="codeline" id="line-278"><code>			}</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>			for _, uni := range stmt.Schema.ParseUniqueConstraints() {</code></span>
+<span class="codeline" id="line-281"><code>				createTableSQL += "CONSTRAINT ? UNIQUE (?),"</code></span>
+<span class="codeline" id="line-282"><code>				values = append(values, clause.Column{Name: uni.Name}, clause.Expr{SQL: stmt.Quote(uni.Field.DBName)})</code></span>
+<span class="codeline" id="line-283"><code>			}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>			for _, chk := range stmt.Schema.ParseCheckConstraints() {</code></span>
+<span class="codeline" id="line-286"><code>				createTableSQL += "CONSTRAINT ? CHECK (?),"</code></span>
+<span class="codeline" id="line-287"><code>				values = append(values, clause.Column{Name: chk.Name}, clause.Expr{SQL: chk.Constraint})</code></span>
+<span class="codeline" id="line-288"><code>			}</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>			createTableSQL = strings.TrimSuffix(createTableSQL, ",")</code></span>
+<span class="codeline" id="line-291"><code></code></span>
+<span class="codeline" id="line-292"><code>			createTableSQL += ")"</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>			if tableOption, ok := m.DB.Get("gorm:table_options"); ok {</code></span>
+<span class="codeline" id="line-295"><code>				createTableSQL += fmt.Sprint(tableOption)</code></span>
+<span class="codeline" id="line-296"><code>			}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>			err = tx.Exec(createTableSQL, values...).Error</code></span>
+<span class="codeline" id="line-299"><code>			return err</code></span>
+<span class="codeline" id="line-300"><code>		}); err != nil {</code></span>
+<span class="codeline" id="line-301"><code>			return err</code></span>
+<span class="codeline" id="line-302"><code>		}</code></span>
+<span class="codeline" id="line-303"><code>	}</code></span>
+<span class="codeline" id="line-304"><code>	return nil</code></span>
+<span class="codeline" id="line-305"><code>}</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>// DropTable drop table for values</code></span>
+<span class="codeline" id="line-308"><code>func (m Migrator) DropTable(values ...interface{}) error {</code></span>
+<span class="codeline" id="line-309"><code>	values = m.ReorderModels(values, false)</code></span>
+<span class="codeline" id="line-310"><code>	for i := len(values) - 1; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-311"><code>		tx := m.DB.Session(&amp;gorm.Session{})</code></span>
+<span class="codeline" id="line-312"><code>		if err := m.RunWithValue(values[i], func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-313"><code>			return tx.Exec("DROP TABLE IF EXISTS ?", m.CurrentTable(stmt)).Error</code></span>
+<span class="codeline" id="line-314"><code>		}); err != nil {</code></span>
+<span class="codeline" id="line-315"><code>			return err</code></span>
+<span class="codeline" id="line-316"><code>		}</code></span>
+<span class="codeline" id="line-317"><code>	}</code></span>
+<span class="codeline" id="line-318"><code>	return nil</code></span>
+<span class="codeline" id="line-319"><code>}</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>// HasTable returns table exists or not for value, value could be a struct or string</code></span>
+<span class="codeline" id="line-322"><code>func (m Migrator) HasTable(value interface{}) bool {</code></span>
+<span class="codeline" id="line-323"><code>	var count int64</code></span>
+<span class="codeline" id="line-324"><code></code></span>
+<span class="codeline" id="line-325"><code>	m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-326"><code>		currentDatabase := m.DB.Migrator().CurrentDatabase()</code></span>
+<span class="codeline" id="line-327"><code>		return m.DB.Raw("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", currentDatabase, stmt.Table, "BASE TABLE").Row().Scan(&amp;count)</code></span>
+<span class="codeline" id="line-328"><code>	})</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>	return count &gt; 0</code></span>
+<span class="codeline" id="line-331"><code>}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>// RenameTable rename table from oldName to newName</code></span>
+<span class="codeline" id="line-334"><code>func (m Migrator) RenameTable(oldName, newName interface{}) error {</code></span>
+<span class="codeline" id="line-335"><code>	var oldTable, newTable interface{}</code></span>
+<span class="codeline" id="line-336"><code>	if v, ok := oldName.(string); ok {</code></span>
+<span class="codeline" id="line-337"><code>		oldTable = clause.Table{Name: v}</code></span>
+<span class="codeline" id="line-338"><code>	} else {</code></span>
+<span class="codeline" id="line-339"><code>		stmt := &amp;gorm.Statement{DB: m.DB}</code></span>
+<span class="codeline" id="line-340"><code>		if err := stmt.Parse(oldName); err == nil {</code></span>
+<span class="codeline" id="line-341"><code>			oldTable = m.CurrentTable(stmt)</code></span>
+<span class="codeline" id="line-342"><code>		} else {</code></span>
+<span class="codeline" id="line-343"><code>			return err</code></span>
+<span class="codeline" id="line-344"><code>		}</code></span>
+<span class="codeline" id="line-345"><code>	}</code></span>
+<span class="codeline" id="line-346"><code></code></span>
+<span class="codeline" id="line-347"><code>	if v, ok := newName.(string); ok {</code></span>
+<span class="codeline" id="line-348"><code>		newTable = clause.Table{Name: v}</code></span>
+<span class="codeline" id="line-349"><code>	} else {</code></span>
+<span class="codeline" id="line-350"><code>		stmt := &amp;gorm.Statement{DB: m.DB}</code></span>
+<span class="codeline" id="line-351"><code>		if err := stmt.Parse(newName); err == nil {</code></span>
+<span class="codeline" id="line-352"><code>			newTable = m.CurrentTable(stmt)</code></span>
+<span class="codeline" id="line-353"><code>		} else {</code></span>
+<span class="codeline" id="line-354"><code>			return err</code></span>
+<span class="codeline" id="line-355"><code>		}</code></span>
+<span class="codeline" id="line-356"><code>	}</code></span>
+<span class="codeline" id="line-357"><code></code></span>
+<span class="codeline" id="line-358"><code>	return m.DB.Exec("ALTER TABLE ? RENAME TO ?", oldTable, newTable).Error</code></span>
+<span class="codeline" id="line-359"><code>}</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>// AddColumn create `name` column for value</code></span>
+<span class="codeline" id="line-362"><code>func (m Migrator) AddColumn(value interface{}, name string) error {</code></span>
+<span class="codeline" id="line-363"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-364"><code>		// avoid using the same name field</code></span>
+<span class="codeline" id="line-365"><code>		f := stmt.Schema.LookUpField(name)</code></span>
+<span class="codeline" id="line-366"><code>		if f == nil {</code></span>
+<span class="codeline" id="line-367"><code>			return fmt.Errorf("failed to look up field with name: %s", name)</code></span>
+<span class="codeline" id="line-368"><code>		}</code></span>
+<span class="codeline" id="line-369"><code></code></span>
+<span class="codeline" id="line-370"><code>		if !f.IgnoreMigration {</code></span>
+<span class="codeline" id="line-371"><code>			return m.DB.Exec(</code></span>
+<span class="codeline" id="line-372"><code>				"ALTER TABLE ? ADD ? ?",</code></span>
+<span class="codeline" id="line-373"><code>				m.CurrentTable(stmt), clause.Column{Name: f.DBName}, m.DB.Migrator().FullDataTypeOf(f),</code></span>
+<span class="codeline" id="line-374"><code>			).Error</code></span>
+<span class="codeline" id="line-375"><code>		}</code></span>
+<span class="codeline" id="line-376"><code></code></span>
+<span class="codeline" id="line-377"><code>		return nil</code></span>
+<span class="codeline" id="line-378"><code>	})</code></span>
+<span class="codeline" id="line-379"><code>}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>// DropColumn drop value's `name` column</code></span>
+<span class="codeline" id="line-382"><code>func (m Migrator) DropColumn(value interface{}, name string) error {</code></span>
+<span class="codeline" id="line-383"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-384"><code>		if field := stmt.Schema.LookUpField(name); field != nil {</code></span>
+<span class="codeline" id="line-385"><code>			name = field.DBName</code></span>
+<span class="codeline" id="line-386"><code>		}</code></span>
+<span class="codeline" id="line-387"><code></code></span>
+<span class="codeline" id="line-388"><code>		return m.DB.Exec(</code></span>
+<span class="codeline" id="line-389"><code>			"ALTER TABLE ? DROP COLUMN ?", m.CurrentTable(stmt), clause.Column{Name: name},</code></span>
+<span class="codeline" id="line-390"><code>		).Error</code></span>
+<span class="codeline" id="line-391"><code>	})</code></span>
+<span class="codeline" id="line-392"><code>}</code></span>
+<span class="codeline" id="line-393"><code></code></span>
+<span class="codeline" id="line-394"><code>// AlterColumn alter value's `field` column' type based on schema definition</code></span>
+<span class="codeline" id="line-395"><code>func (m Migrator) AlterColumn(value interface{}, field string) error {</code></span>
+<span class="codeline" id="line-396"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-397"><code>		if field := stmt.Schema.LookUpField(field); field != nil {</code></span>
+<span class="codeline" id="line-398"><code>			fileType := m.FullDataTypeOf(field)</code></span>
+<span class="codeline" id="line-399"><code>			return m.DB.Exec(</code></span>
+<span class="codeline" id="line-400"><code>				"ALTER TABLE ? ALTER COLUMN ? TYPE ?",</code></span>
+<span class="codeline" id="line-401"><code>				m.CurrentTable(stmt), clause.Column{Name: field.DBName}, fileType,</code></span>
+<span class="codeline" id="line-402"><code>			).Error</code></span>
+<span class="codeline" id="line-403"><code></code></span>
+<span class="codeline" id="line-404"><code>		}</code></span>
+<span class="codeline" id="line-405"><code>		return fmt.Errorf("failed to look up field with name: %s", field)</code></span>
+<span class="codeline" id="line-406"><code>	})</code></span>
+<span class="codeline" id="line-407"><code>}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>// HasColumn check has column `field` for value or not</code></span>
+<span class="codeline" id="line-410"><code>func (m Migrator) HasColumn(value interface{}, field string) bool {</code></span>
+<span class="codeline" id="line-411"><code>	var count int64</code></span>
+<span class="codeline" id="line-412"><code>	m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-413"><code>		currentDatabase := m.DB.Migrator().CurrentDatabase()</code></span>
+<span class="codeline" id="line-414"><code>		name := field</code></span>
+<span class="codeline" id="line-415"><code>		if field := stmt.Schema.LookUpField(field); field != nil {</code></span>
+<span class="codeline" id="line-416"><code>			name = field.DBName</code></span>
+<span class="codeline" id="line-417"><code>		}</code></span>
+<span class="codeline" id="line-418"><code></code></span>
+<span class="codeline" id="line-419"><code>		return m.DB.Raw(</code></span>
+<span class="codeline" id="line-420"><code>			"SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",</code></span>
+<span class="codeline" id="line-421"><code>			currentDatabase, stmt.Table, name,</code></span>
+<span class="codeline" id="line-422"><code>		).Row().Scan(&amp;count)</code></span>
+<span class="codeline" id="line-423"><code>	})</code></span>
+<span class="codeline" id="line-424"><code></code></span>
+<span class="codeline" id="line-425"><code>	return count &gt; 0</code></span>
+<span class="codeline" id="line-426"><code>}</code></span>
+<span class="codeline" id="line-427"><code></code></span>
+<span class="codeline" id="line-428"><code>// RenameColumn rename value's field name from oldName to newName</code></span>
+<span class="codeline" id="line-429"><code>func (m Migrator) RenameColumn(value interface{}, oldName, newName string) error {</code></span>
+<span class="codeline" id="line-430"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-431"><code>		if field := stmt.Schema.LookUpField(oldName); field != nil {</code></span>
+<span class="codeline" id="line-432"><code>			oldName = field.DBName</code></span>
+<span class="codeline" id="line-433"><code>		}</code></span>
+<span class="codeline" id="line-434"><code></code></span>
+<span class="codeline" id="line-435"><code>		if field := stmt.Schema.LookUpField(newName); field != nil {</code></span>
+<span class="codeline" id="line-436"><code>			newName = field.DBName</code></span>
+<span class="codeline" id="line-437"><code>		}</code></span>
+<span class="codeline" id="line-438"><code></code></span>
+<span class="codeline" id="line-439"><code>		return m.DB.Exec(</code></span>
+<span class="codeline" id="line-440"><code>			"ALTER TABLE ? RENAME COLUMN ? TO ?",</code></span>
+<span class="codeline" id="line-441"><code>			m.CurrentTable(stmt), clause.Column{Name: oldName}, clause.Column{Name: newName},</code></span>
+<span class="codeline" id="line-442"><code>		).Error</code></span>
+<span class="codeline" id="line-443"><code>	})</code></span>
+<span class="codeline" id="line-444"><code>}</code></span>
+<span class="codeline" id="line-445"><code></code></span>
+<span class="codeline" id="line-446"><code>// MigrateColumn migrate column</code></span>
+<span class="codeline" id="line-447"><code>func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {</code></span>
+<span class="codeline" id="line-448"><code>	if field.IgnoreMigration {</code></span>
+<span class="codeline" id="line-449"><code>		return nil</code></span>
+<span class="codeline" id="line-450"><code>	}</code></span>
+<span class="codeline" id="line-451"><code></code></span>
+<span class="codeline" id="line-452"><code>	// found, smart migrate</code></span>
+<span class="codeline" id="line-453"><code>	fullDataType := strings.TrimSpace(strings.ToLower(m.DB.Migrator().FullDataTypeOf(field).SQL))</code></span>
+<span class="codeline" id="line-454"><code>	realDataType := strings.ToLower(columnType.DatabaseTypeName())</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>	var (</code></span>
+<span class="codeline" id="line-457"><code>		alterColumn bool</code></span>
+<span class="codeline" id="line-458"><code>		isSameType  = fullDataType == realDataType</code></span>
+<span class="codeline" id="line-459"><code>	)</code></span>
+<span class="codeline" id="line-460"><code></code></span>
+<span class="codeline" id="line-461"><code>	if !field.PrimaryKey {</code></span>
+<span class="codeline" id="line-462"><code>		// check type</code></span>
+<span class="codeline" id="line-463"><code>		if !strings.HasPrefix(fullDataType, realDataType) {</code></span>
+<span class="codeline" id="line-464"><code>			// check type aliases</code></span>
+<span class="codeline" id="line-465"><code>			aliases := m.DB.Migrator().GetTypeAliases(realDataType)</code></span>
+<span class="codeline" id="line-466"><code>			for _, alias := range aliases {</code></span>
+<span class="codeline" id="line-467"><code>				if strings.HasPrefix(fullDataType, alias) {</code></span>
+<span class="codeline" id="line-468"><code>					isSameType = true</code></span>
+<span class="codeline" id="line-469"><code>					break</code></span>
+<span class="codeline" id="line-470"><code>				}</code></span>
+<span class="codeline" id="line-471"><code>			}</code></span>
+<span class="codeline" id="line-472"><code></code></span>
+<span class="codeline" id="line-473"><code>			if !isSameType {</code></span>
+<span class="codeline" id="line-474"><code>				alterColumn = true</code></span>
+<span class="codeline" id="line-475"><code>			}</code></span>
+<span class="codeline" id="line-476"><code>		}</code></span>
+<span class="codeline" id="line-477"><code>	}</code></span>
+<span class="codeline" id="line-478"><code></code></span>
+<span class="codeline" id="line-479"><code>	if !isSameType {</code></span>
+<span class="codeline" id="line-480"><code>		// check size</code></span>
+<span class="codeline" id="line-481"><code>		if length, ok := columnType.Length(); length != int64(field.Size) {</code></span>
+<span class="codeline" id="line-482"><code>			if length &gt; 0 &amp;&amp; field.Size &gt; 0 {</code></span>
+<span class="codeline" id="line-483"><code>				alterColumn = true</code></span>
+<span class="codeline" id="line-484"><code>			} else {</code></span>
+<span class="codeline" id="line-485"><code>				// has size in data type and not equal</code></span>
+<span class="codeline" id="line-486"><code>				// Since the following code is frequently called in the for loop, reg optimization is needed here</code></span>
+<span class="codeline" id="line-487"><code>				matches2 := regFullDataType.FindAllStringSubmatch(fullDataType, -1)</code></span>
+<span class="codeline" id="line-488"><code>				if !field.PrimaryKey &amp;&amp;</code></span>
+<span class="codeline" id="line-489"><code>					(len(matches2) == 1 &amp;&amp; matches2[0][1] != fmt.Sprint(length) &amp;&amp; ok) {</code></span>
+<span class="codeline" id="line-490"><code>					alterColumn = true</code></span>
+<span class="codeline" id="line-491"><code>				}</code></span>
+<span class="codeline" id="line-492"><code>			}</code></span>
+<span class="codeline" id="line-493"><code>		}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>		// check precision</code></span>
+<span class="codeline" id="line-496"><code>		if precision, _, ok := columnType.DecimalSize(); ok &amp;&amp; int64(field.Precision) != precision {</code></span>
+<span class="codeline" id="line-497"><code>			if regexp.MustCompile(fmt.Sprintf("[^0-9]%d[^0-9]", field.Precision)).MatchString(m.DataTypeOf(field)) {</code></span>
+<span class="codeline" id="line-498"><code>				alterColumn = true</code></span>
+<span class="codeline" id="line-499"><code>			}</code></span>
+<span class="codeline" id="line-500"><code>		}</code></span>
+<span class="codeline" id="line-501"><code>	}</code></span>
+<span class="codeline" id="line-502"><code></code></span>
+<span class="codeline" id="line-503"><code>	// check nullable</code></span>
+<span class="codeline" id="line-504"><code>	if nullable, ok := columnType.Nullable(); ok &amp;&amp; nullable == field.NotNull {</code></span>
+<span class="codeline" id="line-505"><code>		// not primary key &amp; database is nullable</code></span>
+<span class="codeline" id="line-506"><code>		if !field.PrimaryKey &amp;&amp; nullable {</code></span>
+<span class="codeline" id="line-507"><code>			alterColumn = true</code></span>
+<span class="codeline" id="line-508"><code>		}</code></span>
+<span class="codeline" id="line-509"><code>	}</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>	// check default value</code></span>
+<span class="codeline" id="line-512"><code>	if !field.PrimaryKey {</code></span>
+<span class="codeline" id="line-513"><code>		currentDefaultNotNull := field.HasDefaultValue &amp;&amp; (field.DefaultValueInterface != nil || !strings.EqualFold(field.DefaultValue, "NULL"))</code></span>
+<span class="codeline" id="line-514"><code>		dv, dvNotNull := columnType.DefaultValue()</code></span>
+<span class="codeline" id="line-515"><code>		if dvNotNull &amp;&amp; !currentDefaultNotNull {</code></span>
+<span class="codeline" id="line-516"><code>			// default value -&gt; null</code></span>
+<span class="codeline" id="line-517"><code>			alterColumn = true</code></span>
+<span class="codeline" id="line-518"><code>		} else if !dvNotNull &amp;&amp; currentDefaultNotNull {</code></span>
+<span class="codeline" id="line-519"><code>			// null -&gt; default value</code></span>
+<span class="codeline" id="line-520"><code>			alterColumn = true</code></span>
+<span class="codeline" id="line-521"><code>		} else if (field.GORMDataType != schema.Time &amp;&amp; dv != field.DefaultValue) ||</code></span>
+<span class="codeline" id="line-522"><code>			(field.GORMDataType == schema.Time &amp;&amp; !strings.EqualFold(strings.TrimSuffix(dv, "()"), strings.TrimSuffix(field.DefaultValue, "()"))) {</code></span>
+<span class="codeline" id="line-523"><code>			// default value not equal</code></span>
+<span class="codeline" id="line-524"><code>			// not both null</code></span>
+<span class="codeline" id="line-525"><code>			if currentDefaultNotNull || dvNotNull {</code></span>
+<span class="codeline" id="line-526"><code>				alterColumn = true</code></span>
+<span class="codeline" id="line-527"><code>			}</code></span>
+<span class="codeline" id="line-528"><code>		}</code></span>
+<span class="codeline" id="line-529"><code>	}</code></span>
+<span class="codeline" id="line-530"><code></code></span>
+<span class="codeline" id="line-531"><code>	// check comment</code></span>
+<span class="codeline" id="line-532"><code>	if comment, ok := columnType.Comment(); ok &amp;&amp; comment != field.Comment {</code></span>
+<span class="codeline" id="line-533"><code>		// not primary key</code></span>
+<span class="codeline" id="line-534"><code>		if !field.PrimaryKey {</code></span>
+<span class="codeline" id="line-535"><code>			alterColumn = true</code></span>
+<span class="codeline" id="line-536"><code>		}</code></span>
+<span class="codeline" id="line-537"><code>	}</code></span>
+<span class="codeline" id="line-538"><code></code></span>
+<span class="codeline" id="line-539"><code>	if alterColumn {</code></span>
+<span class="codeline" id="line-540"><code>		if err := m.DB.Migrator().AlterColumn(value, field.DBName); err != nil {</code></span>
+<span class="codeline" id="line-541"><code>			return err</code></span>
+<span class="codeline" id="line-542"><code>		}</code></span>
+<span class="codeline" id="line-543"><code>	}</code></span>
+<span class="codeline" id="line-544"><code></code></span>
+<span class="codeline" id="line-545"><code>	if err := m.DB.Migrator().MigrateColumnUnique(value, field, columnType); err != nil {</code></span>
+<span class="codeline" id="line-546"><code>		return err</code></span>
+<span class="codeline" id="line-547"><code>	}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>	return nil</code></span>
+<span class="codeline" id="line-550"><code>}</code></span>
+<span class="codeline" id="line-551"><code></code></span>
+<span class="codeline" id="line-552"><code>func (m Migrator) MigrateColumnUnique(value interface{}, field *schema.Field, columnType gorm.ColumnType) error {</code></span>
+<span class="codeline" id="line-553"><code>	unique, ok := columnType.Unique()</code></span>
+<span class="codeline" id="line-554"><code>	if !ok || field.PrimaryKey {</code></span>
+<span class="codeline" id="line-555"><code>		return nil // skip primary key</code></span>
+<span class="codeline" id="line-556"><code>	}</code></span>
+<span class="codeline" id="line-557"><code>	// By default, ColumnType's Unique is not affected by UniqueIndex, so we don't care about UniqueIndex.</code></span>
+<span class="codeline" id="line-558"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-559"><code>		// We're currently only receiving boolean values on `Unique` tag,</code></span>
+<span class="codeline" id="line-560"><code>		// so the UniqueConstraint name is fixed</code></span>
+<span class="codeline" id="line-561"><code>		constraint := m.DB.NamingStrategy.UniqueName(stmt.Table, field.DBName)</code></span>
+<span class="codeline" id="line-562"><code>		if unique &amp;&amp; !field.Unique {</code></span>
+<span class="codeline" id="line-563"><code>			return m.DB.Migrator().DropConstraint(value, constraint)</code></span>
+<span class="codeline" id="line-564"><code>		}</code></span>
+<span class="codeline" id="line-565"><code>		if !unique &amp;&amp; field.Unique {</code></span>
+<span class="codeline" id="line-566"><code>			return m.DB.Migrator().CreateConstraint(value, constraint)</code></span>
+<span class="codeline" id="line-567"><code>		}</code></span>
+<span class="codeline" id="line-568"><code>		return nil</code></span>
+<span class="codeline" id="line-569"><code>	})</code></span>
+<span class="codeline" id="line-570"><code>}</code></span>
+<span class="codeline" id="line-571"><code></code></span>
+<span class="codeline" id="line-572"><code>// ColumnTypes return columnTypes []gorm.ColumnType and execErr error</code></span>
+<span class="codeline" id="line-573"><code>func (m Migrator) ColumnTypes(value interface{}) ([]gorm.ColumnType, error) {</code></span>
+<span class="codeline" id="line-574"><code>	columnTypes := make([]gorm.ColumnType, 0)</code></span>
+<span class="codeline" id="line-575"><code>	execErr := m.RunWithValue(value, func(stmt *gorm.Statement) (err error) {</code></span>
+<span class="codeline" id="line-576"><code>		rows, err := m.DB.Session(&amp;gorm.Session{}).Table(stmt.Table).Limit(1).Rows()</code></span>
+<span class="codeline" id="line-577"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-578"><code>			return err</code></span>
+<span class="codeline" id="line-579"><code>		}</code></span>
+<span class="codeline" id="line-580"><code></code></span>
+<span class="codeline" id="line-581"><code>		defer func() {</code></span>
+<span class="codeline" id="line-582"><code>			err = rows.Close()</code></span>
+<span class="codeline" id="line-583"><code>		}()</code></span>
+<span class="codeline" id="line-584"><code></code></span>
+<span class="codeline" id="line-585"><code>		var rawColumnTypes []*sql.ColumnType</code></span>
+<span class="codeline" id="line-586"><code>		rawColumnTypes, err = rows.ColumnTypes()</code></span>
+<span class="codeline" id="line-587"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-588"><code>			return err</code></span>
+<span class="codeline" id="line-589"><code>		}</code></span>
+<span class="codeline" id="line-590"><code></code></span>
+<span class="codeline" id="line-591"><code>		for _, c := range rawColumnTypes {</code></span>
+<span class="codeline" id="line-592"><code>			columnTypes = append(columnTypes, ColumnType{SQLColumnType: c})</code></span>
+<span class="codeline" id="line-593"><code>		}</code></span>
+<span class="codeline" id="line-594"><code></code></span>
+<span class="codeline" id="line-595"><code>		return</code></span>
+<span class="codeline" id="line-596"><code>	})</code></span>
+<span class="codeline" id="line-597"><code></code></span>
+<span class="codeline" id="line-598"><code>	return columnTypes, execErr</code></span>
+<span class="codeline" id="line-599"><code>}</code></span>
+<span class="codeline" id="line-600"><code></code></span>
+<span class="codeline" id="line-601"><code>// CreateView create view from Query in gorm.ViewOption.</code></span>
+<span class="codeline" id="line-602"><code>// Query in gorm.ViewOption is a [subquery]</code></span>
+<span class="codeline" id="line-603"><code>//</code></span>
+<span class="codeline" id="line-604"><code>//	// CREATE VIEW `user_view` AS SELECT * FROM `users` WHERE age &gt; 20</code></span>
+<span class="codeline" id="line-605"><code>//	q := DB.Model(&amp;User{}).Where("age &gt; ?", 20)</code></span>
+<span class="codeline" id="line-606"><code>//	DB.Debug().Migrator().CreateView("user_view", gorm.ViewOption{Query: q})</code></span>
+<span class="codeline" id="line-607"><code>//</code></span>
+<span class="codeline" id="line-608"><code>//	// CREATE OR REPLACE VIEW `users_view` AS SELECT * FROM `users` WITH CHECK OPTION</code></span>
+<span class="codeline" id="line-609"><code>//	q := DB.Model(&amp;User{})</code></span>
+<span class="codeline" id="line-610"><code>//	DB.Debug().Migrator().CreateView("user_view", gorm.ViewOption{Query: q, Replace: true, CheckOption: "WITH CHECK OPTION"})</code></span>
+<span class="codeline" id="line-611"><code>//</code></span>
+<span class="codeline" id="line-612"><code>// [subquery]: https://gorm.io/docs/advanced_query.html#SubQuery</code></span>
+<span class="codeline" id="line-613"><code>func (m Migrator) CreateView(name string, option gorm.ViewOption) error {</code></span>
+<span class="codeline" id="line-614"><code>	if option.Query == nil {</code></span>
+<span class="codeline" id="line-615"><code>		return gorm.ErrSubQueryRequired</code></span>
+<span class="codeline" id="line-616"><code>	}</code></span>
+<span class="codeline" id="line-617"><code></code></span>
+<span class="codeline" id="line-618"><code>	sql := new(strings.Builder)</code></span>
+<span class="codeline" id="line-619"><code>	sql.WriteString("CREATE ")</code></span>
+<span class="codeline" id="line-620"><code>	if option.Replace {</code></span>
+<span class="codeline" id="line-621"><code>		sql.WriteString("OR REPLACE ")</code></span>
+<span class="codeline" id="line-622"><code>	}</code></span>
+<span class="codeline" id="line-623"><code>	sql.WriteString("VIEW ")</code></span>
+<span class="codeline" id="line-624"><code>	m.QuoteTo(sql, name)</code></span>
+<span class="codeline" id="line-625"><code>	sql.WriteString(" AS ")</code></span>
+<span class="codeline" id="line-626"><code></code></span>
+<span class="codeline" id="line-627"><code>	m.DB.Statement.AddVar(sql, option.Query)</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>	if option.CheckOption != "" {</code></span>
+<span class="codeline" id="line-630"><code>		sql.WriteString(" ")</code></span>
+<span class="codeline" id="line-631"><code>		sql.WriteString(option.CheckOption)</code></span>
+<span class="codeline" id="line-632"><code>	}</code></span>
+<span class="codeline" id="line-633"><code>	return m.DB.Exec(m.Explain(sql.String(), m.DB.Statement.Vars...)).Error</code></span>
+<span class="codeline" id="line-634"><code>}</code></span>
+<span class="codeline" id="line-635"><code></code></span>
+<span class="codeline" id="line-636"><code>// DropView drop view</code></span>
+<span class="codeline" id="line-637"><code>func (m Migrator) DropView(name string) error {</code></span>
+<span class="codeline" id="line-638"><code>	return m.DB.Exec("DROP VIEW IF EXISTS ?", clause.Table{Name: name}).Error</code></span>
+<span class="codeline" id="line-639"><code>}</code></span>
+<span class="codeline" id="line-640"><code></code></span>
+<span class="codeline" id="line-641"><code>// GuessConstraintAndTable guess statement's constraint and it's table based on name</code></span>
+<span class="codeline" id="line-642"><code>//</code></span>
+<span class="codeline" id="line-643"><code>// Deprecated: use GuessConstraintInterfaceAndTable instead.</code></span>
+<span class="codeline" id="line-644"><code>func (m Migrator) GuessConstraintAndTable(stmt *gorm.Statement, name string) (*schema.Constraint, *schema.CheckConstraint, string) {</code></span>
+<span class="codeline" id="line-645"><code>	constraint, table := m.GuessConstraintInterfaceAndTable(stmt, name)</code></span>
+<span class="codeline" id="line-646"><code>	switch c := constraint.(type) {</code></span>
+<span class="codeline" id="line-647"><code>	case *schema.Constraint:</code></span>
+<span class="codeline" id="line-648"><code>		return c, nil, table</code></span>
+<span class="codeline" id="line-649"><code>	case *schema.CheckConstraint:</code></span>
+<span class="codeline" id="line-650"><code>		return nil, c, table</code></span>
+<span class="codeline" id="line-651"><code>	default:</code></span>
+<span class="codeline" id="line-652"><code>		return nil, nil, table</code></span>
+<span class="codeline" id="line-653"><code>	}</code></span>
+<span class="codeline" id="line-654"><code>}</code></span>
+<span class="codeline" id="line-655"><code></code></span>
+<span class="codeline" id="line-656"><code>// GuessConstraintInterfaceAndTable guess statement's constraint and it's table based on name</code></span>
+<span class="codeline" id="line-657"><code>// nolint:cyclop</code></span>
+<span class="codeline" id="line-658"><code>func (m Migrator) GuessConstraintInterfaceAndTable(stmt *gorm.Statement, name string) (_ schema.ConstraintInterface, table string) {</code></span>
+<span class="codeline" id="line-659"><code>	if stmt.Schema == nil {</code></span>
+<span class="codeline" id="line-660"><code>		return nil, stmt.Table</code></span>
+<span class="codeline" id="line-661"><code>	}</code></span>
+<span class="codeline" id="line-662"><code></code></span>
+<span class="codeline" id="line-663"><code>	checkConstraints := stmt.Schema.ParseCheckConstraints()</code></span>
+<span class="codeline" id="line-664"><code>	if chk, ok := checkConstraints[name]; ok {</code></span>
+<span class="codeline" id="line-665"><code>		return &amp;chk, stmt.Table</code></span>
+<span class="codeline" id="line-666"><code>	}</code></span>
+<span class="codeline" id="line-667"><code></code></span>
+<span class="codeline" id="line-668"><code>	uniqueConstraints := stmt.Schema.ParseUniqueConstraints()</code></span>
+<span class="codeline" id="line-669"><code>	if uni, ok := uniqueConstraints[name]; ok {</code></span>
+<span class="codeline" id="line-670"><code>		return &amp;uni, stmt.Table</code></span>
+<span class="codeline" id="line-671"><code>	}</code></span>
+<span class="codeline" id="line-672"><code></code></span>
+<span class="codeline" id="line-673"><code>	getTable := func(rel *schema.Relationship) string {</code></span>
+<span class="codeline" id="line-674"><code>		switch rel.Type {</code></span>
+<span class="codeline" id="line-675"><code>		case schema.HasOne, schema.HasMany:</code></span>
+<span class="codeline" id="line-676"><code>			return rel.FieldSchema.Table</code></span>
+<span class="codeline" id="line-677"><code>		case schema.Many2Many:</code></span>
+<span class="codeline" id="line-678"><code>			return rel.JoinTable.Table</code></span>
+<span class="codeline" id="line-679"><code>		}</code></span>
+<span class="codeline" id="line-680"><code>		return stmt.Table</code></span>
+<span class="codeline" id="line-681"><code>	}</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>	for _, rel := range stmt.Schema.Relationships.Relations {</code></span>
+<span class="codeline" id="line-684"><code>		if constraint := rel.ParseConstraint(); constraint != nil &amp;&amp; constraint.Name == name {</code></span>
+<span class="codeline" id="line-685"><code>			return constraint, getTable(rel)</code></span>
+<span class="codeline" id="line-686"><code>		}</code></span>
+<span class="codeline" id="line-687"><code>	}</code></span>
+<span class="codeline" id="line-688"><code></code></span>
+<span class="codeline" id="line-689"><code>	if field := stmt.Schema.LookUpField(name); field != nil {</code></span>
+<span class="codeline" id="line-690"><code>		for k := range checkConstraints {</code></span>
+<span class="codeline" id="line-691"><code>			if checkConstraints[k].Field == field {</code></span>
+<span class="codeline" id="line-692"><code>				v := checkConstraints[k]</code></span>
+<span class="codeline" id="line-693"><code>				return &amp;v, stmt.Table</code></span>
+<span class="codeline" id="line-694"><code>			}</code></span>
+<span class="codeline" id="line-695"><code>		}</code></span>
+<span class="codeline" id="line-696"><code></code></span>
+<span class="codeline" id="line-697"><code>		for k := range uniqueConstraints {</code></span>
+<span class="codeline" id="line-698"><code>			if uniqueConstraints[k].Field == field {</code></span>
+<span class="codeline" id="line-699"><code>				v := uniqueConstraints[k]</code></span>
+<span class="codeline" id="line-700"><code>				return &amp;v, stmt.Table</code></span>
+<span class="codeline" id="line-701"><code>			}</code></span>
+<span class="codeline" id="line-702"><code>		}</code></span>
+<span class="codeline" id="line-703"><code></code></span>
+<span class="codeline" id="line-704"><code>		for _, rel := range stmt.Schema.Relationships.Relations {</code></span>
+<span class="codeline" id="line-705"><code>			if constraint := rel.ParseConstraint(); constraint != nil &amp;&amp; rel.Field == field {</code></span>
+<span class="codeline" id="line-706"><code>				return constraint, getTable(rel)</code></span>
+<span class="codeline" id="line-707"><code>			}</code></span>
+<span class="codeline" id="line-708"><code>		}</code></span>
+<span class="codeline" id="line-709"><code>	}</code></span>
+<span class="codeline" id="line-710"><code></code></span>
+<span class="codeline" id="line-711"><code>	return nil, stmt.Schema.Table</code></span>
+<span class="codeline" id="line-712"><code>}</code></span>
+<span class="codeline" id="line-713"><code></code></span>
+<span class="codeline" id="line-714"><code>// CreateConstraint create constraint</code></span>
+<span class="codeline" id="line-715"><code>func (m Migrator) CreateConstraint(value interface{}, name string) error {</code></span>
+<span class="codeline" id="line-716"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-717"><code>		constraint, table := m.GuessConstraintInterfaceAndTable(stmt, name)</code></span>
+<span class="codeline" id="line-718"><code>		if constraint != nil {</code></span>
+<span class="codeline" id="line-719"><code>			vars := []interface{}{clause.Table{Name: table}}</code></span>
+<span class="codeline" id="line-720"><code>			if stmt.TableExpr != nil {</code></span>
+<span class="codeline" id="line-721"><code>				vars[0] = stmt.TableExpr</code></span>
+<span class="codeline" id="line-722"><code>			}</code></span>
+<span class="codeline" id="line-723"><code>			sql, values := constraint.Build()</code></span>
+<span class="codeline" id="line-724"><code>			return m.DB.Exec("ALTER TABLE ? ADD "+sql, append(vars, values...)...).Error</code></span>
+<span class="codeline" id="line-725"><code>		}</code></span>
+<span class="codeline" id="line-726"><code>		return nil</code></span>
+<span class="codeline" id="line-727"><code>	})</code></span>
+<span class="codeline" id="line-728"><code>}</code></span>
+<span class="codeline" id="line-729"><code></code></span>
+<span class="codeline" id="line-730"><code>// DropConstraint drop constraint</code></span>
+<span class="codeline" id="line-731"><code>func (m Migrator) DropConstraint(value interface{}, name string) error {</code></span>
+<span class="codeline" id="line-732"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-733"><code>		constraint, table := m.GuessConstraintInterfaceAndTable(stmt, name)</code></span>
+<span class="codeline" id="line-734"><code>		if constraint != nil {</code></span>
+<span class="codeline" id="line-735"><code>			name = constraint.GetName()</code></span>
+<span class="codeline" id="line-736"><code>		}</code></span>
+<span class="codeline" id="line-737"><code>		return m.DB.Exec("ALTER TABLE ? DROP CONSTRAINT ?", clause.Table{Name: table}, clause.Column{Name: name}).Error</code></span>
+<span class="codeline" id="line-738"><code>	})</code></span>
+<span class="codeline" id="line-739"><code>}</code></span>
+<span class="codeline" id="line-740"><code></code></span>
+<span class="codeline" id="line-741"><code>// HasConstraint check has constraint or not</code></span>
+<span class="codeline" id="line-742"><code>func (m Migrator) HasConstraint(value interface{}, name string) bool {</code></span>
+<span class="codeline" id="line-743"><code>	var count int64</code></span>
+<span class="codeline" id="line-744"><code>	m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-745"><code>		currentDatabase := m.DB.Migrator().CurrentDatabase()</code></span>
+<span class="codeline" id="line-746"><code>		constraint, table := m.GuessConstraintInterfaceAndTable(stmt, name)</code></span>
+<span class="codeline" id="line-747"><code>		if constraint != nil {</code></span>
+<span class="codeline" id="line-748"><code>			name = constraint.GetName()</code></span>
+<span class="codeline" id="line-749"><code>		}</code></span>
+<span class="codeline" id="line-750"><code></code></span>
+<span class="codeline" id="line-751"><code>		return m.DB.Raw(</code></span>
+<span class="codeline" id="line-752"><code>			"SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE constraint_schema = ? AND table_name = ? AND constraint_name = ?",</code></span>
+<span class="codeline" id="line-753"><code>			currentDatabase, table, name,</code></span>
+<span class="codeline" id="line-754"><code>		).Row().Scan(&amp;count)</code></span>
+<span class="codeline" id="line-755"><code>	})</code></span>
+<span class="codeline" id="line-756"><code></code></span>
+<span class="codeline" id="line-757"><code>	return count &gt; 0</code></span>
+<span class="codeline" id="line-758"><code>}</code></span>
+<span class="codeline" id="line-759"><code></code></span>
+<span class="codeline" id="line-760"><code>// BuildIndexOptions build index options</code></span>
+<span class="codeline" id="line-761"><code>func (m Migrator) BuildIndexOptions(opts []schema.IndexOption, stmt *gorm.Statement) (results []interface{}) {</code></span>
+<span class="codeline" id="line-762"><code>	for _, opt := range opts {</code></span>
+<span class="codeline" id="line-763"><code>		str := stmt.Quote(opt.DBName)</code></span>
+<span class="codeline" id="line-764"><code>		if opt.Expression != "" {</code></span>
+<span class="codeline" id="line-765"><code>			str = opt.Expression</code></span>
+<span class="codeline" id="line-766"><code>		} else if opt.Length &gt; 0 {</code></span>
+<span class="codeline" id="line-767"><code>			str += fmt.Sprintf("(%d)", opt.Length)</code></span>
+<span class="codeline" id="line-768"><code>		}</code></span>
+<span class="codeline" id="line-769"><code></code></span>
+<span class="codeline" id="line-770"><code>		if opt.Collate != "" {</code></span>
+<span class="codeline" id="line-771"><code>			str += " COLLATE " + opt.Collate</code></span>
+<span class="codeline" id="line-772"><code>		}</code></span>
+<span class="codeline" id="line-773"><code></code></span>
+<span class="codeline" id="line-774"><code>		if opt.Sort != "" {</code></span>
+<span class="codeline" id="line-775"><code>			str += " " + opt.Sort</code></span>
+<span class="codeline" id="line-776"><code>		}</code></span>
+<span class="codeline" id="line-777"><code>		results = append(results, clause.Expr{SQL: str})</code></span>
+<span class="codeline" id="line-778"><code>	}</code></span>
+<span class="codeline" id="line-779"><code>	return</code></span>
+<span class="codeline" id="line-780"><code>}</code></span>
+<span class="codeline" id="line-781"><code></code></span>
+<span class="codeline" id="line-782"><code>// BuildIndexOptionsInterface build index options interface</code></span>
+<span class="codeline" id="line-783"><code>type BuildIndexOptionsInterface interface {</code></span>
+<span class="codeline" id="line-784"><code>	BuildIndexOptions([]schema.IndexOption, *gorm.Statement) []interface{}</code></span>
+<span class="codeline" id="line-785"><code>}</code></span>
+<span class="codeline" id="line-786"><code></code></span>
+<span class="codeline" id="line-787"><code>// CreateIndex create index `name`</code></span>
+<span class="codeline" id="line-788"><code>func (m Migrator) CreateIndex(value interface{}, name string) error {</code></span>
+<span class="codeline" id="line-789"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-790"><code>		if idx := stmt.Schema.LookIndex(name); idx != nil {</code></span>
+<span class="codeline" id="line-791"><code>			opts := m.DB.Migrator().(BuildIndexOptionsInterface).BuildIndexOptions(idx.Fields, stmt)</code></span>
+<span class="codeline" id="line-792"><code>			values := []interface{}{clause.Column{Name: idx.Name}, m.CurrentTable(stmt), opts}</code></span>
+<span class="codeline" id="line-793"><code></code></span>
+<span class="codeline" id="line-794"><code>			createIndexSQL := "CREATE "</code></span>
+<span class="codeline" id="line-795"><code>			if idx.Class != "" {</code></span>
+<span class="codeline" id="line-796"><code>				createIndexSQL += idx.Class + " "</code></span>
+<span class="codeline" id="line-797"><code>			}</code></span>
+<span class="codeline" id="line-798"><code>			createIndexSQL += "INDEX ? ON ??"</code></span>
+<span class="codeline" id="line-799"><code></code></span>
+<span class="codeline" id="line-800"><code>			if idx.Type != "" {</code></span>
+<span class="codeline" id="line-801"><code>				createIndexSQL += " USING " + idx.Type</code></span>
+<span class="codeline" id="line-802"><code>			}</code></span>
+<span class="codeline" id="line-803"><code></code></span>
+<span class="codeline" id="line-804"><code>			if idx.Comment != "" {</code></span>
+<span class="codeline" id="line-805"><code>				createIndexSQL += fmt.Sprintf(" COMMENT '%s'", idx.Comment)</code></span>
+<span class="codeline" id="line-806"><code>			}</code></span>
+<span class="codeline" id="line-807"><code></code></span>
+<span class="codeline" id="line-808"><code>			if idx.Option != "" {</code></span>
+<span class="codeline" id="line-809"><code>				createIndexSQL += " " + idx.Option</code></span>
+<span class="codeline" id="line-810"><code>			}</code></span>
+<span class="codeline" id="line-811"><code></code></span>
+<span class="codeline" id="line-812"><code>			return m.DB.Exec(createIndexSQL, values...).Error</code></span>
+<span class="codeline" id="line-813"><code>		}</code></span>
+<span class="codeline" id="line-814"><code></code></span>
+<span class="codeline" id="line-815"><code>		return fmt.Errorf("failed to create index with name %s", name)</code></span>
+<span class="codeline" id="line-816"><code>	})</code></span>
+<span class="codeline" id="line-817"><code>}</code></span>
+<span class="codeline" id="line-818"><code></code></span>
+<span class="codeline" id="line-819"><code>// DropIndex drop index `name`</code></span>
+<span class="codeline" id="line-820"><code>func (m Migrator) DropIndex(value interface{}, name string) error {</code></span>
+<span class="codeline" id="line-821"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-822"><code>		if idx := stmt.Schema.LookIndex(name); idx != nil {</code></span>
+<span class="codeline" id="line-823"><code>			name = idx.Name</code></span>
+<span class="codeline" id="line-824"><code>		}</code></span>
+<span class="codeline" id="line-825"><code></code></span>
+<span class="codeline" id="line-826"><code>		return m.DB.Exec("DROP INDEX ? ON ?", clause.Column{Name: name}, m.CurrentTable(stmt)).Error</code></span>
+<span class="codeline" id="line-827"><code>	})</code></span>
+<span class="codeline" id="line-828"><code>}</code></span>
+<span class="codeline" id="line-829"><code></code></span>
+<span class="codeline" id="line-830"><code>// HasIndex check has index `name` or not</code></span>
+<span class="codeline" id="line-831"><code>func (m Migrator) HasIndex(value interface{}, name string) bool {</code></span>
+<span class="codeline" id="line-832"><code>	var count int64</code></span>
+<span class="codeline" id="line-833"><code>	m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-834"><code>		currentDatabase := m.DB.Migrator().CurrentDatabase()</code></span>
+<span class="codeline" id="line-835"><code>		if idx := stmt.Schema.LookIndex(name); idx != nil {</code></span>
+<span class="codeline" id="line-836"><code>			name = idx.Name</code></span>
+<span class="codeline" id="line-837"><code>		}</code></span>
+<span class="codeline" id="line-838"><code></code></span>
+<span class="codeline" id="line-839"><code>		return m.DB.Raw(</code></span>
+<span class="codeline" id="line-840"><code>			"SELECT count(*) FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? AND index_name = ?",</code></span>
+<span class="codeline" id="line-841"><code>			currentDatabase, stmt.Table, name,</code></span>
+<span class="codeline" id="line-842"><code>		).Row().Scan(&amp;count)</code></span>
+<span class="codeline" id="line-843"><code>	})</code></span>
+<span class="codeline" id="line-844"><code></code></span>
+<span class="codeline" id="line-845"><code>	return count &gt; 0</code></span>
+<span class="codeline" id="line-846"><code>}</code></span>
+<span class="codeline" id="line-847"><code></code></span>
+<span class="codeline" id="line-848"><code>// RenameIndex rename index from oldName to newName</code></span>
+<span class="codeline" id="line-849"><code>func (m Migrator) RenameIndex(value interface{}, oldName, newName string) error {</code></span>
+<span class="codeline" id="line-850"><code>	return m.RunWithValue(value, func(stmt *gorm.Statement) error {</code></span>
+<span class="codeline" id="line-851"><code>		return m.DB.Exec(</code></span>
+<span class="codeline" id="line-852"><code>			"ALTER TABLE ? RENAME INDEX ? TO ?",</code></span>
+<span class="codeline" id="line-853"><code>			m.CurrentTable(stmt), clause.Column{Name: oldName}, clause.Column{Name: newName},</code></span>
+<span class="codeline" id="line-854"><code>		).Error</code></span>
+<span class="codeline" id="line-855"><code>	})</code></span>
+<span class="codeline" id="line-856"><code>}</code></span>
+<span class="codeline" id="line-857"><code></code></span>
+<span class="codeline" id="line-858"><code>// CurrentDatabase returns current database name</code></span>
+<span class="codeline" id="line-859"><code>func (m Migrator) CurrentDatabase() (name string) {</code></span>
+<span class="codeline" id="line-860"><code>	m.DB.Raw("SELECT DATABASE()").Row().Scan(&amp;name)</code></span>
+<span class="codeline" id="line-861"><code>	return</code></span>
+<span class="codeline" id="line-862"><code>}</code></span>
+<span class="codeline" id="line-863"><code></code></span>
+<span class="codeline" id="line-864"><code>// ReorderModels reorder models according to constraint dependencies</code></span>
+<span class="codeline" id="line-865"><code>func (m Migrator) ReorderModels(values []interface{}, autoAdd bool) (results []interface{}) {</code></span>
+<span class="codeline" id="line-866"><code>	type Dependency struct {</code></span>
+<span class="codeline" id="line-867"><code>		*gorm.Statement</code></span>
+<span class="codeline" id="line-868"><code>		Depends []*schema.Schema</code></span>
+<span class="codeline" id="line-869"><code>	}</code></span>
+<span class="codeline" id="line-870"><code></code></span>
+<span class="codeline" id="line-871"><code>	var (</code></span>
+<span class="codeline" id="line-872"><code>		modelNames, orderedModelNames []string</code></span>
+<span class="codeline" id="line-873"><code>		orderedModelNamesMap          = map[string]bool{}</code></span>
+<span class="codeline" id="line-874"><code>		parsedSchemas                 = map[*schema.Schema]bool{}</code></span>
+<span class="codeline" id="line-875"><code>		valuesMap                     = map[string]Dependency{}</code></span>
+<span class="codeline" id="line-876"><code>		insertIntoOrderedList         func(name string)</code></span>
+<span class="codeline" id="line-877"><code>		parseDependence               func(value interface{}, addToList bool)</code></span>
+<span class="codeline" id="line-878"><code>	)</code></span>
+<span class="codeline" id="line-879"><code></code></span>
+<span class="codeline" id="line-880"><code>	parseDependence = func(value interface{}, addToList bool) {</code></span>
+<span class="codeline" id="line-881"><code>		dep := Dependency{</code></span>
+<span class="codeline" id="line-882"><code>			Statement: &amp;gorm.Statement{DB: m.DB, Dest: value},</code></span>
+<span class="codeline" id="line-883"><code>		}</code></span>
+<span class="codeline" id="line-884"><code>		beDependedOn := map[*schema.Schema]bool{}</code></span>
+<span class="codeline" id="line-885"><code>		// support for special table name</code></span>
+<span class="codeline" id="line-886"><code>		if err := dep.ParseWithSpecialTableName(value, m.DB.Statement.Table); err != nil {</code></span>
+<span class="codeline" id="line-887"><code>			m.DB.Logger.Error(context.Background(), "failed to parse value %#v, got error %v", value, err)</code></span>
+<span class="codeline" id="line-888"><code>		}</code></span>
+<span class="codeline" id="line-889"><code>		if _, ok := parsedSchemas[dep.Statement.Schema]; ok {</code></span>
+<span class="codeline" id="line-890"><code>			return</code></span>
+<span class="codeline" id="line-891"><code>		}</code></span>
+<span class="codeline" id="line-892"><code>		parsedSchemas[dep.Statement.Schema] = true</code></span>
+<span class="codeline" id="line-893"><code></code></span>
+<span class="codeline" id="line-894"><code>		if !m.DB.IgnoreRelationshipsWhenMigrating {</code></span>
+<span class="codeline" id="line-895"><code>			for _, rel := range dep.Schema.Relationships.Relations {</code></span>
+<span class="codeline" id="line-896"><code>				if rel.Field.IgnoreMigration {</code></span>
+<span class="codeline" id="line-897"><code>					continue</code></span>
+<span class="codeline" id="line-898"><code>				}</code></span>
+<span class="codeline" id="line-899"><code>				if c := rel.ParseConstraint(); c != nil &amp;&amp; c.Schema == dep.Statement.Schema &amp;&amp; c.Schema != c.ReferenceSchema {</code></span>
+<span class="codeline" id="line-900"><code>					dep.Depends = append(dep.Depends, c.ReferenceSchema)</code></span>
+<span class="codeline" id="line-901"><code>				}</code></span>
+<span class="codeline" id="line-902"><code></code></span>
+<span class="codeline" id="line-903"><code>				if rel.Type == schema.HasOne || rel.Type == schema.HasMany {</code></span>
+<span class="codeline" id="line-904"><code>					beDependedOn[rel.FieldSchema] = true</code></span>
+<span class="codeline" id="line-905"><code>				}</code></span>
+<span class="codeline" id="line-906"><code></code></span>
+<span class="codeline" id="line-907"><code>				if rel.JoinTable != nil {</code></span>
+<span class="codeline" id="line-908"><code>					// append join value</code></span>
+<span class="codeline" id="line-909"><code>					defer func(rel *schema.Relationship, joinValue interface{}) {</code></span>
+<span class="codeline" id="line-910"><code>						if !beDependedOn[rel.FieldSchema] {</code></span>
+<span class="codeline" id="line-911"><code>							dep.Depends = append(dep.Depends, rel.FieldSchema)</code></span>
+<span class="codeline" id="line-912"><code>						} else {</code></span>
+<span class="codeline" id="line-913"><code>							fieldValue := reflect.New(rel.FieldSchema.ModelType).Interface()</code></span>
+<span class="codeline" id="line-914"><code>							parseDependence(fieldValue, autoAdd)</code></span>
+<span class="codeline" id="line-915"><code>						}</code></span>
+<span class="codeline" id="line-916"><code>						parseDependence(joinValue, autoAdd)</code></span>
+<span class="codeline" id="line-917"><code>					}(rel, reflect.New(rel.JoinTable.ModelType).Interface())</code></span>
+<span class="codeline" id="line-918"><code>				}</code></span>
+<span class="codeline" id="line-919"><code>			}</code></span>
+<span class="codeline" id="line-920"><code>		}</code></span>
+<span class="codeline" id="line-921"><code></code></span>
+<span class="codeline" id="line-922"><code>		valuesMap[dep.Schema.Table] = dep</code></span>
+<span class="codeline" id="line-923"><code></code></span>
+<span class="codeline" id="line-924"><code>		if addToList {</code></span>
+<span class="codeline" id="line-925"><code>			modelNames = append(modelNames, dep.Schema.Table)</code></span>
+<span class="codeline" id="line-926"><code>		}</code></span>
+<span class="codeline" id="line-927"><code>	}</code></span>
+<span class="codeline" id="line-928"><code></code></span>
+<span class="codeline" id="line-929"><code>	insertIntoOrderedList = func(name string) {</code></span>
+<span class="codeline" id="line-930"><code>		if _, ok := orderedModelNamesMap[name]; ok {</code></span>
+<span class="codeline" id="line-931"><code>			return // avoid loop</code></span>
+<span class="codeline" id="line-932"><code>		}</code></span>
+<span class="codeline" id="line-933"><code>		orderedModelNamesMap[name] = true</code></span>
+<span class="codeline" id="line-934"><code></code></span>
+<span class="codeline" id="line-935"><code>		if autoAdd {</code></span>
+<span class="codeline" id="line-936"><code>			dep := valuesMap[name]</code></span>
+<span class="codeline" id="line-937"><code>			for _, d := range dep.Depends {</code></span>
+<span class="codeline" id="line-938"><code>				if _, ok := valuesMap[d.Table]; ok {</code></span>
+<span class="codeline" id="line-939"><code>					insertIntoOrderedList(d.Table)</code></span>
+<span class="codeline" id="line-940"><code>				} else {</code></span>
+<span class="codeline" id="line-941"><code>					parseDependence(reflect.New(d.ModelType).Interface(), autoAdd)</code></span>
+<span class="codeline" id="line-942"><code>					insertIntoOrderedList(d.Table)</code></span>
+<span class="codeline" id="line-943"><code>				}</code></span>
+<span class="codeline" id="line-944"><code>			}</code></span>
+<span class="codeline" id="line-945"><code>		}</code></span>
+<span class="codeline" id="line-946"><code></code></span>
+<span class="codeline" id="line-947"><code>		orderedModelNames = append(orderedModelNames, name)</code></span>
+<span class="codeline" id="line-948"><code>	}</code></span>
+<span class="codeline" id="line-949"><code></code></span>
+<span class="codeline" id="line-950"><code>	for _, value := range values {</code></span>
+<span class="codeline" id="line-951"><code>		if v, ok := value.(string); ok {</code></span>
+<span class="codeline" id="line-952"><code>			results = append(results, v)</code></span>
+<span class="codeline" id="line-953"><code>		} else {</code></span>
+<span class="codeline" id="line-954"><code>			parseDependence(value, true)</code></span>
+<span class="codeline" id="line-955"><code>		}</code></span>
+<span class="codeline" id="line-956"><code>	}</code></span>
+<span class="codeline" id="line-957"><code></code></span>
+<span class="codeline" id="line-958"><code>	for _, name := range modelNames {</code></span>
+<span class="codeline" id="line-959"><code>		insertIntoOrderedList(name)</code></span>
+<span class="codeline" id="line-960"><code>	}</code></span>
+<span class="codeline" id="line-961"><code></code></span>
+<span class="codeline" id="line-962"><code>	for _, name := range orderedModelNames {</code></span>
+<span class="codeline" id="line-963"><code>		results = append(results, valuesMap[name].Statement.Dest)</code></span>
+<span class="codeline" id="line-964"><code>	}</code></span>
+<span class="codeline" id="line-965"><code>	return</code></span>
+<span class="codeline" id="line-966"><code>}</code></span>
+<span class="codeline" id="line-967"><code></code></span>
+<span class="codeline" id="line-968"><code>// CurrentTable returns current statement's table expression</code></span>
+<span class="codeline" id="line-969"><code>func (m Migrator) CurrentTable(stmt *gorm.Statement) interface{} {</code></span>
+<span class="codeline" id="line-970"><code>	if stmt.TableExpr != nil {</code></span>
+<span class="codeline" id="line-971"><code>		return *stmt.TableExpr</code></span>
+<span class="codeline" id="line-972"><code>	}</code></span>
+<span class="codeline" id="line-973"><code>	return clause.Table{Name: stmt.Table}</code></span>
+<span class="codeline" id="line-974"><code>}</code></span>
+<span class="codeline" id="line-975"><code></code></span>
+<span class="codeline" id="line-976"><code>// GetIndexes return Indexes []gorm.Index and execErr error</code></span>
+<span class="codeline" id="line-977"><code>func (m Migrator) GetIndexes(dst interface{}) ([]gorm.Index, error) {</code></span>
+<span class="codeline" id="line-978"><code>	return nil, errors.New("not support")</code></span>
+<span class="codeline" id="line-979"><code>}</code></span>
+<span class="codeline" id="line-980"><code></code></span>
+<span class="codeline" id="line-981"><code>// GetTypeAliases return database type aliases</code></span>
+<span class="codeline" id="line-982"><code>func (m Migrator) GetTypeAliases(databaseTypeName string) []string {</code></span>
+<span class="codeline" id="line-983"><code>	return nil</code></span>
+<span class="codeline" id="line-984"><code>}</code></span>
+<span class="codeline" id="line-985"><code></code></span>
+<span class="codeline" id="line-986"><code>// TableType return tableType gorm.TableType and execErr error</code></span>
+<span class="codeline" id="line-987"><code>func (m Migrator) TableType(dst interface{}) (gorm.TableType, error) {</code></span>
+<span class="codeline" id="line-988"><code>	return nil, errors.New("not support")</code></span>
+<span class="codeline" id="line-989"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

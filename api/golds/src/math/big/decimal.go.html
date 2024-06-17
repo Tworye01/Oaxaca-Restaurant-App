@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: decimal.go in package math/big</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	decimal.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/math/big.html">math/big</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2015 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// This file implements multi-precision decimal numbers.</code></span>
+<span class="codeline" id="line-6"><code>// The implementation is for float to decimal conversion only;</code></span>
+<span class="codeline" id="line-7"><code>// not general purpose use.</code></span>
+<span class="codeline" id="line-8"><code>// The only operations are precise conversion from binary to</code></span>
+<span class="codeline" id="line-9"><code>// decimal and rounding.</code></span>
+<span class="codeline" id="line-10"><code>//</code></span>
+<span class="codeline" id="line-11"><code>// The key observation and some code (shr) is borrowed from</code></span>
+<span class="codeline" id="line-12"><code>// strconv/decimal.go: conversion of binary fractional values can be done</code></span>
+<span class="codeline" id="line-13"><code>// precisely in multi-precision decimal because 2 divides 10 (required for</code></span>
+<span class="codeline" id="line-14"><code>// &gt;&gt; of mantissa); but conversion of decimal floating-point values cannot</code></span>
+<span class="codeline" id="line-15"><code>// be done precisely in binary representation.</code></span>
+<span class="codeline" id="line-16"><code>//</code></span>
+<span class="codeline" id="line-17"><code>// In contrast to strconv/decimal.go, only right shift is implemented in</code></span>
+<span class="codeline" id="line-18"><code>// decimal format - left shift can be done precisely in binary format.</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>package big</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>// A decimal represents an unsigned floating-point number in decimal representation.</code></span>
+<span class="codeline" id="line-23"><code>// The value of a non-zero decimal d is d.mant * 10**d.exp with 0.1 &lt;= d.mant &lt; 1,</code></span>
+<span class="codeline" id="line-24"><code>// with the most-significant mantissa digit at index 0. For the zero decimal, the</code></span>
+<span class="codeline" id="line-25"><code>// mantissa length and exponent are 0.</code></span>
+<span class="codeline" id="line-26"><code>// The zero value for decimal represents a ready-to-use 0.0.</code></span>
+<span class="codeline" id="line-27"><code>type decimal struct {</code></span>
+<span class="codeline" id="line-28"><code>	mant []byte // mantissa ASCII digits, big-endian</code></span>
+<span class="codeline" id="line-29"><code>	exp  int    // exponent</code></span>
+<span class="codeline" id="line-30"><code>}</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// at returns the i'th mantissa digit, starting with the most significant digit at 0.</code></span>
+<span class="codeline" id="line-33"><code>func (d *decimal) at(i int) byte {</code></span>
+<span class="codeline" id="line-34"><code>	if 0 &lt;= i &amp;&amp; i &lt; len(d.mant) {</code></span>
+<span class="codeline" id="line-35"><code>		return d.mant[i]</code></span>
+<span class="codeline" id="line-36"><code>	}</code></span>
+<span class="codeline" id="line-37"><code>	return '0'</code></span>
+<span class="codeline" id="line-38"><code>}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>// Maximum shift amount that can be done in one pass without overflow.</code></span>
+<span class="codeline" id="line-41"><code>// A Word has _W bits and (1&lt;&lt;maxShift - 1)*10 + 9 must fit into Word.</code></span>
+<span class="codeline" id="line-42"><code>const maxShift = _W - 4</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>// TODO(gri) Since we know the desired decimal precision when converting</code></span>
+<span class="codeline" id="line-45"><code>// a floating-point number, we may be able to limit the number of decimal</code></span>
+<span class="codeline" id="line-46"><code>// digits that need to be computed by init by providing an additional</code></span>
+<span class="codeline" id="line-47"><code>// precision argument and keeping track of when a number was truncated early</code></span>
+<span class="codeline" id="line-48"><code>// (equivalent of "sticky bit" in binary rounding).</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>// TODO(gri) Along the same lines, enforce some limit to shift magnitudes</code></span>
+<span class="codeline" id="line-51"><code>// to avoid "infinitely" long running conversions (until we run out of space).</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>// Init initializes x to the decimal representation of m &lt;&lt; shift (for</code></span>
+<span class="codeline" id="line-54"><code>// shift &gt;= 0), or m &gt;&gt; -shift (for shift &lt; 0).</code></span>
+<span class="codeline" id="line-55"><code>func (x *decimal) init(m nat, shift int) {</code></span>
+<span class="codeline" id="line-56"><code>	// special case 0</code></span>
+<span class="codeline" id="line-57"><code>	if len(m) == 0 {</code></span>
+<span class="codeline" id="line-58"><code>		x.mant = x.mant[:0]</code></span>
+<span class="codeline" id="line-59"><code>		x.exp = 0</code></span>
+<span class="codeline" id="line-60"><code>		return</code></span>
+<span class="codeline" id="line-61"><code>	}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>	// Optimization: If we need to shift right, first remove any trailing</code></span>
+<span class="codeline" id="line-64"><code>	// zero bits from m to reduce shift amount that needs to be done in</code></span>
+<span class="codeline" id="line-65"><code>	// decimal format (since that is likely slower).</code></span>
+<span class="codeline" id="line-66"><code>	if shift &lt; 0 {</code></span>
+<span class="codeline" id="line-67"><code>		ntz := m.trailingZeroBits()</code></span>
+<span class="codeline" id="line-68"><code>		s := uint(-shift)</code></span>
+<span class="codeline" id="line-69"><code>		if s &gt;= ntz {</code></span>
+<span class="codeline" id="line-70"><code>			s = ntz // shift at most ntz bits</code></span>
+<span class="codeline" id="line-71"><code>		}</code></span>
+<span class="codeline" id="line-72"><code>		m = nat(nil).shr(m, s)</code></span>
+<span class="codeline" id="line-73"><code>		shift += int(s)</code></span>
+<span class="codeline" id="line-74"><code>	}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>	// Do any shift left in binary representation.</code></span>
+<span class="codeline" id="line-77"><code>	if shift &gt; 0 {</code></span>
+<span class="codeline" id="line-78"><code>		m = nat(nil).shl(m, uint(shift))</code></span>
+<span class="codeline" id="line-79"><code>		shift = 0</code></span>
+<span class="codeline" id="line-80"><code>	}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>	// Convert mantissa into decimal representation.</code></span>
+<span class="codeline" id="line-83"><code>	s := m.utoa(10)</code></span>
+<span class="codeline" id="line-84"><code>	n := len(s)</code></span>
+<span class="codeline" id="line-85"><code>	x.exp = n</code></span>
+<span class="codeline" id="line-86"><code>	// Trim trailing zeros; instead the exponent is tracking</code></span>
+<span class="codeline" id="line-87"><code>	// the decimal point independent of the number of digits.</code></span>
+<span class="codeline" id="line-88"><code>	for n &gt; 0 &amp;&amp; s[n-1] == '0' {</code></span>
+<span class="codeline" id="line-89"><code>		n--</code></span>
+<span class="codeline" id="line-90"><code>	}</code></span>
+<span class="codeline" id="line-91"><code>	x.mant = append(x.mant[:0], s[:n]...)</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>	// Do any (remaining) shift right in decimal representation.</code></span>
+<span class="codeline" id="line-94"><code>	if shift &lt; 0 {</code></span>
+<span class="codeline" id="line-95"><code>		for shift &lt; -maxShift {</code></span>
+<span class="codeline" id="line-96"><code>			shr(x, maxShift)</code></span>
+<span class="codeline" id="line-97"><code>			shift += maxShift</code></span>
+<span class="codeline" id="line-98"><code>		}</code></span>
+<span class="codeline" id="line-99"><code>		shr(x, uint(-shift))</code></span>
+<span class="codeline" id="line-100"><code>	}</code></span>
+<span class="codeline" id="line-101"><code>}</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>// shr implements x &gt;&gt; s, for s &lt;= maxShift.</code></span>
+<span class="codeline" id="line-104"><code>func shr(x *decimal, s uint) {</code></span>
+<span class="codeline" id="line-105"><code>	// Division by 1&lt;&lt;s using shift-and-subtract algorithm.</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>	// pick up enough leading digits to cover first shift</code></span>
+<span class="codeline" id="line-108"><code>	r := 0 // read index</code></span>
+<span class="codeline" id="line-109"><code>	var n Word</code></span>
+<span class="codeline" id="line-110"><code>	for n&gt;&gt;s == 0 &amp;&amp; r &lt; len(x.mant) {</code></span>
+<span class="codeline" id="line-111"><code>		ch := Word(x.mant[r])</code></span>
+<span class="codeline" id="line-112"><code>		r++</code></span>
+<span class="codeline" id="line-113"><code>		n = n*10 + ch - '0'</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code>	if n == 0 {</code></span>
+<span class="codeline" id="line-116"><code>		// x == 0; shouldn't get here, but handle anyway</code></span>
+<span class="codeline" id="line-117"><code>		x.mant = x.mant[:0]</code></span>
+<span class="codeline" id="line-118"><code>		return</code></span>
+<span class="codeline" id="line-119"><code>	}</code></span>
+<span class="codeline" id="line-120"><code>	for n&gt;&gt;s == 0 {</code></span>
+<span class="codeline" id="line-121"><code>		r++</code></span>
+<span class="codeline" id="line-122"><code>		n *= 10</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	x.exp += 1 - r</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	// read a digit, write a digit</code></span>
+<span class="codeline" id="line-127"><code>	w := 0 // write index</code></span>
+<span class="codeline" id="line-128"><code>	mask := Word(1)&lt;&lt;s - 1</code></span>
+<span class="codeline" id="line-129"><code>	for r &lt; len(x.mant) {</code></span>
+<span class="codeline" id="line-130"><code>		ch := Word(x.mant[r])</code></span>
+<span class="codeline" id="line-131"><code>		r++</code></span>
+<span class="codeline" id="line-132"><code>		d := n &gt;&gt; s</code></span>
+<span class="codeline" id="line-133"><code>		n &amp;= mask // n -= d &lt;&lt; s</code></span>
+<span class="codeline" id="line-134"><code>		x.mant[w] = byte(d + '0')</code></span>
+<span class="codeline" id="line-135"><code>		w++</code></span>
+<span class="codeline" id="line-136"><code>		n = n*10 + ch - '0'</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	// write extra digits that still fit</code></span>
+<span class="codeline" id="line-140"><code>	for n &gt; 0 &amp;&amp; w &lt; len(x.mant) {</code></span>
+<span class="codeline" id="line-141"><code>		d := n &gt;&gt; s</code></span>
+<span class="codeline" id="line-142"><code>		n &amp;= mask</code></span>
+<span class="codeline" id="line-143"><code>		x.mant[w] = byte(d + '0')</code></span>
+<span class="codeline" id="line-144"><code>		w++</code></span>
+<span class="codeline" id="line-145"><code>		n = n * 10</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	x.mant = x.mant[:w] // the number may be shorter (e.g. 1024 &gt;&gt; 10)</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>	// append additional digits that didn't fit</code></span>
+<span class="codeline" id="line-150"><code>	for n &gt; 0 {</code></span>
+<span class="codeline" id="line-151"><code>		d := n &gt;&gt; s</code></span>
+<span class="codeline" id="line-152"><code>		n &amp;= mask</code></span>
+<span class="codeline" id="line-153"><code>		x.mant = append(x.mant, byte(d+'0'))</code></span>
+<span class="codeline" id="line-154"><code>		n = n * 10</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>	trim(x)</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>func (x *decimal) String() string {</code></span>
+<span class="codeline" id="line-161"><code>	if len(x.mant) == 0 {</code></span>
+<span class="codeline" id="line-162"><code>		return "0"</code></span>
+<span class="codeline" id="line-163"><code>	}</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>	var buf []byte</code></span>
+<span class="codeline" id="line-166"><code>	switch {</code></span>
+<span class="codeline" id="line-167"><code>	case x.exp &lt;= 0:</code></span>
+<span class="codeline" id="line-168"><code>		// 0.00ddd</code></span>
+<span class="codeline" id="line-169"><code>		buf = make([]byte, 0, 2+(-x.exp)+len(x.mant))</code></span>
+<span class="codeline" id="line-170"><code>		buf = append(buf, "0."...)</code></span>
+<span class="codeline" id="line-171"><code>		buf = appendZeros(buf, -x.exp)</code></span>
+<span class="codeline" id="line-172"><code>		buf = append(buf, x.mant...)</code></span>
+<span class="codeline" id="line-173"><code></code></span>
+<span class="codeline" id="line-174"><code>	case /* 0 &lt; */ x.exp &lt; len(x.mant):</code></span>
+<span class="codeline" id="line-175"><code>		// dd.ddd</code></span>
+<span class="codeline" id="line-176"><code>		buf = make([]byte, 0, 1+len(x.mant))</code></span>
+<span class="codeline" id="line-177"><code>		buf = append(buf, x.mant[:x.exp]...)</code></span>
+<span class="codeline" id="line-178"><code>		buf = append(buf, '.')</code></span>
+<span class="codeline" id="line-179"><code>		buf = append(buf, x.mant[x.exp:]...)</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>	default: // len(x.mant) &lt;= x.exp</code></span>
+<span class="codeline" id="line-182"><code>		// ddd00</code></span>
+<span class="codeline" id="line-183"><code>		buf = make([]byte, 0, x.exp)</code></span>
+<span class="codeline" id="line-184"><code>		buf = append(buf, x.mant...)</code></span>
+<span class="codeline" id="line-185"><code>		buf = appendZeros(buf, x.exp-len(x.mant))</code></span>
+<span class="codeline" id="line-186"><code>	}</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>	return string(buf)</code></span>
+<span class="codeline" id="line-189"><code>}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>// appendZeros appends n 0 digits to buf and returns buf.</code></span>
+<span class="codeline" id="line-192"><code>func appendZeros(buf []byte, n int) []byte {</code></span>
+<span class="codeline" id="line-193"><code>	for ; n &gt; 0; n-- {</code></span>
+<span class="codeline" id="line-194"><code>		buf = append(buf, '0')</code></span>
+<span class="codeline" id="line-195"><code>	}</code></span>
+<span class="codeline" id="line-196"><code>	return buf</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>// shouldRoundUp reports if x should be rounded up</code></span>
+<span class="codeline" id="line-200"><code>// if shortened to n digits. n must be a valid index</code></span>
+<span class="codeline" id="line-201"><code>// for x.mant.</code></span>
+<span class="codeline" id="line-202"><code>func shouldRoundUp(x *decimal, n int) bool {</code></span>
+<span class="codeline" id="line-203"><code>	if x.mant[n] == '5' &amp;&amp; n+1 == len(x.mant) {</code></span>
+<span class="codeline" id="line-204"><code>		// exactly halfway - round to even</code></span>
+<span class="codeline" id="line-205"><code>		return n &gt; 0 &amp;&amp; (x.mant[n-1]-'0')&amp;1 != 0</code></span>
+<span class="codeline" id="line-206"><code>	}</code></span>
+<span class="codeline" id="line-207"><code>	// not halfway - digit tells all (x.mant has no trailing zeros)</code></span>
+<span class="codeline" id="line-208"><code>	return x.mant[n] &gt;= '5'</code></span>
+<span class="codeline" id="line-209"><code>}</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>// round sets x to (at most) n mantissa digits by rounding it</code></span>
+<span class="codeline" id="line-212"><code>// to the nearest even value with n (or fever) mantissa digits.</code></span>
+<span class="codeline" id="line-213"><code>// If n &lt; 0, x remains unchanged.</code></span>
+<span class="codeline" id="line-214"><code>func (x *decimal) round(n int) {</code></span>
+<span class="codeline" id="line-215"><code>	if n &lt; 0 || n &gt;= len(x.mant) {</code></span>
+<span class="codeline" id="line-216"><code>		return // nothing to do</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>	if shouldRoundUp(x, n) {</code></span>
+<span class="codeline" id="line-220"><code>		x.roundUp(n)</code></span>
+<span class="codeline" id="line-221"><code>	} else {</code></span>
+<span class="codeline" id="line-222"><code>		x.roundDown(n)</code></span>
+<span class="codeline" id="line-223"><code>	}</code></span>
+<span class="codeline" id="line-224"><code>}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>func (x *decimal) roundUp(n int) {</code></span>
+<span class="codeline" id="line-227"><code>	if n &lt; 0 || n &gt;= len(x.mant) {</code></span>
+<span class="codeline" id="line-228"><code>		return // nothing to do</code></span>
+<span class="codeline" id="line-229"><code>	}</code></span>
+<span class="codeline" id="line-230"><code>	// 0 &lt;= n &lt; len(x.mant)</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>	// find first digit &lt; '9'</code></span>
+<span class="codeline" id="line-233"><code>	for n &gt; 0 &amp;&amp; x.mant[n-1] &gt;= '9' {</code></span>
+<span class="codeline" id="line-234"><code>		n--</code></span>
+<span class="codeline" id="line-235"><code>	}</code></span>
+<span class="codeline" id="line-236"><code></code></span>
+<span class="codeline" id="line-237"><code>	if n == 0 {</code></span>
+<span class="codeline" id="line-238"><code>		// all digits are '9's =&gt; round up to '1' and update exponent</code></span>
+<span class="codeline" id="line-239"><code>		x.mant[0] = '1' // ok since len(x.mant) &gt; n</code></span>
+<span class="codeline" id="line-240"><code>		x.mant = x.mant[:1]</code></span>
+<span class="codeline" id="line-241"><code>		x.exp++</code></span>
+<span class="codeline" id="line-242"><code>		return</code></span>
+<span class="codeline" id="line-243"><code>	}</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>	// n &gt; 0 &amp;&amp; x.mant[n-1] &lt; '9'</code></span>
+<span class="codeline" id="line-246"><code>	x.mant[n-1]++</code></span>
+<span class="codeline" id="line-247"><code>	x.mant = x.mant[:n]</code></span>
+<span class="codeline" id="line-248"><code>	// x already trimmed</code></span>
+<span class="codeline" id="line-249"><code>}</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>func (x *decimal) roundDown(n int) {</code></span>
+<span class="codeline" id="line-252"><code>	if n &lt; 0 || n &gt;= len(x.mant) {</code></span>
+<span class="codeline" id="line-253"><code>		return // nothing to do</code></span>
+<span class="codeline" id="line-254"><code>	}</code></span>
+<span class="codeline" id="line-255"><code>	x.mant = x.mant[:n]</code></span>
+<span class="codeline" id="line-256"><code>	trim(x)</code></span>
+<span class="codeline" id="line-257"><code>}</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>// trim cuts off any trailing zeros from x's mantissa;</code></span>
+<span class="codeline" id="line-260"><code>// they are meaningless for the value of x.</code></span>
+<span class="codeline" id="line-261"><code>func trim(x *decimal) {</code></span>
+<span class="codeline" id="line-262"><code>	i := len(x.mant)</code></span>
+<span class="codeline" id="line-263"><code>	for i &gt; 0 &amp;&amp; x.mant[i-1] == '0' {</code></span>
+<span class="codeline" id="line-264"><code>		i--</code></span>
+<span class="codeline" id="line-265"><code>	}</code></span>
+<span class="codeline" id="line-266"><code>	x.mant = x.mant[:i]</code></span>
+<span class="codeline" id="line-267"><code>	if i == 0 {</code></span>
+<span class="codeline" id="line-268"><code>		x.exp = 0</code></span>
+<span class="codeline" id="line-269"><code>	}</code></span>
+<span class="codeline" id="line-270"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

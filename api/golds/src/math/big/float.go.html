@@ -1,0 +1,1761 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: float.go in package math/big</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	float.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/math/big.html">math/big</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2014 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// This file implements multi-precision floating-point numbers.</code></span>
+<span class="codeline" id="line-6"><code>// Like in the GNU MPFR library (https://www.mpfr.org/), operands</code></span>
+<span class="codeline" id="line-7"><code>// can be of mixed precision. Unlike MPFR, the rounding mode is</code></span>
+<span class="codeline" id="line-8"><code>// not specified with each operation, but with each operand. The</code></span>
+<span class="codeline" id="line-9"><code>// rounding mode of the result operand determines the rounding</code></span>
+<span class="codeline" id="line-10"><code>// mode of an operation. This is a from-scratch implementation.</code></span>
+<span class="codeline" id="line-11"><code></code></span>
+<span class="codeline" id="line-12"><code>package big</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>import (</code></span>
+<span class="codeline" id="line-15"><code>	"fmt"</code></span>
+<span class="codeline" id="line-16"><code>	"math"</code></span>
+<span class="codeline" id="line-17"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-18"><code>)</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>const debugFloat = false // enable for debugging</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>// A nonzero finite Float represents a multi-precision floating point number</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>//	sign × mantissa × 2**exponent</code></span>
+<span class="codeline" id="line-25"><code>//</code></span>
+<span class="codeline" id="line-26"><code>// with 0.5 &lt;= mantissa &lt; 1.0, and MinExp &lt;= exponent &lt;= MaxExp.</code></span>
+<span class="codeline" id="line-27"><code>// A Float may also be zero (+0, -0) or infinite (+Inf, -Inf).</code></span>
+<span class="codeline" id="line-28"><code>// All Floats are ordered, and the ordering of two Floats x and y</code></span>
+<span class="codeline" id="line-29"><code>// is defined by x.Cmp(y).</code></span>
+<span class="codeline" id="line-30"><code>//</code></span>
+<span class="codeline" id="line-31"><code>// Each Float value also has a precision, rounding mode, and accuracy.</code></span>
+<span class="codeline" id="line-32"><code>// The precision is the maximum number of mantissa bits available to</code></span>
+<span class="codeline" id="line-33"><code>// represent the value. The rounding mode specifies how a result should</code></span>
+<span class="codeline" id="line-34"><code>// be rounded to fit into the mantissa bits, and accuracy describes the</code></span>
+<span class="codeline" id="line-35"><code>// rounding error with respect to the exact result.</code></span>
+<span class="codeline" id="line-36"><code>//</code></span>
+<span class="codeline" id="line-37"><code>// Unless specified otherwise, all operations (including setters) that</code></span>
+<span class="codeline" id="line-38"><code>// specify a *Float variable for the result (usually via the receiver</code></span>
+<span class="codeline" id="line-39"><code>// with the exception of [Float.MantExp]), round the numeric result according</code></span>
+<span class="codeline" id="line-40"><code>// to the precision and rounding mode of the result variable.</code></span>
+<span class="codeline" id="line-41"><code>//</code></span>
+<span class="codeline" id="line-42"><code>// If the provided result precision is 0 (see below), it is set to the</code></span>
+<span class="codeline" id="line-43"><code>// precision of the argument with the largest precision value before any</code></span>
+<span class="codeline" id="line-44"><code>// rounding takes place, and the rounding mode remains unchanged. Thus,</code></span>
+<span class="codeline" id="line-45"><code>// uninitialized Floats provided as result arguments will have their</code></span>
+<span class="codeline" id="line-46"><code>// precision set to a reasonable value determined by the operands, and</code></span>
+<span class="codeline" id="line-47"><code>// their mode is the zero value for RoundingMode (ToNearestEven).</code></span>
+<span class="codeline" id="line-48"><code>//</code></span>
+<span class="codeline" id="line-49"><code>// By setting the desired precision to 24 or 53 and using matching rounding</code></span>
+<span class="codeline" id="line-50"><code>// mode (typically [ToNearestEven]), Float operations produce the same results</code></span>
+<span class="codeline" id="line-51"><code>// as the corresponding float32 or float64 IEEE-754 arithmetic for operands</code></span>
+<span class="codeline" id="line-52"><code>// that correspond to normal (i.e., not denormal) float32 or float64 numbers.</code></span>
+<span class="codeline" id="line-53"><code>// Exponent underflow and overflow lead to a 0 or an Infinity for different</code></span>
+<span class="codeline" id="line-54"><code>// values than IEEE-754 because Float exponents have a much larger range.</code></span>
+<span class="codeline" id="line-55"><code>//</code></span>
+<span class="codeline" id="line-56"><code>// The zero (uninitialized) value for a Float is ready to use and represents</code></span>
+<span class="codeline" id="line-57"><code>// the number +0.0 exactly, with precision 0 and rounding mode [ToNearestEven].</code></span>
+<span class="codeline" id="line-58"><code>//</code></span>
+<span class="codeline" id="line-59"><code>// Operations always take pointer arguments (*Float) rather</code></span>
+<span class="codeline" id="line-60"><code>// than Float values, and each unique Float value requires</code></span>
+<span class="codeline" id="line-61"><code>// its own unique *Float pointer. To "copy" a Float value,</code></span>
+<span class="codeline" id="line-62"><code>// an existing (or newly allocated) Float must be set to</code></span>
+<span class="codeline" id="line-63"><code>// a new value using the [Float.Set] method; shallow copies</code></span>
+<span class="codeline" id="line-64"><code>// of Floats are not supported and may lead to errors.</code></span>
+<span class="codeline" id="line-65"><code>type Float struct {</code></span>
+<span class="codeline" id="line-66"><code>	prec uint32</code></span>
+<span class="codeline" id="line-67"><code>	mode RoundingMode</code></span>
+<span class="codeline" id="line-68"><code>	acc  Accuracy</code></span>
+<span class="codeline" id="line-69"><code>	form form</code></span>
+<span class="codeline" id="line-70"><code>	neg  bool</code></span>
+<span class="codeline" id="line-71"><code>	mant nat</code></span>
+<span class="codeline" id="line-72"><code>	exp  int32</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>// An ErrNaN panic is raised by a [Float] operation that would lead to</code></span>
+<span class="codeline" id="line-76"><code>// a NaN under IEEE-754 rules. An ErrNaN implements the error interface.</code></span>
+<span class="codeline" id="line-77"><code>type ErrNaN struct {</code></span>
+<span class="codeline" id="line-78"><code>	msg string</code></span>
+<span class="codeline" id="line-79"><code>}</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>func (err ErrNaN) Error() string {</code></span>
+<span class="codeline" id="line-82"><code>	return err.msg</code></span>
+<span class="codeline" id="line-83"><code>}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>// NewFloat allocates and returns a new [Float] set to x,</code></span>
+<span class="codeline" id="line-86"><code>// with precision 53 and rounding mode [ToNearestEven].</code></span>
+<span class="codeline" id="line-87"><code>// NewFloat panics with [ErrNaN] if x is a NaN.</code></span>
+<span class="codeline" id="line-88"><code>func NewFloat(x float64) *Float {</code></span>
+<span class="codeline" id="line-89"><code>	if math.IsNaN(x) {</code></span>
+<span class="codeline" id="line-90"><code>		panic(ErrNaN{"NewFloat(NaN)"})</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code>	return new(Float).SetFloat64(x)</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>// Exponent and precision limits.</code></span>
+<span class="codeline" id="line-96"><code>const (</code></span>
+<span class="codeline" id="line-97"><code>	MaxExp  = math.MaxInt32  // largest supported exponent</code></span>
+<span class="codeline" id="line-98"><code>	MinExp  = math.MinInt32  // smallest supported exponent</code></span>
+<span class="codeline" id="line-99"><code>	MaxPrec = math.MaxUint32 // largest (theoretically) supported precision; likely memory-limited</code></span>
+<span class="codeline" id="line-100"><code>)</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>// Internal representation: The mantissa bits x.mant of a nonzero finite</code></span>
+<span class="codeline" id="line-103"><code>// Float x are stored in a nat slice long enough to hold up to x.prec bits;</code></span>
+<span class="codeline" id="line-104"><code>// the slice may (but doesn't have to) be shorter if the mantissa contains</code></span>
+<span class="codeline" id="line-105"><code>// trailing 0 bits. x.mant is normalized if the msb of x.mant == 1 (i.e.,</code></span>
+<span class="codeline" id="line-106"><code>// the msb is shifted all the way "to the left"). Thus, if the mantissa has</code></span>
+<span class="codeline" id="line-107"><code>// trailing 0 bits or x.prec is not a multiple of the Word size _W,</code></span>
+<span class="codeline" id="line-108"><code>// x.mant[0] has trailing zero bits. The msb of the mantissa corresponds</code></span>
+<span class="codeline" id="line-109"><code>// to the value 0.5; the exponent x.exp shifts the binary point as needed.</code></span>
+<span class="codeline" id="line-110"><code>//</code></span>
+<span class="codeline" id="line-111"><code>// A zero or non-finite Float x ignores x.mant and x.exp.</code></span>
+<span class="codeline" id="line-112"><code>//</code></span>
+<span class="codeline" id="line-113"><code>// x                 form      neg      mant         exp</code></span>
+<span class="codeline" id="line-114"><code>// ----------------------------------------------------------</code></span>
+<span class="codeline" id="line-115"><code>// ±0                zero      sign     -            -</code></span>
+<span class="codeline" id="line-116"><code>// 0 &lt; |x| &lt; +Inf    finite    sign     mantissa     exponent</code></span>
+<span class="codeline" id="line-117"><code>// ±Inf              inf       sign     -            -</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>// A form value describes the internal representation.</code></span>
+<span class="codeline" id="line-120"><code>type form byte</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>// The form value order is relevant - do not change!</code></span>
+<span class="codeline" id="line-123"><code>const (</code></span>
+<span class="codeline" id="line-124"><code>	zero form = iota</code></span>
+<span class="codeline" id="line-125"><code>	finite</code></span>
+<span class="codeline" id="line-126"><code>	inf</code></span>
+<span class="codeline" id="line-127"><code>)</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>// RoundingMode determines how a [Float] value is rounded to the</code></span>
+<span class="codeline" id="line-130"><code>// desired precision. Rounding may change the [Float] value; the</code></span>
+<span class="codeline" id="line-131"><code>// rounding error is described by the [Float]'s [Accuracy].</code></span>
+<span class="codeline" id="line-132"><code>type RoundingMode byte</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>// These constants define supported rounding modes.</code></span>
+<span class="codeline" id="line-135"><code>const (</code></span>
+<span class="codeline" id="line-136"><code>	ToNearestEven RoundingMode = iota // == IEEE 754-2008 roundTiesToEven</code></span>
+<span class="codeline" id="line-137"><code>	ToNearestAway                     // == IEEE 754-2008 roundTiesToAway</code></span>
+<span class="codeline" id="line-138"><code>	ToZero                            // == IEEE 754-2008 roundTowardZero</code></span>
+<span class="codeline" id="line-139"><code>	AwayFromZero                      // no IEEE 754-2008 equivalent</code></span>
+<span class="codeline" id="line-140"><code>	ToNegativeInf                     // == IEEE 754-2008 roundTowardNegative</code></span>
+<span class="codeline" id="line-141"><code>	ToPositiveInf                     // == IEEE 754-2008 roundTowardPositive</code></span>
+<span class="codeline" id="line-142"><code>)</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>//go:generate stringer -type=RoundingMode</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>// Accuracy describes the rounding error produced by the most recent</code></span>
+<span class="codeline" id="line-147"><code>// operation that generated a [Float] value, relative to the exact value.</code></span>
+<span class="codeline" id="line-148"><code>type Accuracy int8</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// Constants describing the [Accuracy] of a [Float].</code></span>
+<span class="codeline" id="line-151"><code>const (</code></span>
+<span class="codeline" id="line-152"><code>	Below Accuracy = -1</code></span>
+<span class="codeline" id="line-153"><code>	Exact Accuracy = 0</code></span>
+<span class="codeline" id="line-154"><code>	Above Accuracy = +1</code></span>
+<span class="codeline" id="line-155"><code>)</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>//go:generate stringer -type=Accuracy</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>// SetPrec sets z's precision to prec and returns the (possibly) rounded</code></span>
+<span class="codeline" id="line-160"><code>// value of z. Rounding occurs according to z's rounding mode if the mantissa</code></span>
+<span class="codeline" id="line-161"><code>// cannot be represented in prec bits without loss of precision.</code></span>
+<span class="codeline" id="line-162"><code>// SetPrec(0) maps all finite values to ±0; infinite values remain unchanged.</code></span>
+<span class="codeline" id="line-163"><code>// If prec &gt; [MaxPrec], it is set to [MaxPrec].</code></span>
+<span class="codeline" id="line-164"><code>func (z *Float) SetPrec(prec uint) *Float {</code></span>
+<span class="codeline" id="line-165"><code>	z.acc = Exact // optimistically assume no rounding is needed</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>	// special case</code></span>
+<span class="codeline" id="line-168"><code>	if prec == 0 {</code></span>
+<span class="codeline" id="line-169"><code>		z.prec = 0</code></span>
+<span class="codeline" id="line-170"><code>		if z.form == finite {</code></span>
+<span class="codeline" id="line-171"><code>			// truncate z to 0</code></span>
+<span class="codeline" id="line-172"><code>			z.acc = makeAcc(z.neg)</code></span>
+<span class="codeline" id="line-173"><code>			z.form = zero</code></span>
+<span class="codeline" id="line-174"><code>		}</code></span>
+<span class="codeline" id="line-175"><code>		return z</code></span>
+<span class="codeline" id="line-176"><code>	}</code></span>
+<span class="codeline" id="line-177"><code></code></span>
+<span class="codeline" id="line-178"><code>	// general case</code></span>
+<span class="codeline" id="line-179"><code>	if prec &gt; MaxPrec {</code></span>
+<span class="codeline" id="line-180"><code>		prec = MaxPrec</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code>	old := z.prec</code></span>
+<span class="codeline" id="line-183"><code>	z.prec = uint32(prec)</code></span>
+<span class="codeline" id="line-184"><code>	if z.prec &lt; old {</code></span>
+<span class="codeline" id="line-185"><code>		z.round(0)</code></span>
+<span class="codeline" id="line-186"><code>	}</code></span>
+<span class="codeline" id="line-187"><code>	return z</code></span>
+<span class="codeline" id="line-188"><code>}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>func makeAcc(above bool) Accuracy {</code></span>
+<span class="codeline" id="line-191"><code>	if above {</code></span>
+<span class="codeline" id="line-192"><code>		return Above</code></span>
+<span class="codeline" id="line-193"><code>	}</code></span>
+<span class="codeline" id="line-194"><code>	return Below</code></span>
+<span class="codeline" id="line-195"><code>}</code></span>
+<span class="codeline" id="line-196"><code></code></span>
+<span class="codeline" id="line-197"><code>// SetMode sets z's rounding mode to mode and returns an exact z.</code></span>
+<span class="codeline" id="line-198"><code>// z remains unchanged otherwise.</code></span>
+<span class="codeline" id="line-199"><code>// z.SetMode(z.Mode()) is a cheap way to set z's accuracy to [Exact].</code></span>
+<span class="codeline" id="line-200"><code>func (z *Float) SetMode(mode RoundingMode) *Float {</code></span>
+<span class="codeline" id="line-201"><code>	z.mode = mode</code></span>
+<span class="codeline" id="line-202"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-203"><code>	return z</code></span>
+<span class="codeline" id="line-204"><code>}</code></span>
+<span class="codeline" id="line-205"><code></code></span>
+<span class="codeline" id="line-206"><code>// Prec returns the mantissa precision of x in bits.</code></span>
+<span class="codeline" id="line-207"><code>// The result may be 0 for |x| == 0 and |x| == Inf.</code></span>
+<span class="codeline" id="line-208"><code>func (x *Float) Prec() uint {</code></span>
+<span class="codeline" id="line-209"><code>	return uint(x.prec)</code></span>
+<span class="codeline" id="line-210"><code>}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>// MinPrec returns the minimum precision required to represent x exactly</code></span>
+<span class="codeline" id="line-213"><code>// (i.e., the smallest prec before x.SetPrec(prec) would start rounding x).</code></span>
+<span class="codeline" id="line-214"><code>// The result is 0 for |x| == 0 and |x| == Inf.</code></span>
+<span class="codeline" id="line-215"><code>func (x *Float) MinPrec() uint {</code></span>
+<span class="codeline" id="line-216"><code>	if x.form != finite {</code></span>
+<span class="codeline" id="line-217"><code>		return 0</code></span>
+<span class="codeline" id="line-218"><code>	}</code></span>
+<span class="codeline" id="line-219"><code>	return uint(len(x.mant))*_W - x.mant.trailingZeroBits()</code></span>
+<span class="codeline" id="line-220"><code>}</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>// Mode returns the rounding mode of x.</code></span>
+<span class="codeline" id="line-223"><code>func (x *Float) Mode() RoundingMode {</code></span>
+<span class="codeline" id="line-224"><code>	return x.mode</code></span>
+<span class="codeline" id="line-225"><code>}</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>// Acc returns the accuracy of x produced by the most recent</code></span>
+<span class="codeline" id="line-228"><code>// operation, unless explicitly documented otherwise by that</code></span>
+<span class="codeline" id="line-229"><code>// operation.</code></span>
+<span class="codeline" id="line-230"><code>func (x *Float) Acc() Accuracy {</code></span>
+<span class="codeline" id="line-231"><code>	return x.acc</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>// Sign returns:</code></span>
+<span class="codeline" id="line-235"><code>//</code></span>
+<span class="codeline" id="line-236"><code>//	-1 if x &lt;   0</code></span>
+<span class="codeline" id="line-237"><code>//	 0 if x is ±0</code></span>
+<span class="codeline" id="line-238"><code>//	+1 if x &gt;   0</code></span>
+<span class="codeline" id="line-239"><code>func (x *Float) Sign() int {</code></span>
+<span class="codeline" id="line-240"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-241"><code>		x.validate()</code></span>
+<span class="codeline" id="line-242"><code>	}</code></span>
+<span class="codeline" id="line-243"><code>	if x.form == zero {</code></span>
+<span class="codeline" id="line-244"><code>		return 0</code></span>
+<span class="codeline" id="line-245"><code>	}</code></span>
+<span class="codeline" id="line-246"><code>	if x.neg {</code></span>
+<span class="codeline" id="line-247"><code>		return -1</code></span>
+<span class="codeline" id="line-248"><code>	}</code></span>
+<span class="codeline" id="line-249"><code>	return 1</code></span>
+<span class="codeline" id="line-250"><code>}</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>// MantExp breaks x into its mantissa and exponent components</code></span>
+<span class="codeline" id="line-253"><code>// and returns the exponent. If a non-nil mant argument is</code></span>
+<span class="codeline" id="line-254"><code>// provided its value is set to the mantissa of x, with the</code></span>
+<span class="codeline" id="line-255"><code>// same precision and rounding mode as x. The components</code></span>
+<span class="codeline" id="line-256"><code>// satisfy x == mant × 2**exp, with 0.5 &lt;= |mant| &lt; 1.0.</code></span>
+<span class="codeline" id="line-257"><code>// Calling MantExp with a nil argument is an efficient way to</code></span>
+<span class="codeline" id="line-258"><code>// get the exponent of the receiver.</code></span>
+<span class="codeline" id="line-259"><code>//</code></span>
+<span class="codeline" id="line-260"><code>// Special cases are:</code></span>
+<span class="codeline" id="line-261"><code>//</code></span>
+<span class="codeline" id="line-262"><code>//	(  ±0).MantExp(mant) = 0, with mant set to   ±0</code></span>
+<span class="codeline" id="line-263"><code>//	(±Inf).MantExp(mant) = 0, with mant set to ±Inf</code></span>
+<span class="codeline" id="line-264"><code>//</code></span>
+<span class="codeline" id="line-265"><code>// x and mant may be the same in which case x is set to its</code></span>
+<span class="codeline" id="line-266"><code>// mantissa value.</code></span>
+<span class="codeline" id="line-267"><code>func (x *Float) MantExp(mant *Float) (exp int) {</code></span>
+<span class="codeline" id="line-268"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-269"><code>		x.validate()</code></span>
+<span class="codeline" id="line-270"><code>	}</code></span>
+<span class="codeline" id="line-271"><code>	if x.form == finite {</code></span>
+<span class="codeline" id="line-272"><code>		exp = int(x.exp)</code></span>
+<span class="codeline" id="line-273"><code>	}</code></span>
+<span class="codeline" id="line-274"><code>	if mant != nil {</code></span>
+<span class="codeline" id="line-275"><code>		mant.Copy(x)</code></span>
+<span class="codeline" id="line-276"><code>		if mant.form == finite {</code></span>
+<span class="codeline" id="line-277"><code>			mant.exp = 0</code></span>
+<span class="codeline" id="line-278"><code>		}</code></span>
+<span class="codeline" id="line-279"><code>	}</code></span>
+<span class="codeline" id="line-280"><code>	return</code></span>
+<span class="codeline" id="line-281"><code>}</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>func (z *Float) setExpAndRound(exp int64, sbit uint) {</code></span>
+<span class="codeline" id="line-284"><code>	if exp &lt; MinExp {</code></span>
+<span class="codeline" id="line-285"><code>		// underflow</code></span>
+<span class="codeline" id="line-286"><code>		z.acc = makeAcc(z.neg)</code></span>
+<span class="codeline" id="line-287"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-288"><code>		return</code></span>
+<span class="codeline" id="line-289"><code>	}</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>	if exp &gt; MaxExp {</code></span>
+<span class="codeline" id="line-292"><code>		// overflow</code></span>
+<span class="codeline" id="line-293"><code>		z.acc = makeAcc(!z.neg)</code></span>
+<span class="codeline" id="line-294"><code>		z.form = inf</code></span>
+<span class="codeline" id="line-295"><code>		return</code></span>
+<span class="codeline" id="line-296"><code>	}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	z.form = finite</code></span>
+<span class="codeline" id="line-299"><code>	z.exp = int32(exp)</code></span>
+<span class="codeline" id="line-300"><code>	z.round(sbit)</code></span>
+<span class="codeline" id="line-301"><code>}</code></span>
+<span class="codeline" id="line-302"><code></code></span>
+<span class="codeline" id="line-303"><code>// SetMantExp sets z to mant × 2**exp and returns z.</code></span>
+<span class="codeline" id="line-304"><code>// The result z has the same precision and rounding mode</code></span>
+<span class="codeline" id="line-305"><code>// as mant. SetMantExp is an inverse of [Float.MantExp] but does</code></span>
+<span class="codeline" id="line-306"><code>// not require 0.5 &lt;= |mant| &lt; 1.0. Specifically, for a</code></span>
+<span class="codeline" id="line-307"><code>// given x of type *[Float], SetMantExp relates to [Float.MantExp]</code></span>
+<span class="codeline" id="line-308"><code>// as follows:</code></span>
+<span class="codeline" id="line-309"><code>//</code></span>
+<span class="codeline" id="line-310"><code>//	mant := new(Float)</code></span>
+<span class="codeline" id="line-311"><code>//	new(Float).SetMantExp(mant, x.MantExp(mant)).Cmp(x) == 0</code></span>
+<span class="codeline" id="line-312"><code>//</code></span>
+<span class="codeline" id="line-313"><code>// Special cases are:</code></span>
+<span class="codeline" id="line-314"><code>//</code></span>
+<span class="codeline" id="line-315"><code>//	z.SetMantExp(  ±0, exp) =   ±0</code></span>
+<span class="codeline" id="line-316"><code>//	z.SetMantExp(±Inf, exp) = ±Inf</code></span>
+<span class="codeline" id="line-317"><code>//</code></span>
+<span class="codeline" id="line-318"><code>// z and mant may be the same in which case z's exponent</code></span>
+<span class="codeline" id="line-319"><code>// is set to exp.</code></span>
+<span class="codeline" id="line-320"><code>func (z *Float) SetMantExp(mant *Float, exp int) *Float {</code></span>
+<span class="codeline" id="line-321"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-322"><code>		z.validate()</code></span>
+<span class="codeline" id="line-323"><code>		mant.validate()</code></span>
+<span class="codeline" id="line-324"><code>	}</code></span>
+<span class="codeline" id="line-325"><code>	z.Copy(mant)</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>	if z.form == finite {</code></span>
+<span class="codeline" id="line-328"><code>		// 0 &lt; |mant| &lt; +Inf</code></span>
+<span class="codeline" id="line-329"><code>		z.setExpAndRound(int64(z.exp)+int64(exp), 0)</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	return z</code></span>
+<span class="codeline" id="line-332"><code>}</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>// Signbit reports whether x is negative or negative zero.</code></span>
+<span class="codeline" id="line-335"><code>func (x *Float) Signbit() bool {</code></span>
+<span class="codeline" id="line-336"><code>	return x.neg</code></span>
+<span class="codeline" id="line-337"><code>}</code></span>
+<span class="codeline" id="line-338"><code></code></span>
+<span class="codeline" id="line-339"><code>// IsInf reports whether x is +Inf or -Inf.</code></span>
+<span class="codeline" id="line-340"><code>func (x *Float) IsInf() bool {</code></span>
+<span class="codeline" id="line-341"><code>	return x.form == inf</code></span>
+<span class="codeline" id="line-342"><code>}</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>// IsInt reports whether x is an integer.</code></span>
+<span class="codeline" id="line-345"><code>// ±Inf values are not integers.</code></span>
+<span class="codeline" id="line-346"><code>func (x *Float) IsInt() bool {</code></span>
+<span class="codeline" id="line-347"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-348"><code>		x.validate()</code></span>
+<span class="codeline" id="line-349"><code>	}</code></span>
+<span class="codeline" id="line-350"><code>	// special cases</code></span>
+<span class="codeline" id="line-351"><code>	if x.form != finite {</code></span>
+<span class="codeline" id="line-352"><code>		return x.form == zero</code></span>
+<span class="codeline" id="line-353"><code>	}</code></span>
+<span class="codeline" id="line-354"><code>	// x.form == finite</code></span>
+<span class="codeline" id="line-355"><code>	if x.exp &lt;= 0 {</code></span>
+<span class="codeline" id="line-356"><code>		return false</code></span>
+<span class="codeline" id="line-357"><code>	}</code></span>
+<span class="codeline" id="line-358"><code>	// x.exp &gt; 0</code></span>
+<span class="codeline" id="line-359"><code>	return x.prec &lt;= uint32(x.exp) || x.MinPrec() &lt;= uint(x.exp) // not enough bits for fractional mantissa</code></span>
+<span class="codeline" id="line-360"><code>}</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>// debugging support</code></span>
+<span class="codeline" id="line-363"><code>func (x *Float) validate() {</code></span>
+<span class="codeline" id="line-364"><code>	if !debugFloat {</code></span>
+<span class="codeline" id="line-365"><code>		// avoid performance bugs</code></span>
+<span class="codeline" id="line-366"><code>		panic("validate called but debugFloat is not set")</code></span>
+<span class="codeline" id="line-367"><code>	}</code></span>
+<span class="codeline" id="line-368"><code>	if msg := x.validate0(); msg != "" {</code></span>
+<span class="codeline" id="line-369"><code>		panic(msg)</code></span>
+<span class="codeline" id="line-370"><code>	}</code></span>
+<span class="codeline" id="line-371"><code>}</code></span>
+<span class="codeline" id="line-372"><code></code></span>
+<span class="codeline" id="line-373"><code>func (x *Float) validate0() string {</code></span>
+<span class="codeline" id="line-374"><code>	if x.form != finite {</code></span>
+<span class="codeline" id="line-375"><code>		return ""</code></span>
+<span class="codeline" id="line-376"><code>	}</code></span>
+<span class="codeline" id="line-377"><code>	m := len(x.mant)</code></span>
+<span class="codeline" id="line-378"><code>	if m == 0 {</code></span>
+<span class="codeline" id="line-379"><code>		return "nonzero finite number with empty mantissa"</code></span>
+<span class="codeline" id="line-380"><code>	}</code></span>
+<span class="codeline" id="line-381"><code>	const msb = 1 &lt;&lt; (_W - 1)</code></span>
+<span class="codeline" id="line-382"><code>	if x.mant[m-1]&amp;msb == 0 {</code></span>
+<span class="codeline" id="line-383"><code>		return fmt.Sprintf("msb not set in last word %#x of %s", x.mant[m-1], x.Text('p', 0))</code></span>
+<span class="codeline" id="line-384"><code>	}</code></span>
+<span class="codeline" id="line-385"><code>	if x.prec == 0 {</code></span>
+<span class="codeline" id="line-386"><code>		return "zero precision finite number"</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code>	return ""</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>// round rounds z according to z.mode to z.prec bits and sets z.acc accordingly.</code></span>
+<span class="codeline" id="line-392"><code>// sbit must be 0 or 1 and summarizes any "sticky bit" information one might</code></span>
+<span class="codeline" id="line-393"><code>// have before calling round. z's mantissa must be normalized (with the msb set)</code></span>
+<span class="codeline" id="line-394"><code>// or empty.</code></span>
+<span class="codeline" id="line-395"><code>//</code></span>
+<span class="codeline" id="line-396"><code>// CAUTION: The rounding modes ToNegativeInf, ToPositiveInf are affected by the</code></span>
+<span class="codeline" id="line-397"><code>// sign of z. For correct rounding, the sign of z must be set correctly before</code></span>
+<span class="codeline" id="line-398"><code>// calling round.</code></span>
+<span class="codeline" id="line-399"><code>func (z *Float) round(sbit uint) {</code></span>
+<span class="codeline" id="line-400"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-401"><code>		z.validate()</code></span>
+<span class="codeline" id="line-402"><code>	}</code></span>
+<span class="codeline" id="line-403"><code></code></span>
+<span class="codeline" id="line-404"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-405"><code>	if z.form != finite {</code></span>
+<span class="codeline" id="line-406"><code>		// ±0 or ±Inf =&gt; nothing left to do</code></span>
+<span class="codeline" id="line-407"><code>		return</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code>	// z.form == finite &amp;&amp; len(z.mant) &gt; 0</code></span>
+<span class="codeline" id="line-410"><code>	// m &gt; 0 implies z.prec &gt; 0 (checked by validate)</code></span>
+<span class="codeline" id="line-411"><code></code></span>
+<span class="codeline" id="line-412"><code>	m := uint32(len(z.mant)) // present mantissa length in words</code></span>
+<span class="codeline" id="line-413"><code>	bits := m * _W           // present mantissa bits; bits &gt; 0</code></span>
+<span class="codeline" id="line-414"><code>	if bits &lt;= z.prec {</code></span>
+<span class="codeline" id="line-415"><code>		// mantissa fits =&gt; nothing to do</code></span>
+<span class="codeline" id="line-416"><code>		return</code></span>
+<span class="codeline" id="line-417"><code>	}</code></span>
+<span class="codeline" id="line-418"><code>	// bits &gt; z.prec</code></span>
+<span class="codeline" id="line-419"><code></code></span>
+<span class="codeline" id="line-420"><code>	// Rounding is based on two bits: the rounding bit (rbit) and the</code></span>
+<span class="codeline" id="line-421"><code>	// sticky bit (sbit). The rbit is the bit immediately before the</code></span>
+<span class="codeline" id="line-422"><code>	// z.prec leading mantissa bits (the "0.5"). The sbit is set if any</code></span>
+<span class="codeline" id="line-423"><code>	// of the bits before the rbit are set (the "0.25", "0.125", etc.):</code></span>
+<span class="codeline" id="line-424"><code>	//</code></span>
+<span class="codeline" id="line-425"><code>	//   rbit  sbit  =&gt; "fractional part"</code></span>
+<span class="codeline" id="line-426"><code>	//</code></span>
+<span class="codeline" id="line-427"><code>	//   0     0        == 0</code></span>
+<span class="codeline" id="line-428"><code>	//   0     1        &gt;  0  , &lt; 0.5</code></span>
+<span class="codeline" id="line-429"><code>	//   1     0        == 0.5</code></span>
+<span class="codeline" id="line-430"><code>	//   1     1        &gt;  0.5, &lt; 1.0</code></span>
+<span class="codeline" id="line-431"><code></code></span>
+<span class="codeline" id="line-432"><code>	// bits &gt; z.prec: mantissa too large =&gt; round</code></span>
+<span class="codeline" id="line-433"><code>	r := uint(bits - z.prec - 1) // rounding bit position; r &gt;= 0</code></span>
+<span class="codeline" id="line-434"><code>	rbit := z.mant.bit(r) &amp; 1    // rounding bit; be safe and ensure it's a single bit</code></span>
+<span class="codeline" id="line-435"><code>	// The sticky bit is only needed for rounding ToNearestEven</code></span>
+<span class="codeline" id="line-436"><code>	// or when the rounding bit is zero. Avoid computation otherwise.</code></span>
+<span class="codeline" id="line-437"><code>	if sbit == 0 &amp;&amp; (rbit == 0 || z.mode == ToNearestEven) {</code></span>
+<span class="codeline" id="line-438"><code>		sbit = z.mant.sticky(r)</code></span>
+<span class="codeline" id="line-439"><code>	}</code></span>
+<span class="codeline" id="line-440"><code>	sbit &amp;= 1 // be safe and ensure it's a single bit</code></span>
+<span class="codeline" id="line-441"><code></code></span>
+<span class="codeline" id="line-442"><code>	// cut off extra words</code></span>
+<span class="codeline" id="line-443"><code>	n := (z.prec + (_W - 1)) / _W // mantissa length in words for desired precision</code></span>
+<span class="codeline" id="line-444"><code>	if m &gt; n {</code></span>
+<span class="codeline" id="line-445"><code>		copy(z.mant, z.mant[m-n:]) // move n last words to front</code></span>
+<span class="codeline" id="line-446"><code>		z.mant = z.mant[:n]</code></span>
+<span class="codeline" id="line-447"><code>	}</code></span>
+<span class="codeline" id="line-448"><code></code></span>
+<span class="codeline" id="line-449"><code>	// determine number of trailing zero bits (ntz) and compute lsb mask of mantissa's least-significant word</code></span>
+<span class="codeline" id="line-450"><code>	ntz := n*_W - z.prec // 0 &lt;= ntz &lt; _W</code></span>
+<span class="codeline" id="line-451"><code>	lsb := Word(1) &lt;&lt; ntz</code></span>
+<span class="codeline" id="line-452"><code></code></span>
+<span class="codeline" id="line-453"><code>	// round if result is inexact</code></span>
+<span class="codeline" id="line-454"><code>	if rbit|sbit != 0 {</code></span>
+<span class="codeline" id="line-455"><code>		// Make rounding decision: The result mantissa is truncated ("rounded down")</code></span>
+<span class="codeline" id="line-456"><code>		// by default. Decide if we need to increment, or "round up", the (unsigned)</code></span>
+<span class="codeline" id="line-457"><code>		// mantissa.</code></span>
+<span class="codeline" id="line-458"><code>		inc := false</code></span>
+<span class="codeline" id="line-459"><code>		switch z.mode {</code></span>
+<span class="codeline" id="line-460"><code>		case ToNegativeInf:</code></span>
+<span class="codeline" id="line-461"><code>			inc = z.neg</code></span>
+<span class="codeline" id="line-462"><code>		case ToZero:</code></span>
+<span class="codeline" id="line-463"><code>			// nothing to do</code></span>
+<span class="codeline" id="line-464"><code>		case ToNearestEven:</code></span>
+<span class="codeline" id="line-465"><code>			inc = rbit != 0 &amp;&amp; (sbit != 0 || z.mant[0]&amp;lsb != 0)</code></span>
+<span class="codeline" id="line-466"><code>		case ToNearestAway:</code></span>
+<span class="codeline" id="line-467"><code>			inc = rbit != 0</code></span>
+<span class="codeline" id="line-468"><code>		case AwayFromZero:</code></span>
+<span class="codeline" id="line-469"><code>			inc = true</code></span>
+<span class="codeline" id="line-470"><code>		case ToPositiveInf:</code></span>
+<span class="codeline" id="line-471"><code>			inc = !z.neg</code></span>
+<span class="codeline" id="line-472"><code>		default:</code></span>
+<span class="codeline" id="line-473"><code>			panic("unreachable")</code></span>
+<span class="codeline" id="line-474"><code>		}</code></span>
+<span class="codeline" id="line-475"><code></code></span>
+<span class="codeline" id="line-476"><code>		// A positive result (!z.neg) is Above the exact result if we increment,</code></span>
+<span class="codeline" id="line-477"><code>		// and it's Below if we truncate (Exact results require no rounding).</code></span>
+<span class="codeline" id="line-478"><code>		// For a negative result (z.neg) it is exactly the opposite.</code></span>
+<span class="codeline" id="line-479"><code>		z.acc = makeAcc(inc != z.neg)</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>		if inc {</code></span>
+<span class="codeline" id="line-482"><code>			// add 1 to mantissa</code></span>
+<span class="codeline" id="line-483"><code>			if addVW(z.mant, z.mant, lsb) != 0 {</code></span>
+<span class="codeline" id="line-484"><code>				// mantissa overflow =&gt; adjust exponent</code></span>
+<span class="codeline" id="line-485"><code>				if z.exp &gt;= MaxExp {</code></span>
+<span class="codeline" id="line-486"><code>					// exponent overflow</code></span>
+<span class="codeline" id="line-487"><code>					z.form = inf</code></span>
+<span class="codeline" id="line-488"><code>					return</code></span>
+<span class="codeline" id="line-489"><code>				}</code></span>
+<span class="codeline" id="line-490"><code>				z.exp++</code></span>
+<span class="codeline" id="line-491"><code>				// adjust mantissa: divide by 2 to compensate for exponent adjustment</code></span>
+<span class="codeline" id="line-492"><code>				shrVU(z.mant, z.mant, 1)</code></span>
+<span class="codeline" id="line-493"><code>				// set msb == carry == 1 from the mantissa overflow above</code></span>
+<span class="codeline" id="line-494"><code>				const msb = 1 &lt;&lt; (_W - 1)</code></span>
+<span class="codeline" id="line-495"><code>				z.mant[n-1] |= msb</code></span>
+<span class="codeline" id="line-496"><code>			}</code></span>
+<span class="codeline" id="line-497"><code>		}</code></span>
+<span class="codeline" id="line-498"><code>	}</code></span>
+<span class="codeline" id="line-499"><code></code></span>
+<span class="codeline" id="line-500"><code>	// zero out trailing bits in least-significant word</code></span>
+<span class="codeline" id="line-501"><code>	z.mant[0] &amp;^= lsb - 1</code></span>
+<span class="codeline" id="line-502"><code></code></span>
+<span class="codeline" id="line-503"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-504"><code>		z.validate()</code></span>
+<span class="codeline" id="line-505"><code>	}</code></span>
+<span class="codeline" id="line-506"><code>}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>func (z *Float) setBits64(neg bool, x uint64) *Float {</code></span>
+<span class="codeline" id="line-509"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-510"><code>		z.prec = 64</code></span>
+<span class="codeline" id="line-511"><code>	}</code></span>
+<span class="codeline" id="line-512"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-513"><code>	z.neg = neg</code></span>
+<span class="codeline" id="line-514"><code>	if x == 0 {</code></span>
+<span class="codeline" id="line-515"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-516"><code>		return z</code></span>
+<span class="codeline" id="line-517"><code>	}</code></span>
+<span class="codeline" id="line-518"><code>	// x != 0</code></span>
+<span class="codeline" id="line-519"><code>	z.form = finite</code></span>
+<span class="codeline" id="line-520"><code>	s := bits.LeadingZeros64(x)</code></span>
+<span class="codeline" id="line-521"><code>	z.mant = z.mant.setUint64(x &lt;&lt; uint(s))</code></span>
+<span class="codeline" id="line-522"><code>	z.exp = int32(64 - s) // always fits</code></span>
+<span class="codeline" id="line-523"><code>	if z.prec &lt; 64 {</code></span>
+<span class="codeline" id="line-524"><code>		z.round(0)</code></span>
+<span class="codeline" id="line-525"><code>	}</code></span>
+<span class="codeline" id="line-526"><code>	return z</code></span>
+<span class="codeline" id="line-527"><code>}</code></span>
+<span class="codeline" id="line-528"><code></code></span>
+<span class="codeline" id="line-529"><code>// SetUint64 sets z to the (possibly rounded) value of x and returns z.</code></span>
+<span class="codeline" id="line-530"><code>// If z's precision is 0, it is changed to 64 (and rounding will have</code></span>
+<span class="codeline" id="line-531"><code>// no effect).</code></span>
+<span class="codeline" id="line-532"><code>func (z *Float) SetUint64(x uint64) *Float {</code></span>
+<span class="codeline" id="line-533"><code>	return z.setBits64(false, x)</code></span>
+<span class="codeline" id="line-534"><code>}</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>// SetInt64 sets z to the (possibly rounded) value of x and returns z.</code></span>
+<span class="codeline" id="line-537"><code>// If z's precision is 0, it is changed to 64 (and rounding will have</code></span>
+<span class="codeline" id="line-538"><code>// no effect).</code></span>
+<span class="codeline" id="line-539"><code>func (z *Float) SetInt64(x int64) *Float {</code></span>
+<span class="codeline" id="line-540"><code>	u := x</code></span>
+<span class="codeline" id="line-541"><code>	if u &lt; 0 {</code></span>
+<span class="codeline" id="line-542"><code>		u = -u</code></span>
+<span class="codeline" id="line-543"><code>	}</code></span>
+<span class="codeline" id="line-544"><code>	// We cannot simply call z.SetUint64(uint64(u)) and change</code></span>
+<span class="codeline" id="line-545"><code>	// the sign afterwards because the sign affects rounding.</code></span>
+<span class="codeline" id="line-546"><code>	return z.setBits64(x &lt; 0, uint64(u))</code></span>
+<span class="codeline" id="line-547"><code>}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>// SetFloat64 sets z to the (possibly rounded) value of x and returns z.</code></span>
+<span class="codeline" id="line-550"><code>// If z's precision is 0, it is changed to 53 (and rounding will have</code></span>
+<span class="codeline" id="line-551"><code>// no effect). SetFloat64 panics with [ErrNaN] if x is a NaN.</code></span>
+<span class="codeline" id="line-552"><code>func (z *Float) SetFloat64(x float64) *Float {</code></span>
+<span class="codeline" id="line-553"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-554"><code>		z.prec = 53</code></span>
+<span class="codeline" id="line-555"><code>	}</code></span>
+<span class="codeline" id="line-556"><code>	if math.IsNaN(x) {</code></span>
+<span class="codeline" id="line-557"><code>		panic(ErrNaN{"Float.SetFloat64(NaN)"})</code></span>
+<span class="codeline" id="line-558"><code>	}</code></span>
+<span class="codeline" id="line-559"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-560"><code>	z.neg = math.Signbit(x) // handle -0, -Inf correctly</code></span>
+<span class="codeline" id="line-561"><code>	if x == 0 {</code></span>
+<span class="codeline" id="line-562"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-563"><code>		return z</code></span>
+<span class="codeline" id="line-564"><code>	}</code></span>
+<span class="codeline" id="line-565"><code>	if math.IsInf(x, 0) {</code></span>
+<span class="codeline" id="line-566"><code>		z.form = inf</code></span>
+<span class="codeline" id="line-567"><code>		return z</code></span>
+<span class="codeline" id="line-568"><code>	}</code></span>
+<span class="codeline" id="line-569"><code>	// normalized x != 0</code></span>
+<span class="codeline" id="line-570"><code>	z.form = finite</code></span>
+<span class="codeline" id="line-571"><code>	fmant, exp := math.Frexp(x) // get normalized mantissa</code></span>
+<span class="codeline" id="line-572"><code>	z.mant = z.mant.setUint64(1&lt;&lt;63 | math.Float64bits(fmant)&lt;&lt;11)</code></span>
+<span class="codeline" id="line-573"><code>	z.exp = int32(exp) // always fits</code></span>
+<span class="codeline" id="line-574"><code>	if z.prec &lt; 53 {</code></span>
+<span class="codeline" id="line-575"><code>		z.round(0)</code></span>
+<span class="codeline" id="line-576"><code>	}</code></span>
+<span class="codeline" id="line-577"><code>	return z</code></span>
+<span class="codeline" id="line-578"><code>}</code></span>
+<span class="codeline" id="line-579"><code></code></span>
+<span class="codeline" id="line-580"><code>// fnorm normalizes mantissa m by shifting it to the left</code></span>
+<span class="codeline" id="line-581"><code>// such that the msb of the most-significant word (msw) is 1.</code></span>
+<span class="codeline" id="line-582"><code>// It returns the shift amount. It assumes that len(m) != 0.</code></span>
+<span class="codeline" id="line-583"><code>func fnorm(m nat) int64 {</code></span>
+<span class="codeline" id="line-584"><code>	if debugFloat &amp;&amp; (len(m) == 0 || m[len(m)-1] == 0) {</code></span>
+<span class="codeline" id="line-585"><code>		panic("msw of mantissa is 0")</code></span>
+<span class="codeline" id="line-586"><code>	}</code></span>
+<span class="codeline" id="line-587"><code>	s := nlz(m[len(m)-1])</code></span>
+<span class="codeline" id="line-588"><code>	if s &gt; 0 {</code></span>
+<span class="codeline" id="line-589"><code>		c := shlVU(m, m, s)</code></span>
+<span class="codeline" id="line-590"><code>		if debugFloat &amp;&amp; c != 0 {</code></span>
+<span class="codeline" id="line-591"><code>			panic("nlz or shlVU incorrect")</code></span>
+<span class="codeline" id="line-592"><code>		}</code></span>
+<span class="codeline" id="line-593"><code>	}</code></span>
+<span class="codeline" id="line-594"><code>	return int64(s)</code></span>
+<span class="codeline" id="line-595"><code>}</code></span>
+<span class="codeline" id="line-596"><code></code></span>
+<span class="codeline" id="line-597"><code>// SetInt sets z to the (possibly rounded) value of x and returns z.</code></span>
+<span class="codeline" id="line-598"><code>// If z's precision is 0, it is changed to the larger of x.BitLen()</code></span>
+<span class="codeline" id="line-599"><code>// or 64 (and rounding will have no effect).</code></span>
+<span class="codeline" id="line-600"><code>func (z *Float) SetInt(x *Int) *Float {</code></span>
+<span class="codeline" id="line-601"><code>	// TODO(gri) can be more efficient if z.prec &gt; 0</code></span>
+<span class="codeline" id="line-602"><code>	// but small compared to the size of x, or if there</code></span>
+<span class="codeline" id="line-603"><code>	// are many trailing 0's.</code></span>
+<span class="codeline" id="line-604"><code>	bits := uint32(x.BitLen())</code></span>
+<span class="codeline" id="line-605"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-606"><code>		z.prec = umax32(bits, 64)</code></span>
+<span class="codeline" id="line-607"><code>	}</code></span>
+<span class="codeline" id="line-608"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-609"><code>	z.neg = x.neg</code></span>
+<span class="codeline" id="line-610"><code>	if len(x.abs) == 0 {</code></span>
+<span class="codeline" id="line-611"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-612"><code>		return z</code></span>
+<span class="codeline" id="line-613"><code>	}</code></span>
+<span class="codeline" id="line-614"><code>	// x != 0</code></span>
+<span class="codeline" id="line-615"><code>	z.mant = z.mant.set(x.abs)</code></span>
+<span class="codeline" id="line-616"><code>	fnorm(z.mant)</code></span>
+<span class="codeline" id="line-617"><code>	z.setExpAndRound(int64(bits), 0)</code></span>
+<span class="codeline" id="line-618"><code>	return z</code></span>
+<span class="codeline" id="line-619"><code>}</code></span>
+<span class="codeline" id="line-620"><code></code></span>
+<span class="codeline" id="line-621"><code>// SetRat sets z to the (possibly rounded) value of x and returns z.</code></span>
+<span class="codeline" id="line-622"><code>// If z's precision is 0, it is changed to the largest of a.BitLen(),</code></span>
+<span class="codeline" id="line-623"><code>// b.BitLen(), or 64; with x = a/b.</code></span>
+<span class="codeline" id="line-624"><code>func (z *Float) SetRat(x *Rat) *Float {</code></span>
+<span class="codeline" id="line-625"><code>	if x.IsInt() {</code></span>
+<span class="codeline" id="line-626"><code>		return z.SetInt(x.Num())</code></span>
+<span class="codeline" id="line-627"><code>	}</code></span>
+<span class="codeline" id="line-628"><code>	var a, b Float</code></span>
+<span class="codeline" id="line-629"><code>	a.SetInt(x.Num())</code></span>
+<span class="codeline" id="line-630"><code>	b.SetInt(x.Denom())</code></span>
+<span class="codeline" id="line-631"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-632"><code>		z.prec = umax32(a.prec, b.prec)</code></span>
+<span class="codeline" id="line-633"><code>	}</code></span>
+<span class="codeline" id="line-634"><code>	return z.Quo(&amp;a, &amp;b)</code></span>
+<span class="codeline" id="line-635"><code>}</code></span>
+<span class="codeline" id="line-636"><code></code></span>
+<span class="codeline" id="line-637"><code>// SetInf sets z to the infinite Float -Inf if signbit is</code></span>
+<span class="codeline" id="line-638"><code>// set, or +Inf if signbit is not set, and returns z. The</code></span>
+<span class="codeline" id="line-639"><code>// precision of z is unchanged and the result is always</code></span>
+<span class="codeline" id="line-640"><code>// [Exact].</code></span>
+<span class="codeline" id="line-641"><code>func (z *Float) SetInf(signbit bool) *Float {</code></span>
+<span class="codeline" id="line-642"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-643"><code>	z.form = inf</code></span>
+<span class="codeline" id="line-644"><code>	z.neg = signbit</code></span>
+<span class="codeline" id="line-645"><code>	return z</code></span>
+<span class="codeline" id="line-646"><code>}</code></span>
+<span class="codeline" id="line-647"><code></code></span>
+<span class="codeline" id="line-648"><code>// Set sets z to the (possibly rounded) value of x and returns z.</code></span>
+<span class="codeline" id="line-649"><code>// If z's precision is 0, it is changed to the precision of x</code></span>
+<span class="codeline" id="line-650"><code>// before setting z (and rounding will have no effect).</code></span>
+<span class="codeline" id="line-651"><code>// Rounding is performed according to z's precision and rounding</code></span>
+<span class="codeline" id="line-652"><code>// mode; and z's accuracy reports the result error relative to the</code></span>
+<span class="codeline" id="line-653"><code>// exact (not rounded) result.</code></span>
+<span class="codeline" id="line-654"><code>func (z *Float) Set(x *Float) *Float {</code></span>
+<span class="codeline" id="line-655"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-656"><code>		x.validate()</code></span>
+<span class="codeline" id="line-657"><code>	}</code></span>
+<span class="codeline" id="line-658"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-659"><code>	if z != x {</code></span>
+<span class="codeline" id="line-660"><code>		z.form = x.form</code></span>
+<span class="codeline" id="line-661"><code>		z.neg = x.neg</code></span>
+<span class="codeline" id="line-662"><code>		if x.form == finite {</code></span>
+<span class="codeline" id="line-663"><code>			z.exp = x.exp</code></span>
+<span class="codeline" id="line-664"><code>			z.mant = z.mant.set(x.mant)</code></span>
+<span class="codeline" id="line-665"><code>		}</code></span>
+<span class="codeline" id="line-666"><code>		if z.prec == 0 {</code></span>
+<span class="codeline" id="line-667"><code>			z.prec = x.prec</code></span>
+<span class="codeline" id="line-668"><code>		} else if z.prec &lt; x.prec {</code></span>
+<span class="codeline" id="line-669"><code>			z.round(0)</code></span>
+<span class="codeline" id="line-670"><code>		}</code></span>
+<span class="codeline" id="line-671"><code>	}</code></span>
+<span class="codeline" id="line-672"><code>	return z</code></span>
+<span class="codeline" id="line-673"><code>}</code></span>
+<span class="codeline" id="line-674"><code></code></span>
+<span class="codeline" id="line-675"><code>// Copy sets z to x, with the same precision, rounding mode, and</code></span>
+<span class="codeline" id="line-676"><code>// accuracy as x, and returns z. x is not changed even if z and</code></span>
+<span class="codeline" id="line-677"><code>// x are the same.</code></span>
+<span class="codeline" id="line-678"><code>func (z *Float) Copy(x *Float) *Float {</code></span>
+<span class="codeline" id="line-679"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-680"><code>		x.validate()</code></span>
+<span class="codeline" id="line-681"><code>	}</code></span>
+<span class="codeline" id="line-682"><code>	if z != x {</code></span>
+<span class="codeline" id="line-683"><code>		z.prec = x.prec</code></span>
+<span class="codeline" id="line-684"><code>		z.mode = x.mode</code></span>
+<span class="codeline" id="line-685"><code>		z.acc = x.acc</code></span>
+<span class="codeline" id="line-686"><code>		z.form = x.form</code></span>
+<span class="codeline" id="line-687"><code>		z.neg = x.neg</code></span>
+<span class="codeline" id="line-688"><code>		if z.form == finite {</code></span>
+<span class="codeline" id="line-689"><code>			z.mant = z.mant.set(x.mant)</code></span>
+<span class="codeline" id="line-690"><code>			z.exp = x.exp</code></span>
+<span class="codeline" id="line-691"><code>		}</code></span>
+<span class="codeline" id="line-692"><code>	}</code></span>
+<span class="codeline" id="line-693"><code>	return z</code></span>
+<span class="codeline" id="line-694"><code>}</code></span>
+<span class="codeline" id="line-695"><code></code></span>
+<span class="codeline" id="line-696"><code>// msb32 returns the 32 most significant bits of x.</code></span>
+<span class="codeline" id="line-697"><code>func msb32(x nat) uint32 {</code></span>
+<span class="codeline" id="line-698"><code>	i := len(x) - 1</code></span>
+<span class="codeline" id="line-699"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-700"><code>		return 0</code></span>
+<span class="codeline" id="line-701"><code>	}</code></span>
+<span class="codeline" id="line-702"><code>	if debugFloat &amp;&amp; x[i]&amp;(1&lt;&lt;(_W-1)) == 0 {</code></span>
+<span class="codeline" id="line-703"><code>		panic("x not normalized")</code></span>
+<span class="codeline" id="line-704"><code>	}</code></span>
+<span class="codeline" id="line-705"><code>	switch _W {</code></span>
+<span class="codeline" id="line-706"><code>	case 32:</code></span>
+<span class="codeline" id="line-707"><code>		return uint32(x[i])</code></span>
+<span class="codeline" id="line-708"><code>	case 64:</code></span>
+<span class="codeline" id="line-709"><code>		return uint32(x[i] &gt;&gt; 32)</code></span>
+<span class="codeline" id="line-710"><code>	}</code></span>
+<span class="codeline" id="line-711"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-712"><code>}</code></span>
+<span class="codeline" id="line-713"><code></code></span>
+<span class="codeline" id="line-714"><code>// msb64 returns the 64 most significant bits of x.</code></span>
+<span class="codeline" id="line-715"><code>func msb64(x nat) uint64 {</code></span>
+<span class="codeline" id="line-716"><code>	i := len(x) - 1</code></span>
+<span class="codeline" id="line-717"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-718"><code>		return 0</code></span>
+<span class="codeline" id="line-719"><code>	}</code></span>
+<span class="codeline" id="line-720"><code>	if debugFloat &amp;&amp; x[i]&amp;(1&lt;&lt;(_W-1)) == 0 {</code></span>
+<span class="codeline" id="line-721"><code>		panic("x not normalized")</code></span>
+<span class="codeline" id="line-722"><code>	}</code></span>
+<span class="codeline" id="line-723"><code>	switch _W {</code></span>
+<span class="codeline" id="line-724"><code>	case 32:</code></span>
+<span class="codeline" id="line-725"><code>		v := uint64(x[i]) &lt;&lt; 32</code></span>
+<span class="codeline" id="line-726"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-727"><code>			v |= uint64(x[i-1])</code></span>
+<span class="codeline" id="line-728"><code>		}</code></span>
+<span class="codeline" id="line-729"><code>		return v</code></span>
+<span class="codeline" id="line-730"><code>	case 64:</code></span>
+<span class="codeline" id="line-731"><code>		return uint64(x[i])</code></span>
+<span class="codeline" id="line-732"><code>	}</code></span>
+<span class="codeline" id="line-733"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-734"><code>}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>// Uint64 returns the unsigned integer resulting from truncating x</code></span>
+<span class="codeline" id="line-737"><code>// towards zero. If 0 &lt;= x &lt;= math.MaxUint64, the result is [Exact]</code></span>
+<span class="codeline" id="line-738"><code>// if x is an integer and [Below] otherwise.</code></span>
+<span class="codeline" id="line-739"><code>// The result is (0, [Above]) for x &lt; 0, and ([math.MaxUint64], [Below])</code></span>
+<span class="codeline" id="line-740"><code>// for x &gt; [math.MaxUint64].</code></span>
+<span class="codeline" id="line-741"><code>func (x *Float) Uint64() (uint64, Accuracy) {</code></span>
+<span class="codeline" id="line-742"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-743"><code>		x.validate()</code></span>
+<span class="codeline" id="line-744"><code>	}</code></span>
+<span class="codeline" id="line-745"><code></code></span>
+<span class="codeline" id="line-746"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-747"><code>	case finite:</code></span>
+<span class="codeline" id="line-748"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-749"><code>			return 0, Above</code></span>
+<span class="codeline" id="line-750"><code>		}</code></span>
+<span class="codeline" id="line-751"><code>		// 0 &lt; x &lt; +Inf</code></span>
+<span class="codeline" id="line-752"><code>		if x.exp &lt;= 0 {</code></span>
+<span class="codeline" id="line-753"><code>			// 0 &lt; x &lt; 1</code></span>
+<span class="codeline" id="line-754"><code>			return 0, Below</code></span>
+<span class="codeline" id="line-755"><code>		}</code></span>
+<span class="codeline" id="line-756"><code>		// 1 &lt;= x &lt; Inf</code></span>
+<span class="codeline" id="line-757"><code>		if x.exp &lt;= 64 {</code></span>
+<span class="codeline" id="line-758"><code>			// u = trunc(x) fits into a uint64</code></span>
+<span class="codeline" id="line-759"><code>			u := msb64(x.mant) &gt;&gt; (64 - uint32(x.exp))</code></span>
+<span class="codeline" id="line-760"><code>			if x.MinPrec() &lt;= 64 {</code></span>
+<span class="codeline" id="line-761"><code>				return u, Exact</code></span>
+<span class="codeline" id="line-762"><code>			}</code></span>
+<span class="codeline" id="line-763"><code>			return u, Below // x truncated</code></span>
+<span class="codeline" id="line-764"><code>		}</code></span>
+<span class="codeline" id="line-765"><code>		// x too large</code></span>
+<span class="codeline" id="line-766"><code>		return math.MaxUint64, Below</code></span>
+<span class="codeline" id="line-767"><code></code></span>
+<span class="codeline" id="line-768"><code>	case zero:</code></span>
+<span class="codeline" id="line-769"><code>		return 0, Exact</code></span>
+<span class="codeline" id="line-770"><code></code></span>
+<span class="codeline" id="line-771"><code>	case inf:</code></span>
+<span class="codeline" id="line-772"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-773"><code>			return 0, Above</code></span>
+<span class="codeline" id="line-774"><code>		}</code></span>
+<span class="codeline" id="line-775"><code>		return math.MaxUint64, Below</code></span>
+<span class="codeline" id="line-776"><code>	}</code></span>
+<span class="codeline" id="line-777"><code></code></span>
+<span class="codeline" id="line-778"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-779"><code>}</code></span>
+<span class="codeline" id="line-780"><code></code></span>
+<span class="codeline" id="line-781"><code>// Int64 returns the integer resulting from truncating x towards zero.</code></span>
+<span class="codeline" id="line-782"><code>// If [math.MinInt64] &lt;= x &lt;= [math.MaxInt64], the result is [Exact] if x is</code></span>
+<span class="codeline" id="line-783"><code>// an integer, and [Above] (x &lt; 0) or [Below] (x &gt; 0) otherwise.</code></span>
+<span class="codeline" id="line-784"><code>// The result is ([math.MinInt64], [Above]) for x &lt; [math.MinInt64],</code></span>
+<span class="codeline" id="line-785"><code>// and ([math.MaxInt64], [Below]) for x &gt; [math.MaxInt64].</code></span>
+<span class="codeline" id="line-786"><code>func (x *Float) Int64() (int64, Accuracy) {</code></span>
+<span class="codeline" id="line-787"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-788"><code>		x.validate()</code></span>
+<span class="codeline" id="line-789"><code>	}</code></span>
+<span class="codeline" id="line-790"><code></code></span>
+<span class="codeline" id="line-791"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-792"><code>	case finite:</code></span>
+<span class="codeline" id="line-793"><code>		// 0 &lt; |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-794"><code>		acc := makeAcc(x.neg)</code></span>
+<span class="codeline" id="line-795"><code>		if x.exp &lt;= 0 {</code></span>
+<span class="codeline" id="line-796"><code>			// 0 &lt; |x| &lt; 1</code></span>
+<span class="codeline" id="line-797"><code>			return 0, acc</code></span>
+<span class="codeline" id="line-798"><code>		}</code></span>
+<span class="codeline" id="line-799"><code>		// x.exp &gt; 0</code></span>
+<span class="codeline" id="line-800"><code></code></span>
+<span class="codeline" id="line-801"><code>		// 1 &lt;= |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-802"><code>		if x.exp &lt;= 63 {</code></span>
+<span class="codeline" id="line-803"><code>			// i = trunc(x) fits into an int64 (excluding math.MinInt64)</code></span>
+<span class="codeline" id="line-804"><code>			i := int64(msb64(x.mant) &gt;&gt; (64 - uint32(x.exp)))</code></span>
+<span class="codeline" id="line-805"><code>			if x.neg {</code></span>
+<span class="codeline" id="line-806"><code>				i = -i</code></span>
+<span class="codeline" id="line-807"><code>			}</code></span>
+<span class="codeline" id="line-808"><code>			if x.MinPrec() &lt;= uint(x.exp) {</code></span>
+<span class="codeline" id="line-809"><code>				return i, Exact</code></span>
+<span class="codeline" id="line-810"><code>			}</code></span>
+<span class="codeline" id="line-811"><code>			return i, acc // x truncated</code></span>
+<span class="codeline" id="line-812"><code>		}</code></span>
+<span class="codeline" id="line-813"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-814"><code>			// check for special case x == math.MinInt64 (i.e., x == -(0.5 &lt;&lt; 64))</code></span>
+<span class="codeline" id="line-815"><code>			if x.exp == 64 &amp;&amp; x.MinPrec() == 1 {</code></span>
+<span class="codeline" id="line-816"><code>				acc = Exact</code></span>
+<span class="codeline" id="line-817"><code>			}</code></span>
+<span class="codeline" id="line-818"><code>			return math.MinInt64, acc</code></span>
+<span class="codeline" id="line-819"><code>		}</code></span>
+<span class="codeline" id="line-820"><code>		// x too large</code></span>
+<span class="codeline" id="line-821"><code>		return math.MaxInt64, Below</code></span>
+<span class="codeline" id="line-822"><code></code></span>
+<span class="codeline" id="line-823"><code>	case zero:</code></span>
+<span class="codeline" id="line-824"><code>		return 0, Exact</code></span>
+<span class="codeline" id="line-825"><code></code></span>
+<span class="codeline" id="line-826"><code>	case inf:</code></span>
+<span class="codeline" id="line-827"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-828"><code>			return math.MinInt64, Above</code></span>
+<span class="codeline" id="line-829"><code>		}</code></span>
+<span class="codeline" id="line-830"><code>		return math.MaxInt64, Below</code></span>
+<span class="codeline" id="line-831"><code>	}</code></span>
+<span class="codeline" id="line-832"><code></code></span>
+<span class="codeline" id="line-833"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-834"><code>}</code></span>
+<span class="codeline" id="line-835"><code></code></span>
+<span class="codeline" id="line-836"><code>// Float32 returns the float32 value nearest to x. If x is too small to be</code></span>
+<span class="codeline" id="line-837"><code>// represented by a float32 (|x| &lt; [math.SmallestNonzeroFloat32]), the result</code></span>
+<span class="codeline" id="line-838"><code>// is (0, [Below]) or (-0, [Above]), respectively, depending on the sign of x.</code></span>
+<span class="codeline" id="line-839"><code>// If x is too large to be represented by a float32 (|x| &gt; [math.MaxFloat32]),</code></span>
+<span class="codeline" id="line-840"><code>// the result is (+Inf, [Above]) or (-Inf, [Below]), depending on the sign of x.</code></span>
+<span class="codeline" id="line-841"><code>func (x *Float) Float32() (float32, Accuracy) {</code></span>
+<span class="codeline" id="line-842"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-843"><code>		x.validate()</code></span>
+<span class="codeline" id="line-844"><code>	}</code></span>
+<span class="codeline" id="line-845"><code></code></span>
+<span class="codeline" id="line-846"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-847"><code>	case finite:</code></span>
+<span class="codeline" id="line-848"><code>		// 0 &lt; |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-849"><code></code></span>
+<span class="codeline" id="line-850"><code>		const (</code></span>
+<span class="codeline" id="line-851"><code>			fbits = 32                //        float size</code></span>
+<span class="codeline" id="line-852"><code>			mbits = 23                //        mantissa size (excluding implicit msb)</code></span>
+<span class="codeline" id="line-853"><code>			ebits = fbits - mbits - 1 //     8  exponent size</code></span>
+<span class="codeline" id="line-854"><code>			bias  = 1&lt;&lt;(ebits-1) - 1  //   127  exponent bias</code></span>
+<span class="codeline" id="line-855"><code>			dmin  = 1 - bias - mbits  //  -149  smallest unbiased exponent (denormal)</code></span>
+<span class="codeline" id="line-856"><code>			emin  = 1 - bias          //  -126  smallest unbiased exponent (normal)</code></span>
+<span class="codeline" id="line-857"><code>			emax  = bias              //   127  largest unbiased exponent (normal)</code></span>
+<span class="codeline" id="line-858"><code>		)</code></span>
+<span class="codeline" id="line-859"><code></code></span>
+<span class="codeline" id="line-860"><code>		// Float mantissa m is 0.5 &lt;= m &lt; 1.0; compute exponent e for float32 mantissa.</code></span>
+<span class="codeline" id="line-861"><code>		e := x.exp - 1 // exponent for normal mantissa m with 1.0 &lt;= m &lt; 2.0</code></span>
+<span class="codeline" id="line-862"><code></code></span>
+<span class="codeline" id="line-863"><code>		// Compute precision p for float32 mantissa.</code></span>
+<span class="codeline" id="line-864"><code>		// If the exponent is too small, we have a denormal number before</code></span>
+<span class="codeline" id="line-865"><code>		// rounding and fewer than p mantissa bits of precision available</code></span>
+<span class="codeline" id="line-866"><code>		// (the exponent remains fixed but the mantissa gets shifted right).</code></span>
+<span class="codeline" id="line-867"><code>		p := mbits + 1 // precision of normal float</code></span>
+<span class="codeline" id="line-868"><code>		if e &lt; emin {</code></span>
+<span class="codeline" id="line-869"><code>			// recompute precision</code></span>
+<span class="codeline" id="line-870"><code>			p = mbits + 1 - emin + int(e)</code></span>
+<span class="codeline" id="line-871"><code>			// If p == 0, the mantissa of x is shifted so much to the right</code></span>
+<span class="codeline" id="line-872"><code>			// that its msb falls immediately to the right of the float32</code></span>
+<span class="codeline" id="line-873"><code>			// mantissa space. In other words, if the smallest denormal is</code></span>
+<span class="codeline" id="line-874"><code>			// considered "1.0", for p == 0, the mantissa value m is &gt;= 0.5.</code></span>
+<span class="codeline" id="line-875"><code>			// If m &gt; 0.5, it is rounded up to 1.0; i.e., the smallest denormal.</code></span>
+<span class="codeline" id="line-876"><code>			// If m == 0.5, it is rounded down to even, i.e., 0.0.</code></span>
+<span class="codeline" id="line-877"><code>			// If p &lt; 0, the mantissa value m is &lt;= "0.25" which is never rounded up.</code></span>
+<span class="codeline" id="line-878"><code>			if p &lt; 0 /* m &lt;= 0.25 */ || p == 0 &amp;&amp; x.mant.sticky(uint(len(x.mant))*_W-1) == 0 /* m == 0.5 */ {</code></span>
+<span class="codeline" id="line-879"><code>				// underflow to ±0</code></span>
+<span class="codeline" id="line-880"><code>				if x.neg {</code></span>
+<span class="codeline" id="line-881"><code>					var z float32</code></span>
+<span class="codeline" id="line-882"><code>					return -z, Above</code></span>
+<span class="codeline" id="line-883"><code>				}</code></span>
+<span class="codeline" id="line-884"><code>				return 0.0, Below</code></span>
+<span class="codeline" id="line-885"><code>			}</code></span>
+<span class="codeline" id="line-886"><code>			// otherwise, round up</code></span>
+<span class="codeline" id="line-887"><code>			// We handle p == 0 explicitly because it's easy and because</code></span>
+<span class="codeline" id="line-888"><code>			// Float.round doesn't support rounding to 0 bits of precision.</code></span>
+<span class="codeline" id="line-889"><code>			if p == 0 {</code></span>
+<span class="codeline" id="line-890"><code>				if x.neg {</code></span>
+<span class="codeline" id="line-891"><code>					return -math.SmallestNonzeroFloat32, Below</code></span>
+<span class="codeline" id="line-892"><code>				}</code></span>
+<span class="codeline" id="line-893"><code>				return math.SmallestNonzeroFloat32, Above</code></span>
+<span class="codeline" id="line-894"><code>			}</code></span>
+<span class="codeline" id="line-895"><code>		}</code></span>
+<span class="codeline" id="line-896"><code>		// p &gt; 0</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>		// round</code></span>
+<span class="codeline" id="line-899"><code>		var r Float</code></span>
+<span class="codeline" id="line-900"><code>		r.prec = uint32(p)</code></span>
+<span class="codeline" id="line-901"><code>		r.Set(x)</code></span>
+<span class="codeline" id="line-902"><code>		e = r.exp - 1</code></span>
+<span class="codeline" id="line-903"><code></code></span>
+<span class="codeline" id="line-904"><code>		// Rounding may have caused r to overflow to ±Inf</code></span>
+<span class="codeline" id="line-905"><code>		// (rounding never causes underflows to 0).</code></span>
+<span class="codeline" id="line-906"><code>		// If the exponent is too large, also overflow to ±Inf.</code></span>
+<span class="codeline" id="line-907"><code>		if r.form == inf || e &gt; emax {</code></span>
+<span class="codeline" id="line-908"><code>			// overflow</code></span>
+<span class="codeline" id="line-909"><code>			if x.neg {</code></span>
+<span class="codeline" id="line-910"><code>				return float32(math.Inf(-1)), Below</code></span>
+<span class="codeline" id="line-911"><code>			}</code></span>
+<span class="codeline" id="line-912"><code>			return float32(math.Inf(+1)), Above</code></span>
+<span class="codeline" id="line-913"><code>		}</code></span>
+<span class="codeline" id="line-914"><code>		// e &lt;= emax</code></span>
+<span class="codeline" id="line-915"><code></code></span>
+<span class="codeline" id="line-916"><code>		// Determine sign, biased exponent, and mantissa.</code></span>
+<span class="codeline" id="line-917"><code>		var sign, bexp, mant uint32</code></span>
+<span class="codeline" id="line-918"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-919"><code>			sign = 1 &lt;&lt; (fbits - 1)</code></span>
+<span class="codeline" id="line-920"><code>		}</code></span>
+<span class="codeline" id="line-921"><code></code></span>
+<span class="codeline" id="line-922"><code>		// Rounding may have caused a denormal number to</code></span>
+<span class="codeline" id="line-923"><code>		// become normal. Check again.</code></span>
+<span class="codeline" id="line-924"><code>		if e &lt; emin {</code></span>
+<span class="codeline" id="line-925"><code>			// denormal number: recompute precision</code></span>
+<span class="codeline" id="line-926"><code>			// Since rounding may have at best increased precision</code></span>
+<span class="codeline" id="line-927"><code>			// and we have eliminated p &lt;= 0 early, we know p &gt; 0.</code></span>
+<span class="codeline" id="line-928"><code>			// bexp == 0 for denormals</code></span>
+<span class="codeline" id="line-929"><code>			p = mbits + 1 - emin + int(e)</code></span>
+<span class="codeline" id="line-930"><code>			mant = msb32(r.mant) &gt;&gt; uint(fbits-p)</code></span>
+<span class="codeline" id="line-931"><code>		} else {</code></span>
+<span class="codeline" id="line-932"><code>			// normal number: emin &lt;= e &lt;= emax</code></span>
+<span class="codeline" id="line-933"><code>			bexp = uint32(e+bias) &lt;&lt; mbits</code></span>
+<span class="codeline" id="line-934"><code>			mant = msb32(r.mant) &gt;&gt; ebits &amp; (1&lt;&lt;mbits - 1) // cut off msb (implicit 1 bit)</code></span>
+<span class="codeline" id="line-935"><code>		}</code></span>
+<span class="codeline" id="line-936"><code></code></span>
+<span class="codeline" id="line-937"><code>		return math.Float32frombits(sign | bexp | mant), r.acc</code></span>
+<span class="codeline" id="line-938"><code></code></span>
+<span class="codeline" id="line-939"><code>	case zero:</code></span>
+<span class="codeline" id="line-940"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-941"><code>			var z float32</code></span>
+<span class="codeline" id="line-942"><code>			return -z, Exact</code></span>
+<span class="codeline" id="line-943"><code>		}</code></span>
+<span class="codeline" id="line-944"><code>		return 0.0, Exact</code></span>
+<span class="codeline" id="line-945"><code></code></span>
+<span class="codeline" id="line-946"><code>	case inf:</code></span>
+<span class="codeline" id="line-947"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-948"><code>			return float32(math.Inf(-1)), Exact</code></span>
+<span class="codeline" id="line-949"><code>		}</code></span>
+<span class="codeline" id="line-950"><code>		return float32(math.Inf(+1)), Exact</code></span>
+<span class="codeline" id="line-951"><code>	}</code></span>
+<span class="codeline" id="line-952"><code></code></span>
+<span class="codeline" id="line-953"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-954"><code>}</code></span>
+<span class="codeline" id="line-955"><code></code></span>
+<span class="codeline" id="line-956"><code>// Float64 returns the float64 value nearest to x. If x is too small to be</code></span>
+<span class="codeline" id="line-957"><code>// represented by a float64 (|x| &lt; [math.SmallestNonzeroFloat64]), the result</code></span>
+<span class="codeline" id="line-958"><code>// is (0, [Below]) or (-0, [Above]), respectively, depending on the sign of x.</code></span>
+<span class="codeline" id="line-959"><code>// If x is too large to be represented by a float64 (|x| &gt; [math.MaxFloat64]),</code></span>
+<span class="codeline" id="line-960"><code>// the result is (+Inf, [Above]) or (-Inf, [Below]), depending on the sign of x.</code></span>
+<span class="codeline" id="line-961"><code>func (x *Float) Float64() (float64, Accuracy) {</code></span>
+<span class="codeline" id="line-962"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-963"><code>		x.validate()</code></span>
+<span class="codeline" id="line-964"><code>	}</code></span>
+<span class="codeline" id="line-965"><code></code></span>
+<span class="codeline" id="line-966"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-967"><code>	case finite:</code></span>
+<span class="codeline" id="line-968"><code>		// 0 &lt; |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-969"><code></code></span>
+<span class="codeline" id="line-970"><code>		const (</code></span>
+<span class="codeline" id="line-971"><code>			fbits = 64                //        float size</code></span>
+<span class="codeline" id="line-972"><code>			mbits = 52                //        mantissa size (excluding implicit msb)</code></span>
+<span class="codeline" id="line-973"><code>			ebits = fbits - mbits - 1 //    11  exponent size</code></span>
+<span class="codeline" id="line-974"><code>			bias  = 1&lt;&lt;(ebits-1) - 1  //  1023  exponent bias</code></span>
+<span class="codeline" id="line-975"><code>			dmin  = 1 - bias - mbits  // -1074  smallest unbiased exponent (denormal)</code></span>
+<span class="codeline" id="line-976"><code>			emin  = 1 - bias          // -1022  smallest unbiased exponent (normal)</code></span>
+<span class="codeline" id="line-977"><code>			emax  = bias              //  1023  largest unbiased exponent (normal)</code></span>
+<span class="codeline" id="line-978"><code>		)</code></span>
+<span class="codeline" id="line-979"><code></code></span>
+<span class="codeline" id="line-980"><code>		// Float mantissa m is 0.5 &lt;= m &lt; 1.0; compute exponent e for float64 mantissa.</code></span>
+<span class="codeline" id="line-981"><code>		e := x.exp - 1 // exponent for normal mantissa m with 1.0 &lt;= m &lt; 2.0</code></span>
+<span class="codeline" id="line-982"><code></code></span>
+<span class="codeline" id="line-983"><code>		// Compute precision p for float64 mantissa.</code></span>
+<span class="codeline" id="line-984"><code>		// If the exponent is too small, we have a denormal number before</code></span>
+<span class="codeline" id="line-985"><code>		// rounding and fewer than p mantissa bits of precision available</code></span>
+<span class="codeline" id="line-986"><code>		// (the exponent remains fixed but the mantissa gets shifted right).</code></span>
+<span class="codeline" id="line-987"><code>		p := mbits + 1 // precision of normal float</code></span>
+<span class="codeline" id="line-988"><code>		if e &lt; emin {</code></span>
+<span class="codeline" id="line-989"><code>			// recompute precision</code></span>
+<span class="codeline" id="line-990"><code>			p = mbits + 1 - emin + int(e)</code></span>
+<span class="codeline" id="line-991"><code>			// If p == 0, the mantissa of x is shifted so much to the right</code></span>
+<span class="codeline" id="line-992"><code>			// that its msb falls immediately to the right of the float64</code></span>
+<span class="codeline" id="line-993"><code>			// mantissa space. In other words, if the smallest denormal is</code></span>
+<span class="codeline" id="line-994"><code>			// considered "1.0", for p == 0, the mantissa value m is &gt;= 0.5.</code></span>
+<span class="codeline" id="line-995"><code>			// If m &gt; 0.5, it is rounded up to 1.0; i.e., the smallest denormal.</code></span>
+<span class="codeline" id="line-996"><code>			// If m == 0.5, it is rounded down to even, i.e., 0.0.</code></span>
+<span class="codeline" id="line-997"><code>			// If p &lt; 0, the mantissa value m is &lt;= "0.25" which is never rounded up.</code></span>
+<span class="codeline" id="line-998"><code>			if p &lt; 0 /* m &lt;= 0.25 */ || p == 0 &amp;&amp; x.mant.sticky(uint(len(x.mant))*_W-1) == 0 /* m == 0.5 */ {</code></span>
+<span class="codeline" id="line-999"><code>				// underflow to ±0</code></span>
+<span class="codeline" id="line-1000"><code>				if x.neg {</code></span>
+<span class="codeline" id="line-1001"><code>					var z float64</code></span>
+<span class="codeline" id="line-1002"><code>					return -z, Above</code></span>
+<span class="codeline" id="line-1003"><code>				}</code></span>
+<span class="codeline" id="line-1004"><code>				return 0.0, Below</code></span>
+<span class="codeline" id="line-1005"><code>			}</code></span>
+<span class="codeline" id="line-1006"><code>			// otherwise, round up</code></span>
+<span class="codeline" id="line-1007"><code>			// We handle p == 0 explicitly because it's easy and because</code></span>
+<span class="codeline" id="line-1008"><code>			// Float.round doesn't support rounding to 0 bits of precision.</code></span>
+<span class="codeline" id="line-1009"><code>			if p == 0 {</code></span>
+<span class="codeline" id="line-1010"><code>				if x.neg {</code></span>
+<span class="codeline" id="line-1011"><code>					return -math.SmallestNonzeroFloat64, Below</code></span>
+<span class="codeline" id="line-1012"><code>				}</code></span>
+<span class="codeline" id="line-1013"><code>				return math.SmallestNonzeroFloat64, Above</code></span>
+<span class="codeline" id="line-1014"><code>			}</code></span>
+<span class="codeline" id="line-1015"><code>		}</code></span>
+<span class="codeline" id="line-1016"><code>		// p &gt; 0</code></span>
+<span class="codeline" id="line-1017"><code></code></span>
+<span class="codeline" id="line-1018"><code>		// round</code></span>
+<span class="codeline" id="line-1019"><code>		var r Float</code></span>
+<span class="codeline" id="line-1020"><code>		r.prec = uint32(p)</code></span>
+<span class="codeline" id="line-1021"><code>		r.Set(x)</code></span>
+<span class="codeline" id="line-1022"><code>		e = r.exp - 1</code></span>
+<span class="codeline" id="line-1023"><code></code></span>
+<span class="codeline" id="line-1024"><code>		// Rounding may have caused r to overflow to ±Inf</code></span>
+<span class="codeline" id="line-1025"><code>		// (rounding never causes underflows to 0).</code></span>
+<span class="codeline" id="line-1026"><code>		// If the exponent is too large, also overflow to ±Inf.</code></span>
+<span class="codeline" id="line-1027"><code>		if r.form == inf || e &gt; emax {</code></span>
+<span class="codeline" id="line-1028"><code>			// overflow</code></span>
+<span class="codeline" id="line-1029"><code>			if x.neg {</code></span>
+<span class="codeline" id="line-1030"><code>				return math.Inf(-1), Below</code></span>
+<span class="codeline" id="line-1031"><code>			}</code></span>
+<span class="codeline" id="line-1032"><code>			return math.Inf(+1), Above</code></span>
+<span class="codeline" id="line-1033"><code>		}</code></span>
+<span class="codeline" id="line-1034"><code>		// e &lt;= emax</code></span>
+<span class="codeline" id="line-1035"><code></code></span>
+<span class="codeline" id="line-1036"><code>		// Determine sign, biased exponent, and mantissa.</code></span>
+<span class="codeline" id="line-1037"><code>		var sign, bexp, mant uint64</code></span>
+<span class="codeline" id="line-1038"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-1039"><code>			sign = 1 &lt;&lt; (fbits - 1)</code></span>
+<span class="codeline" id="line-1040"><code>		}</code></span>
+<span class="codeline" id="line-1041"><code></code></span>
+<span class="codeline" id="line-1042"><code>		// Rounding may have caused a denormal number to</code></span>
+<span class="codeline" id="line-1043"><code>		// become normal. Check again.</code></span>
+<span class="codeline" id="line-1044"><code>		if e &lt; emin {</code></span>
+<span class="codeline" id="line-1045"><code>			// denormal number: recompute precision</code></span>
+<span class="codeline" id="line-1046"><code>			// Since rounding may have at best increased precision</code></span>
+<span class="codeline" id="line-1047"><code>			// and we have eliminated p &lt;= 0 early, we know p &gt; 0.</code></span>
+<span class="codeline" id="line-1048"><code>			// bexp == 0 for denormals</code></span>
+<span class="codeline" id="line-1049"><code>			p = mbits + 1 - emin + int(e)</code></span>
+<span class="codeline" id="line-1050"><code>			mant = msb64(r.mant) &gt;&gt; uint(fbits-p)</code></span>
+<span class="codeline" id="line-1051"><code>		} else {</code></span>
+<span class="codeline" id="line-1052"><code>			// normal number: emin &lt;= e &lt;= emax</code></span>
+<span class="codeline" id="line-1053"><code>			bexp = uint64(e+bias) &lt;&lt; mbits</code></span>
+<span class="codeline" id="line-1054"><code>			mant = msb64(r.mant) &gt;&gt; ebits &amp; (1&lt;&lt;mbits - 1) // cut off msb (implicit 1 bit)</code></span>
+<span class="codeline" id="line-1055"><code>		}</code></span>
+<span class="codeline" id="line-1056"><code></code></span>
+<span class="codeline" id="line-1057"><code>		return math.Float64frombits(sign | bexp | mant), r.acc</code></span>
+<span class="codeline" id="line-1058"><code></code></span>
+<span class="codeline" id="line-1059"><code>	case zero:</code></span>
+<span class="codeline" id="line-1060"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-1061"><code>			var z float64</code></span>
+<span class="codeline" id="line-1062"><code>			return -z, Exact</code></span>
+<span class="codeline" id="line-1063"><code>		}</code></span>
+<span class="codeline" id="line-1064"><code>		return 0.0, Exact</code></span>
+<span class="codeline" id="line-1065"><code></code></span>
+<span class="codeline" id="line-1066"><code>	case inf:</code></span>
+<span class="codeline" id="line-1067"><code>		if x.neg {</code></span>
+<span class="codeline" id="line-1068"><code>			return math.Inf(-1), Exact</code></span>
+<span class="codeline" id="line-1069"><code>		}</code></span>
+<span class="codeline" id="line-1070"><code>		return math.Inf(+1), Exact</code></span>
+<span class="codeline" id="line-1071"><code>	}</code></span>
+<span class="codeline" id="line-1072"><code></code></span>
+<span class="codeline" id="line-1073"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-1074"><code>}</code></span>
+<span class="codeline" id="line-1075"><code></code></span>
+<span class="codeline" id="line-1076"><code>// Int returns the result of truncating x towards zero;</code></span>
+<span class="codeline" id="line-1077"><code>// or nil if x is an infinity.</code></span>
+<span class="codeline" id="line-1078"><code>// The result is [Exact] if x.IsInt(); otherwise it is [Below]</code></span>
+<span class="codeline" id="line-1079"><code>// for x &gt; 0, and [Above] for x &lt; 0.</code></span>
+<span class="codeline" id="line-1080"><code>// If a non-nil *[Int] argument z is provided, [Int] stores</code></span>
+<span class="codeline" id="line-1081"><code>// the result in z instead of allocating a new [Int].</code></span>
+<span class="codeline" id="line-1082"><code>func (x *Float) Int(z *Int) (*Int, Accuracy) {</code></span>
+<span class="codeline" id="line-1083"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1084"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1085"><code>	}</code></span>
+<span class="codeline" id="line-1086"><code></code></span>
+<span class="codeline" id="line-1087"><code>	if z == nil &amp;&amp; x.form &lt;= finite {</code></span>
+<span class="codeline" id="line-1088"><code>		z = new(Int)</code></span>
+<span class="codeline" id="line-1089"><code>	}</code></span>
+<span class="codeline" id="line-1090"><code></code></span>
+<span class="codeline" id="line-1091"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-1092"><code>	case finite:</code></span>
+<span class="codeline" id="line-1093"><code>		// 0 &lt; |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-1094"><code>		acc := makeAcc(x.neg)</code></span>
+<span class="codeline" id="line-1095"><code>		if x.exp &lt;= 0 {</code></span>
+<span class="codeline" id="line-1096"><code>			// 0 &lt; |x| &lt; 1</code></span>
+<span class="codeline" id="line-1097"><code>			return z.SetInt64(0), acc</code></span>
+<span class="codeline" id="line-1098"><code>		}</code></span>
+<span class="codeline" id="line-1099"><code>		// x.exp &gt; 0</code></span>
+<span class="codeline" id="line-1100"><code></code></span>
+<span class="codeline" id="line-1101"><code>		// 1 &lt;= |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-1102"><code>		// determine minimum required precision for x</code></span>
+<span class="codeline" id="line-1103"><code>		allBits := uint(len(x.mant)) * _W</code></span>
+<span class="codeline" id="line-1104"><code>		exp := uint(x.exp)</code></span>
+<span class="codeline" id="line-1105"><code>		if x.MinPrec() &lt;= exp {</code></span>
+<span class="codeline" id="line-1106"><code>			acc = Exact</code></span>
+<span class="codeline" id="line-1107"><code>		}</code></span>
+<span class="codeline" id="line-1108"><code>		// shift mantissa as needed</code></span>
+<span class="codeline" id="line-1109"><code>		if z == nil {</code></span>
+<span class="codeline" id="line-1110"><code>			z = new(Int)</code></span>
+<span class="codeline" id="line-1111"><code>		}</code></span>
+<span class="codeline" id="line-1112"><code>		z.neg = x.neg</code></span>
+<span class="codeline" id="line-1113"><code>		switch {</code></span>
+<span class="codeline" id="line-1114"><code>		case exp &gt; allBits:</code></span>
+<span class="codeline" id="line-1115"><code>			z.abs = z.abs.shl(x.mant, exp-allBits)</code></span>
+<span class="codeline" id="line-1116"><code>		default:</code></span>
+<span class="codeline" id="line-1117"><code>			z.abs = z.abs.set(x.mant)</code></span>
+<span class="codeline" id="line-1118"><code>		case exp &lt; allBits:</code></span>
+<span class="codeline" id="line-1119"><code>			z.abs = z.abs.shr(x.mant, allBits-exp)</code></span>
+<span class="codeline" id="line-1120"><code>		}</code></span>
+<span class="codeline" id="line-1121"><code>		return z, acc</code></span>
+<span class="codeline" id="line-1122"><code></code></span>
+<span class="codeline" id="line-1123"><code>	case zero:</code></span>
+<span class="codeline" id="line-1124"><code>		return z.SetInt64(0), Exact</code></span>
+<span class="codeline" id="line-1125"><code></code></span>
+<span class="codeline" id="line-1126"><code>	case inf:</code></span>
+<span class="codeline" id="line-1127"><code>		return nil, makeAcc(x.neg)</code></span>
+<span class="codeline" id="line-1128"><code>	}</code></span>
+<span class="codeline" id="line-1129"><code></code></span>
+<span class="codeline" id="line-1130"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-1131"><code>}</code></span>
+<span class="codeline" id="line-1132"><code></code></span>
+<span class="codeline" id="line-1133"><code>// Rat returns the rational number corresponding to x;</code></span>
+<span class="codeline" id="line-1134"><code>// or nil if x is an infinity.</code></span>
+<span class="codeline" id="line-1135"><code>// The result is [Exact] if x is not an Inf.</code></span>
+<span class="codeline" id="line-1136"><code>// If a non-nil *[Rat] argument z is provided, [Rat] stores</code></span>
+<span class="codeline" id="line-1137"><code>// the result in z instead of allocating a new [Rat].</code></span>
+<span class="codeline" id="line-1138"><code>func (x *Float) Rat(z *Rat) (*Rat, Accuracy) {</code></span>
+<span class="codeline" id="line-1139"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1140"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1141"><code>	}</code></span>
+<span class="codeline" id="line-1142"><code></code></span>
+<span class="codeline" id="line-1143"><code>	if z == nil &amp;&amp; x.form &lt;= finite {</code></span>
+<span class="codeline" id="line-1144"><code>		z = new(Rat)</code></span>
+<span class="codeline" id="line-1145"><code>	}</code></span>
+<span class="codeline" id="line-1146"><code></code></span>
+<span class="codeline" id="line-1147"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-1148"><code>	case finite:</code></span>
+<span class="codeline" id="line-1149"><code>		// 0 &lt; |x| &lt; +Inf</code></span>
+<span class="codeline" id="line-1150"><code>		allBits := int32(len(x.mant)) * _W</code></span>
+<span class="codeline" id="line-1151"><code>		// build up numerator and denominator</code></span>
+<span class="codeline" id="line-1152"><code>		z.a.neg = x.neg</code></span>
+<span class="codeline" id="line-1153"><code>		switch {</code></span>
+<span class="codeline" id="line-1154"><code>		case x.exp &gt; allBits:</code></span>
+<span class="codeline" id="line-1155"><code>			z.a.abs = z.a.abs.shl(x.mant, uint(x.exp-allBits))</code></span>
+<span class="codeline" id="line-1156"><code>			z.b.abs = z.b.abs[:0] // == 1 (see Rat)</code></span>
+<span class="codeline" id="line-1157"><code>			// z already in normal form</code></span>
+<span class="codeline" id="line-1158"><code>		default:</code></span>
+<span class="codeline" id="line-1159"><code>			z.a.abs = z.a.abs.set(x.mant)</code></span>
+<span class="codeline" id="line-1160"><code>			z.b.abs = z.b.abs[:0] // == 1 (see Rat)</code></span>
+<span class="codeline" id="line-1161"><code>			// z already in normal form</code></span>
+<span class="codeline" id="line-1162"><code>		case x.exp &lt; allBits:</code></span>
+<span class="codeline" id="line-1163"><code>			z.a.abs = z.a.abs.set(x.mant)</code></span>
+<span class="codeline" id="line-1164"><code>			t := z.b.abs.setUint64(1)</code></span>
+<span class="codeline" id="line-1165"><code>			z.b.abs = t.shl(t, uint(allBits-x.exp))</code></span>
+<span class="codeline" id="line-1166"><code>			z.norm()</code></span>
+<span class="codeline" id="line-1167"><code>		}</code></span>
+<span class="codeline" id="line-1168"><code>		return z, Exact</code></span>
+<span class="codeline" id="line-1169"><code></code></span>
+<span class="codeline" id="line-1170"><code>	case zero:</code></span>
+<span class="codeline" id="line-1171"><code>		return z.SetInt64(0), Exact</code></span>
+<span class="codeline" id="line-1172"><code></code></span>
+<span class="codeline" id="line-1173"><code>	case inf:</code></span>
+<span class="codeline" id="line-1174"><code>		return nil, makeAcc(x.neg)</code></span>
+<span class="codeline" id="line-1175"><code>	}</code></span>
+<span class="codeline" id="line-1176"><code></code></span>
+<span class="codeline" id="line-1177"><code>	panic("unreachable")</code></span>
+<span class="codeline" id="line-1178"><code>}</code></span>
+<span class="codeline" id="line-1179"><code></code></span>
+<span class="codeline" id="line-1180"><code>// Abs sets z to the (possibly rounded) value |x| (the absolute value of x)</code></span>
+<span class="codeline" id="line-1181"><code>// and returns z.</code></span>
+<span class="codeline" id="line-1182"><code>func (z *Float) Abs(x *Float) *Float {</code></span>
+<span class="codeline" id="line-1183"><code>	z.Set(x)</code></span>
+<span class="codeline" id="line-1184"><code>	z.neg = false</code></span>
+<span class="codeline" id="line-1185"><code>	return z</code></span>
+<span class="codeline" id="line-1186"><code>}</code></span>
+<span class="codeline" id="line-1187"><code></code></span>
+<span class="codeline" id="line-1188"><code>// Neg sets z to the (possibly rounded) value of x with its sign negated,</code></span>
+<span class="codeline" id="line-1189"><code>// and returns z.</code></span>
+<span class="codeline" id="line-1190"><code>func (z *Float) Neg(x *Float) *Float {</code></span>
+<span class="codeline" id="line-1191"><code>	z.Set(x)</code></span>
+<span class="codeline" id="line-1192"><code>	z.neg = !z.neg</code></span>
+<span class="codeline" id="line-1193"><code>	return z</code></span>
+<span class="codeline" id="line-1194"><code>}</code></span>
+<span class="codeline" id="line-1195"><code></code></span>
+<span class="codeline" id="line-1196"><code>func validateBinaryOperands(x, y *Float) {</code></span>
+<span class="codeline" id="line-1197"><code>	if !debugFloat {</code></span>
+<span class="codeline" id="line-1198"><code>		// avoid performance bugs</code></span>
+<span class="codeline" id="line-1199"><code>		panic("validateBinaryOperands called but debugFloat is not set")</code></span>
+<span class="codeline" id="line-1200"><code>	}</code></span>
+<span class="codeline" id="line-1201"><code>	if len(x.mant) == 0 {</code></span>
+<span class="codeline" id="line-1202"><code>		panic("empty mantissa for x")</code></span>
+<span class="codeline" id="line-1203"><code>	}</code></span>
+<span class="codeline" id="line-1204"><code>	if len(y.mant) == 0 {</code></span>
+<span class="codeline" id="line-1205"><code>		panic("empty mantissa for y")</code></span>
+<span class="codeline" id="line-1206"><code>	}</code></span>
+<span class="codeline" id="line-1207"><code>}</code></span>
+<span class="codeline" id="line-1208"><code></code></span>
+<span class="codeline" id="line-1209"><code>// z = x + y, ignoring signs of x and y for the addition</code></span>
+<span class="codeline" id="line-1210"><code>// but using the sign of z for rounding the result.</code></span>
+<span class="codeline" id="line-1211"><code>// x and y must have a non-empty mantissa and valid exponent.</code></span>
+<span class="codeline" id="line-1212"><code>func (z *Float) uadd(x, y *Float) {</code></span>
+<span class="codeline" id="line-1213"><code>	// Note: This implementation requires 2 shifts most of the</code></span>
+<span class="codeline" id="line-1214"><code>	// time. It is also inefficient if exponents or precisions</code></span>
+<span class="codeline" id="line-1215"><code>	// differ by wide margins. The following article describes</code></span>
+<span class="codeline" id="line-1216"><code>	// an efficient (but much more complicated) implementation</code></span>
+<span class="codeline" id="line-1217"><code>	// compatible with the internal representation used here:</code></span>
+<span class="codeline" id="line-1218"><code>	//</code></span>
+<span class="codeline" id="line-1219"><code>	// Vincent Lefèvre: "The Generic Multiple-Precision Floating-</code></span>
+<span class="codeline" id="line-1220"><code>	// Point Addition With Exact Rounding (as in the MPFR Library)"</code></span>
+<span class="codeline" id="line-1221"><code>	// http://www.vinc17.net/research/papers/rnc6.pdf</code></span>
+<span class="codeline" id="line-1222"><code></code></span>
+<span class="codeline" id="line-1223"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1224"><code>		validateBinaryOperands(x, y)</code></span>
+<span class="codeline" id="line-1225"><code>	}</code></span>
+<span class="codeline" id="line-1226"><code></code></span>
+<span class="codeline" id="line-1227"><code>	// compute exponents ex, ey for mantissa with "binary point"</code></span>
+<span class="codeline" id="line-1228"><code>	// on the right (mantissa.0) - use int64 to avoid overflow</code></span>
+<span class="codeline" id="line-1229"><code>	ex := int64(x.exp) - int64(len(x.mant))*_W</code></span>
+<span class="codeline" id="line-1230"><code>	ey := int64(y.exp) - int64(len(y.mant))*_W</code></span>
+<span class="codeline" id="line-1231"><code></code></span>
+<span class="codeline" id="line-1232"><code>	al := alias(z.mant, x.mant) || alias(z.mant, y.mant)</code></span>
+<span class="codeline" id="line-1233"><code></code></span>
+<span class="codeline" id="line-1234"><code>	// TODO(gri) having a combined add-and-shift primitive</code></span>
+<span class="codeline" id="line-1235"><code>	//           could make this code significantly faster</code></span>
+<span class="codeline" id="line-1236"><code>	switch {</code></span>
+<span class="codeline" id="line-1237"><code>	case ex &lt; ey:</code></span>
+<span class="codeline" id="line-1238"><code>		if al {</code></span>
+<span class="codeline" id="line-1239"><code>			t := nat(nil).shl(y.mant, uint(ey-ex))</code></span>
+<span class="codeline" id="line-1240"><code>			z.mant = z.mant.add(x.mant, t)</code></span>
+<span class="codeline" id="line-1241"><code>		} else {</code></span>
+<span class="codeline" id="line-1242"><code>			z.mant = z.mant.shl(y.mant, uint(ey-ex))</code></span>
+<span class="codeline" id="line-1243"><code>			z.mant = z.mant.add(x.mant, z.mant)</code></span>
+<span class="codeline" id="line-1244"><code>		}</code></span>
+<span class="codeline" id="line-1245"><code>	default:</code></span>
+<span class="codeline" id="line-1246"><code>		// ex == ey, no shift needed</code></span>
+<span class="codeline" id="line-1247"><code>		z.mant = z.mant.add(x.mant, y.mant)</code></span>
+<span class="codeline" id="line-1248"><code>	case ex &gt; ey:</code></span>
+<span class="codeline" id="line-1249"><code>		if al {</code></span>
+<span class="codeline" id="line-1250"><code>			t := nat(nil).shl(x.mant, uint(ex-ey))</code></span>
+<span class="codeline" id="line-1251"><code>			z.mant = z.mant.add(t, y.mant)</code></span>
+<span class="codeline" id="line-1252"><code>		} else {</code></span>
+<span class="codeline" id="line-1253"><code>			z.mant = z.mant.shl(x.mant, uint(ex-ey))</code></span>
+<span class="codeline" id="line-1254"><code>			z.mant = z.mant.add(z.mant, y.mant)</code></span>
+<span class="codeline" id="line-1255"><code>		}</code></span>
+<span class="codeline" id="line-1256"><code>		ex = ey</code></span>
+<span class="codeline" id="line-1257"><code>	}</code></span>
+<span class="codeline" id="line-1258"><code>	// len(z.mant) &gt; 0</code></span>
+<span class="codeline" id="line-1259"><code></code></span>
+<span class="codeline" id="line-1260"><code>	z.setExpAndRound(ex+int64(len(z.mant))*_W-fnorm(z.mant), 0)</code></span>
+<span class="codeline" id="line-1261"><code>}</code></span>
+<span class="codeline" id="line-1262"><code></code></span>
+<span class="codeline" id="line-1263"><code>// z = x - y for |x| &gt; |y|, ignoring signs of x and y for the subtraction</code></span>
+<span class="codeline" id="line-1264"><code>// but using the sign of z for rounding the result.</code></span>
+<span class="codeline" id="line-1265"><code>// x and y must have a non-empty mantissa and valid exponent.</code></span>
+<span class="codeline" id="line-1266"><code>func (z *Float) usub(x, y *Float) {</code></span>
+<span class="codeline" id="line-1267"><code>	// This code is symmetric to uadd.</code></span>
+<span class="codeline" id="line-1268"><code>	// We have not factored the common code out because</code></span>
+<span class="codeline" id="line-1269"><code>	// eventually uadd (and usub) should be optimized</code></span>
+<span class="codeline" id="line-1270"><code>	// by special-casing, and the code will diverge.</code></span>
+<span class="codeline" id="line-1271"><code></code></span>
+<span class="codeline" id="line-1272"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1273"><code>		validateBinaryOperands(x, y)</code></span>
+<span class="codeline" id="line-1274"><code>	}</code></span>
+<span class="codeline" id="line-1275"><code></code></span>
+<span class="codeline" id="line-1276"><code>	ex := int64(x.exp) - int64(len(x.mant))*_W</code></span>
+<span class="codeline" id="line-1277"><code>	ey := int64(y.exp) - int64(len(y.mant))*_W</code></span>
+<span class="codeline" id="line-1278"><code></code></span>
+<span class="codeline" id="line-1279"><code>	al := alias(z.mant, x.mant) || alias(z.mant, y.mant)</code></span>
+<span class="codeline" id="line-1280"><code></code></span>
+<span class="codeline" id="line-1281"><code>	switch {</code></span>
+<span class="codeline" id="line-1282"><code>	case ex &lt; ey:</code></span>
+<span class="codeline" id="line-1283"><code>		if al {</code></span>
+<span class="codeline" id="line-1284"><code>			t := nat(nil).shl(y.mant, uint(ey-ex))</code></span>
+<span class="codeline" id="line-1285"><code>			z.mant = t.sub(x.mant, t)</code></span>
+<span class="codeline" id="line-1286"><code>		} else {</code></span>
+<span class="codeline" id="line-1287"><code>			z.mant = z.mant.shl(y.mant, uint(ey-ex))</code></span>
+<span class="codeline" id="line-1288"><code>			z.mant = z.mant.sub(x.mant, z.mant)</code></span>
+<span class="codeline" id="line-1289"><code>		}</code></span>
+<span class="codeline" id="line-1290"><code>	default:</code></span>
+<span class="codeline" id="line-1291"><code>		// ex == ey, no shift needed</code></span>
+<span class="codeline" id="line-1292"><code>		z.mant = z.mant.sub(x.mant, y.mant)</code></span>
+<span class="codeline" id="line-1293"><code>	case ex &gt; ey:</code></span>
+<span class="codeline" id="line-1294"><code>		if al {</code></span>
+<span class="codeline" id="line-1295"><code>			t := nat(nil).shl(x.mant, uint(ex-ey))</code></span>
+<span class="codeline" id="line-1296"><code>			z.mant = t.sub(t, y.mant)</code></span>
+<span class="codeline" id="line-1297"><code>		} else {</code></span>
+<span class="codeline" id="line-1298"><code>			z.mant = z.mant.shl(x.mant, uint(ex-ey))</code></span>
+<span class="codeline" id="line-1299"><code>			z.mant = z.mant.sub(z.mant, y.mant)</code></span>
+<span class="codeline" id="line-1300"><code>		}</code></span>
+<span class="codeline" id="line-1301"><code>		ex = ey</code></span>
+<span class="codeline" id="line-1302"><code>	}</code></span>
+<span class="codeline" id="line-1303"><code></code></span>
+<span class="codeline" id="line-1304"><code>	// operands may have canceled each other out</code></span>
+<span class="codeline" id="line-1305"><code>	if len(z.mant) == 0 {</code></span>
+<span class="codeline" id="line-1306"><code>		z.acc = Exact</code></span>
+<span class="codeline" id="line-1307"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1308"><code>		z.neg = false</code></span>
+<span class="codeline" id="line-1309"><code>		return</code></span>
+<span class="codeline" id="line-1310"><code>	}</code></span>
+<span class="codeline" id="line-1311"><code>	// len(z.mant) &gt; 0</code></span>
+<span class="codeline" id="line-1312"><code></code></span>
+<span class="codeline" id="line-1313"><code>	z.setExpAndRound(ex+int64(len(z.mant))*_W-fnorm(z.mant), 0)</code></span>
+<span class="codeline" id="line-1314"><code>}</code></span>
+<span class="codeline" id="line-1315"><code></code></span>
+<span class="codeline" id="line-1316"><code>// z = x * y, ignoring signs of x and y for the multiplication</code></span>
+<span class="codeline" id="line-1317"><code>// but using the sign of z for rounding the result.</code></span>
+<span class="codeline" id="line-1318"><code>// x and y must have a non-empty mantissa and valid exponent.</code></span>
+<span class="codeline" id="line-1319"><code>func (z *Float) umul(x, y *Float) {</code></span>
+<span class="codeline" id="line-1320"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1321"><code>		validateBinaryOperands(x, y)</code></span>
+<span class="codeline" id="line-1322"><code>	}</code></span>
+<span class="codeline" id="line-1323"><code></code></span>
+<span class="codeline" id="line-1324"><code>	// Note: This is doing too much work if the precision</code></span>
+<span class="codeline" id="line-1325"><code>	// of z is less than the sum of the precisions of x</code></span>
+<span class="codeline" id="line-1326"><code>	// and y which is often the case (e.g., if all floats</code></span>
+<span class="codeline" id="line-1327"><code>	// have the same precision).</code></span>
+<span class="codeline" id="line-1328"><code>	// TODO(gri) Optimize this for the common case.</code></span>
+<span class="codeline" id="line-1329"><code></code></span>
+<span class="codeline" id="line-1330"><code>	e := int64(x.exp) + int64(y.exp)</code></span>
+<span class="codeline" id="line-1331"><code>	if x == y {</code></span>
+<span class="codeline" id="line-1332"><code>		z.mant = z.mant.sqr(x.mant)</code></span>
+<span class="codeline" id="line-1333"><code>	} else {</code></span>
+<span class="codeline" id="line-1334"><code>		z.mant = z.mant.mul(x.mant, y.mant)</code></span>
+<span class="codeline" id="line-1335"><code>	}</code></span>
+<span class="codeline" id="line-1336"><code>	z.setExpAndRound(e-fnorm(z.mant), 0)</code></span>
+<span class="codeline" id="line-1337"><code>}</code></span>
+<span class="codeline" id="line-1338"><code></code></span>
+<span class="codeline" id="line-1339"><code>// z = x / y, ignoring signs of x and y for the division</code></span>
+<span class="codeline" id="line-1340"><code>// but using the sign of z for rounding the result.</code></span>
+<span class="codeline" id="line-1341"><code>// x and y must have a non-empty mantissa and valid exponent.</code></span>
+<span class="codeline" id="line-1342"><code>func (z *Float) uquo(x, y *Float) {</code></span>
+<span class="codeline" id="line-1343"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1344"><code>		validateBinaryOperands(x, y)</code></span>
+<span class="codeline" id="line-1345"><code>	}</code></span>
+<span class="codeline" id="line-1346"><code></code></span>
+<span class="codeline" id="line-1347"><code>	// mantissa length in words for desired result precision + 1</code></span>
+<span class="codeline" id="line-1348"><code>	// (at least one extra bit so we get the rounding bit after</code></span>
+<span class="codeline" id="line-1349"><code>	// the division)</code></span>
+<span class="codeline" id="line-1350"><code>	n := int(z.prec/_W) + 1</code></span>
+<span class="codeline" id="line-1351"><code></code></span>
+<span class="codeline" id="line-1352"><code>	// compute adjusted x.mant such that we get enough result precision</code></span>
+<span class="codeline" id="line-1353"><code>	xadj := x.mant</code></span>
+<span class="codeline" id="line-1354"><code>	if d := n - len(x.mant) + len(y.mant); d &gt; 0 {</code></span>
+<span class="codeline" id="line-1355"><code>		// d extra words needed =&gt; add d "0 digits" to x</code></span>
+<span class="codeline" id="line-1356"><code>		xadj = make(nat, len(x.mant)+d)</code></span>
+<span class="codeline" id="line-1357"><code>		copy(xadj[d:], x.mant)</code></span>
+<span class="codeline" id="line-1358"><code>	}</code></span>
+<span class="codeline" id="line-1359"><code>	// TODO(gri): If we have too many digits (d &lt; 0), we should be able</code></span>
+<span class="codeline" id="line-1360"><code>	// to shorten x for faster division. But we must be extra careful</code></span>
+<span class="codeline" id="line-1361"><code>	// with rounding in that case.</code></span>
+<span class="codeline" id="line-1362"><code></code></span>
+<span class="codeline" id="line-1363"><code>	// Compute d before division since there may be aliasing of x.mant</code></span>
+<span class="codeline" id="line-1364"><code>	// (via xadj) or y.mant with z.mant.</code></span>
+<span class="codeline" id="line-1365"><code>	d := len(xadj) - len(y.mant)</code></span>
+<span class="codeline" id="line-1366"><code></code></span>
+<span class="codeline" id="line-1367"><code>	// divide</code></span>
+<span class="codeline" id="line-1368"><code>	var r nat</code></span>
+<span class="codeline" id="line-1369"><code>	z.mant, r = z.mant.div(nil, xadj, y.mant)</code></span>
+<span class="codeline" id="line-1370"><code>	e := int64(x.exp) - int64(y.exp) - int64(d-len(z.mant))*_W</code></span>
+<span class="codeline" id="line-1371"><code></code></span>
+<span class="codeline" id="line-1372"><code>	// The result is long enough to include (at least) the rounding bit.</code></span>
+<span class="codeline" id="line-1373"><code>	// If there's a non-zero remainder, the corresponding fractional part</code></span>
+<span class="codeline" id="line-1374"><code>	// (if it were computed), would have a non-zero sticky bit (if it were</code></span>
+<span class="codeline" id="line-1375"><code>	// zero, it couldn't have a non-zero remainder).</code></span>
+<span class="codeline" id="line-1376"><code>	var sbit uint</code></span>
+<span class="codeline" id="line-1377"><code>	if len(r) &gt; 0 {</code></span>
+<span class="codeline" id="line-1378"><code>		sbit = 1</code></span>
+<span class="codeline" id="line-1379"><code>	}</code></span>
+<span class="codeline" id="line-1380"><code></code></span>
+<span class="codeline" id="line-1381"><code>	z.setExpAndRound(e-fnorm(z.mant), sbit)</code></span>
+<span class="codeline" id="line-1382"><code>}</code></span>
+<span class="codeline" id="line-1383"><code></code></span>
+<span class="codeline" id="line-1384"><code>// ucmp returns -1, 0, or +1, depending on whether</code></span>
+<span class="codeline" id="line-1385"><code>// |x| &lt; |y|, |x| == |y|, or |x| &gt; |y|.</code></span>
+<span class="codeline" id="line-1386"><code>// x and y must have a non-empty mantissa and valid exponent.</code></span>
+<span class="codeline" id="line-1387"><code>func (x *Float) ucmp(y *Float) int {</code></span>
+<span class="codeline" id="line-1388"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1389"><code>		validateBinaryOperands(x, y)</code></span>
+<span class="codeline" id="line-1390"><code>	}</code></span>
+<span class="codeline" id="line-1391"><code></code></span>
+<span class="codeline" id="line-1392"><code>	switch {</code></span>
+<span class="codeline" id="line-1393"><code>	case x.exp &lt; y.exp:</code></span>
+<span class="codeline" id="line-1394"><code>		return -1</code></span>
+<span class="codeline" id="line-1395"><code>	case x.exp &gt; y.exp:</code></span>
+<span class="codeline" id="line-1396"><code>		return +1</code></span>
+<span class="codeline" id="line-1397"><code>	}</code></span>
+<span class="codeline" id="line-1398"><code>	// x.exp == y.exp</code></span>
+<span class="codeline" id="line-1399"><code></code></span>
+<span class="codeline" id="line-1400"><code>	// compare mantissas</code></span>
+<span class="codeline" id="line-1401"><code>	i := len(x.mant)</code></span>
+<span class="codeline" id="line-1402"><code>	j := len(y.mant)</code></span>
+<span class="codeline" id="line-1403"><code>	for i &gt; 0 || j &gt; 0 {</code></span>
+<span class="codeline" id="line-1404"><code>		var xm, ym Word</code></span>
+<span class="codeline" id="line-1405"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-1406"><code>			i--</code></span>
+<span class="codeline" id="line-1407"><code>			xm = x.mant[i]</code></span>
+<span class="codeline" id="line-1408"><code>		}</code></span>
+<span class="codeline" id="line-1409"><code>		if j &gt; 0 {</code></span>
+<span class="codeline" id="line-1410"><code>			j--</code></span>
+<span class="codeline" id="line-1411"><code>			ym = y.mant[j]</code></span>
+<span class="codeline" id="line-1412"><code>		}</code></span>
+<span class="codeline" id="line-1413"><code>		switch {</code></span>
+<span class="codeline" id="line-1414"><code>		case xm &lt; ym:</code></span>
+<span class="codeline" id="line-1415"><code>			return -1</code></span>
+<span class="codeline" id="line-1416"><code>		case xm &gt; ym:</code></span>
+<span class="codeline" id="line-1417"><code>			return +1</code></span>
+<span class="codeline" id="line-1418"><code>		}</code></span>
+<span class="codeline" id="line-1419"><code>	}</code></span>
+<span class="codeline" id="line-1420"><code></code></span>
+<span class="codeline" id="line-1421"><code>	return 0</code></span>
+<span class="codeline" id="line-1422"><code>}</code></span>
+<span class="codeline" id="line-1423"><code></code></span>
+<span class="codeline" id="line-1424"><code>// Handling of sign bit as defined by IEEE 754-2008, section 6.3:</code></span>
+<span class="codeline" id="line-1425"><code>//</code></span>
+<span class="codeline" id="line-1426"><code>// When neither the inputs nor result are NaN, the sign of a product or</code></span>
+<span class="codeline" id="line-1427"><code>// quotient is the exclusive OR of the operands’ signs; the sign of a sum,</code></span>
+<span class="codeline" id="line-1428"><code>// or of a difference x−y regarded as a sum x+(−y), differs from at most</code></span>
+<span class="codeline" id="line-1429"><code>// one of the addends’ signs; and the sign of the result of conversions,</code></span>
+<span class="codeline" id="line-1430"><code>// the quantize operation, the roundToIntegral operations, and the</code></span>
+<span class="codeline" id="line-1431"><code>// roundToIntegralExact (see 5.3.1) is the sign of the first or only operand.</code></span>
+<span class="codeline" id="line-1432"><code>// These rules shall apply even when operands or results are zero or infinite.</code></span>
+<span class="codeline" id="line-1433"><code>//</code></span>
+<span class="codeline" id="line-1434"><code>// When the sum of two operands with opposite signs (or the difference of</code></span>
+<span class="codeline" id="line-1435"><code>// two operands with like signs) is exactly zero, the sign of that sum (or</code></span>
+<span class="codeline" id="line-1436"><code>// difference) shall be +0 in all rounding-direction attributes except</code></span>
+<span class="codeline" id="line-1437"><code>// roundTowardNegative; under that attribute, the sign of an exact zero</code></span>
+<span class="codeline" id="line-1438"><code>// sum (or difference) shall be −0. However, x+x = x−(−x) retains the same</code></span>
+<span class="codeline" id="line-1439"><code>// sign as x even when x is zero.</code></span>
+<span class="codeline" id="line-1440"><code>//</code></span>
+<span class="codeline" id="line-1441"><code>// See also: https://play.golang.org/p/RtH3UCt5IH</code></span>
+<span class="codeline" id="line-1442"><code></code></span>
+<span class="codeline" id="line-1443"><code>// Add sets z to the rounded sum x+y and returns z. If z's precision is 0,</code></span>
+<span class="codeline" id="line-1444"><code>// it is changed to the larger of x's or y's precision before the operation.</code></span>
+<span class="codeline" id="line-1445"><code>// Rounding is performed according to z's precision and rounding mode; and</code></span>
+<span class="codeline" id="line-1446"><code>// z's accuracy reports the result error relative to the exact (not rounded)</code></span>
+<span class="codeline" id="line-1447"><code>// result. Add panics with [ErrNaN] if x and y are infinities with opposite</code></span>
+<span class="codeline" id="line-1448"><code>// signs. The value of z is undefined in that case.</code></span>
+<span class="codeline" id="line-1449"><code>func (z *Float) Add(x, y *Float) *Float {</code></span>
+<span class="codeline" id="line-1450"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1451"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1452"><code>		y.validate()</code></span>
+<span class="codeline" id="line-1453"><code>	}</code></span>
+<span class="codeline" id="line-1454"><code></code></span>
+<span class="codeline" id="line-1455"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-1456"><code>		z.prec = umax32(x.prec, y.prec)</code></span>
+<span class="codeline" id="line-1457"><code>	}</code></span>
+<span class="codeline" id="line-1458"><code></code></span>
+<span class="codeline" id="line-1459"><code>	if x.form == finite &amp;&amp; y.form == finite {</code></span>
+<span class="codeline" id="line-1460"><code>		// x + y (common case)</code></span>
+<span class="codeline" id="line-1461"><code></code></span>
+<span class="codeline" id="line-1462"><code>		// Below we set z.neg = x.neg, and when z aliases y this will</code></span>
+<span class="codeline" id="line-1463"><code>		// change the y operand's sign. This is fine, because if an</code></span>
+<span class="codeline" id="line-1464"><code>		// operand aliases the receiver it'll be overwritten, but we still</code></span>
+<span class="codeline" id="line-1465"><code>		// want the original x.neg and y.neg values when we evaluate</code></span>
+<span class="codeline" id="line-1466"><code>		// x.neg != y.neg, so we need to save y.neg before setting z.neg.</code></span>
+<span class="codeline" id="line-1467"><code>		yneg := y.neg</code></span>
+<span class="codeline" id="line-1468"><code></code></span>
+<span class="codeline" id="line-1469"><code>		z.neg = x.neg</code></span>
+<span class="codeline" id="line-1470"><code>		if x.neg == yneg {</code></span>
+<span class="codeline" id="line-1471"><code>			// x + y == x + y</code></span>
+<span class="codeline" id="line-1472"><code>			// (-x) + (-y) == -(x + y)</code></span>
+<span class="codeline" id="line-1473"><code>			z.uadd(x, y)</code></span>
+<span class="codeline" id="line-1474"><code>		} else {</code></span>
+<span class="codeline" id="line-1475"><code>			// x + (-y) == x - y == -(y - x)</code></span>
+<span class="codeline" id="line-1476"><code>			// (-x) + y == y - x == -(x - y)</code></span>
+<span class="codeline" id="line-1477"><code>			if x.ucmp(y) &gt; 0 {</code></span>
+<span class="codeline" id="line-1478"><code>				z.usub(x, y)</code></span>
+<span class="codeline" id="line-1479"><code>			} else {</code></span>
+<span class="codeline" id="line-1480"><code>				z.neg = !z.neg</code></span>
+<span class="codeline" id="line-1481"><code>				z.usub(y, x)</code></span>
+<span class="codeline" id="line-1482"><code>			}</code></span>
+<span class="codeline" id="line-1483"><code>		}</code></span>
+<span class="codeline" id="line-1484"><code>		if z.form == zero &amp;&amp; z.mode == ToNegativeInf &amp;&amp; z.acc == Exact {</code></span>
+<span class="codeline" id="line-1485"><code>			z.neg = true</code></span>
+<span class="codeline" id="line-1486"><code>		}</code></span>
+<span class="codeline" id="line-1487"><code>		return z</code></span>
+<span class="codeline" id="line-1488"><code>	}</code></span>
+<span class="codeline" id="line-1489"><code></code></span>
+<span class="codeline" id="line-1490"><code>	if x.form == inf &amp;&amp; y.form == inf &amp;&amp; x.neg != y.neg {</code></span>
+<span class="codeline" id="line-1491"><code>		// +Inf + -Inf</code></span>
+<span class="codeline" id="line-1492"><code>		// -Inf + +Inf</code></span>
+<span class="codeline" id="line-1493"><code>		// value of z is undefined but make sure it's valid</code></span>
+<span class="codeline" id="line-1494"><code>		z.acc = Exact</code></span>
+<span class="codeline" id="line-1495"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1496"><code>		z.neg = false</code></span>
+<span class="codeline" id="line-1497"><code>		panic(ErrNaN{"addition of infinities with opposite signs"})</code></span>
+<span class="codeline" id="line-1498"><code>	}</code></span>
+<span class="codeline" id="line-1499"><code></code></span>
+<span class="codeline" id="line-1500"><code>	if x.form == zero &amp;&amp; y.form == zero {</code></span>
+<span class="codeline" id="line-1501"><code>		// ±0 + ±0</code></span>
+<span class="codeline" id="line-1502"><code>		z.acc = Exact</code></span>
+<span class="codeline" id="line-1503"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1504"><code>		z.neg = x.neg &amp;&amp; y.neg // -0 + -0 == -0</code></span>
+<span class="codeline" id="line-1505"><code>		return z</code></span>
+<span class="codeline" id="line-1506"><code>	}</code></span>
+<span class="codeline" id="line-1507"><code></code></span>
+<span class="codeline" id="line-1508"><code>	if x.form == inf || y.form == zero {</code></span>
+<span class="codeline" id="line-1509"><code>		// ±Inf + y</code></span>
+<span class="codeline" id="line-1510"><code>		// x + ±0</code></span>
+<span class="codeline" id="line-1511"><code>		return z.Set(x)</code></span>
+<span class="codeline" id="line-1512"><code>	}</code></span>
+<span class="codeline" id="line-1513"><code></code></span>
+<span class="codeline" id="line-1514"><code>	// ±0 + y</code></span>
+<span class="codeline" id="line-1515"><code>	// x + ±Inf</code></span>
+<span class="codeline" id="line-1516"><code>	return z.Set(y)</code></span>
+<span class="codeline" id="line-1517"><code>}</code></span>
+<span class="codeline" id="line-1518"><code></code></span>
+<span class="codeline" id="line-1519"><code>// Sub sets z to the rounded difference x-y and returns z.</code></span>
+<span class="codeline" id="line-1520"><code>// Precision, rounding, and accuracy reporting are as for [Float.Add].</code></span>
+<span class="codeline" id="line-1521"><code>// Sub panics with [ErrNaN] if x and y are infinities with equal</code></span>
+<span class="codeline" id="line-1522"><code>// signs. The value of z is undefined in that case.</code></span>
+<span class="codeline" id="line-1523"><code>func (z *Float) Sub(x, y *Float) *Float {</code></span>
+<span class="codeline" id="line-1524"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1525"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1526"><code>		y.validate()</code></span>
+<span class="codeline" id="line-1527"><code>	}</code></span>
+<span class="codeline" id="line-1528"><code></code></span>
+<span class="codeline" id="line-1529"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-1530"><code>		z.prec = umax32(x.prec, y.prec)</code></span>
+<span class="codeline" id="line-1531"><code>	}</code></span>
+<span class="codeline" id="line-1532"><code></code></span>
+<span class="codeline" id="line-1533"><code>	if x.form == finite &amp;&amp; y.form == finite {</code></span>
+<span class="codeline" id="line-1534"><code>		// x - y (common case)</code></span>
+<span class="codeline" id="line-1535"><code>		yneg := y.neg</code></span>
+<span class="codeline" id="line-1536"><code>		z.neg = x.neg</code></span>
+<span class="codeline" id="line-1537"><code>		if x.neg != yneg {</code></span>
+<span class="codeline" id="line-1538"><code>			// x - (-y) == x + y</code></span>
+<span class="codeline" id="line-1539"><code>			// (-x) - y == -(x + y)</code></span>
+<span class="codeline" id="line-1540"><code>			z.uadd(x, y)</code></span>
+<span class="codeline" id="line-1541"><code>		} else {</code></span>
+<span class="codeline" id="line-1542"><code>			// x - y == x - y == -(y - x)</code></span>
+<span class="codeline" id="line-1543"><code>			// (-x) - (-y) == y - x == -(x - y)</code></span>
+<span class="codeline" id="line-1544"><code>			if x.ucmp(y) &gt; 0 {</code></span>
+<span class="codeline" id="line-1545"><code>				z.usub(x, y)</code></span>
+<span class="codeline" id="line-1546"><code>			} else {</code></span>
+<span class="codeline" id="line-1547"><code>				z.neg = !z.neg</code></span>
+<span class="codeline" id="line-1548"><code>				z.usub(y, x)</code></span>
+<span class="codeline" id="line-1549"><code>			}</code></span>
+<span class="codeline" id="line-1550"><code>		}</code></span>
+<span class="codeline" id="line-1551"><code>		if z.form == zero &amp;&amp; z.mode == ToNegativeInf &amp;&amp; z.acc == Exact {</code></span>
+<span class="codeline" id="line-1552"><code>			z.neg = true</code></span>
+<span class="codeline" id="line-1553"><code>		}</code></span>
+<span class="codeline" id="line-1554"><code>		return z</code></span>
+<span class="codeline" id="line-1555"><code>	}</code></span>
+<span class="codeline" id="line-1556"><code></code></span>
+<span class="codeline" id="line-1557"><code>	if x.form == inf &amp;&amp; y.form == inf &amp;&amp; x.neg == y.neg {</code></span>
+<span class="codeline" id="line-1558"><code>		// +Inf - +Inf</code></span>
+<span class="codeline" id="line-1559"><code>		// -Inf - -Inf</code></span>
+<span class="codeline" id="line-1560"><code>		// value of z is undefined but make sure it's valid</code></span>
+<span class="codeline" id="line-1561"><code>		z.acc = Exact</code></span>
+<span class="codeline" id="line-1562"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1563"><code>		z.neg = false</code></span>
+<span class="codeline" id="line-1564"><code>		panic(ErrNaN{"subtraction of infinities with equal signs"})</code></span>
+<span class="codeline" id="line-1565"><code>	}</code></span>
+<span class="codeline" id="line-1566"><code></code></span>
+<span class="codeline" id="line-1567"><code>	if x.form == zero &amp;&amp; y.form == zero {</code></span>
+<span class="codeline" id="line-1568"><code>		// ±0 - ±0</code></span>
+<span class="codeline" id="line-1569"><code>		z.acc = Exact</code></span>
+<span class="codeline" id="line-1570"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1571"><code>		z.neg = x.neg &amp;&amp; !y.neg // -0 - +0 == -0</code></span>
+<span class="codeline" id="line-1572"><code>		return z</code></span>
+<span class="codeline" id="line-1573"><code>	}</code></span>
+<span class="codeline" id="line-1574"><code></code></span>
+<span class="codeline" id="line-1575"><code>	if x.form == inf || y.form == zero {</code></span>
+<span class="codeline" id="line-1576"><code>		// ±Inf - y</code></span>
+<span class="codeline" id="line-1577"><code>		// x - ±0</code></span>
+<span class="codeline" id="line-1578"><code>		return z.Set(x)</code></span>
+<span class="codeline" id="line-1579"><code>	}</code></span>
+<span class="codeline" id="line-1580"><code></code></span>
+<span class="codeline" id="line-1581"><code>	// ±0 - y</code></span>
+<span class="codeline" id="line-1582"><code>	// x - ±Inf</code></span>
+<span class="codeline" id="line-1583"><code>	return z.Neg(y)</code></span>
+<span class="codeline" id="line-1584"><code>}</code></span>
+<span class="codeline" id="line-1585"><code></code></span>
+<span class="codeline" id="line-1586"><code>// Mul sets z to the rounded product x*y and returns z.</code></span>
+<span class="codeline" id="line-1587"><code>// Precision, rounding, and accuracy reporting are as for [Float.Add].</code></span>
+<span class="codeline" id="line-1588"><code>// Mul panics with [ErrNaN] if one operand is zero and the other</code></span>
+<span class="codeline" id="line-1589"><code>// operand an infinity. The value of z is undefined in that case.</code></span>
+<span class="codeline" id="line-1590"><code>func (z *Float) Mul(x, y *Float) *Float {</code></span>
+<span class="codeline" id="line-1591"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1592"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1593"><code>		y.validate()</code></span>
+<span class="codeline" id="line-1594"><code>	}</code></span>
+<span class="codeline" id="line-1595"><code></code></span>
+<span class="codeline" id="line-1596"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-1597"><code>		z.prec = umax32(x.prec, y.prec)</code></span>
+<span class="codeline" id="line-1598"><code>	}</code></span>
+<span class="codeline" id="line-1599"><code></code></span>
+<span class="codeline" id="line-1600"><code>	z.neg = x.neg != y.neg</code></span>
+<span class="codeline" id="line-1601"><code></code></span>
+<span class="codeline" id="line-1602"><code>	if x.form == finite &amp;&amp; y.form == finite {</code></span>
+<span class="codeline" id="line-1603"><code>		// x * y (common case)</code></span>
+<span class="codeline" id="line-1604"><code>		z.umul(x, y)</code></span>
+<span class="codeline" id="line-1605"><code>		return z</code></span>
+<span class="codeline" id="line-1606"><code>	}</code></span>
+<span class="codeline" id="line-1607"><code></code></span>
+<span class="codeline" id="line-1608"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-1609"><code>	if x.form == zero &amp;&amp; y.form == inf || x.form == inf &amp;&amp; y.form == zero {</code></span>
+<span class="codeline" id="line-1610"><code>		// ±0 * ±Inf</code></span>
+<span class="codeline" id="line-1611"><code>		// ±Inf * ±0</code></span>
+<span class="codeline" id="line-1612"><code>		// value of z is undefined but make sure it's valid</code></span>
+<span class="codeline" id="line-1613"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1614"><code>		z.neg = false</code></span>
+<span class="codeline" id="line-1615"><code>		panic(ErrNaN{"multiplication of zero with infinity"})</code></span>
+<span class="codeline" id="line-1616"><code>	}</code></span>
+<span class="codeline" id="line-1617"><code></code></span>
+<span class="codeline" id="line-1618"><code>	if x.form == inf || y.form == inf {</code></span>
+<span class="codeline" id="line-1619"><code>		// ±Inf * y</code></span>
+<span class="codeline" id="line-1620"><code>		// x * ±Inf</code></span>
+<span class="codeline" id="line-1621"><code>		z.form = inf</code></span>
+<span class="codeline" id="line-1622"><code>		return z</code></span>
+<span class="codeline" id="line-1623"><code>	}</code></span>
+<span class="codeline" id="line-1624"><code></code></span>
+<span class="codeline" id="line-1625"><code>	// ±0 * y</code></span>
+<span class="codeline" id="line-1626"><code>	// x * ±0</code></span>
+<span class="codeline" id="line-1627"><code>	z.form = zero</code></span>
+<span class="codeline" id="line-1628"><code>	return z</code></span>
+<span class="codeline" id="line-1629"><code>}</code></span>
+<span class="codeline" id="line-1630"><code></code></span>
+<span class="codeline" id="line-1631"><code>// Quo sets z to the rounded quotient x/y and returns z.</code></span>
+<span class="codeline" id="line-1632"><code>// Precision, rounding, and accuracy reporting are as for [Float.Add].</code></span>
+<span class="codeline" id="line-1633"><code>// Quo panics with [ErrNaN] if both operands are zero or infinities.</code></span>
+<span class="codeline" id="line-1634"><code>// The value of z is undefined in that case.</code></span>
+<span class="codeline" id="line-1635"><code>func (z *Float) Quo(x, y *Float) *Float {</code></span>
+<span class="codeline" id="line-1636"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1637"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1638"><code>		y.validate()</code></span>
+<span class="codeline" id="line-1639"><code>	}</code></span>
+<span class="codeline" id="line-1640"><code></code></span>
+<span class="codeline" id="line-1641"><code>	if z.prec == 0 {</code></span>
+<span class="codeline" id="line-1642"><code>		z.prec = umax32(x.prec, y.prec)</code></span>
+<span class="codeline" id="line-1643"><code>	}</code></span>
+<span class="codeline" id="line-1644"><code></code></span>
+<span class="codeline" id="line-1645"><code>	z.neg = x.neg != y.neg</code></span>
+<span class="codeline" id="line-1646"><code></code></span>
+<span class="codeline" id="line-1647"><code>	if x.form == finite &amp;&amp; y.form == finite {</code></span>
+<span class="codeline" id="line-1648"><code>		// x / y (common case)</code></span>
+<span class="codeline" id="line-1649"><code>		z.uquo(x, y)</code></span>
+<span class="codeline" id="line-1650"><code>		return z</code></span>
+<span class="codeline" id="line-1651"><code>	}</code></span>
+<span class="codeline" id="line-1652"><code></code></span>
+<span class="codeline" id="line-1653"><code>	z.acc = Exact</code></span>
+<span class="codeline" id="line-1654"><code>	if x.form == zero &amp;&amp; y.form == zero || x.form == inf &amp;&amp; y.form == inf {</code></span>
+<span class="codeline" id="line-1655"><code>		// ±0 / ±0</code></span>
+<span class="codeline" id="line-1656"><code>		// ±Inf / ±Inf</code></span>
+<span class="codeline" id="line-1657"><code>		// value of z is undefined but make sure it's valid</code></span>
+<span class="codeline" id="line-1658"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1659"><code>		z.neg = false</code></span>
+<span class="codeline" id="line-1660"><code>		panic(ErrNaN{"division of zero by zero or infinity by infinity"})</code></span>
+<span class="codeline" id="line-1661"><code>	}</code></span>
+<span class="codeline" id="line-1662"><code></code></span>
+<span class="codeline" id="line-1663"><code>	if x.form == zero || y.form == inf {</code></span>
+<span class="codeline" id="line-1664"><code>		// ±0 / y</code></span>
+<span class="codeline" id="line-1665"><code>		// x / ±Inf</code></span>
+<span class="codeline" id="line-1666"><code>		z.form = zero</code></span>
+<span class="codeline" id="line-1667"><code>		return z</code></span>
+<span class="codeline" id="line-1668"><code>	}</code></span>
+<span class="codeline" id="line-1669"><code></code></span>
+<span class="codeline" id="line-1670"><code>	// x / ±0</code></span>
+<span class="codeline" id="line-1671"><code>	// ±Inf / y</code></span>
+<span class="codeline" id="line-1672"><code>	z.form = inf</code></span>
+<span class="codeline" id="line-1673"><code>	return z</code></span>
+<span class="codeline" id="line-1674"><code>}</code></span>
+<span class="codeline" id="line-1675"><code></code></span>
+<span class="codeline" id="line-1676"><code>// Cmp compares x and y and returns:</code></span>
+<span class="codeline" id="line-1677"><code>//</code></span>
+<span class="codeline" id="line-1678"><code>//	-1 if x &lt;  y</code></span>
+<span class="codeline" id="line-1679"><code>//	 0 if x == y (incl. -0 == 0, -Inf == -Inf, and +Inf == +Inf)</code></span>
+<span class="codeline" id="line-1680"><code>//	+1 if x &gt;  y</code></span>
+<span class="codeline" id="line-1681"><code>func (x *Float) Cmp(y *Float) int {</code></span>
+<span class="codeline" id="line-1682"><code>	if debugFloat {</code></span>
+<span class="codeline" id="line-1683"><code>		x.validate()</code></span>
+<span class="codeline" id="line-1684"><code>		y.validate()</code></span>
+<span class="codeline" id="line-1685"><code>	}</code></span>
+<span class="codeline" id="line-1686"><code></code></span>
+<span class="codeline" id="line-1687"><code>	mx := x.ord()</code></span>
+<span class="codeline" id="line-1688"><code>	my := y.ord()</code></span>
+<span class="codeline" id="line-1689"><code>	switch {</code></span>
+<span class="codeline" id="line-1690"><code>	case mx &lt; my:</code></span>
+<span class="codeline" id="line-1691"><code>		return -1</code></span>
+<span class="codeline" id="line-1692"><code>	case mx &gt; my:</code></span>
+<span class="codeline" id="line-1693"><code>		return +1</code></span>
+<span class="codeline" id="line-1694"><code>	}</code></span>
+<span class="codeline" id="line-1695"><code>	// mx == my</code></span>
+<span class="codeline" id="line-1696"><code></code></span>
+<span class="codeline" id="line-1697"><code>	// only if |mx| == 1 we have to compare the mantissae</code></span>
+<span class="codeline" id="line-1698"><code>	switch mx {</code></span>
+<span class="codeline" id="line-1699"><code>	case -1:</code></span>
+<span class="codeline" id="line-1700"><code>		return y.ucmp(x)</code></span>
+<span class="codeline" id="line-1701"><code>	case +1:</code></span>
+<span class="codeline" id="line-1702"><code>		return x.ucmp(y)</code></span>
+<span class="codeline" id="line-1703"><code>	}</code></span>
+<span class="codeline" id="line-1704"><code></code></span>
+<span class="codeline" id="line-1705"><code>	return 0</code></span>
+<span class="codeline" id="line-1706"><code>}</code></span>
+<span class="codeline" id="line-1707"><code></code></span>
+<span class="codeline" id="line-1708"><code>// ord classifies x and returns:</code></span>
+<span class="codeline" id="line-1709"><code>//</code></span>
+<span class="codeline" id="line-1710"><code>//	-2 if -Inf == x</code></span>
+<span class="codeline" id="line-1711"><code>//	-1 if -Inf &lt; x &lt; 0</code></span>
+<span class="codeline" id="line-1712"><code>//	 0 if x == 0 (signed or unsigned)</code></span>
+<span class="codeline" id="line-1713"><code>//	+1 if 0 &lt; x &lt; +Inf</code></span>
+<span class="codeline" id="line-1714"><code>//	+2 if x == +Inf</code></span>
+<span class="codeline" id="line-1715"><code>func (x *Float) ord() int {</code></span>
+<span class="codeline" id="line-1716"><code>	var m int</code></span>
+<span class="codeline" id="line-1717"><code>	switch x.form {</code></span>
+<span class="codeline" id="line-1718"><code>	case finite:</code></span>
+<span class="codeline" id="line-1719"><code>		m = 1</code></span>
+<span class="codeline" id="line-1720"><code>	case zero:</code></span>
+<span class="codeline" id="line-1721"><code>		return 0</code></span>
+<span class="codeline" id="line-1722"><code>	case inf:</code></span>
+<span class="codeline" id="line-1723"><code>		m = 2</code></span>
+<span class="codeline" id="line-1724"><code>	}</code></span>
+<span class="codeline" id="line-1725"><code>	if x.neg {</code></span>
+<span class="codeline" id="line-1726"><code>		m = -m</code></span>
+<span class="codeline" id="line-1727"><code>	}</code></span>
+<span class="codeline" id="line-1728"><code>	return m</code></span>
+<span class="codeline" id="line-1729"><code>}</code></span>
+<span class="codeline" id="line-1730"><code></code></span>
+<span class="codeline" id="line-1731"><code>func umax32(x, y uint32) uint32 {</code></span>
+<span class="codeline" id="line-1732"><code>	if x &gt; y {</code></span>
+<span class="codeline" id="line-1733"><code>		return x</code></span>
+<span class="codeline" id="line-1734"><code>	}</code></span>
+<span class="codeline" id="line-1735"><code>	return y</code></span>
+<span class="codeline" id="line-1736"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

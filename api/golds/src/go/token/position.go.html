@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: position.go in package go/token</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	position.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/token.html">go/token</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2010 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package token</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"fmt"</code></span>
+<span class="codeline" id="line-9"><code>	"sort"</code></span>
+<span class="codeline" id="line-10"><code>	"strconv"</code></span>
+<span class="codeline" id="line-11"><code>	"sync"</code></span>
+<span class="codeline" id="line-12"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>// -----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-16"><code>// Positions</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>// Position describes an arbitrary source position</code></span>
+<span class="codeline" id="line-19"><code>// including the file, line, and column location.</code></span>
+<span class="codeline" id="line-20"><code>// A Position is valid if the line number is &gt; 0.</code></span>
+<span class="codeline" id="line-21"><code>type Position struct {</code></span>
+<span class="codeline" id="line-22"><code>	Filename string // filename, if any</code></span>
+<span class="codeline" id="line-23"><code>	Offset   int    // offset, starting at 0</code></span>
+<span class="codeline" id="line-24"><code>	Line     int    // line number, starting at 1</code></span>
+<span class="codeline" id="line-25"><code>	Column   int    // column number, starting at 1 (byte count)</code></span>
+<span class="codeline" id="line-26"><code>}</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// IsValid reports whether the position is valid.</code></span>
+<span class="codeline" id="line-29"><code>func (pos *Position) IsValid() bool { return pos.Line &gt; 0 }</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>// String returns a string in one of several forms:</code></span>
+<span class="codeline" id="line-32"><code>//</code></span>
+<span class="codeline" id="line-33"><code>//	file:line:column    valid position with file name</code></span>
+<span class="codeline" id="line-34"><code>//	file:line           valid position with file name but no column (column == 0)</code></span>
+<span class="codeline" id="line-35"><code>//	line:column         valid position without file name</code></span>
+<span class="codeline" id="line-36"><code>//	line                valid position without file name and no column (column == 0)</code></span>
+<span class="codeline" id="line-37"><code>//	file                invalid position with file name</code></span>
+<span class="codeline" id="line-38"><code>//	-                   invalid position without file name</code></span>
+<span class="codeline" id="line-39"><code>func (pos Position) String() string {</code></span>
+<span class="codeline" id="line-40"><code>	s := pos.Filename</code></span>
+<span class="codeline" id="line-41"><code>	if pos.IsValid() {</code></span>
+<span class="codeline" id="line-42"><code>		if s != "" {</code></span>
+<span class="codeline" id="line-43"><code>			s += ":"</code></span>
+<span class="codeline" id="line-44"><code>		}</code></span>
+<span class="codeline" id="line-45"><code>		s += strconv.Itoa(pos.Line)</code></span>
+<span class="codeline" id="line-46"><code>		if pos.Column != 0 {</code></span>
+<span class="codeline" id="line-47"><code>			s += fmt.Sprintf(":%d", pos.Column)</code></span>
+<span class="codeline" id="line-48"><code>		}</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code>	if s == "" {</code></span>
+<span class="codeline" id="line-51"><code>		s = "-"</code></span>
+<span class="codeline" id="line-52"><code>	}</code></span>
+<span class="codeline" id="line-53"><code>	return s</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>// Pos is a compact encoding of a source position within a file set.</code></span>
+<span class="codeline" id="line-57"><code>// It can be converted into a [Position] for a more convenient, but much</code></span>
+<span class="codeline" id="line-58"><code>// larger, representation.</code></span>
+<span class="codeline" id="line-59"><code>//</code></span>
+<span class="codeline" id="line-60"><code>// The Pos value for a given file is a number in the range [base, base+size],</code></span>
+<span class="codeline" id="line-61"><code>// where base and size are specified when a file is added to the file set.</code></span>
+<span class="codeline" id="line-62"><code>// The difference between a Pos value and the corresponding file base</code></span>
+<span class="codeline" id="line-63"><code>// corresponds to the byte offset of that position (represented by the Pos value)</code></span>
+<span class="codeline" id="line-64"><code>// from the beginning of the file. Thus, the file base offset is the Pos value</code></span>
+<span class="codeline" id="line-65"><code>// representing the first byte in the file.</code></span>
+<span class="codeline" id="line-66"><code>//</code></span>
+<span class="codeline" id="line-67"><code>// To create the Pos value for a specific source offset (measured in bytes),</code></span>
+<span class="codeline" id="line-68"><code>// first add the respective file to the current file set using [FileSet.AddFile]</code></span>
+<span class="codeline" id="line-69"><code>// and then call [File.Pos](offset) for that file. Given a Pos value p</code></span>
+<span class="codeline" id="line-70"><code>// for a specific file set fset, the corresponding [Position] value is</code></span>
+<span class="codeline" id="line-71"><code>// obtained by calling fset.Position(p).</code></span>
+<span class="codeline" id="line-72"><code>//</code></span>
+<span class="codeline" id="line-73"><code>// Pos values can be compared directly with the usual comparison operators:</code></span>
+<span class="codeline" id="line-74"><code>// If two Pos values p and q are in the same file, comparing p and q is</code></span>
+<span class="codeline" id="line-75"><code>// equivalent to comparing the respective source file offsets. If p and q</code></span>
+<span class="codeline" id="line-76"><code>// are in different files, p &lt; q is true if the file implied by p was added</code></span>
+<span class="codeline" id="line-77"><code>// to the respective file set before the file implied by q.</code></span>
+<span class="codeline" id="line-78"><code>type Pos int</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>// The zero value for [Pos] is NoPos; there is no file and line information</code></span>
+<span class="codeline" id="line-81"><code>// associated with it, and NoPos.IsValid() is false. NoPos is always</code></span>
+<span class="codeline" id="line-82"><code>// smaller than any other [Pos] value. The corresponding [Position] value</code></span>
+<span class="codeline" id="line-83"><code>// for NoPos is the zero value for [Position].</code></span>
+<span class="codeline" id="line-84"><code>const NoPos Pos = 0</code></span>
+<span class="codeline" id="line-85"><code></code></span>
+<span class="codeline" id="line-86"><code>// IsValid reports whether the position is valid.</code></span>
+<span class="codeline" id="line-87"><code>func (p Pos) IsValid() bool {</code></span>
+<span class="codeline" id="line-88"><code>	return p != NoPos</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>// -----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-92"><code>// File</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>// A File is a handle for a file belonging to a [FileSet].</code></span>
+<span class="codeline" id="line-95"><code>// A File has a name, size, and line offset table.</code></span>
+<span class="codeline" id="line-96"><code>type File struct {</code></span>
+<span class="codeline" id="line-97"><code>	name string // file name as provided to AddFile</code></span>
+<span class="codeline" id="line-98"><code>	base int    // Pos value range for this file is [base...base+size]</code></span>
+<span class="codeline" id="line-99"><code>	size int    // file size as provided to AddFile</code></span>
+<span class="codeline" id="line-100"><code></code></span>
+<span class="codeline" id="line-101"><code>	// lines and infos are protected by mutex</code></span>
+<span class="codeline" id="line-102"><code>	mutex sync.Mutex</code></span>
+<span class="codeline" id="line-103"><code>	lines []int // lines contains the offset of the first character for each line (the first entry is always 0)</code></span>
+<span class="codeline" id="line-104"><code>	infos []lineInfo</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// Name returns the file name of file f as registered with AddFile.</code></span>
+<span class="codeline" id="line-108"><code>func (f *File) Name() string {</code></span>
+<span class="codeline" id="line-109"><code>	return f.name</code></span>
+<span class="codeline" id="line-110"><code>}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>// Base returns the base offset of file f as registered with AddFile.</code></span>
+<span class="codeline" id="line-113"><code>func (f *File) Base() int {</code></span>
+<span class="codeline" id="line-114"><code>	return f.base</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>// Size returns the size of file f as registered with AddFile.</code></span>
+<span class="codeline" id="line-118"><code>func (f *File) Size() int {</code></span>
+<span class="codeline" id="line-119"><code>	return f.size</code></span>
+<span class="codeline" id="line-120"><code>}</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>// LineCount returns the number of lines in file f.</code></span>
+<span class="codeline" id="line-123"><code>func (f *File) LineCount() int {</code></span>
+<span class="codeline" id="line-124"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-125"><code>	n := len(f.lines)</code></span>
+<span class="codeline" id="line-126"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-127"><code>	return n</code></span>
+<span class="codeline" id="line-128"><code>}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>// AddLine adds the line offset for a new line.</code></span>
+<span class="codeline" id="line-131"><code>// The line offset must be larger than the offset for the previous line</code></span>
+<span class="codeline" id="line-132"><code>// and smaller than the file size; otherwise the line offset is ignored.</code></span>
+<span class="codeline" id="line-133"><code>func (f *File) AddLine(offset int) {</code></span>
+<span class="codeline" id="line-134"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-135"><code>	if i := len(f.lines); (i == 0 || f.lines[i-1] &lt; offset) &amp;&amp; offset &lt; f.size {</code></span>
+<span class="codeline" id="line-136"><code>		f.lines = append(f.lines, offset)</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-139"><code>}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>// MergeLine merges a line with the following line. It is akin to replacing</code></span>
+<span class="codeline" id="line-142"><code>// the newline character at the end of the line with a space (to not change the</code></span>
+<span class="codeline" id="line-143"><code>// remaining offsets). To obtain the line number, consult e.g. [Position.Line].</code></span>
+<span class="codeline" id="line-144"><code>// MergeLine will panic if given an invalid line number.</code></span>
+<span class="codeline" id="line-145"><code>func (f *File) MergeLine(line int) {</code></span>
+<span class="codeline" id="line-146"><code>	if line &lt; 1 {</code></span>
+<span class="codeline" id="line-147"><code>		panic(fmt.Sprintf("invalid line number %d (should be &gt;= 1)", line))</code></span>
+<span class="codeline" id="line-148"><code>	}</code></span>
+<span class="codeline" id="line-149"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-150"><code>	defer f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-151"><code>	if line &gt;= len(f.lines) {</code></span>
+<span class="codeline" id="line-152"><code>		panic(fmt.Sprintf("invalid line number %d (should be &lt; %d)", line, len(f.lines)))</code></span>
+<span class="codeline" id="line-153"><code>	}</code></span>
+<span class="codeline" id="line-154"><code>	// To merge the line numbered &lt;line&gt; with the line numbered &lt;line+1&gt;,</code></span>
+<span class="codeline" id="line-155"><code>	// we need to remove the entry in lines corresponding to the line</code></span>
+<span class="codeline" id="line-156"><code>	// numbered &lt;line+1&gt;. The entry in lines corresponding to the line</code></span>
+<span class="codeline" id="line-157"><code>	// numbered &lt;line+1&gt; is located at index &lt;line&gt;, since indices in lines</code></span>
+<span class="codeline" id="line-158"><code>	// are 0-based and line numbers are 1-based.</code></span>
+<span class="codeline" id="line-159"><code>	copy(f.lines[line:], f.lines[line+1:])</code></span>
+<span class="codeline" id="line-160"><code>	f.lines = f.lines[:len(f.lines)-1]</code></span>
+<span class="codeline" id="line-161"><code>}</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>// Lines returns the effective line offset table of the form described by [File.SetLines].</code></span>
+<span class="codeline" id="line-164"><code>// Callers must not mutate the result.</code></span>
+<span class="codeline" id="line-165"><code>func (f *File) Lines() []int {</code></span>
+<span class="codeline" id="line-166"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-167"><code>	lines := f.lines</code></span>
+<span class="codeline" id="line-168"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-169"><code>	return lines</code></span>
+<span class="codeline" id="line-170"><code>}</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>// SetLines sets the line offsets for a file and reports whether it succeeded.</code></span>
+<span class="codeline" id="line-173"><code>// The line offsets are the offsets of the first character of each line;</code></span>
+<span class="codeline" id="line-174"><code>// for instance for the content "ab\nc\n" the line offsets are {0, 3}.</code></span>
+<span class="codeline" id="line-175"><code>// An empty file has an empty line offset table.</code></span>
+<span class="codeline" id="line-176"><code>// Each line offset must be larger than the offset for the previous line</code></span>
+<span class="codeline" id="line-177"><code>// and smaller than the file size; otherwise SetLines fails and returns</code></span>
+<span class="codeline" id="line-178"><code>// false.</code></span>
+<span class="codeline" id="line-179"><code>// Callers must not mutate the provided slice after SetLines returns.</code></span>
+<span class="codeline" id="line-180"><code>func (f *File) SetLines(lines []int) bool {</code></span>
+<span class="codeline" id="line-181"><code>	// verify validity of lines table</code></span>
+<span class="codeline" id="line-182"><code>	size := f.size</code></span>
+<span class="codeline" id="line-183"><code>	for i, offset := range lines {</code></span>
+<span class="codeline" id="line-184"><code>		if i &gt; 0 &amp;&amp; offset &lt;= lines[i-1] || size &lt;= offset {</code></span>
+<span class="codeline" id="line-185"><code>			return false</code></span>
+<span class="codeline" id="line-186"><code>		}</code></span>
+<span class="codeline" id="line-187"><code>	}</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>	// set lines table</code></span>
+<span class="codeline" id="line-190"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-191"><code>	f.lines = lines</code></span>
+<span class="codeline" id="line-192"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-193"><code>	return true</code></span>
+<span class="codeline" id="line-194"><code>}</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>// SetLinesForContent sets the line offsets for the given file content.</code></span>
+<span class="codeline" id="line-197"><code>// It ignores position-altering //line comments.</code></span>
+<span class="codeline" id="line-198"><code>func (f *File) SetLinesForContent(content []byte) {</code></span>
+<span class="codeline" id="line-199"><code>	var lines []int</code></span>
+<span class="codeline" id="line-200"><code>	line := 0</code></span>
+<span class="codeline" id="line-201"><code>	for offset, b := range content {</code></span>
+<span class="codeline" id="line-202"><code>		if line &gt;= 0 {</code></span>
+<span class="codeline" id="line-203"><code>			lines = append(lines, line)</code></span>
+<span class="codeline" id="line-204"><code>		}</code></span>
+<span class="codeline" id="line-205"><code>		line = -1</code></span>
+<span class="codeline" id="line-206"><code>		if b == '\n' {</code></span>
+<span class="codeline" id="line-207"><code>			line = offset + 1</code></span>
+<span class="codeline" id="line-208"><code>		}</code></span>
+<span class="codeline" id="line-209"><code>	}</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>	// set lines table</code></span>
+<span class="codeline" id="line-212"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-213"><code>	f.lines = lines</code></span>
+<span class="codeline" id="line-214"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-215"><code>}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>// LineStart returns the [Pos] value of the start of the specified line.</code></span>
+<span class="codeline" id="line-218"><code>// It ignores any alternative positions set using [File.AddLineColumnInfo].</code></span>
+<span class="codeline" id="line-219"><code>// LineStart panics if the 1-based line number is invalid.</code></span>
+<span class="codeline" id="line-220"><code>func (f *File) LineStart(line int) Pos {</code></span>
+<span class="codeline" id="line-221"><code>	if line &lt; 1 {</code></span>
+<span class="codeline" id="line-222"><code>		panic(fmt.Sprintf("invalid line number %d (should be &gt;= 1)", line))</code></span>
+<span class="codeline" id="line-223"><code>	}</code></span>
+<span class="codeline" id="line-224"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-225"><code>	defer f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-226"><code>	if line &gt; len(f.lines) {</code></span>
+<span class="codeline" id="line-227"><code>		panic(fmt.Sprintf("invalid line number %d (should be &lt; %d)", line, len(f.lines)))</code></span>
+<span class="codeline" id="line-228"><code>	}</code></span>
+<span class="codeline" id="line-229"><code>	return Pos(f.base + f.lines[line-1])</code></span>
+<span class="codeline" id="line-230"><code>}</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>// A lineInfo object describes alternative file, line, and column</code></span>
+<span class="codeline" id="line-233"><code>// number information (such as provided via a //line directive)</code></span>
+<span class="codeline" id="line-234"><code>// for a given file offset.</code></span>
+<span class="codeline" id="line-235"><code>type lineInfo struct {</code></span>
+<span class="codeline" id="line-236"><code>	// fields are exported to make them accessible to gob</code></span>
+<span class="codeline" id="line-237"><code>	Offset       int</code></span>
+<span class="codeline" id="line-238"><code>	Filename     string</code></span>
+<span class="codeline" id="line-239"><code>	Line, Column int</code></span>
+<span class="codeline" id="line-240"><code>}</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>// AddLineInfo is like [File.AddLineColumnInfo] with a column = 1 argument.</code></span>
+<span class="codeline" id="line-243"><code>// It is here for backward-compatibility for code prior to Go 1.11.</code></span>
+<span class="codeline" id="line-244"><code>func (f *File) AddLineInfo(offset int, filename string, line int) {</code></span>
+<span class="codeline" id="line-245"><code>	f.AddLineColumnInfo(offset, filename, line, 1)</code></span>
+<span class="codeline" id="line-246"><code>}</code></span>
+<span class="codeline" id="line-247"><code></code></span>
+<span class="codeline" id="line-248"><code>// AddLineColumnInfo adds alternative file, line, and column number</code></span>
+<span class="codeline" id="line-249"><code>// information for a given file offset. The offset must be larger</code></span>
+<span class="codeline" id="line-250"><code>// than the offset for the previously added alternative line info</code></span>
+<span class="codeline" id="line-251"><code>// and smaller than the file size; otherwise the information is</code></span>
+<span class="codeline" id="line-252"><code>// ignored.</code></span>
+<span class="codeline" id="line-253"><code>//</code></span>
+<span class="codeline" id="line-254"><code>// AddLineColumnInfo is typically used to register alternative position</code></span>
+<span class="codeline" id="line-255"><code>// information for line directives such as //line filename:line:column.</code></span>
+<span class="codeline" id="line-256"><code>func (f *File) AddLineColumnInfo(offset int, filename string, line, column int) {</code></span>
+<span class="codeline" id="line-257"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-258"><code>	if i := len(f.infos); (i == 0 || f.infos[i-1].Offset &lt; offset) &amp;&amp; offset &lt; f.size {</code></span>
+<span class="codeline" id="line-259"><code>		f.infos = append(f.infos, lineInfo{offset, filename, line, column})</code></span>
+<span class="codeline" id="line-260"><code>	}</code></span>
+<span class="codeline" id="line-261"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-262"><code>}</code></span>
+<span class="codeline" id="line-263"><code></code></span>
+<span class="codeline" id="line-264"><code>// Pos returns the Pos value for the given file offset;</code></span>
+<span class="codeline" id="line-265"><code>// the offset must be &lt;= f.Size().</code></span>
+<span class="codeline" id="line-266"><code>// f.Pos(f.Offset(p)) == p.</code></span>
+<span class="codeline" id="line-267"><code>func (f *File) Pos(offset int) Pos {</code></span>
+<span class="codeline" id="line-268"><code>	if offset &gt; f.size {</code></span>
+<span class="codeline" id="line-269"><code>		panic(fmt.Sprintf("invalid file offset %d (should be &lt;= %d)", offset, f.size))</code></span>
+<span class="codeline" id="line-270"><code>	}</code></span>
+<span class="codeline" id="line-271"><code>	return Pos(f.base + offset)</code></span>
+<span class="codeline" id="line-272"><code>}</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>// Offset returns the offset for the given file position p;</code></span>
+<span class="codeline" id="line-275"><code>// p must be a valid [Pos] value in that file.</code></span>
+<span class="codeline" id="line-276"><code>// f.Offset(f.Pos(offset)) == offset.</code></span>
+<span class="codeline" id="line-277"><code>func (f *File) Offset(p Pos) int {</code></span>
+<span class="codeline" id="line-278"><code>	if int(p) &lt; f.base || int(p) &gt; f.base+f.size {</code></span>
+<span class="codeline" id="line-279"><code>		panic(fmt.Sprintf("invalid Pos value %d (should be in [%d, %d])", p, f.base, f.base+f.size))</code></span>
+<span class="codeline" id="line-280"><code>	}</code></span>
+<span class="codeline" id="line-281"><code>	return int(p) - f.base</code></span>
+<span class="codeline" id="line-282"><code>}</code></span>
+<span class="codeline" id="line-283"><code></code></span>
+<span class="codeline" id="line-284"><code>// Line returns the line number for the given file position p;</code></span>
+<span class="codeline" id="line-285"><code>// p must be a [Pos] value in that file or [NoPos].</code></span>
+<span class="codeline" id="line-286"><code>func (f *File) Line(p Pos) int {</code></span>
+<span class="codeline" id="line-287"><code>	return f.Position(p).Line</code></span>
+<span class="codeline" id="line-288"><code>}</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>func searchLineInfos(a []lineInfo, x int) int {</code></span>
+<span class="codeline" id="line-291"><code>	return sort.Search(len(a), func(i int) bool { return a[i].Offset &gt; x }) - 1</code></span>
+<span class="codeline" id="line-292"><code>}</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>// unpack returns the filename and line and column number for a file offset.</code></span>
+<span class="codeline" id="line-295"><code>// If adjusted is set, unpack will return the filename and line information</code></span>
+<span class="codeline" id="line-296"><code>// possibly adjusted by //line comments; otherwise those comments are ignored.</code></span>
+<span class="codeline" id="line-297"><code>func (f *File) unpack(offset int, adjusted bool) (filename string, line, column int) {</code></span>
+<span class="codeline" id="line-298"><code>	f.mutex.Lock()</code></span>
+<span class="codeline" id="line-299"><code>	filename = f.name</code></span>
+<span class="codeline" id="line-300"><code>	if i := searchInts(f.lines, offset); i &gt;= 0 {</code></span>
+<span class="codeline" id="line-301"><code>		line, column = i+1, offset-f.lines[i]+1</code></span>
+<span class="codeline" id="line-302"><code>	}</code></span>
+<span class="codeline" id="line-303"><code>	if adjusted &amp;&amp; len(f.infos) &gt; 0 {</code></span>
+<span class="codeline" id="line-304"><code>		// few files have extra line infos</code></span>
+<span class="codeline" id="line-305"><code>		if i := searchLineInfos(f.infos, offset); i &gt;= 0 {</code></span>
+<span class="codeline" id="line-306"><code>			alt := &amp;f.infos[i]</code></span>
+<span class="codeline" id="line-307"><code>			filename = alt.Filename</code></span>
+<span class="codeline" id="line-308"><code>			if i := searchInts(f.lines, alt.Offset); i &gt;= 0 {</code></span>
+<span class="codeline" id="line-309"><code>				// i+1 is the line at which the alternative position was recorded</code></span>
+<span class="codeline" id="line-310"><code>				d := line - (i + 1) // line distance from alternative position base</code></span>
+<span class="codeline" id="line-311"><code>				line = alt.Line + d</code></span>
+<span class="codeline" id="line-312"><code>				if alt.Column == 0 {</code></span>
+<span class="codeline" id="line-313"><code>					// alternative column is unknown =&gt; relative column is unknown</code></span>
+<span class="codeline" id="line-314"><code>					// (the current specification for line directives requires</code></span>
+<span class="codeline" id="line-315"><code>					// this to apply until the next PosBase/line directive,</code></span>
+<span class="codeline" id="line-316"><code>					// not just until the new newline)</code></span>
+<span class="codeline" id="line-317"><code>					column = 0</code></span>
+<span class="codeline" id="line-318"><code>				} else if d == 0 {</code></span>
+<span class="codeline" id="line-319"><code>					// the alternative position base is on the current line</code></span>
+<span class="codeline" id="line-320"><code>					// =&gt; column is relative to alternative column</code></span>
+<span class="codeline" id="line-321"><code>					column = alt.Column + (offset - alt.Offset)</code></span>
+<span class="codeline" id="line-322"><code>				}</code></span>
+<span class="codeline" id="line-323"><code>			}</code></span>
+<span class="codeline" id="line-324"><code>		}</code></span>
+<span class="codeline" id="line-325"><code>	}</code></span>
+<span class="codeline" id="line-326"><code>	// TODO(mvdan): move Unlock back under Lock with a defer statement once</code></span>
+<span class="codeline" id="line-327"><code>	// https://go.dev/issue/38471 is fixed to remove the performance penalty.</code></span>
+<span class="codeline" id="line-328"><code>	f.mutex.Unlock()</code></span>
+<span class="codeline" id="line-329"><code>	return</code></span>
+<span class="codeline" id="line-330"><code>}</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>func (f *File) position(p Pos, adjusted bool) (pos Position) {</code></span>
+<span class="codeline" id="line-333"><code>	offset := int(p) - f.base</code></span>
+<span class="codeline" id="line-334"><code>	pos.Offset = offset</code></span>
+<span class="codeline" id="line-335"><code>	pos.Filename, pos.Line, pos.Column = f.unpack(offset, adjusted)</code></span>
+<span class="codeline" id="line-336"><code>	return</code></span>
+<span class="codeline" id="line-337"><code>}</code></span>
+<span class="codeline" id="line-338"><code></code></span>
+<span class="codeline" id="line-339"><code>// PositionFor returns the Position value for the given file position p.</code></span>
+<span class="codeline" id="line-340"><code>// If adjusted is set, the position may be adjusted by position-altering</code></span>
+<span class="codeline" id="line-341"><code>// //line comments; otherwise those comments are ignored.</code></span>
+<span class="codeline" id="line-342"><code>// p must be a Pos value in f or NoPos.</code></span>
+<span class="codeline" id="line-343"><code>func (f *File) PositionFor(p Pos, adjusted bool) (pos Position) {</code></span>
+<span class="codeline" id="line-344"><code>	if p != NoPos {</code></span>
+<span class="codeline" id="line-345"><code>		if int(p) &lt; f.base || int(p) &gt; f.base+f.size {</code></span>
+<span class="codeline" id="line-346"><code>			panic(fmt.Sprintf("invalid Pos value %d (should be in [%d, %d])", p, f.base, f.base+f.size))</code></span>
+<span class="codeline" id="line-347"><code>		}</code></span>
+<span class="codeline" id="line-348"><code>		pos = f.position(p, adjusted)</code></span>
+<span class="codeline" id="line-349"><code>	}</code></span>
+<span class="codeline" id="line-350"><code>	return</code></span>
+<span class="codeline" id="line-351"><code>}</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>// Position returns the Position value for the given file position p.</code></span>
+<span class="codeline" id="line-354"><code>// Calling f.Position(p) is equivalent to calling f.PositionFor(p, true).</code></span>
+<span class="codeline" id="line-355"><code>func (f *File) Position(p Pos) (pos Position) {</code></span>
+<span class="codeline" id="line-356"><code>	return f.PositionFor(p, true)</code></span>
+<span class="codeline" id="line-357"><code>}</code></span>
+<span class="codeline" id="line-358"><code></code></span>
+<span class="codeline" id="line-359"><code>// -----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-360"><code>// FileSet</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>// A FileSet represents a set of source files.</code></span>
+<span class="codeline" id="line-363"><code>// Methods of file sets are synchronized; multiple goroutines</code></span>
+<span class="codeline" id="line-364"><code>// may invoke them concurrently.</code></span>
+<span class="codeline" id="line-365"><code>//</code></span>
+<span class="codeline" id="line-366"><code>// The byte offsets for each file in a file set are mapped into</code></span>
+<span class="codeline" id="line-367"><code>// distinct (integer) intervals, one interval [base, base+size]</code></span>
+<span class="codeline" id="line-368"><code>// per file. [FileSet.Base] represents the first byte in the file, and size</code></span>
+<span class="codeline" id="line-369"><code>// is the corresponding file size. A [Pos] value is a value in such</code></span>
+<span class="codeline" id="line-370"><code>// an interval. By determining the interval a [Pos] value belongs</code></span>
+<span class="codeline" id="line-371"><code>// to, the file, its file base, and thus the byte offset (position)</code></span>
+<span class="codeline" id="line-372"><code>// the [Pos] value is representing can be computed.</code></span>
+<span class="codeline" id="line-373"><code>//</code></span>
+<span class="codeline" id="line-374"><code>// When adding a new file, a file base must be provided. That can</code></span>
+<span class="codeline" id="line-375"><code>// be any integer value that is past the end of any interval of any</code></span>
+<span class="codeline" id="line-376"><code>// file already in the file set. For convenience, [FileSet.Base] provides</code></span>
+<span class="codeline" id="line-377"><code>// such a value, which is simply the end of the Pos interval of the most</code></span>
+<span class="codeline" id="line-378"><code>// recently added file, plus one. Unless there is a need to extend an</code></span>
+<span class="codeline" id="line-379"><code>// interval later, using the [FileSet.Base] should be used as argument</code></span>
+<span class="codeline" id="line-380"><code>// for [FileSet.AddFile].</code></span>
+<span class="codeline" id="line-381"><code>//</code></span>
+<span class="codeline" id="line-382"><code>// A [File] may be removed from a FileSet when it is no longer needed.</code></span>
+<span class="codeline" id="line-383"><code>// This may reduce memory usage in a long-running application.</code></span>
+<span class="codeline" id="line-384"><code>type FileSet struct {</code></span>
+<span class="codeline" id="line-385"><code>	mutex sync.RWMutex         // protects the file set</code></span>
+<span class="codeline" id="line-386"><code>	base  int                  // base offset for the next file</code></span>
+<span class="codeline" id="line-387"><code>	files []*File              // list of files in the order added to the set</code></span>
+<span class="codeline" id="line-388"><code>	last  atomic.Pointer[File] // cache of last file looked up</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>// NewFileSet creates a new file set.</code></span>
+<span class="codeline" id="line-392"><code>func NewFileSet() *FileSet {</code></span>
+<span class="codeline" id="line-393"><code>	return &amp;FileSet{</code></span>
+<span class="codeline" id="line-394"><code>		base: 1, // 0 == NoPos</code></span>
+<span class="codeline" id="line-395"><code>	}</code></span>
+<span class="codeline" id="line-396"><code>}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>// Base returns the minimum base offset that must be provided to</code></span>
+<span class="codeline" id="line-399"><code>// [FileSet.AddFile] when adding the next file.</code></span>
+<span class="codeline" id="line-400"><code>func (s *FileSet) Base() int {</code></span>
+<span class="codeline" id="line-401"><code>	s.mutex.RLock()</code></span>
+<span class="codeline" id="line-402"><code>	b := s.base</code></span>
+<span class="codeline" id="line-403"><code>	s.mutex.RUnlock()</code></span>
+<span class="codeline" id="line-404"><code>	return b</code></span>
+<span class="codeline" id="line-405"><code>}</code></span>
+<span class="codeline" id="line-406"><code></code></span>
+<span class="codeline" id="line-407"><code>// AddFile adds a new file with a given filename, base offset, and file size</code></span>
+<span class="codeline" id="line-408"><code>// to the file set s and returns the file. Multiple files may have the same</code></span>
+<span class="codeline" id="line-409"><code>// name. The base offset must not be smaller than the [FileSet.Base], and</code></span>
+<span class="codeline" id="line-410"><code>// size must not be negative. As a special case, if a negative base is provided,</code></span>
+<span class="codeline" id="line-411"><code>// the current value of the [FileSet.Base] is used instead.</code></span>
+<span class="codeline" id="line-412"><code>//</code></span>
+<span class="codeline" id="line-413"><code>// Adding the file will set the file set's [FileSet.Base] value to base + size + 1</code></span>
+<span class="codeline" id="line-414"><code>// as the minimum base value for the next file. The following relationship</code></span>
+<span class="codeline" id="line-415"><code>// exists between a [Pos] value p for a given file offset offs:</code></span>
+<span class="codeline" id="line-416"><code>//</code></span>
+<span class="codeline" id="line-417"><code>//	int(p) = base + offs</code></span>
+<span class="codeline" id="line-418"><code>//</code></span>
+<span class="codeline" id="line-419"><code>// with offs in the range [0, size] and thus p in the range [base, base+size].</code></span>
+<span class="codeline" id="line-420"><code>// For convenience, [File.Pos] may be used to create file-specific position</code></span>
+<span class="codeline" id="line-421"><code>// values from a file offset.</code></span>
+<span class="codeline" id="line-422"><code>func (s *FileSet) AddFile(filename string, base, size int) *File {</code></span>
+<span class="codeline" id="line-423"><code>	// Allocate f outside the critical section.</code></span>
+<span class="codeline" id="line-424"><code>	f := &amp;File{name: filename, size: size, lines: []int{0}}</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>	s.mutex.Lock()</code></span>
+<span class="codeline" id="line-427"><code>	defer s.mutex.Unlock()</code></span>
+<span class="codeline" id="line-428"><code>	if base &lt; 0 {</code></span>
+<span class="codeline" id="line-429"><code>		base = s.base</code></span>
+<span class="codeline" id="line-430"><code>	}</code></span>
+<span class="codeline" id="line-431"><code>	if base &lt; s.base {</code></span>
+<span class="codeline" id="line-432"><code>		panic(fmt.Sprintf("invalid base %d (should be &gt;= %d)", base, s.base))</code></span>
+<span class="codeline" id="line-433"><code>	}</code></span>
+<span class="codeline" id="line-434"><code>	f.base = base</code></span>
+<span class="codeline" id="line-435"><code>	if size &lt; 0 {</code></span>
+<span class="codeline" id="line-436"><code>		panic(fmt.Sprintf("invalid size %d (should be &gt;= 0)", size))</code></span>
+<span class="codeline" id="line-437"><code>	}</code></span>
+<span class="codeline" id="line-438"><code>	// base &gt;= s.base &amp;&amp; size &gt;= 0</code></span>
+<span class="codeline" id="line-439"><code>	base += size + 1 // +1 because EOF also has a position</code></span>
+<span class="codeline" id="line-440"><code>	if base &lt; 0 {</code></span>
+<span class="codeline" id="line-441"><code>		panic("token.Pos offset overflow (&gt; 2G of source code in file set)")</code></span>
+<span class="codeline" id="line-442"><code>	}</code></span>
+<span class="codeline" id="line-443"><code>	// add the file to the file set</code></span>
+<span class="codeline" id="line-444"><code>	s.base = base</code></span>
+<span class="codeline" id="line-445"><code>	s.files = append(s.files, f)</code></span>
+<span class="codeline" id="line-446"><code>	s.last.Store(f)</code></span>
+<span class="codeline" id="line-447"><code>	return f</code></span>
+<span class="codeline" id="line-448"><code>}</code></span>
+<span class="codeline" id="line-449"><code></code></span>
+<span class="codeline" id="line-450"><code>// RemoveFile removes a file from the [FileSet] so that subsequent</code></span>
+<span class="codeline" id="line-451"><code>// queries for its [Pos] interval yield a negative result.</code></span>
+<span class="codeline" id="line-452"><code>// This reduces the memory usage of a long-lived [FileSet] that</code></span>
+<span class="codeline" id="line-453"><code>// encounters an unbounded stream of files.</code></span>
+<span class="codeline" id="line-454"><code>//</code></span>
+<span class="codeline" id="line-455"><code>// Removing a file that does not belong to the set has no effect.</code></span>
+<span class="codeline" id="line-456"><code>func (s *FileSet) RemoveFile(file *File) {</code></span>
+<span class="codeline" id="line-457"><code>	s.last.CompareAndSwap(file, nil) // clear last file cache</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>	s.mutex.Lock()</code></span>
+<span class="codeline" id="line-460"><code>	defer s.mutex.Unlock()</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>	if i := searchFiles(s.files, file.base); i &gt;= 0 &amp;&amp; s.files[i] == file {</code></span>
+<span class="codeline" id="line-463"><code>		last := &amp;s.files[len(s.files)-1]</code></span>
+<span class="codeline" id="line-464"><code>		s.files = append(s.files[:i], s.files[i+1:]...)</code></span>
+<span class="codeline" id="line-465"><code>		*last = nil // don't prolong lifetime when popping last element</code></span>
+<span class="codeline" id="line-466"><code>	}</code></span>
+<span class="codeline" id="line-467"><code>}</code></span>
+<span class="codeline" id="line-468"><code></code></span>
+<span class="codeline" id="line-469"><code>// Iterate calls f for the files in the file set in the order they were added</code></span>
+<span class="codeline" id="line-470"><code>// until f returns false.</code></span>
+<span class="codeline" id="line-471"><code>func (s *FileSet) Iterate(f func(*File) bool) {</code></span>
+<span class="codeline" id="line-472"><code>	for i := 0; ; i++ {</code></span>
+<span class="codeline" id="line-473"><code>		var file *File</code></span>
+<span class="codeline" id="line-474"><code>		s.mutex.RLock()</code></span>
+<span class="codeline" id="line-475"><code>		if i &lt; len(s.files) {</code></span>
+<span class="codeline" id="line-476"><code>			file = s.files[i]</code></span>
+<span class="codeline" id="line-477"><code>		}</code></span>
+<span class="codeline" id="line-478"><code>		s.mutex.RUnlock()</code></span>
+<span class="codeline" id="line-479"><code>		if file == nil || !f(file) {</code></span>
+<span class="codeline" id="line-480"><code>			break</code></span>
+<span class="codeline" id="line-481"><code>		}</code></span>
+<span class="codeline" id="line-482"><code>	}</code></span>
+<span class="codeline" id="line-483"><code>}</code></span>
+<span class="codeline" id="line-484"><code></code></span>
+<span class="codeline" id="line-485"><code>func searchFiles(a []*File, x int) int {</code></span>
+<span class="codeline" id="line-486"><code>	return sort.Search(len(a), func(i int) bool { return a[i].base &gt; x }) - 1</code></span>
+<span class="codeline" id="line-487"><code>}</code></span>
+<span class="codeline" id="line-488"><code></code></span>
+<span class="codeline" id="line-489"><code>func (s *FileSet) file(p Pos) *File {</code></span>
+<span class="codeline" id="line-490"><code>	// common case: p is in last file.</code></span>
+<span class="codeline" id="line-491"><code>	if f := s.last.Load(); f != nil &amp;&amp; f.base &lt;= int(p) &amp;&amp; int(p) &lt;= f.base+f.size {</code></span>
+<span class="codeline" id="line-492"><code>		return f</code></span>
+<span class="codeline" id="line-493"><code>	}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>	s.mutex.RLock()</code></span>
+<span class="codeline" id="line-496"><code>	defer s.mutex.RUnlock()</code></span>
+<span class="codeline" id="line-497"><code></code></span>
+<span class="codeline" id="line-498"><code>	// p is not in last file - search all files</code></span>
+<span class="codeline" id="line-499"><code>	if i := searchFiles(s.files, int(p)); i &gt;= 0 {</code></span>
+<span class="codeline" id="line-500"><code>		f := s.files[i]</code></span>
+<span class="codeline" id="line-501"><code>		// f.base &lt;= int(p) by definition of searchFiles</code></span>
+<span class="codeline" id="line-502"><code>		if int(p) &lt;= f.base+f.size {</code></span>
+<span class="codeline" id="line-503"><code>			// Update cache of last file. A race is ok,</code></span>
+<span class="codeline" id="line-504"><code>			// but an exclusive lock causes heavy contention.</code></span>
+<span class="codeline" id="line-505"><code>			s.last.Store(f)</code></span>
+<span class="codeline" id="line-506"><code>			return f</code></span>
+<span class="codeline" id="line-507"><code>		}</code></span>
+<span class="codeline" id="line-508"><code>	}</code></span>
+<span class="codeline" id="line-509"><code>	return nil</code></span>
+<span class="codeline" id="line-510"><code>}</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>// File returns the file that contains the position p.</code></span>
+<span class="codeline" id="line-513"><code>// If no such file is found (for instance for p == [NoPos]),</code></span>
+<span class="codeline" id="line-514"><code>// the result is nil.</code></span>
+<span class="codeline" id="line-515"><code>func (s *FileSet) File(p Pos) (f *File) {</code></span>
+<span class="codeline" id="line-516"><code>	if p != NoPos {</code></span>
+<span class="codeline" id="line-517"><code>		f = s.file(p)</code></span>
+<span class="codeline" id="line-518"><code>	}</code></span>
+<span class="codeline" id="line-519"><code>	return</code></span>
+<span class="codeline" id="line-520"><code>}</code></span>
+<span class="codeline" id="line-521"><code></code></span>
+<span class="codeline" id="line-522"><code>// PositionFor converts a [Pos] p in the fileset into a [Position] value.</code></span>
+<span class="codeline" id="line-523"><code>// If adjusted is set, the position may be adjusted by position-altering</code></span>
+<span class="codeline" id="line-524"><code>// //line comments; otherwise those comments are ignored.</code></span>
+<span class="codeline" id="line-525"><code>// p must be a [Pos] value in s or [NoPos].</code></span>
+<span class="codeline" id="line-526"><code>func (s *FileSet) PositionFor(p Pos, adjusted bool) (pos Position) {</code></span>
+<span class="codeline" id="line-527"><code>	if p != NoPos {</code></span>
+<span class="codeline" id="line-528"><code>		if f := s.file(p); f != nil {</code></span>
+<span class="codeline" id="line-529"><code>			return f.position(p, adjusted)</code></span>
+<span class="codeline" id="line-530"><code>		}</code></span>
+<span class="codeline" id="line-531"><code>	}</code></span>
+<span class="codeline" id="line-532"><code>	return</code></span>
+<span class="codeline" id="line-533"><code>}</code></span>
+<span class="codeline" id="line-534"><code></code></span>
+<span class="codeline" id="line-535"><code>// Position converts a [Pos] p in the fileset into a Position value.</code></span>
+<span class="codeline" id="line-536"><code>// Calling s.Position(p) is equivalent to calling s.PositionFor(p, true).</code></span>
+<span class="codeline" id="line-537"><code>func (s *FileSet) Position(p Pos) (pos Position) {</code></span>
+<span class="codeline" id="line-538"><code>	return s.PositionFor(p, true)</code></span>
+<span class="codeline" id="line-539"><code>}</code></span>
+<span class="codeline" id="line-540"><code></code></span>
+<span class="codeline" id="line-541"><code>// -----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-542"><code>// Helper functions</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>func searchInts(a []int, x int) int {</code></span>
+<span class="codeline" id="line-545"><code>	// This function body is a manually inlined version of:</code></span>
+<span class="codeline" id="line-546"><code>	//</code></span>
+<span class="codeline" id="line-547"><code>	//   return sort.Search(len(a), func(i int) bool { return a[i] &gt; x }) - 1</code></span>
+<span class="codeline" id="line-548"><code>	//</code></span>
+<span class="codeline" id="line-549"><code>	// With better compiler optimizations, this may not be needed in the</code></span>
+<span class="codeline" id="line-550"><code>	// future, but at the moment this change improves the go/printer</code></span>
+<span class="codeline" id="line-551"><code>	// benchmark performance by ~30%. This has a direct impact on the</code></span>
+<span class="codeline" id="line-552"><code>	// speed of gofmt and thus seems worthwhile (2011-04-29).</code></span>
+<span class="codeline" id="line-553"><code>	// TODO(gri): Remove this when compilers have caught up.</code></span>
+<span class="codeline" id="line-554"><code>	i, j := 0, len(a)</code></span>
+<span class="codeline" id="line-555"><code>	for i &lt; j {</code></span>
+<span class="codeline" id="line-556"><code>		h := int(uint(i+j) &gt;&gt; 1) // avoid overflow when computing h</code></span>
+<span class="codeline" id="line-557"><code>		// i ≤ h &lt; j</code></span>
+<span class="codeline" id="line-558"><code>		if a[h] &lt;= x {</code></span>
+<span class="codeline" id="line-559"><code>			i = h + 1</code></span>
+<span class="codeline" id="line-560"><code>		} else {</code></span>
+<span class="codeline" id="line-561"><code>			j = h</code></span>
+<span class="codeline" id="line-562"><code>		}</code></span>
+<span class="codeline" id="line-563"><code>	}</code></span>
+<span class="codeline" id="line-564"><code>	return i - 1</code></span>
+<span class="codeline" id="line-565"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

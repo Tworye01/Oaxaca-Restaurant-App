@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: key_schedule.go in package crypto/tls</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	key_schedule.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/tls.html">crypto/tls</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2018 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package tls</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"crypto/ecdh"</code></span>
+<span class="codeline" id="line-9"><code>	"crypto/hmac"</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"hash"</code></span>
+<span class="codeline" id="line-13"><code>	"io"</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>	"golang.org/x/crypto/cryptobyte"</code></span>
+<span class="codeline" id="line-16"><code>	"golang.org/x/crypto/hkdf"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// This file contains the functions necessary to compute the TLS 1.3 key</code></span>
+<span class="codeline" id="line-20"><code>// schedule. See RFC 8446, Section 7.</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>const (</code></span>
+<span class="codeline" id="line-23"><code>	resumptionBinderLabel         = "res binder"</code></span>
+<span class="codeline" id="line-24"><code>	clientEarlyTrafficLabel       = "c e traffic"</code></span>
+<span class="codeline" id="line-25"><code>	clientHandshakeTrafficLabel   = "c hs traffic"</code></span>
+<span class="codeline" id="line-26"><code>	serverHandshakeTrafficLabel   = "s hs traffic"</code></span>
+<span class="codeline" id="line-27"><code>	clientApplicationTrafficLabel = "c ap traffic"</code></span>
+<span class="codeline" id="line-28"><code>	serverApplicationTrafficLabel = "s ap traffic"</code></span>
+<span class="codeline" id="line-29"><code>	exporterLabel                 = "exp master"</code></span>
+<span class="codeline" id="line-30"><code>	resumptionLabel               = "res master"</code></span>
+<span class="codeline" id="line-31"><code>	trafficUpdateLabel            = "traffic upd"</code></span>
+<span class="codeline" id="line-32"><code>)</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>// expandLabel implements HKDF-Expand-Label from RFC 8446, Section 7.1.</code></span>
+<span class="codeline" id="line-35"><code>func (c *cipherSuiteTLS13) expandLabel(secret []byte, label string, context []byte, length int) []byte {</code></span>
+<span class="codeline" id="line-36"><code>	var hkdfLabel cryptobyte.Builder</code></span>
+<span class="codeline" id="line-37"><code>	hkdfLabel.AddUint16(uint16(length))</code></span>
+<span class="codeline" id="line-38"><code>	hkdfLabel.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {</code></span>
+<span class="codeline" id="line-39"><code>		b.AddBytes([]byte("tls13 "))</code></span>
+<span class="codeline" id="line-40"><code>		b.AddBytes([]byte(label))</code></span>
+<span class="codeline" id="line-41"><code>	})</code></span>
+<span class="codeline" id="line-42"><code>	hkdfLabel.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {</code></span>
+<span class="codeline" id="line-43"><code>		b.AddBytes(context)</code></span>
+<span class="codeline" id="line-44"><code>	})</code></span>
+<span class="codeline" id="line-45"><code>	hkdfLabelBytes, err := hkdfLabel.Bytes()</code></span>
+<span class="codeline" id="line-46"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-47"><code>		// Rather than calling BytesOrPanic, we explicitly handle this error, in</code></span>
+<span class="codeline" id="line-48"><code>		// order to provide a reasonable error message. It should be basically</code></span>
+<span class="codeline" id="line-49"><code>		// impossible for this to panic, and routing errors back through the</code></span>
+<span class="codeline" id="line-50"><code>		// tree rooted in this function is quite painful. The labels are fixed</code></span>
+<span class="codeline" id="line-51"><code>		// size, and the context is either a fixed-length computed hash, or</code></span>
+<span class="codeline" id="line-52"><code>		// parsed from a field which has the same length limitation. As such, an</code></span>
+<span class="codeline" id="line-53"><code>		// error here is likely to only be caused during development.</code></span>
+<span class="codeline" id="line-54"><code>		//</code></span>
+<span class="codeline" id="line-55"><code>		// NOTE: another reasonable approach here might be to return a</code></span>
+<span class="codeline" id="line-56"><code>		// randomized slice if we encounter an error, which would break the</code></span>
+<span class="codeline" id="line-57"><code>		// connection, but avoid panicking. This would perhaps be safer but</code></span>
+<span class="codeline" id="line-58"><code>		// significantly more confusing to users.</code></span>
+<span class="codeline" id="line-59"><code>		panic(fmt.Errorf("failed to construct HKDF label: %s", err))</code></span>
+<span class="codeline" id="line-60"><code>	}</code></span>
+<span class="codeline" id="line-61"><code>	out := make([]byte, length)</code></span>
+<span class="codeline" id="line-62"><code>	n, err := hkdf.Expand(c.hash.New, secret, hkdfLabelBytes).Read(out)</code></span>
+<span class="codeline" id="line-63"><code>	if err != nil || n != length {</code></span>
+<span class="codeline" id="line-64"><code>		panic("tls: HKDF-Expand-Label invocation failed unexpectedly")</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code>	return out</code></span>
+<span class="codeline" id="line-67"><code>}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>// deriveSecret implements Derive-Secret from RFC 8446, Section 7.1.</code></span>
+<span class="codeline" id="line-70"><code>func (c *cipherSuiteTLS13) deriveSecret(secret []byte, label string, transcript hash.Hash) []byte {</code></span>
+<span class="codeline" id="line-71"><code>	if transcript == nil {</code></span>
+<span class="codeline" id="line-72"><code>		transcript = c.hash.New()</code></span>
+<span class="codeline" id="line-73"><code>	}</code></span>
+<span class="codeline" id="line-74"><code>	return c.expandLabel(secret, label, transcript.Sum(nil), c.hash.Size())</code></span>
+<span class="codeline" id="line-75"><code>}</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>// extract implements HKDF-Extract with the cipher suite hash.</code></span>
+<span class="codeline" id="line-78"><code>func (c *cipherSuiteTLS13) extract(newSecret, currentSecret []byte) []byte {</code></span>
+<span class="codeline" id="line-79"><code>	if newSecret == nil {</code></span>
+<span class="codeline" id="line-80"><code>		newSecret = make([]byte, c.hash.Size())</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code>	return hkdf.Extract(c.hash.New, newSecret, currentSecret)</code></span>
+<span class="codeline" id="line-83"><code>}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>// nextTrafficSecret generates the next traffic secret, given the current one,</code></span>
+<span class="codeline" id="line-86"><code>// according to RFC 8446, Section 7.2.</code></span>
+<span class="codeline" id="line-87"><code>func (c *cipherSuiteTLS13) nextTrafficSecret(trafficSecret []byte) []byte {</code></span>
+<span class="codeline" id="line-88"><code>	return c.expandLabel(trafficSecret, trafficUpdateLabel, nil, c.hash.Size())</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>// trafficKey generates traffic keys according to RFC 8446, Section 7.3.</code></span>
+<span class="codeline" id="line-92"><code>func (c *cipherSuiteTLS13) trafficKey(trafficSecret []byte) (key, iv []byte) {</code></span>
+<span class="codeline" id="line-93"><code>	key = c.expandLabel(trafficSecret, "key", nil, c.keyLen)</code></span>
+<span class="codeline" id="line-94"><code>	iv = c.expandLabel(trafficSecret, "iv", nil, aeadNonceLength)</code></span>
+<span class="codeline" id="line-95"><code>	return</code></span>
+<span class="codeline" id="line-96"><code>}</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>// finishedHash generates the Finished verify_data or PskBinderEntry according</code></span>
+<span class="codeline" id="line-99"><code>// to RFC 8446, Section 4.4.4. See sections 4.4 and 4.2.11.2 for the baseKey</code></span>
+<span class="codeline" id="line-100"><code>// selection.</code></span>
+<span class="codeline" id="line-101"><code>func (c *cipherSuiteTLS13) finishedHash(baseKey []byte, transcript hash.Hash) []byte {</code></span>
+<span class="codeline" id="line-102"><code>	finishedKey := c.expandLabel(baseKey, "finished", nil, c.hash.Size())</code></span>
+<span class="codeline" id="line-103"><code>	verifyData := hmac.New(c.hash.New, finishedKey)</code></span>
+<span class="codeline" id="line-104"><code>	verifyData.Write(transcript.Sum(nil))</code></span>
+<span class="codeline" id="line-105"><code>	return verifyData.Sum(nil)</code></span>
+<span class="codeline" id="line-106"><code>}</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>// exportKeyingMaterial implements RFC5705 exporters for TLS 1.3 according to</code></span>
+<span class="codeline" id="line-109"><code>// RFC 8446, Section 7.5.</code></span>
+<span class="codeline" id="line-110"><code>func (c *cipherSuiteTLS13) exportKeyingMaterial(masterSecret []byte, transcript hash.Hash) func(string, []byte, int) ([]byte, error) {</code></span>
+<span class="codeline" id="line-111"><code>	expMasterSecret := c.deriveSecret(masterSecret, exporterLabel, transcript)</code></span>
+<span class="codeline" id="line-112"><code>	return func(label string, context []byte, length int) ([]byte, error) {</code></span>
+<span class="codeline" id="line-113"><code>		secret := c.deriveSecret(expMasterSecret, label, nil)</code></span>
+<span class="codeline" id="line-114"><code>		h := c.hash.New()</code></span>
+<span class="codeline" id="line-115"><code>		h.Write(context)</code></span>
+<span class="codeline" id="line-116"><code>		return c.expandLabel(secret, "exporter", h.Sum(nil), length), nil</code></span>
+<span class="codeline" id="line-117"><code>	}</code></span>
+<span class="codeline" id="line-118"><code>}</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>// generateECDHEKey returns a PrivateKey that implements Diffie-Hellman</code></span>
+<span class="codeline" id="line-121"><code>// according to RFC 8446, Section 4.2.8.2.</code></span>
+<span class="codeline" id="line-122"><code>func generateECDHEKey(rand io.Reader, curveID CurveID) (*ecdh.PrivateKey, error) {</code></span>
+<span class="codeline" id="line-123"><code>	curve, ok := curveForCurveID(curveID)</code></span>
+<span class="codeline" id="line-124"><code>	if !ok {</code></span>
+<span class="codeline" id="line-125"><code>		return nil, errors.New("tls: internal error: unsupported curve")</code></span>
+<span class="codeline" id="line-126"><code>	}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>	return curve.GenerateKey(rand)</code></span>
+<span class="codeline" id="line-129"><code>}</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>func curveForCurveID(id CurveID) (ecdh.Curve, bool) {</code></span>
+<span class="codeline" id="line-132"><code>	switch id {</code></span>
+<span class="codeline" id="line-133"><code>	case X25519:</code></span>
+<span class="codeline" id="line-134"><code>		return ecdh.X25519(), true</code></span>
+<span class="codeline" id="line-135"><code>	case CurveP256:</code></span>
+<span class="codeline" id="line-136"><code>		return ecdh.P256(), true</code></span>
+<span class="codeline" id="line-137"><code>	case CurveP384:</code></span>
+<span class="codeline" id="line-138"><code>		return ecdh.P384(), true</code></span>
+<span class="codeline" id="line-139"><code>	case CurveP521:</code></span>
+<span class="codeline" id="line-140"><code>		return ecdh.P521(), true</code></span>
+<span class="codeline" id="line-141"><code>	default:</code></span>
+<span class="codeline" id="line-142"><code>		return nil, false</code></span>
+<span class="codeline" id="line-143"><code>	}</code></span>
+<span class="codeline" id="line-144"><code>}</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>func curveIDForCurve(curve ecdh.Curve) (CurveID, bool) {</code></span>
+<span class="codeline" id="line-147"><code>	switch curve {</code></span>
+<span class="codeline" id="line-148"><code>	case ecdh.X25519():</code></span>
+<span class="codeline" id="line-149"><code>		return X25519, true</code></span>
+<span class="codeline" id="line-150"><code>	case ecdh.P256():</code></span>
+<span class="codeline" id="line-151"><code>		return CurveP256, true</code></span>
+<span class="codeline" id="line-152"><code>	case ecdh.P384():</code></span>
+<span class="codeline" id="line-153"><code>		return CurveP384, true</code></span>
+<span class="codeline" id="line-154"><code>	case ecdh.P521():</code></span>
+<span class="codeline" id="line-155"><code>		return CurveP521, true</code></span>
+<span class="codeline" id="line-156"><code>	default:</code></span>
+<span class="codeline" id="line-157"><code>		return 0, false</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

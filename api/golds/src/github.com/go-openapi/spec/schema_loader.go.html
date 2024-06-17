@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: schema_loader.go in package github.com/go-openapi/spec</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	schema_loader.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/go-openapi/spec.html">github.com/go-openapi/spec</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2015 go-swagger maintainers</code></span>
+<span class="codeline" id="line-2"><code>//</code></span>
+<span class="codeline" id="line-3"><code>// Licensed under the Apache License, Version 2.0 (the "License");</code></span>
+<span class="codeline" id="line-4"><code>// you may not use this file except in compliance with the License.</code></span>
+<span class="codeline" id="line-5"><code>// You may obtain a copy of the License at</code></span>
+<span class="codeline" id="line-6"><code>//</code></span>
+<span class="codeline" id="line-7"><code>//    http://www.apache.org/licenses/LICENSE-2.0</code></span>
+<span class="codeline" id="line-8"><code>//</code></span>
+<span class="codeline" id="line-9"><code>// Unless required by applicable law or agreed to in writing, software</code></span>
+<span class="codeline" id="line-10"><code>// distributed under the License is distributed on an "AS IS" BASIS,</code></span>
+<span class="codeline" id="line-11"><code>// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.</code></span>
+<span class="codeline" id="line-12"><code>// See the License for the specific language governing permissions and</code></span>
+<span class="codeline" id="line-13"><code>// limitations under the License.</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>package spec</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>import (</code></span>
+<span class="codeline" id="line-18"><code>	"encoding/json"</code></span>
+<span class="codeline" id="line-19"><code>	"fmt"</code></span>
+<span class="codeline" id="line-20"><code>	"log"</code></span>
+<span class="codeline" id="line-21"><code>	"net/url"</code></span>
+<span class="codeline" id="line-22"><code>	"reflect"</code></span>
+<span class="codeline" id="line-23"><code>	"strings"</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>	"github.com/go-openapi/swag"</code></span>
+<span class="codeline" id="line-26"><code>)</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// PathLoader is a function to use when loading remote refs.</code></span>
+<span class="codeline" id="line-29"><code>//</code></span>
+<span class="codeline" id="line-30"><code>// This is a package level default. It may be overridden or bypassed by</code></span>
+<span class="codeline" id="line-31"><code>// specifying the loader in ExpandOptions.</code></span>
+<span class="codeline" id="line-32"><code>//</code></span>
+<span class="codeline" id="line-33"><code>// NOTE: if you are using the go-openapi/loads package, it will override</code></span>
+<span class="codeline" id="line-34"><code>// this value with its own default (a loader to retrieve YAML documents as</code></span>
+<span class="codeline" id="line-35"><code>// well as JSON ones).</code></span>
+<span class="codeline" id="line-36"><code>var PathLoader = func(pth string) (json.RawMessage, error) {</code></span>
+<span class="codeline" id="line-37"><code>	data, err := swag.LoadFromFileOrHTTP(pth)</code></span>
+<span class="codeline" id="line-38"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-39"><code>		return nil, err</code></span>
+<span class="codeline" id="line-40"><code>	}</code></span>
+<span class="codeline" id="line-41"><code>	return json.RawMessage(data), nil</code></span>
+<span class="codeline" id="line-42"><code>}</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>// resolverContext allows to share a context during spec processing.</code></span>
+<span class="codeline" id="line-45"><code>// At the moment, it just holds the index of circular references found.</code></span>
+<span class="codeline" id="line-46"><code>type resolverContext struct {</code></span>
+<span class="codeline" id="line-47"><code>	// circulars holds all visited circular references, to shortcircuit $ref resolution.</code></span>
+<span class="codeline" id="line-48"><code>	//</code></span>
+<span class="codeline" id="line-49"><code>	// This structure is privately instantiated and needs not be locked against</code></span>
+<span class="codeline" id="line-50"><code>	// concurrent access, unless we chose to implement a parallel spec walking.</code></span>
+<span class="codeline" id="line-51"><code>	circulars map[string]bool</code></span>
+<span class="codeline" id="line-52"><code>	basePath  string</code></span>
+<span class="codeline" id="line-53"><code>	loadDoc   func(string) (json.RawMessage, error)</code></span>
+<span class="codeline" id="line-54"><code>	rootID    string</code></span>
+<span class="codeline" id="line-55"><code>}</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>func newResolverContext(options *ExpandOptions) *resolverContext {</code></span>
+<span class="codeline" id="line-58"><code>	expandOptions := optionsOrDefault(options)</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// path loader may be overridden by options</code></span>
+<span class="codeline" id="line-61"><code>	var loader func(string) (json.RawMessage, error)</code></span>
+<span class="codeline" id="line-62"><code>	if expandOptions.PathLoader == nil {</code></span>
+<span class="codeline" id="line-63"><code>		loader = PathLoader</code></span>
+<span class="codeline" id="line-64"><code>	} else {</code></span>
+<span class="codeline" id="line-65"><code>		loader = expandOptions.PathLoader</code></span>
+<span class="codeline" id="line-66"><code>	}</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>	return &amp;resolverContext{</code></span>
+<span class="codeline" id="line-69"><code>		circulars: make(map[string]bool),</code></span>
+<span class="codeline" id="line-70"><code>		basePath:  expandOptions.RelativeBase, // keep the root base path in context</code></span>
+<span class="codeline" id="line-71"><code>		loadDoc:   loader,</code></span>
+<span class="codeline" id="line-72"><code>	}</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>type schemaLoader struct {</code></span>
+<span class="codeline" id="line-76"><code>	root    interface{}</code></span>
+<span class="codeline" id="line-77"><code>	options *ExpandOptions</code></span>
+<span class="codeline" id="line-78"><code>	cache   ResolutionCache</code></span>
+<span class="codeline" id="line-79"><code>	context *resolverContext</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>func (r *schemaLoader) transitiveResolver(basePath string, ref Ref) *schemaLoader {</code></span>
+<span class="codeline" id="line-83"><code>	if ref.IsRoot() || ref.HasFragmentOnly {</code></span>
+<span class="codeline" id="line-84"><code>		return r</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>	baseRef := MustCreateRef(basePath)</code></span>
+<span class="codeline" id="line-88"><code>	currentRef := normalizeRef(&amp;ref, basePath)</code></span>
+<span class="codeline" id="line-89"><code>	if strings.HasPrefix(currentRef.String(), baseRef.String()) {</code></span>
+<span class="codeline" id="line-90"><code>		return r</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>	// set a new root against which to resolve</code></span>
+<span class="codeline" id="line-94"><code>	rootURL := currentRef.GetURL()</code></span>
+<span class="codeline" id="line-95"><code>	rootURL.Fragment = ""</code></span>
+<span class="codeline" id="line-96"><code>	root, _ := r.cache.Get(rootURL.String())</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>	// shallow copy of resolver options to set a new RelativeBase when</code></span>
+<span class="codeline" id="line-99"><code>	// traversing multiple documents</code></span>
+<span class="codeline" id="line-100"><code>	newOptions := r.options</code></span>
+<span class="codeline" id="line-101"><code>	newOptions.RelativeBase = rootURL.String()</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>	return defaultSchemaLoader(root, newOptions, r.cache, r.context)</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>func (r *schemaLoader) updateBasePath(transitive *schemaLoader, basePath string) string {</code></span>
+<span class="codeline" id="line-107"><code>	if transitive != r {</code></span>
+<span class="codeline" id="line-108"><code>		if transitive.options != nil &amp;&amp; transitive.options.RelativeBase != "" {</code></span>
+<span class="codeline" id="line-109"><code>			return normalizeBase(transitive.options.RelativeBase)</code></span>
+<span class="codeline" id="line-110"><code>		}</code></span>
+<span class="codeline" id="line-111"><code>	}</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>	return basePath</code></span>
+<span class="codeline" id="line-114"><code>}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>func (r *schemaLoader) resolveRef(ref *Ref, target interface{}, basePath string) error {</code></span>
+<span class="codeline" id="line-117"><code>	tgt := reflect.ValueOf(target)</code></span>
+<span class="codeline" id="line-118"><code>	if tgt.Kind() != reflect.Ptr {</code></span>
+<span class="codeline" id="line-119"><code>		return ErrResolveRefNeedsAPointer</code></span>
+<span class="codeline" id="line-120"><code>	}</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	if ref.GetURL() == nil {</code></span>
+<span class="codeline" id="line-123"><code>		return nil</code></span>
+<span class="codeline" id="line-124"><code>	}</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	var (</code></span>
+<span class="codeline" id="line-127"><code>		res  interface{}</code></span>
+<span class="codeline" id="line-128"><code>		data interface{}</code></span>
+<span class="codeline" id="line-129"><code>		err  error</code></span>
+<span class="codeline" id="line-130"><code>	)</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	// Resolve against the root if it isn't nil, and if ref is pointing at the root, or has a fragment only which means</code></span>
+<span class="codeline" id="line-133"><code>	// it is pointing somewhere in the root.</code></span>
+<span class="codeline" id="line-134"><code>	root := r.root</code></span>
+<span class="codeline" id="line-135"><code>	if (ref.IsRoot() || ref.HasFragmentOnly) &amp;&amp; root == nil &amp;&amp; basePath != "" {</code></span>
+<span class="codeline" id="line-136"><code>		if baseRef, erb := NewRef(basePath); erb == nil {</code></span>
+<span class="codeline" id="line-137"><code>			root, _, _, _ = r.load(baseRef.GetURL())</code></span>
+<span class="codeline" id="line-138"><code>		}</code></span>
+<span class="codeline" id="line-139"><code>	}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>	if (ref.IsRoot() || ref.HasFragmentOnly) &amp;&amp; root != nil {</code></span>
+<span class="codeline" id="line-142"><code>		data = root</code></span>
+<span class="codeline" id="line-143"><code>	} else {</code></span>
+<span class="codeline" id="line-144"><code>		baseRef := normalizeRef(ref, basePath)</code></span>
+<span class="codeline" id="line-145"><code>		data, _, _, err = r.load(baseRef.GetURL())</code></span>
+<span class="codeline" id="line-146"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-147"><code>			return err</code></span>
+<span class="codeline" id="line-148"><code>		}</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	res = data</code></span>
+<span class="codeline" id="line-152"><code>	if ref.String() != "" {</code></span>
+<span class="codeline" id="line-153"><code>		res, _, err = ref.GetPointer().Get(data)</code></span>
+<span class="codeline" id="line-154"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-155"><code>			return err</code></span>
+<span class="codeline" id="line-156"><code>		}</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code>	return swag.DynamicJSONToStruct(res, target)</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>func (r *schemaLoader) load(refURL *url.URL) (interface{}, url.URL, bool, error) {</code></span>
+<span class="codeline" id="line-162"><code>	debugLog("loading schema from url: %s", refURL)</code></span>
+<span class="codeline" id="line-163"><code>	toFetch := *refURL</code></span>
+<span class="codeline" id="line-164"><code>	toFetch.Fragment = ""</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>	var err error</code></span>
+<span class="codeline" id="line-167"><code>	pth := toFetch.String()</code></span>
+<span class="codeline" id="line-168"><code>	normalized := normalizeBase(pth)</code></span>
+<span class="codeline" id="line-169"><code>	debugLog("loading doc from: %s", normalized)</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>	data, fromCache := r.cache.Get(normalized)</code></span>
+<span class="codeline" id="line-172"><code>	if fromCache {</code></span>
+<span class="codeline" id="line-173"><code>		return data, toFetch, fromCache, nil</code></span>
+<span class="codeline" id="line-174"><code>	}</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>	b, err := r.context.loadDoc(normalized)</code></span>
+<span class="codeline" id="line-177"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-178"><code>		return nil, url.URL{}, false, err</code></span>
+<span class="codeline" id="line-179"><code>	}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>	var doc interface{}</code></span>
+<span class="codeline" id="line-182"><code>	if err := json.Unmarshal(b, &amp;doc); err != nil {</code></span>
+<span class="codeline" id="line-183"><code>		return nil, url.URL{}, false, err</code></span>
+<span class="codeline" id="line-184"><code>	}</code></span>
+<span class="codeline" id="line-185"><code>	r.cache.Set(normalized, doc)</code></span>
+<span class="codeline" id="line-186"><code></code></span>
+<span class="codeline" id="line-187"><code>	return doc, toFetch, fromCache, nil</code></span>
+<span class="codeline" id="line-188"><code>}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>// isCircular detects cycles in sequences of $ref.</code></span>
+<span class="codeline" id="line-191"><code>//</code></span>
+<span class="codeline" id="line-192"><code>// It relies on a private context (which needs not be locked).</code></span>
+<span class="codeline" id="line-193"><code>func (r *schemaLoader) isCircular(ref *Ref, basePath string, parentRefs ...string) (foundCycle bool) {</code></span>
+<span class="codeline" id="line-194"><code>	normalizedRef := normalizeURI(ref.String(), basePath)</code></span>
+<span class="codeline" id="line-195"><code>	if _, ok := r.context.circulars[normalizedRef]; ok {</code></span>
+<span class="codeline" id="line-196"><code>		// circular $ref has been already detected in another explored cycle</code></span>
+<span class="codeline" id="line-197"><code>		foundCycle = true</code></span>
+<span class="codeline" id="line-198"><code>		return</code></span>
+<span class="codeline" id="line-199"><code>	}</code></span>
+<span class="codeline" id="line-200"><code>	foundCycle = swag.ContainsStrings(parentRefs, normalizedRef) // normalized windows url's are lower cased</code></span>
+<span class="codeline" id="line-201"><code>	if foundCycle {</code></span>
+<span class="codeline" id="line-202"><code>		r.context.circulars[normalizedRef] = true</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code>	return</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>// Resolve resolves a reference against basePath and stores the result in target.</code></span>
+<span class="codeline" id="line-208"><code>//</code></span>
+<span class="codeline" id="line-209"><code>// Resolve is not in charge of following references: it only resolves ref by following its URL.</code></span>
+<span class="codeline" id="line-210"><code>//</code></span>
+<span class="codeline" id="line-211"><code>// If the schema the ref is referring to holds nested refs, Resolve doesn't resolve them.</code></span>
+<span class="codeline" id="line-212"><code>//</code></span>
+<span class="codeline" id="line-213"><code>// If basePath is an empty string, ref is resolved against the root schema stored in the schemaLoader struct</code></span>
+<span class="codeline" id="line-214"><code>func (r *schemaLoader) Resolve(ref *Ref, target interface{}, basePath string) error {</code></span>
+<span class="codeline" id="line-215"><code>	return r.resolveRef(ref, target, basePath)</code></span>
+<span class="codeline" id="line-216"><code>}</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>func (r *schemaLoader) deref(input interface{}, parentRefs []string, basePath string) error {</code></span>
+<span class="codeline" id="line-219"><code>	var ref *Ref</code></span>
+<span class="codeline" id="line-220"><code>	switch refable := input.(type) {</code></span>
+<span class="codeline" id="line-221"><code>	case *Schema:</code></span>
+<span class="codeline" id="line-222"><code>		ref = &amp;refable.Ref</code></span>
+<span class="codeline" id="line-223"><code>	case *Parameter:</code></span>
+<span class="codeline" id="line-224"><code>		ref = &amp;refable.Ref</code></span>
+<span class="codeline" id="line-225"><code>	case *Response:</code></span>
+<span class="codeline" id="line-226"><code>		ref = &amp;refable.Ref</code></span>
+<span class="codeline" id="line-227"><code>	case *PathItem:</code></span>
+<span class="codeline" id="line-228"><code>		ref = &amp;refable.Ref</code></span>
+<span class="codeline" id="line-229"><code>	default:</code></span>
+<span class="codeline" id="line-230"><code>		return fmt.Errorf("unsupported type: %T: %w", input, ErrDerefUnsupportedType)</code></span>
+<span class="codeline" id="line-231"><code>	}</code></span>
+<span class="codeline" id="line-232"><code></code></span>
+<span class="codeline" id="line-233"><code>	curRef := ref.String()</code></span>
+<span class="codeline" id="line-234"><code>	if curRef == "" {</code></span>
+<span class="codeline" id="line-235"><code>		return nil</code></span>
+<span class="codeline" id="line-236"><code>	}</code></span>
+<span class="codeline" id="line-237"><code></code></span>
+<span class="codeline" id="line-238"><code>	normalizedRef := normalizeRef(ref, basePath)</code></span>
+<span class="codeline" id="line-239"><code>	normalizedBasePath := normalizedRef.RemoteURI()</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>	if r.isCircular(normalizedRef, basePath, parentRefs...) {</code></span>
+<span class="codeline" id="line-242"><code>		return nil</code></span>
+<span class="codeline" id="line-243"><code>	}</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>	if err := r.resolveRef(ref, input, basePath); r.shouldStopOnError(err) {</code></span>
+<span class="codeline" id="line-246"><code>		return err</code></span>
+<span class="codeline" id="line-247"><code>	}</code></span>
+<span class="codeline" id="line-248"><code></code></span>
+<span class="codeline" id="line-249"><code>	if ref.String() == "" || ref.String() == curRef {</code></span>
+<span class="codeline" id="line-250"><code>		// done with rereferencing</code></span>
+<span class="codeline" id="line-251"><code>		return nil</code></span>
+<span class="codeline" id="line-252"><code>	}</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>	parentRefs = append(parentRefs, normalizedRef.String())</code></span>
+<span class="codeline" id="line-255"><code>	return r.deref(input, parentRefs, normalizedBasePath)</code></span>
+<span class="codeline" id="line-256"><code>}</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>func (r *schemaLoader) shouldStopOnError(err error) bool {</code></span>
+<span class="codeline" id="line-259"><code>	if err != nil &amp;&amp; !r.options.ContinueOnError {</code></span>
+<span class="codeline" id="line-260"><code>		return true</code></span>
+<span class="codeline" id="line-261"><code>	}</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-264"><code>		log.Println(err)</code></span>
+<span class="codeline" id="line-265"><code>	}</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>	return false</code></span>
+<span class="codeline" id="line-268"><code>}</code></span>
+<span class="codeline" id="line-269"><code></code></span>
+<span class="codeline" id="line-270"><code>func (r *schemaLoader) setSchemaID(target interface{}, id, basePath string) (string, string) {</code></span>
+<span class="codeline" id="line-271"><code>	debugLog("schema has ID: %s", id)</code></span>
+<span class="codeline" id="line-272"><code></code></span>
+<span class="codeline" id="line-273"><code>	// handling the case when id is a folder</code></span>
+<span class="codeline" id="line-274"><code>	// remember that basePath has to point to a file</code></span>
+<span class="codeline" id="line-275"><code>	var refPath string</code></span>
+<span class="codeline" id="line-276"><code>	if strings.HasSuffix(id, "/") {</code></span>
+<span class="codeline" id="line-277"><code>		// ensure this is detected as a file, not a folder</code></span>
+<span class="codeline" id="line-278"><code>		refPath = fmt.Sprintf("%s%s", id, "placeholder.json")</code></span>
+<span class="codeline" id="line-279"><code>	} else {</code></span>
+<span class="codeline" id="line-280"><code>		refPath = id</code></span>
+<span class="codeline" id="line-281"><code>	}</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>	// updates the current base path</code></span>
+<span class="codeline" id="line-284"><code>	// * important: ID can be a relative path</code></span>
+<span class="codeline" id="line-285"><code>	// * registers target to be fetchable from the new base proposed by this id</code></span>
+<span class="codeline" id="line-286"><code>	newBasePath := normalizeURI(refPath, basePath)</code></span>
+<span class="codeline" id="line-287"><code></code></span>
+<span class="codeline" id="line-288"><code>	// store found IDs for possible future reuse in $ref</code></span>
+<span class="codeline" id="line-289"><code>	r.cache.Set(newBasePath, target)</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>	// the root document has an ID: all $ref relative to that ID may</code></span>
+<span class="codeline" id="line-292"><code>	// be rebased relative to the root document</code></span>
+<span class="codeline" id="line-293"><code>	if basePath == r.context.basePath {</code></span>
+<span class="codeline" id="line-294"><code>		debugLog("root document is a schema with ID: %s (normalized as:%s)", id, newBasePath)</code></span>
+<span class="codeline" id="line-295"><code>		r.context.rootID = newBasePath</code></span>
+<span class="codeline" id="line-296"><code>	}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	return newBasePath, refPath</code></span>
+<span class="codeline" id="line-299"><code>}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>func defaultSchemaLoader(</code></span>
+<span class="codeline" id="line-302"><code>	root interface{},</code></span>
+<span class="codeline" id="line-303"><code>	expandOptions *ExpandOptions,</code></span>
+<span class="codeline" id="line-304"><code>	cache ResolutionCache,</code></span>
+<span class="codeline" id="line-305"><code>	context *resolverContext) *schemaLoader {</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>	if expandOptions == nil {</code></span>
+<span class="codeline" id="line-308"><code>		expandOptions = &amp;ExpandOptions{}</code></span>
+<span class="codeline" id="line-309"><code>	}</code></span>
+<span class="codeline" id="line-310"><code></code></span>
+<span class="codeline" id="line-311"><code>	cache = cacheOrDefault(cache)</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>	if expandOptions.RelativeBase == "" {</code></span>
+<span class="codeline" id="line-314"><code>		// if no relative base is provided, assume the root document</code></span>
+<span class="codeline" id="line-315"><code>		// contains all $ref, or at least, that the relative documents</code></span>
+<span class="codeline" id="line-316"><code>		// may be resolved from the current working directory.</code></span>
+<span class="codeline" id="line-317"><code>		expandOptions.RelativeBase = baseForRoot(root, cache)</code></span>
+<span class="codeline" id="line-318"><code>	}</code></span>
+<span class="codeline" id="line-319"><code>	debugLog("effective expander options: %#v", expandOptions)</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>	if context == nil {</code></span>
+<span class="codeline" id="line-322"><code>		context = newResolverContext(expandOptions)</code></span>
+<span class="codeline" id="line-323"><code>	}</code></span>
+<span class="codeline" id="line-324"><code></code></span>
+<span class="codeline" id="line-325"><code>	return &amp;schemaLoader{</code></span>
+<span class="codeline" id="line-326"><code>		root:    root,</code></span>
+<span class="codeline" id="line-327"><code>		options: expandOptions,</code></span>
+<span class="codeline" id="line-328"><code>		cache:   cache,</code></span>
+<span class="codeline" id="line-329"><code>		context: context,</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

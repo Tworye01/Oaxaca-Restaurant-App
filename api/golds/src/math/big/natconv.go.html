@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: natconv.go in package math/big</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	natconv.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/math/big.html">math/big</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2015 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// This file implements nat-to-string conversion functions.</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package big</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"io"</code></span>
+<span class="codeline" id="line-13"><code>	"math"</code></span>
+<span class="codeline" id="line-14"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-15"><code>	"sync"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>const digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>// Note: MaxBase = len(digits), but it must remain an untyped rune constant</code></span>
+<span class="codeline" id="line-21"><code>//       for API compatibility.</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>// MaxBase is the largest number base accepted for string conversions.</code></span>
+<span class="codeline" id="line-24"><code>const MaxBase = 10 + ('z' - 'a' + 1) + ('Z' - 'A' + 1)</code></span>
+<span class="codeline" id="line-25"><code>const maxBaseSmall = 10 + ('z' - 'a' + 1)</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>// maxPow returns (b**n, n) such that b**n is the largest power b**n &lt;= _M.</code></span>
+<span class="codeline" id="line-28"><code>// For instance maxPow(10) == (1e19, 19) for 19 decimal digits in a 64bit Word.</code></span>
+<span class="codeline" id="line-29"><code>// In other words, at most n digits in base b fit into a Word.</code></span>
+<span class="codeline" id="line-30"><code>// TODO(gri) replace this with a table, generated at build time.</code></span>
+<span class="codeline" id="line-31"><code>func maxPow(b Word) (p Word, n int) {</code></span>
+<span class="codeline" id="line-32"><code>	p, n = b, 1 // assuming b &lt;= _M</code></span>
+<span class="codeline" id="line-33"><code>	for max := _M / b; p &lt;= max; {</code></span>
+<span class="codeline" id="line-34"><code>		// p == b**n &amp;&amp; p &lt;= max</code></span>
+<span class="codeline" id="line-35"><code>		p *= b</code></span>
+<span class="codeline" id="line-36"><code>		n++</code></span>
+<span class="codeline" id="line-37"><code>	}</code></span>
+<span class="codeline" id="line-38"><code>	// p == b**n &amp;&amp; p &lt;= _M</code></span>
+<span class="codeline" id="line-39"><code>	return</code></span>
+<span class="codeline" id="line-40"><code>}</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>// pow returns x**n for n &gt; 0, and 1 otherwise.</code></span>
+<span class="codeline" id="line-43"><code>func pow(x Word, n int) (p Word) {</code></span>
+<span class="codeline" id="line-44"><code>	// n == sum of bi * 2**i, for 0 &lt;= i &lt; imax, and bi is 0 or 1</code></span>
+<span class="codeline" id="line-45"><code>	// thus x**n == product of x**(2**i) for all i where bi == 1</code></span>
+<span class="codeline" id="line-46"><code>	// (Russian Peasant Method for exponentiation)</code></span>
+<span class="codeline" id="line-47"><code>	p = 1</code></span>
+<span class="codeline" id="line-48"><code>	for n &gt; 0 {</code></span>
+<span class="codeline" id="line-49"><code>		if n&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-50"><code>			p *= x</code></span>
+<span class="codeline" id="line-51"><code>		}</code></span>
+<span class="codeline" id="line-52"><code>		x *= x</code></span>
+<span class="codeline" id="line-53"><code>		n &gt;&gt;= 1</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code>	return</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// scan errors</code></span>
+<span class="codeline" id="line-59"><code>var (</code></span>
+<span class="codeline" id="line-60"><code>	errNoDigits = errors.New("number has no digits")</code></span>
+<span class="codeline" id="line-61"><code>	errInvalSep = errors.New("'_' must separate successive digits")</code></span>
+<span class="codeline" id="line-62"><code>)</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>// scan scans the number corresponding to the longest possible prefix</code></span>
+<span class="codeline" id="line-65"><code>// from r representing an unsigned number in a given conversion base.</code></span>
+<span class="codeline" id="line-66"><code>// scan returns the corresponding natural number res, the actual base b,</code></span>
+<span class="codeline" id="line-67"><code>// a digit count, and a read or syntax error err, if any.</code></span>
+<span class="codeline" id="line-68"><code>//</code></span>
+<span class="codeline" id="line-69"><code>// For base 0, an underscore character “_” may appear between a base</code></span>
+<span class="codeline" id="line-70"><code>// prefix and an adjacent digit, and between successive digits; such</code></span>
+<span class="codeline" id="line-71"><code>// underscores do not change the value of the number, or the returned</code></span>
+<span class="codeline" id="line-72"><code>// digit count. Incorrect placement of underscores is reported as an</code></span>
+<span class="codeline" id="line-73"><code>// error if there are no other errors. If base != 0, underscores are</code></span>
+<span class="codeline" id="line-74"><code>// not recognized and thus terminate scanning like any other character</code></span>
+<span class="codeline" id="line-75"><code>// that is not a valid radix point or digit.</code></span>
+<span class="codeline" id="line-76"><code>//</code></span>
+<span class="codeline" id="line-77"><code>//	number    = mantissa | prefix pmantissa .</code></span>
+<span class="codeline" id="line-78"><code>//	prefix    = "0" [ "b" | "B" | "o" | "O" | "x" | "X" ] .</code></span>
+<span class="codeline" id="line-79"><code>//	mantissa  = digits "." [ digits ] | digits | "." digits .</code></span>
+<span class="codeline" id="line-80"><code>//	pmantissa = [ "_" ] digits "." [ digits ] | [ "_" ] digits | "." digits .</code></span>
+<span class="codeline" id="line-81"><code>//	digits    = digit { [ "_" ] digit } .</code></span>
+<span class="codeline" id="line-82"><code>//	digit     = "0" ... "9" | "a" ... "z" | "A" ... "Z" .</code></span>
+<span class="codeline" id="line-83"><code>//</code></span>
+<span class="codeline" id="line-84"><code>// Unless fracOk is set, the base argument must be 0 or a value between</code></span>
+<span class="codeline" id="line-85"><code>// 2 and MaxBase. If fracOk is set, the base argument must be one of</code></span>
+<span class="codeline" id="line-86"><code>// 0, 2, 8, 10, or 16. Providing an invalid base argument leads to a run-</code></span>
+<span class="codeline" id="line-87"><code>// time panic.</code></span>
+<span class="codeline" id="line-88"><code>//</code></span>
+<span class="codeline" id="line-89"><code>// For base 0, the number prefix determines the actual base: A prefix of</code></span>
+<span class="codeline" id="line-90"><code>// “0b” or “0B” selects base 2, “0o” or “0O” selects base 8, and</code></span>
+<span class="codeline" id="line-91"><code>// “0x” or “0X” selects base 16. If fracOk is false, a “0” prefix</code></span>
+<span class="codeline" id="line-92"><code>// (immediately followed by digits) selects base 8 as well. Otherwise,</code></span>
+<span class="codeline" id="line-93"><code>// the selected base is 10 and no prefix is accepted.</code></span>
+<span class="codeline" id="line-94"><code>//</code></span>
+<span class="codeline" id="line-95"><code>// If fracOk is set, a period followed by a fractional part is permitted.</code></span>
+<span class="codeline" id="line-96"><code>// The result value is computed as if there were no period present; and</code></span>
+<span class="codeline" id="line-97"><code>// the count value is used to determine the fractional part.</code></span>
+<span class="codeline" id="line-98"><code>//</code></span>
+<span class="codeline" id="line-99"><code>// For bases &lt;= 36, lower and upper case letters are considered the same:</code></span>
+<span class="codeline" id="line-100"><code>// The letters 'a' to 'z' and 'A' to 'Z' represent digit values 10 to 35.</code></span>
+<span class="codeline" id="line-101"><code>// For bases &gt; 36, the upper case letters 'A' to 'Z' represent the digit</code></span>
+<span class="codeline" id="line-102"><code>// values 36 to 61.</code></span>
+<span class="codeline" id="line-103"><code>//</code></span>
+<span class="codeline" id="line-104"><code>// A result digit count &gt; 0 corresponds to the number of (non-prefix) digits</code></span>
+<span class="codeline" id="line-105"><code>// parsed. A digit count &lt;= 0 indicates the presence of a period (if fracOk</code></span>
+<span class="codeline" id="line-106"><code>// is set, only), and -count is the number of fractional digits found.</code></span>
+<span class="codeline" id="line-107"><code>// In this case, the actual value of the scanned number is res * b**count.</code></span>
+<span class="codeline" id="line-108"><code>func (z nat) scan(r io.ByteScanner, base int, fracOk bool) (res nat, b, count int, err error) {</code></span>
+<span class="codeline" id="line-109"><code>	// reject invalid bases</code></span>
+<span class="codeline" id="line-110"><code>	baseOk := base == 0 ||</code></span>
+<span class="codeline" id="line-111"><code>		!fracOk &amp;&amp; 2 &lt;= base &amp;&amp; base &lt;= MaxBase ||</code></span>
+<span class="codeline" id="line-112"><code>		fracOk &amp;&amp; (base == 2 || base == 8 || base == 10 || base == 16)</code></span>
+<span class="codeline" id="line-113"><code>	if !baseOk {</code></span>
+<span class="codeline" id="line-114"><code>		panic(fmt.Sprintf("invalid number base %d", base))</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>	// prev encodes the previously seen char: it is one</code></span>
+<span class="codeline" id="line-118"><code>	// of '_', '0' (a digit), or '.' (anything else). A</code></span>
+<span class="codeline" id="line-119"><code>	// valid separator '_' may only occur after a digit</code></span>
+<span class="codeline" id="line-120"><code>	// and if base == 0.</code></span>
+<span class="codeline" id="line-121"><code>	prev := '.'</code></span>
+<span class="codeline" id="line-122"><code>	invalSep := false</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>	// one char look-ahead</code></span>
+<span class="codeline" id="line-125"><code>	ch, err := r.ReadByte()</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>	// determine actual base</code></span>
+<span class="codeline" id="line-128"><code>	b, prefix := base, 0</code></span>
+<span class="codeline" id="line-129"><code>	if base == 0 {</code></span>
+<span class="codeline" id="line-130"><code>		// actual base is 10 unless there's a base prefix</code></span>
+<span class="codeline" id="line-131"><code>		b = 10</code></span>
+<span class="codeline" id="line-132"><code>		if err == nil &amp;&amp; ch == '0' {</code></span>
+<span class="codeline" id="line-133"><code>			prev = '0'</code></span>
+<span class="codeline" id="line-134"><code>			count = 1</code></span>
+<span class="codeline" id="line-135"><code>			ch, err = r.ReadByte()</code></span>
+<span class="codeline" id="line-136"><code>			if err == nil {</code></span>
+<span class="codeline" id="line-137"><code>				// possibly one of 0b, 0B, 0o, 0O, 0x, 0X</code></span>
+<span class="codeline" id="line-138"><code>				switch ch {</code></span>
+<span class="codeline" id="line-139"><code>				case 'b', 'B':</code></span>
+<span class="codeline" id="line-140"><code>					b, prefix = 2, 'b'</code></span>
+<span class="codeline" id="line-141"><code>				case 'o', 'O':</code></span>
+<span class="codeline" id="line-142"><code>					b, prefix = 8, 'o'</code></span>
+<span class="codeline" id="line-143"><code>				case 'x', 'X':</code></span>
+<span class="codeline" id="line-144"><code>					b, prefix = 16, 'x'</code></span>
+<span class="codeline" id="line-145"><code>				default:</code></span>
+<span class="codeline" id="line-146"><code>					if !fracOk {</code></span>
+<span class="codeline" id="line-147"><code>						b, prefix = 8, '0'</code></span>
+<span class="codeline" id="line-148"><code>					}</code></span>
+<span class="codeline" id="line-149"><code>				}</code></span>
+<span class="codeline" id="line-150"><code>				if prefix != 0 {</code></span>
+<span class="codeline" id="line-151"><code>					count = 0 // prefix is not counted</code></span>
+<span class="codeline" id="line-152"><code>					if prefix != '0' {</code></span>
+<span class="codeline" id="line-153"><code>						ch, err = r.ReadByte()</code></span>
+<span class="codeline" id="line-154"><code>					}</code></span>
+<span class="codeline" id="line-155"><code>				}</code></span>
+<span class="codeline" id="line-156"><code>			}</code></span>
+<span class="codeline" id="line-157"><code>		}</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>	// convert string</code></span>
+<span class="codeline" id="line-161"><code>	// Algorithm: Collect digits in groups of at most n digits in di</code></span>
+<span class="codeline" id="line-162"><code>	// and then use mulAddWW for every such group to add them to the</code></span>
+<span class="codeline" id="line-163"><code>	// result.</code></span>
+<span class="codeline" id="line-164"><code>	z = z[:0]</code></span>
+<span class="codeline" id="line-165"><code>	b1 := Word(b)</code></span>
+<span class="codeline" id="line-166"><code>	bn, n := maxPow(b1) // at most n digits in base b1 fit into Word</code></span>
+<span class="codeline" id="line-167"><code>	di := Word(0)       // 0 &lt;= di &lt; b1**i &lt; bn</code></span>
+<span class="codeline" id="line-168"><code>	i := 0              // 0 &lt;= i &lt; n</code></span>
+<span class="codeline" id="line-169"><code>	dp := -1            // position of decimal point</code></span>
+<span class="codeline" id="line-170"><code>	for err == nil {</code></span>
+<span class="codeline" id="line-171"><code>		if ch == '.' &amp;&amp; fracOk {</code></span>
+<span class="codeline" id="line-172"><code>			fracOk = false</code></span>
+<span class="codeline" id="line-173"><code>			if prev == '_' {</code></span>
+<span class="codeline" id="line-174"><code>				invalSep = true</code></span>
+<span class="codeline" id="line-175"><code>			}</code></span>
+<span class="codeline" id="line-176"><code>			prev = '.'</code></span>
+<span class="codeline" id="line-177"><code>			dp = count</code></span>
+<span class="codeline" id="line-178"><code>		} else if ch == '_' &amp;&amp; base == 0 {</code></span>
+<span class="codeline" id="line-179"><code>			if prev != '0' {</code></span>
+<span class="codeline" id="line-180"><code>				invalSep = true</code></span>
+<span class="codeline" id="line-181"><code>			}</code></span>
+<span class="codeline" id="line-182"><code>			prev = '_'</code></span>
+<span class="codeline" id="line-183"><code>		} else {</code></span>
+<span class="codeline" id="line-184"><code>			// convert rune into digit value d1</code></span>
+<span class="codeline" id="line-185"><code>			var d1 Word</code></span>
+<span class="codeline" id="line-186"><code>			switch {</code></span>
+<span class="codeline" id="line-187"><code>			case '0' &lt;= ch &amp;&amp; ch &lt;= '9':</code></span>
+<span class="codeline" id="line-188"><code>				d1 = Word(ch - '0')</code></span>
+<span class="codeline" id="line-189"><code>			case 'a' &lt;= ch &amp;&amp; ch &lt;= 'z':</code></span>
+<span class="codeline" id="line-190"><code>				d1 = Word(ch - 'a' + 10)</code></span>
+<span class="codeline" id="line-191"><code>			case 'A' &lt;= ch &amp;&amp; ch &lt;= 'Z':</code></span>
+<span class="codeline" id="line-192"><code>				if b &lt;= maxBaseSmall {</code></span>
+<span class="codeline" id="line-193"><code>					d1 = Word(ch - 'A' + 10)</code></span>
+<span class="codeline" id="line-194"><code>				} else {</code></span>
+<span class="codeline" id="line-195"><code>					d1 = Word(ch - 'A' + maxBaseSmall)</code></span>
+<span class="codeline" id="line-196"><code>				}</code></span>
+<span class="codeline" id="line-197"><code>			default:</code></span>
+<span class="codeline" id="line-198"><code>				d1 = MaxBase + 1</code></span>
+<span class="codeline" id="line-199"><code>			}</code></span>
+<span class="codeline" id="line-200"><code>			if d1 &gt;= b1 {</code></span>
+<span class="codeline" id="line-201"><code>				r.UnreadByte() // ch does not belong to number anymore</code></span>
+<span class="codeline" id="line-202"><code>				break</code></span>
+<span class="codeline" id="line-203"><code>			}</code></span>
+<span class="codeline" id="line-204"><code>			prev = '0'</code></span>
+<span class="codeline" id="line-205"><code>			count++</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>			// collect d1 in di</code></span>
+<span class="codeline" id="line-208"><code>			di = di*b1 + d1</code></span>
+<span class="codeline" id="line-209"><code>			i++</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>			// if di is "full", add it to the result</code></span>
+<span class="codeline" id="line-212"><code>			if i == n {</code></span>
+<span class="codeline" id="line-213"><code>				z = z.mulAddWW(z, bn, di)</code></span>
+<span class="codeline" id="line-214"><code>				di = 0</code></span>
+<span class="codeline" id="line-215"><code>				i = 0</code></span>
+<span class="codeline" id="line-216"><code>			}</code></span>
+<span class="codeline" id="line-217"><code>		}</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>		ch, err = r.ReadByte()</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>	if err == io.EOF {</code></span>
+<span class="codeline" id="line-223"><code>		err = nil</code></span>
+<span class="codeline" id="line-224"><code>	}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>	// other errors take precedence over invalid separators</code></span>
+<span class="codeline" id="line-227"><code>	if err == nil &amp;&amp; (invalSep || prev == '_') {</code></span>
+<span class="codeline" id="line-228"><code>		err = errInvalSep</code></span>
+<span class="codeline" id="line-229"><code>	}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>	if count == 0 {</code></span>
+<span class="codeline" id="line-232"><code>		// no digits found</code></span>
+<span class="codeline" id="line-233"><code>		if prefix == '0' {</code></span>
+<span class="codeline" id="line-234"><code>			// there was only the octal prefix 0 (possibly followed by separators and digits &gt; 7);</code></span>
+<span class="codeline" id="line-235"><code>			// interpret as decimal 0</code></span>
+<span class="codeline" id="line-236"><code>			return z[:0], 10, 1, err</code></span>
+<span class="codeline" id="line-237"><code>		}</code></span>
+<span class="codeline" id="line-238"><code>		err = errNoDigits // fall through; result will be 0</code></span>
+<span class="codeline" id="line-239"><code>	}</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>	// add remaining digits to result</code></span>
+<span class="codeline" id="line-242"><code>	if i &gt; 0 {</code></span>
+<span class="codeline" id="line-243"><code>		z = z.mulAddWW(z, pow(b1, i), di)</code></span>
+<span class="codeline" id="line-244"><code>	}</code></span>
+<span class="codeline" id="line-245"><code>	res = z.norm()</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>	// adjust count for fraction, if any</code></span>
+<span class="codeline" id="line-248"><code>	if dp &gt;= 0 {</code></span>
+<span class="codeline" id="line-249"><code>		// 0 &lt;= dp &lt;= count</code></span>
+<span class="codeline" id="line-250"><code>		count = dp - count</code></span>
+<span class="codeline" id="line-251"><code>	}</code></span>
+<span class="codeline" id="line-252"><code></code></span>
+<span class="codeline" id="line-253"><code>	return</code></span>
+<span class="codeline" id="line-254"><code>}</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>// utoa converts x to an ASCII representation in the given base;</code></span>
+<span class="codeline" id="line-257"><code>// base must be between 2 and MaxBase, inclusive.</code></span>
+<span class="codeline" id="line-258"><code>func (x nat) utoa(base int) []byte {</code></span>
+<span class="codeline" id="line-259"><code>	return x.itoa(false, base)</code></span>
+<span class="codeline" id="line-260"><code>}</code></span>
+<span class="codeline" id="line-261"><code></code></span>
+<span class="codeline" id="line-262"><code>// itoa is like utoa but it prepends a '-' if neg &amp;&amp; x != 0.</code></span>
+<span class="codeline" id="line-263"><code>func (x nat) itoa(neg bool, base int) []byte {</code></span>
+<span class="codeline" id="line-264"><code>	if base &lt; 2 || base &gt; MaxBase {</code></span>
+<span class="codeline" id="line-265"><code>		panic("invalid base")</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>	// x == 0</code></span>
+<span class="codeline" id="line-269"><code>	if len(x) == 0 {</code></span>
+<span class="codeline" id="line-270"><code>		return []byte("0")</code></span>
+<span class="codeline" id="line-271"><code>	}</code></span>
+<span class="codeline" id="line-272"><code>	// len(x) &gt; 0</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>	// allocate buffer for conversion</code></span>
+<span class="codeline" id="line-275"><code>	i := int(float64(x.bitLen())/math.Log2(float64(base))) + 1 // off by 1 at most</code></span>
+<span class="codeline" id="line-276"><code>	if neg {</code></span>
+<span class="codeline" id="line-277"><code>		i++</code></span>
+<span class="codeline" id="line-278"><code>	}</code></span>
+<span class="codeline" id="line-279"><code>	s := make([]byte, i)</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	// convert power of two and non power of two bases separately</code></span>
+<span class="codeline" id="line-282"><code>	if b := Word(base); b == b&amp;-b {</code></span>
+<span class="codeline" id="line-283"><code>		// shift is base b digit size in bits</code></span>
+<span class="codeline" id="line-284"><code>		shift := uint(bits.TrailingZeros(uint(b))) // shift &gt; 0 because b &gt;= 2</code></span>
+<span class="codeline" id="line-285"><code>		mask := Word(1&lt;&lt;shift - 1)</code></span>
+<span class="codeline" id="line-286"><code>		w := x[0]         // current word</code></span>
+<span class="codeline" id="line-287"><code>		nbits := uint(_W) // number of unprocessed bits in w</code></span>
+<span class="codeline" id="line-288"><code></code></span>
+<span class="codeline" id="line-289"><code>		// convert less-significant words (include leading zeros)</code></span>
+<span class="codeline" id="line-290"><code>		for k := 1; k &lt; len(x); k++ {</code></span>
+<span class="codeline" id="line-291"><code>			// convert full digits</code></span>
+<span class="codeline" id="line-292"><code>			for nbits &gt;= shift {</code></span>
+<span class="codeline" id="line-293"><code>				i--</code></span>
+<span class="codeline" id="line-294"><code>				s[i] = digits[w&amp;mask]</code></span>
+<span class="codeline" id="line-295"><code>				w &gt;&gt;= shift</code></span>
+<span class="codeline" id="line-296"><code>				nbits -= shift</code></span>
+<span class="codeline" id="line-297"><code>			}</code></span>
+<span class="codeline" id="line-298"><code></code></span>
+<span class="codeline" id="line-299"><code>			// convert any partial leading digit and advance to next word</code></span>
+<span class="codeline" id="line-300"><code>			if nbits == 0 {</code></span>
+<span class="codeline" id="line-301"><code>				// no partial digit remaining, just advance</code></span>
+<span class="codeline" id="line-302"><code>				w = x[k]</code></span>
+<span class="codeline" id="line-303"><code>				nbits = _W</code></span>
+<span class="codeline" id="line-304"><code>			} else {</code></span>
+<span class="codeline" id="line-305"><code>				// partial digit in current word w (== x[k-1]) and next word x[k]</code></span>
+<span class="codeline" id="line-306"><code>				w |= x[k] &lt;&lt; nbits</code></span>
+<span class="codeline" id="line-307"><code>				i--</code></span>
+<span class="codeline" id="line-308"><code>				s[i] = digits[w&amp;mask]</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>				// advance</code></span>
+<span class="codeline" id="line-311"><code>				w = x[k] &gt;&gt; (shift - nbits)</code></span>
+<span class="codeline" id="line-312"><code>				nbits = _W - (shift - nbits)</code></span>
+<span class="codeline" id="line-313"><code>			}</code></span>
+<span class="codeline" id="line-314"><code>		}</code></span>
+<span class="codeline" id="line-315"><code></code></span>
+<span class="codeline" id="line-316"><code>		// convert digits of most-significant word w (omit leading zeros)</code></span>
+<span class="codeline" id="line-317"><code>		for w != 0 {</code></span>
+<span class="codeline" id="line-318"><code>			i--</code></span>
+<span class="codeline" id="line-319"><code>			s[i] = digits[w&amp;mask]</code></span>
+<span class="codeline" id="line-320"><code>			w &gt;&gt;= shift</code></span>
+<span class="codeline" id="line-321"><code>		}</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>	} else {</code></span>
+<span class="codeline" id="line-324"><code>		bb, ndigits := maxPow(b)</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>		// construct table of successive squares of bb*leafSize to use in subdivisions</code></span>
+<span class="codeline" id="line-327"><code>		// result (table != nil) &lt;=&gt; (len(x) &gt; leafSize &gt; 0)</code></span>
+<span class="codeline" id="line-328"><code>		table := divisors(len(x), b, ndigits, bb)</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>		// preserve x, create local copy for use by convertWords</code></span>
+<span class="codeline" id="line-331"><code>		q := nat(nil).set(x)</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>		// convert q to string s in base b</code></span>
+<span class="codeline" id="line-334"><code>		q.convertWords(s, b, ndigits, bb, table)</code></span>
+<span class="codeline" id="line-335"><code></code></span>
+<span class="codeline" id="line-336"><code>		// strip leading zeros</code></span>
+<span class="codeline" id="line-337"><code>		// (x != 0; thus s must contain at least one non-zero digit</code></span>
+<span class="codeline" id="line-338"><code>		// and the loop will terminate)</code></span>
+<span class="codeline" id="line-339"><code>		i = 0</code></span>
+<span class="codeline" id="line-340"><code>		for s[i] == '0' {</code></span>
+<span class="codeline" id="line-341"><code>			i++</code></span>
+<span class="codeline" id="line-342"><code>		}</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code></code></span>
+<span class="codeline" id="line-345"><code>	if neg {</code></span>
+<span class="codeline" id="line-346"><code>		i--</code></span>
+<span class="codeline" id="line-347"><code>		s[i] = '-'</code></span>
+<span class="codeline" id="line-348"><code>	}</code></span>
+<span class="codeline" id="line-349"><code></code></span>
+<span class="codeline" id="line-350"><code>	return s[i:]</code></span>
+<span class="codeline" id="line-351"><code>}</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>// Convert words of q to base b digits in s. If q is large, it is recursively "split in half"</code></span>
+<span class="codeline" id="line-354"><code>// by nat/nat division using tabulated divisors. Otherwise, it is converted iteratively using</code></span>
+<span class="codeline" id="line-355"><code>// repeated nat/Word division.</code></span>
+<span class="codeline" id="line-356"><code>//</code></span>
+<span class="codeline" id="line-357"><code>// The iterative method processes n Words by n divW() calls, each of which visits every Word in the</code></span>
+<span class="codeline" id="line-358"><code>// incrementally shortened q for a total of n + (n-1) + (n-2) ... + 2 + 1, or n(n+1)/2 divW()'s.</code></span>
+<span class="codeline" id="line-359"><code>// Recursive conversion divides q by its approximate square root, yielding two parts, each half</code></span>
+<span class="codeline" id="line-360"><code>// the size of q. Using the iterative method on both halves means 2 * (n/2)(n/2 + 1)/2 divW()'s</code></span>
+<span class="codeline" id="line-361"><code>// plus the expensive long div(). Asymptotically, the ratio is favorable at 1/2 the divW()'s, and</code></span>
+<span class="codeline" id="line-362"><code>// is made better by splitting the subblocks recursively. Best is to split blocks until one more</code></span>
+<span class="codeline" id="line-363"><code>// split would take longer (because of the nat/nat div()) than the twice as many divW()'s of the</code></span>
+<span class="codeline" id="line-364"><code>// iterative approach. This threshold is represented by leafSize. Benchmarking of leafSize in the</code></span>
+<span class="codeline" id="line-365"><code>// range 2..64 shows that values of 8 and 16 work well, with a 4x speedup at medium lengths and</code></span>
+<span class="codeline" id="line-366"><code>// ~30x for 20000 digits. Use nat_test.go's BenchmarkLeafSize tests to optimize leafSize for</code></span>
+<span class="codeline" id="line-367"><code>// specific hardware.</code></span>
+<span class="codeline" id="line-368"><code>func (q nat) convertWords(s []byte, b Word, ndigits int, bb Word, table []divisor) {</code></span>
+<span class="codeline" id="line-369"><code>	// split larger blocks recursively</code></span>
+<span class="codeline" id="line-370"><code>	if table != nil {</code></span>
+<span class="codeline" id="line-371"><code>		// len(q) &gt; leafSize &gt; 0</code></span>
+<span class="codeline" id="line-372"><code>		var r nat</code></span>
+<span class="codeline" id="line-373"><code>		index := len(table) - 1</code></span>
+<span class="codeline" id="line-374"><code>		for len(q) &gt; leafSize {</code></span>
+<span class="codeline" id="line-375"><code>			// find divisor close to sqrt(q) if possible, but in any case &lt; q</code></span>
+<span class="codeline" id="line-376"><code>			maxLength := q.bitLen()     // ~= log2 q, or at of least largest possible q of this bit length</code></span>
+<span class="codeline" id="line-377"><code>			minLength := maxLength &gt;&gt; 1 // ~= log2 sqrt(q)</code></span>
+<span class="codeline" id="line-378"><code>			for index &gt; 0 &amp;&amp; table[index-1].nbits &gt; minLength {</code></span>
+<span class="codeline" id="line-379"><code>				index-- // desired</code></span>
+<span class="codeline" id="line-380"><code>			}</code></span>
+<span class="codeline" id="line-381"><code>			if table[index].nbits &gt;= maxLength &amp;&amp; table[index].bbb.cmp(q) &gt;= 0 {</code></span>
+<span class="codeline" id="line-382"><code>				index--</code></span>
+<span class="codeline" id="line-383"><code>				if index &lt; 0 {</code></span>
+<span class="codeline" id="line-384"><code>					panic("internal inconsistency")</code></span>
+<span class="codeline" id="line-385"><code>				}</code></span>
+<span class="codeline" id="line-386"><code>			}</code></span>
+<span class="codeline" id="line-387"><code></code></span>
+<span class="codeline" id="line-388"><code>			// split q into the two digit number (q'*bbb + r) to form independent subblocks</code></span>
+<span class="codeline" id="line-389"><code>			q, r = q.div(r, q, table[index].bbb)</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>			// convert subblocks and collect results in s[:h] and s[h:]</code></span>
+<span class="codeline" id="line-392"><code>			h := len(s) - table[index].ndigits</code></span>
+<span class="codeline" id="line-393"><code>			r.convertWords(s[h:], b, ndigits, bb, table[0:index])</code></span>
+<span class="codeline" id="line-394"><code>			s = s[:h] // == q.convertWords(s, b, ndigits, bb, table[0:index+1])</code></span>
+<span class="codeline" id="line-395"><code>		}</code></span>
+<span class="codeline" id="line-396"><code>	}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>	// having split any large blocks now process the remaining (small) block iteratively</code></span>
+<span class="codeline" id="line-399"><code>	i := len(s)</code></span>
+<span class="codeline" id="line-400"><code>	var r Word</code></span>
+<span class="codeline" id="line-401"><code>	if b == 10 {</code></span>
+<span class="codeline" id="line-402"><code>		// hard-coding for 10 here speeds this up by 1.25x (allows for / and % by constants)</code></span>
+<span class="codeline" id="line-403"><code>		for len(q) &gt; 0 {</code></span>
+<span class="codeline" id="line-404"><code>			// extract least significant, base bb "digit"</code></span>
+<span class="codeline" id="line-405"><code>			q, r = q.divW(q, bb)</code></span>
+<span class="codeline" id="line-406"><code>			for j := 0; j &lt; ndigits &amp;&amp; i &gt; 0; j++ {</code></span>
+<span class="codeline" id="line-407"><code>				i--</code></span>
+<span class="codeline" id="line-408"><code>				// avoid % computation since r%10 == r - int(r/10)*10;</code></span>
+<span class="codeline" id="line-409"><code>				// this appears to be faster for BenchmarkString10000Base10</code></span>
+<span class="codeline" id="line-410"><code>				// and smaller strings (but a bit slower for larger ones)</code></span>
+<span class="codeline" id="line-411"><code>				t := r / 10</code></span>
+<span class="codeline" id="line-412"><code>				s[i] = '0' + byte(r-t*10)</code></span>
+<span class="codeline" id="line-413"><code>				r = t</code></span>
+<span class="codeline" id="line-414"><code>			}</code></span>
+<span class="codeline" id="line-415"><code>		}</code></span>
+<span class="codeline" id="line-416"><code>	} else {</code></span>
+<span class="codeline" id="line-417"><code>		for len(q) &gt; 0 {</code></span>
+<span class="codeline" id="line-418"><code>			// extract least significant, base bb "digit"</code></span>
+<span class="codeline" id="line-419"><code>			q, r = q.divW(q, bb)</code></span>
+<span class="codeline" id="line-420"><code>			for j := 0; j &lt; ndigits &amp;&amp; i &gt; 0; j++ {</code></span>
+<span class="codeline" id="line-421"><code>				i--</code></span>
+<span class="codeline" id="line-422"><code>				s[i] = digits[r%b]</code></span>
+<span class="codeline" id="line-423"><code>				r /= b</code></span>
+<span class="codeline" id="line-424"><code>			}</code></span>
+<span class="codeline" id="line-425"><code>		}</code></span>
+<span class="codeline" id="line-426"><code>	}</code></span>
+<span class="codeline" id="line-427"><code></code></span>
+<span class="codeline" id="line-428"><code>	// prepend high-order zeros</code></span>
+<span class="codeline" id="line-429"><code>	for i &gt; 0 { // while need more leading zeros</code></span>
+<span class="codeline" id="line-430"><code>		i--</code></span>
+<span class="codeline" id="line-431"><code>		s[i] = '0'</code></span>
+<span class="codeline" id="line-432"><code>	}</code></span>
+<span class="codeline" id="line-433"><code>}</code></span>
+<span class="codeline" id="line-434"><code></code></span>
+<span class="codeline" id="line-435"><code>// Split blocks greater than leafSize Words (or set to 0 to disable recursive conversion)</code></span>
+<span class="codeline" id="line-436"><code>// Benchmark and configure leafSize using: go test -bench="Leaf"</code></span>
+<span class="codeline" id="line-437"><code>//</code></span>
+<span class="codeline" id="line-438"><code>//	8 and 16 effective on 3.0 GHz Xeon "Clovertown" CPU (128 byte cache lines)</code></span>
+<span class="codeline" id="line-439"><code>//	8 and 16 effective on 2.66 GHz Core 2 Duo "Penryn" CPU</code></span>
+<span class="codeline" id="line-440"><code>var leafSize int = 8 // number of Word-size binary values treat as a monolithic block</code></span>
+<span class="codeline" id="line-441"><code></code></span>
+<span class="codeline" id="line-442"><code>type divisor struct {</code></span>
+<span class="codeline" id="line-443"><code>	bbb     nat // divisor</code></span>
+<span class="codeline" id="line-444"><code>	nbits   int // bit length of divisor (discounting leading zeros) ~= log2(bbb)</code></span>
+<span class="codeline" id="line-445"><code>	ndigits int // digit length of divisor in terms of output base digits</code></span>
+<span class="codeline" id="line-446"><code>}</code></span>
+<span class="codeline" id="line-447"><code></code></span>
+<span class="codeline" id="line-448"><code>var cacheBase10 struct {</code></span>
+<span class="codeline" id="line-449"><code>	sync.Mutex</code></span>
+<span class="codeline" id="line-450"><code>	table [64]divisor // cached divisors for base 10</code></span>
+<span class="codeline" id="line-451"><code>}</code></span>
+<span class="codeline" id="line-452"><code></code></span>
+<span class="codeline" id="line-453"><code>// expWW computes x**y</code></span>
+<span class="codeline" id="line-454"><code>func (z nat) expWW(x, y Word) nat {</code></span>
+<span class="codeline" id="line-455"><code>	return z.expNN(nat(nil).setWord(x), nat(nil).setWord(y), nil, false)</code></span>
+<span class="codeline" id="line-456"><code>}</code></span>
+<span class="codeline" id="line-457"><code></code></span>
+<span class="codeline" id="line-458"><code>// construct table of powers of bb*leafSize to use in subdivisions.</code></span>
+<span class="codeline" id="line-459"><code>func divisors(m int, b Word, ndigits int, bb Word) []divisor {</code></span>
+<span class="codeline" id="line-460"><code>	// only compute table when recursive conversion is enabled and x is large</code></span>
+<span class="codeline" id="line-461"><code>	if leafSize == 0 || m &lt;= leafSize {</code></span>
+<span class="codeline" id="line-462"><code>		return nil</code></span>
+<span class="codeline" id="line-463"><code>	}</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>	// determine k where (bb**leafSize)**(2**k) &gt;= sqrt(x)</code></span>
+<span class="codeline" id="line-466"><code>	k := 1</code></span>
+<span class="codeline" id="line-467"><code>	for words := leafSize; words &lt; m&gt;&gt;1 &amp;&amp; k &lt; len(cacheBase10.table); words &lt;&lt;= 1 {</code></span>
+<span class="codeline" id="line-468"><code>		k++</code></span>
+<span class="codeline" id="line-469"><code>	}</code></span>
+<span class="codeline" id="line-470"><code></code></span>
+<span class="codeline" id="line-471"><code>	// reuse and extend existing table of divisors or create new table as appropriate</code></span>
+<span class="codeline" id="line-472"><code>	var table []divisor // for b == 10, table overlaps with cacheBase10.table</code></span>
+<span class="codeline" id="line-473"><code>	if b == 10 {</code></span>
+<span class="codeline" id="line-474"><code>		cacheBase10.Lock()</code></span>
+<span class="codeline" id="line-475"><code>		table = cacheBase10.table[0:k] // reuse old table for this conversion</code></span>
+<span class="codeline" id="line-476"><code>	} else {</code></span>
+<span class="codeline" id="line-477"><code>		table = make([]divisor, k) // create new table for this conversion</code></span>
+<span class="codeline" id="line-478"><code>	}</code></span>
+<span class="codeline" id="line-479"><code></code></span>
+<span class="codeline" id="line-480"><code>	// extend table</code></span>
+<span class="codeline" id="line-481"><code>	if table[k-1].ndigits == 0 {</code></span>
+<span class="codeline" id="line-482"><code>		// add new entries as needed</code></span>
+<span class="codeline" id="line-483"><code>		var larger nat</code></span>
+<span class="codeline" id="line-484"><code>		for i := 0; i &lt; k; i++ {</code></span>
+<span class="codeline" id="line-485"><code>			if table[i].ndigits == 0 {</code></span>
+<span class="codeline" id="line-486"><code>				if i == 0 {</code></span>
+<span class="codeline" id="line-487"><code>					table[0].bbb = nat(nil).expWW(bb, Word(leafSize))</code></span>
+<span class="codeline" id="line-488"><code>					table[0].ndigits = ndigits * leafSize</code></span>
+<span class="codeline" id="line-489"><code>				} else {</code></span>
+<span class="codeline" id="line-490"><code>					table[i].bbb = nat(nil).sqr(table[i-1].bbb)</code></span>
+<span class="codeline" id="line-491"><code>					table[i].ndigits = 2 * table[i-1].ndigits</code></span>
+<span class="codeline" id="line-492"><code>				}</code></span>
+<span class="codeline" id="line-493"><code></code></span>
+<span class="codeline" id="line-494"><code>				// optimization: exploit aggregated extra bits in macro blocks</code></span>
+<span class="codeline" id="line-495"><code>				larger = nat(nil).set(table[i].bbb)</code></span>
+<span class="codeline" id="line-496"><code>				for mulAddVWW(larger, larger, b, 0) == 0 {</code></span>
+<span class="codeline" id="line-497"><code>					table[i].bbb = table[i].bbb.set(larger)</code></span>
+<span class="codeline" id="line-498"><code>					table[i].ndigits++</code></span>
+<span class="codeline" id="line-499"><code>				}</code></span>
+<span class="codeline" id="line-500"><code></code></span>
+<span class="codeline" id="line-501"><code>				table[i].nbits = table[i].bbb.bitLen()</code></span>
+<span class="codeline" id="line-502"><code>			}</code></span>
+<span class="codeline" id="line-503"><code>		}</code></span>
+<span class="codeline" id="line-504"><code>	}</code></span>
+<span class="codeline" id="line-505"><code></code></span>
+<span class="codeline" id="line-506"><code>	if b == 10 {</code></span>
+<span class="codeline" id="line-507"><code>		cacheBase10.Unlock()</code></span>
+<span class="codeline" id="line-508"><code>	}</code></span>
+<span class="codeline" id="line-509"><code></code></span>
+<span class="codeline" id="line-510"><code>	return table</code></span>
+<span class="codeline" id="line-511"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: hmac.go in package crypto/hmac</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	hmac.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/hmac.html">crypto/hmac</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>/*</code></span>
+<span class="codeline" id="line-6"><code>Package hmac implements the Keyed-Hash Message Authentication Code (HMAC) as</code></span>
+<span class="codeline" id="line-7"><code>defined in U.S. Federal Information Processing Standards Publication 198.</code></span>
+<span class="codeline" id="line-8"><code>An HMAC is a cryptographic hash that uses a key to sign a message.</code></span>
+<span class="codeline" id="line-9"><code>The receiver verifies the hash by recomputing it using the same key.</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>Receivers should be careful to use Equal to compare MACs in order to avoid</code></span>
+<span class="codeline" id="line-12"><code>timing side-channels:</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>	// ValidMAC reports whether messageMAC is a valid HMAC tag for message.</code></span>
+<span class="codeline" id="line-15"><code>	func ValidMAC(message, messageMAC, key []byte) bool {</code></span>
+<span class="codeline" id="line-16"><code>		mac := hmac.New(sha256.New, key)</code></span>
+<span class="codeline" id="line-17"><code>		mac.Write(message)</code></span>
+<span class="codeline" id="line-18"><code>		expectedMAC := mac.Sum(nil)</code></span>
+<span class="codeline" id="line-19"><code>		return hmac.Equal(messageMAC, expectedMAC)</code></span>
+<span class="codeline" id="line-20"><code>	}</code></span>
+<span class="codeline" id="line-21"><code>*/</code></span></div><span class="codeline" id="line-22"><code>package hmac</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>import (</code></span>
+<span class="codeline" id="line-25"><code>	"crypto/internal/boring"</code></span>
+<span class="codeline" id="line-26"><code>	"crypto/subtle"</code></span>
+<span class="codeline" id="line-27"><code>	"hash"</code></span>
+<span class="codeline" id="line-28"><code>)</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>// FIPS 198-1:</code></span>
+<span class="codeline" id="line-31"><code>// https://csrc.nist.gov/publications/fips/fips198-1/FIPS-198-1_final.pdf</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>// key is zero padded to the block size of the hash function</code></span>
+<span class="codeline" id="line-34"><code>// ipad = 0x36 byte repeated for key length</code></span>
+<span class="codeline" id="line-35"><code>// opad = 0x5c byte repeated for key length</code></span>
+<span class="codeline" id="line-36"><code>// hmac = H([key ^ opad] H([key ^ ipad] text))</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>// marshalable is the combination of encoding.BinaryMarshaler and</code></span>
+<span class="codeline" id="line-39"><code>// encoding.BinaryUnmarshaler. Their method definitions are repeated here to</code></span>
+<span class="codeline" id="line-40"><code>// avoid a dependency on the encoding package.</code></span>
+<span class="codeline" id="line-41"><code>type marshalable interface {</code></span>
+<span class="codeline" id="line-42"><code>	MarshalBinary() ([]byte, error)</code></span>
+<span class="codeline" id="line-43"><code>	UnmarshalBinary([]byte) error</code></span>
+<span class="codeline" id="line-44"><code>}</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>type hmac struct {</code></span>
+<span class="codeline" id="line-47"><code>	opad, ipad   []byte</code></span>
+<span class="codeline" id="line-48"><code>	outer, inner hash.Hash</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>	// If marshaled is true, then opad and ipad do not contain a padded</code></span>
+<span class="codeline" id="line-51"><code>	// copy of the key, but rather the marshaled state of outer/inner after</code></span>
+<span class="codeline" id="line-52"><code>	// opad/ipad has been fed into it.</code></span>
+<span class="codeline" id="line-53"><code>	marshaled bool</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>func (h *hmac) Sum(in []byte) []byte {</code></span>
+<span class="codeline" id="line-57"><code>	origLen := len(in)</code></span>
+<span class="codeline" id="line-58"><code>	in = h.inner.Sum(in)</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	if h.marshaled {</code></span>
+<span class="codeline" id="line-61"><code>		if err := h.outer.(marshalable).UnmarshalBinary(h.opad); err != nil {</code></span>
+<span class="codeline" id="line-62"><code>			panic(err)</code></span>
+<span class="codeline" id="line-63"><code>		}</code></span>
+<span class="codeline" id="line-64"><code>	} else {</code></span>
+<span class="codeline" id="line-65"><code>		h.outer.Reset()</code></span>
+<span class="codeline" id="line-66"><code>		h.outer.Write(h.opad)</code></span>
+<span class="codeline" id="line-67"><code>	}</code></span>
+<span class="codeline" id="line-68"><code>	h.outer.Write(in[origLen:])</code></span>
+<span class="codeline" id="line-69"><code>	return h.outer.Sum(in[:origLen])</code></span>
+<span class="codeline" id="line-70"><code>}</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>func (h *hmac) Write(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-73"><code>	return h.inner.Write(p)</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>func (h *hmac) Size() int      { return h.outer.Size() }</code></span>
+<span class="codeline" id="line-77"><code>func (h *hmac) BlockSize() int { return h.inner.BlockSize() }</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>func (h *hmac) Reset() {</code></span>
+<span class="codeline" id="line-80"><code>	if h.marshaled {</code></span>
+<span class="codeline" id="line-81"><code>		if err := h.inner.(marshalable).UnmarshalBinary(h.ipad); err != nil {</code></span>
+<span class="codeline" id="line-82"><code>			panic(err)</code></span>
+<span class="codeline" id="line-83"><code>		}</code></span>
+<span class="codeline" id="line-84"><code>		return</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>	h.inner.Reset()</code></span>
+<span class="codeline" id="line-88"><code>	h.inner.Write(h.ipad)</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	// If the underlying hash is marshalable, we can save some time by</code></span>
+<span class="codeline" id="line-91"><code>	// saving a copy of the hash state now, and restoring it on future</code></span>
+<span class="codeline" id="line-92"><code>	// calls to Reset and Sum instead of writing ipad/opad every time.</code></span>
+<span class="codeline" id="line-93"><code>	//</code></span>
+<span class="codeline" id="line-94"><code>	// If either hash is unmarshalable for whatever reason,</code></span>
+<span class="codeline" id="line-95"><code>	// it's safe to bail out here.</code></span>
+<span class="codeline" id="line-96"><code>	marshalableInner, innerOK := h.inner.(marshalable)</code></span>
+<span class="codeline" id="line-97"><code>	if !innerOK {</code></span>
+<span class="codeline" id="line-98"><code>		return</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	marshalableOuter, outerOK := h.outer.(marshalable)</code></span>
+<span class="codeline" id="line-101"><code>	if !outerOK {</code></span>
+<span class="codeline" id="line-102"><code>		return</code></span>
+<span class="codeline" id="line-103"><code>	}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>	imarshal, err := marshalableInner.MarshalBinary()</code></span>
+<span class="codeline" id="line-106"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-107"><code>		return</code></span>
+<span class="codeline" id="line-108"><code>	}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>	h.outer.Reset()</code></span>
+<span class="codeline" id="line-111"><code>	h.outer.Write(h.opad)</code></span>
+<span class="codeline" id="line-112"><code>	omarshal, err := marshalableOuter.MarshalBinary()</code></span>
+<span class="codeline" id="line-113"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-114"><code>		return</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>	// Marshaling succeeded; save the marshaled state for later</code></span>
+<span class="codeline" id="line-118"><code>	h.ipad = imarshal</code></span>
+<span class="codeline" id="line-119"><code>	h.opad = omarshal</code></span>
+<span class="codeline" id="line-120"><code>	h.marshaled = true</code></span>
+<span class="codeline" id="line-121"><code>}</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>// New returns a new HMAC hash using the given [hash.Hash] type and key.</code></span>
+<span class="codeline" id="line-124"><code>// New functions like sha256.New from [crypto/sha256] can be used as h.</code></span>
+<span class="codeline" id="line-125"><code>// h must return a new Hash every time it is called.</code></span>
+<span class="codeline" id="line-126"><code>// Note that unlike other hash implementations in the standard library,</code></span>
+<span class="codeline" id="line-127"><code>// the returned Hash does not implement [encoding.BinaryMarshaler]</code></span>
+<span class="codeline" id="line-128"><code>// or [encoding.BinaryUnmarshaler].</code></span>
+<span class="codeline" id="line-129"><code>func New(h func() hash.Hash, key []byte) hash.Hash {</code></span>
+<span class="codeline" id="line-130"><code>	if boring.Enabled {</code></span>
+<span class="codeline" id="line-131"><code>		hm := boring.NewHMAC(h, key)</code></span>
+<span class="codeline" id="line-132"><code>		if hm != nil {</code></span>
+<span class="codeline" id="line-133"><code>			return hm</code></span>
+<span class="codeline" id="line-134"><code>		}</code></span>
+<span class="codeline" id="line-135"><code>		// BoringCrypto did not recognize h, so fall through to standard Go code.</code></span>
+<span class="codeline" id="line-136"><code>	}</code></span>
+<span class="codeline" id="line-137"><code>	hm := new(hmac)</code></span>
+<span class="codeline" id="line-138"><code>	hm.outer = h()</code></span>
+<span class="codeline" id="line-139"><code>	hm.inner = h()</code></span>
+<span class="codeline" id="line-140"><code>	unique := true</code></span>
+<span class="codeline" id="line-141"><code>	func() {</code></span>
+<span class="codeline" id="line-142"><code>		defer func() {</code></span>
+<span class="codeline" id="line-143"><code>			// The comparison might panic if the underlying types are not comparable.</code></span>
+<span class="codeline" id="line-144"><code>			_ = recover()</code></span>
+<span class="codeline" id="line-145"><code>		}()</code></span>
+<span class="codeline" id="line-146"><code>		if hm.outer == hm.inner {</code></span>
+<span class="codeline" id="line-147"><code>			unique = false</code></span>
+<span class="codeline" id="line-148"><code>		}</code></span>
+<span class="codeline" id="line-149"><code>	}()</code></span>
+<span class="codeline" id="line-150"><code>	if !unique {</code></span>
+<span class="codeline" id="line-151"><code>		panic("crypto/hmac: hash generation function does not produce unique values")</code></span>
+<span class="codeline" id="line-152"><code>	}</code></span>
+<span class="codeline" id="line-153"><code>	blocksize := hm.inner.BlockSize()</code></span>
+<span class="codeline" id="line-154"><code>	hm.ipad = make([]byte, blocksize)</code></span>
+<span class="codeline" id="line-155"><code>	hm.opad = make([]byte, blocksize)</code></span>
+<span class="codeline" id="line-156"><code>	if len(key) &gt; blocksize {</code></span>
+<span class="codeline" id="line-157"><code>		// If key is too big, hash it.</code></span>
+<span class="codeline" id="line-158"><code>		hm.outer.Write(key)</code></span>
+<span class="codeline" id="line-159"><code>		key = hm.outer.Sum(nil)</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code>	copy(hm.ipad, key)</code></span>
+<span class="codeline" id="line-162"><code>	copy(hm.opad, key)</code></span>
+<span class="codeline" id="line-163"><code>	for i := range hm.ipad {</code></span>
+<span class="codeline" id="line-164"><code>		hm.ipad[i] ^= 0x36</code></span>
+<span class="codeline" id="line-165"><code>	}</code></span>
+<span class="codeline" id="line-166"><code>	for i := range hm.opad {</code></span>
+<span class="codeline" id="line-167"><code>		hm.opad[i] ^= 0x5c</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code>	hm.inner.Write(hm.ipad)</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>	return hm</code></span>
+<span class="codeline" id="line-172"><code>}</code></span>
+<span class="codeline" id="line-173"><code></code></span>
+<span class="codeline" id="line-174"><code>// Equal compares two MACs for equality without leaking timing information.</code></span>
+<span class="codeline" id="line-175"><code>func Equal(mac1, mac2 []byte) bool {</code></span>
+<span class="codeline" id="line-176"><code>	// We don't have to be constant time if the lengths of the MACs are</code></span>
+<span class="codeline" id="line-177"><code>	// different as that suggests that a completely different hash function</code></span>
+<span class="codeline" id="line-178"><code>	// was used.</code></span>
+<span class="codeline" id="line-179"><code>	return subtle.ConstantTimeCompare(mac1, mac2) == 1</code></span>
+<span class="codeline" id="line-180"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

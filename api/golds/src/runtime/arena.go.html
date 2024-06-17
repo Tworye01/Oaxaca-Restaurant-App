@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: arena.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	arena.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2022 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// Implementation of (safe) user arenas.</code></span>
+<span class="codeline" id="line-6"><code>//</code></span>
+<span class="codeline" id="line-7"><code>// This file contains the implementation of user arenas wherein Go values can</code></span>
+<span class="codeline" id="line-8"><code>// be manually allocated and freed in bulk. The act of manually freeing memory,</code></span>
+<span class="codeline" id="line-9"><code>// potentially before a GC cycle, means that a garbage collection cycle can be</code></span>
+<span class="codeline" id="line-10"><code>// delayed, improving efficiency by reducing GC cycle frequency. There are other</code></span>
+<span class="codeline" id="line-11"><code>// potential efficiency benefits, such as improved locality and access to a more</code></span>
+<span class="codeline" id="line-12"><code>// efficient allocation strategy.</code></span>
+<span class="codeline" id="line-13"><code>//</code></span>
+<span class="codeline" id="line-14"><code>// What makes the arenas here safe is that once they are freed, accessing the</code></span>
+<span class="codeline" id="line-15"><code>// arena's memory will cause an explicit program fault, and the arena's address</code></span>
+<span class="codeline" id="line-16"><code>// space will not be reused until no more pointers into it are found. There's one</code></span>
+<span class="codeline" id="line-17"><code>// exception to this: if an arena allocated memory that isn't exhausted, it's placed</code></span>
+<span class="codeline" id="line-18"><code>// back into a pool for reuse. This means that a crash is not always guaranteed.</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>// While this may seem unsafe, it still prevents memory corruption, and is in fact</code></span>
+<span class="codeline" id="line-21"><code>// necessary in order to make new(T) a valid implementation of arenas. Such a property</code></span>
+<span class="codeline" id="line-22"><code>// is desirable to allow for a trivial implementation. (It also avoids complexities</code></span>
+<span class="codeline" id="line-23"><code>// that arise from synchronization with the GC when trying to set the arena chunks to</code></span>
+<span class="codeline" id="line-24"><code>// fault while the GC is active.)</code></span>
+<span class="codeline" id="line-25"><code>//</code></span>
+<span class="codeline" id="line-26"><code>// The implementation works in layers. At the bottom, arenas are managed in chunks.</code></span>
+<span class="codeline" id="line-27"><code>// Each chunk must be a multiple of the heap arena size, or the heap arena size must</code></span>
+<span class="codeline" id="line-28"><code>// be divisible by the arena chunks. The address space for each chunk, and each</code></span>
+<span class="codeline" id="line-29"><code>// corresponding heapArena for that address space, are eternally reserved for use as</code></span>
+<span class="codeline" id="line-30"><code>// arena chunks. That is, they can never be used for the general heap. Each chunk</code></span>
+<span class="codeline" id="line-31"><code>// is also represented by a single mspan, and is modeled as a single large heap</code></span>
+<span class="codeline" id="line-32"><code>// allocation. It must be, because each chunk contains ordinary Go values that may</code></span>
+<span class="codeline" id="line-33"><code>// point into the heap, so it must be scanned just like any other object. Any</code></span>
+<span class="codeline" id="line-34"><code>// pointer into a chunk will therefore always cause the whole chunk to be scanned</code></span>
+<span class="codeline" id="line-35"><code>// while its corresponding arena is still live.</code></span>
+<span class="codeline" id="line-36"><code>//</code></span>
+<span class="codeline" id="line-37"><code>// Chunks may be allocated either from new memory mapped by the OS on our behalf,</code></span>
+<span class="codeline" id="line-38"><code>// or by reusing old freed chunks. When chunks are freed, their underlying memory</code></span>
+<span class="codeline" id="line-39"><code>// is returned to the OS, set to fault on access, and may not be reused until the</code></span>
+<span class="codeline" id="line-40"><code>// program doesn't point into the chunk anymore (the code refers to this state as</code></span>
+<span class="codeline" id="line-41"><code>// "quarantined"), a property checked by the GC.</code></span>
+<span class="codeline" id="line-42"><code>//</code></span>
+<span class="codeline" id="line-43"><code>// The sweeper handles moving chunks out of this quarantine state to be ready for</code></span>
+<span class="codeline" id="line-44"><code>// reuse. When the chunk is placed into the quarantine state, its corresponding</code></span>
+<span class="codeline" id="line-45"><code>// span is marked as noscan so that the GC doesn't try to scan memory that would</code></span>
+<span class="codeline" id="line-46"><code>// cause a fault.</code></span>
+<span class="codeline" id="line-47"><code>//</code></span>
+<span class="codeline" id="line-48"><code>// At the next layer are the user arenas themselves. They consist of a single</code></span>
+<span class="codeline" id="line-49"><code>// active chunk which new Go values are bump-allocated into and a list of chunks</code></span>
+<span class="codeline" id="line-50"><code>// that were exhausted when allocating into the arena. Once the arena is freed,</code></span>
+<span class="codeline" id="line-51"><code>// it frees all full chunks it references, and places the active one onto a reuse</code></span>
+<span class="codeline" id="line-52"><code>// list for a future arena to use. Each arena keeps its list of referenced chunks</code></span>
+<span class="codeline" id="line-53"><code>// explicitly live until it is freed. Each user arena also maps to an object which</code></span>
+<span class="codeline" id="line-54"><code>// has a finalizer attached that ensures the arena's chunks are all freed even if</code></span>
+<span class="codeline" id="line-55"><code>// the arena itself is never explicitly freed.</code></span>
+<span class="codeline" id="line-56"><code>//</code></span>
+<span class="codeline" id="line-57"><code>// Pointer-ful memory is bump-allocated from low addresses to high addresses in each</code></span>
+<span class="codeline" id="line-58"><code>// chunk, while pointer-free memory is bump-allocated from high address to low</code></span>
+<span class="codeline" id="line-59"><code>// addresses. The reason for this is to take advantage of a GC optimization wherein</code></span>
+<span class="codeline" id="line-60"><code>// the GC will stop scanning an object when there are no more pointers in it, which</code></span>
+<span class="codeline" id="line-61"><code>// also allows us to elide clearing the heap bitmap for pointer-free Go values</code></span>
+<span class="codeline" id="line-62"><code>// allocated into arenas.</code></span>
+<span class="codeline" id="line-63"><code>//</code></span>
+<span class="codeline" id="line-64"><code>// Note that arenas are not safe to use concurrently.</code></span>
+<span class="codeline" id="line-65"><code>//</code></span>
+<span class="codeline" id="line-66"><code>// In summary, there are 2 resources: arenas, and arena chunks. They exist in the</code></span>
+<span class="codeline" id="line-67"><code>// following lifecycle:</code></span>
+<span class="codeline" id="line-68"><code>//</code></span>
+<span class="codeline" id="line-69"><code>// (1) A new arena is created via newArena.</code></span>
+<span class="codeline" id="line-70"><code>// (2) Chunks are allocated to hold memory allocated into the arena with new or slice.</code></span>
+<span class="codeline" id="line-71"><code>//    (a) Chunks are first allocated from the reuse list of partially-used chunks.</code></span>
+<span class="codeline" id="line-72"><code>//    (b) If there are no such chunks, then chunks on the ready list are taken.</code></span>
+<span class="codeline" id="line-73"><code>//    (c) Failing all the above, memory for a new chunk is mapped.</code></span>
+<span class="codeline" id="line-74"><code>// (3) The arena is freed, or all references to it are dropped, triggering its finalizer.</code></span>
+<span class="codeline" id="line-75"><code>//    (a) If the GC is not active, exhausted chunks are set to fault and placed on a</code></span>
+<span class="codeline" id="line-76"><code>//        quarantine list.</code></span>
+<span class="codeline" id="line-77"><code>//    (b) If the GC is active, exhausted chunks are placed on a fault list and will</code></span>
+<span class="codeline" id="line-78"><code>//        go through step (a) at a later point in time.</code></span>
+<span class="codeline" id="line-79"><code>//    (c) Any remaining partially-used chunk is placed on a reuse list.</code></span>
+<span class="codeline" id="line-80"><code>// (4) Once no more pointers are found into quarantined arena chunks, the sweeper</code></span>
+<span class="codeline" id="line-81"><code>//     takes these chunks out of quarantine and places them on the ready list.</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>package runtime</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>import (</code></span>
+<span class="codeline" id="line-86"><code>	"internal/goarch"</code></span>
+<span class="codeline" id="line-87"><code>	"internal/goexperiment"</code></span>
+<span class="codeline" id="line-88"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-89"><code>	"runtime/internal/math"</code></span>
+<span class="codeline" id="line-90"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-91"><code>)</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>// Functions starting with arena_ are meant to be exported to downstream users</code></span>
+<span class="codeline" id="line-94"><code>// of arenas. They should wrap these functions in a higher-lever API.</code></span>
+<span class="codeline" id="line-95"><code>//</code></span>
+<span class="codeline" id="line-96"><code>// The underlying arena and its resources are managed through an opaque unsafe.Pointer.</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>// arena_newArena is a wrapper around newUserArena.</code></span>
+<span class="codeline" id="line-99"><code>//</code></span>
+<span class="codeline" id="line-100"><code>//go:linkname arena_newArena arena.runtime_arena_newArena</code></span>
+<span class="codeline" id="line-101"><code>func arena_newArena() unsafe.Pointer {</code></span>
+<span class="codeline" id="line-102"><code>	return unsafe.Pointer(newUserArena())</code></span>
+<span class="codeline" id="line-103"><code>}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>// arena_arena_New is a wrapper around (*userArena).new, except that typ</code></span>
+<span class="codeline" id="line-106"><code>// is an any (must be a *_type, still) and typ must be a type descriptor</code></span>
+<span class="codeline" id="line-107"><code>// for a pointer to the type to actually be allocated, i.e. pass a *T</code></span>
+<span class="codeline" id="line-108"><code>// to allocate a T. This is necessary because this function returns a *T.</code></span>
+<span class="codeline" id="line-109"><code>//</code></span>
+<span class="codeline" id="line-110"><code>//go:linkname arena_arena_New arena.runtime_arena_arena_New</code></span>
+<span class="codeline" id="line-111"><code>func arena_arena_New(arena unsafe.Pointer, typ any) any {</code></span>
+<span class="codeline" id="line-112"><code>	t := (*_type)(efaceOf(&amp;typ).data)</code></span>
+<span class="codeline" id="line-113"><code>	if t.Kind_&amp;kindMask != kindPtr {</code></span>
+<span class="codeline" id="line-114"><code>		throw("arena_New: non-pointer type")</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	te := (*ptrtype)(unsafe.Pointer(t)).Elem</code></span>
+<span class="codeline" id="line-117"><code>	x := ((*userArena)(arena)).new(te)</code></span>
+<span class="codeline" id="line-118"><code>	var result any</code></span>
+<span class="codeline" id="line-119"><code>	e := efaceOf(&amp;result)</code></span>
+<span class="codeline" id="line-120"><code>	e._type = t</code></span>
+<span class="codeline" id="line-121"><code>	e.data = x</code></span>
+<span class="codeline" id="line-122"><code>	return result</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// arena_arena_Slice is a wrapper around (*userArena).slice.</code></span>
+<span class="codeline" id="line-126"><code>//</code></span>
+<span class="codeline" id="line-127"><code>//go:linkname arena_arena_Slice arena.runtime_arena_arena_Slice</code></span>
+<span class="codeline" id="line-128"><code>func arena_arena_Slice(arena unsafe.Pointer, slice any, cap int) {</code></span>
+<span class="codeline" id="line-129"><code>	((*userArena)(arena)).slice(slice, cap)</code></span>
+<span class="codeline" id="line-130"><code>}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>// arena_arena_Free is a wrapper around (*userArena).free.</code></span>
+<span class="codeline" id="line-133"><code>//</code></span>
+<span class="codeline" id="line-134"><code>//go:linkname arena_arena_Free arena.runtime_arena_arena_Free</code></span>
+<span class="codeline" id="line-135"><code>func arena_arena_Free(arena unsafe.Pointer) {</code></span>
+<span class="codeline" id="line-136"><code>	((*userArena)(arena)).free()</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>// arena_heapify takes a value that lives in an arena and makes a copy</code></span>
+<span class="codeline" id="line-140"><code>// of it on the heap. Values that don't live in an arena are returned unmodified.</code></span>
+<span class="codeline" id="line-141"><code>//</code></span>
+<span class="codeline" id="line-142"><code>//go:linkname arena_heapify arena.runtime_arena_heapify</code></span>
+<span class="codeline" id="line-143"><code>func arena_heapify(s any) any {</code></span>
+<span class="codeline" id="line-144"><code>	var v unsafe.Pointer</code></span>
+<span class="codeline" id="line-145"><code>	e := efaceOf(&amp;s)</code></span>
+<span class="codeline" id="line-146"><code>	t := e._type</code></span>
+<span class="codeline" id="line-147"><code>	switch t.Kind_ &amp; kindMask {</code></span>
+<span class="codeline" id="line-148"><code>	case kindString:</code></span>
+<span class="codeline" id="line-149"><code>		v = stringStructOf((*string)(e.data)).str</code></span>
+<span class="codeline" id="line-150"><code>	case kindSlice:</code></span>
+<span class="codeline" id="line-151"><code>		v = (*slice)(e.data).array</code></span>
+<span class="codeline" id="line-152"><code>	case kindPtr:</code></span>
+<span class="codeline" id="line-153"><code>		v = e.data</code></span>
+<span class="codeline" id="line-154"><code>	default:</code></span>
+<span class="codeline" id="line-155"><code>		panic("arena: Clone only supports pointers, slices, and strings")</code></span>
+<span class="codeline" id="line-156"><code>	}</code></span>
+<span class="codeline" id="line-157"><code>	span := spanOf(uintptr(v))</code></span>
+<span class="codeline" id="line-158"><code>	if span == nil || !span.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-159"><code>		// Not stored in a user arena chunk.</code></span>
+<span class="codeline" id="line-160"><code>		return s</code></span>
+<span class="codeline" id="line-161"><code>	}</code></span>
+<span class="codeline" id="line-162"><code>	// Heap-allocate storage for a copy.</code></span>
+<span class="codeline" id="line-163"><code>	var x any</code></span>
+<span class="codeline" id="line-164"><code>	switch t.Kind_ &amp; kindMask {</code></span>
+<span class="codeline" id="line-165"><code>	case kindString:</code></span>
+<span class="codeline" id="line-166"><code>		s1 := s.(string)</code></span>
+<span class="codeline" id="line-167"><code>		s2, b := rawstring(len(s1))</code></span>
+<span class="codeline" id="line-168"><code>		copy(b, s1)</code></span>
+<span class="codeline" id="line-169"><code>		x = s2</code></span>
+<span class="codeline" id="line-170"><code>	case kindSlice:</code></span>
+<span class="codeline" id="line-171"><code>		len := (*slice)(e.data).len</code></span>
+<span class="codeline" id="line-172"><code>		et := (*slicetype)(unsafe.Pointer(t)).Elem</code></span>
+<span class="codeline" id="line-173"><code>		sl := new(slice)</code></span>
+<span class="codeline" id="line-174"><code>		*sl = slice{makeslicecopy(et, len, len, (*slice)(e.data).array), len, len}</code></span>
+<span class="codeline" id="line-175"><code>		xe := efaceOf(&amp;x)</code></span>
+<span class="codeline" id="line-176"><code>		xe._type = t</code></span>
+<span class="codeline" id="line-177"><code>		xe.data = unsafe.Pointer(sl)</code></span>
+<span class="codeline" id="line-178"><code>	case kindPtr:</code></span>
+<span class="codeline" id="line-179"><code>		et := (*ptrtype)(unsafe.Pointer(t)).Elem</code></span>
+<span class="codeline" id="line-180"><code>		e2 := newobject(et)</code></span>
+<span class="codeline" id="line-181"><code>		typedmemmove(et, e2, e.data)</code></span>
+<span class="codeline" id="line-182"><code>		xe := efaceOf(&amp;x)</code></span>
+<span class="codeline" id="line-183"><code>		xe._type = t</code></span>
+<span class="codeline" id="line-184"><code>		xe.data = e2</code></span>
+<span class="codeline" id="line-185"><code>	}</code></span>
+<span class="codeline" id="line-186"><code>	return x</code></span>
+<span class="codeline" id="line-187"><code>}</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>const (</code></span>
+<span class="codeline" id="line-190"><code>	// userArenaChunkBytes is the size of a user arena chunk.</code></span>
+<span class="codeline" id="line-191"><code>	userArenaChunkBytesMax = 8 &lt;&lt; 20</code></span>
+<span class="codeline" id="line-192"><code>	userArenaChunkBytes    = uintptr(int64(userArenaChunkBytesMax-heapArenaBytes)&amp;(int64(userArenaChunkBytesMax-heapArenaBytes)&gt;&gt;63) + heapArenaBytes) // min(userArenaChunkBytesMax, heapArenaBytes)</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>	// userArenaChunkPages is the number of pages a user arena chunk uses.</code></span>
+<span class="codeline" id="line-195"><code>	userArenaChunkPages = userArenaChunkBytes / pageSize</code></span>
+<span class="codeline" id="line-196"><code></code></span>
+<span class="codeline" id="line-197"><code>	// userArenaChunkMaxAllocBytes is the maximum size of an object that can</code></span>
+<span class="codeline" id="line-198"><code>	// be allocated from an arena. This number is chosen to cap worst-case</code></span>
+<span class="codeline" id="line-199"><code>	// fragmentation of user arenas to 25%. Larger allocations are redirected</code></span>
+<span class="codeline" id="line-200"><code>	// to the heap.</code></span>
+<span class="codeline" id="line-201"><code>	userArenaChunkMaxAllocBytes = userArenaChunkBytes / 4</code></span>
+<span class="codeline" id="line-202"><code>)</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>func init() {</code></span>
+<span class="codeline" id="line-205"><code>	if userArenaChunkPages*pageSize != userArenaChunkBytes {</code></span>
+<span class="codeline" id="line-206"><code>		throw("user arena chunk size is not a multiple of the page size")</code></span>
+<span class="codeline" id="line-207"><code>	}</code></span>
+<span class="codeline" id="line-208"><code>	if userArenaChunkBytes%physPageSize != 0 {</code></span>
+<span class="codeline" id="line-209"><code>		throw("user arena chunk size is not a multiple of the physical page size")</code></span>
+<span class="codeline" id="line-210"><code>	}</code></span>
+<span class="codeline" id="line-211"><code>	if userArenaChunkBytes &lt; heapArenaBytes {</code></span>
+<span class="codeline" id="line-212"><code>		if heapArenaBytes%userArenaChunkBytes != 0 {</code></span>
+<span class="codeline" id="line-213"><code>			throw("user arena chunk size is smaller than a heap arena, but doesn't divide it")</code></span>
+<span class="codeline" id="line-214"><code>		}</code></span>
+<span class="codeline" id="line-215"><code>	} else {</code></span>
+<span class="codeline" id="line-216"><code>		if userArenaChunkBytes%heapArenaBytes != 0 {</code></span>
+<span class="codeline" id="line-217"><code>			throw("user arena chunks size is larger than a heap arena, but not a multiple")</code></span>
+<span class="codeline" id="line-218"><code>		}</code></span>
+<span class="codeline" id="line-219"><code>	}</code></span>
+<span class="codeline" id="line-220"><code>	lockInit(&amp;userArenaState.lock, lockRankUserArenaState)</code></span>
+<span class="codeline" id="line-221"><code>}</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>// userArenaChunkReserveBytes returns the amount of additional bytes to reserve for</code></span>
+<span class="codeline" id="line-224"><code>// heap metadata.</code></span>
+<span class="codeline" id="line-225"><code>func userArenaChunkReserveBytes() uintptr {</code></span>
+<span class="codeline" id="line-226"><code>	if goexperiment.AllocHeaders {</code></span>
+<span class="codeline" id="line-227"><code>		// In the allocation headers experiment, we reserve the end of the chunk for</code></span>
+<span class="codeline" id="line-228"><code>		// a pointer/scalar bitmap. We also reserve space for a dummy _type that</code></span>
+<span class="codeline" id="line-229"><code>		// refers to the bitmap. The PtrBytes field of the dummy _type indicates how</code></span>
+<span class="codeline" id="line-230"><code>		// many of those bits are valid.</code></span>
+<span class="codeline" id="line-231"><code>		return userArenaChunkBytes/goarch.PtrSize/8 + unsafe.Sizeof(_type{})</code></span>
+<span class="codeline" id="line-232"><code>	}</code></span>
+<span class="codeline" id="line-233"><code>	return 0</code></span>
+<span class="codeline" id="line-234"><code>}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>type userArena struct {</code></span>
+<span class="codeline" id="line-237"><code>	// full is a list of full chunks that have not enough free memory left, and</code></span>
+<span class="codeline" id="line-238"><code>	// that we'll free once this user arena is freed.</code></span>
+<span class="codeline" id="line-239"><code>	//</code></span>
+<span class="codeline" id="line-240"><code>	// Can't use mSpanList here because it's not-in-heap.</code></span>
+<span class="codeline" id="line-241"><code>	fullList *mspan</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>	// active is the user arena chunk we're currently allocating into.</code></span>
+<span class="codeline" id="line-244"><code>	active *mspan</code></span>
+<span class="codeline" id="line-245"><code></code></span>
+<span class="codeline" id="line-246"><code>	// refs is a set of references to the arena chunks so that they're kept alive.</code></span>
+<span class="codeline" id="line-247"><code>	//</code></span>
+<span class="codeline" id="line-248"><code>	// The last reference in the list always refers to active, while the rest of</code></span>
+<span class="codeline" id="line-249"><code>	// them correspond to fullList. Specifically, the head of fullList is the</code></span>
+<span class="codeline" id="line-250"><code>	// second-to-last one, fullList.next is the third-to-last, and so on.</code></span>
+<span class="codeline" id="line-251"><code>	//</code></span>
+<span class="codeline" id="line-252"><code>	// In other words, every time a new chunk becomes active, its appended to this</code></span>
+<span class="codeline" id="line-253"><code>	// list.</code></span>
+<span class="codeline" id="line-254"><code>	refs []unsafe.Pointer</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>	// defunct is true if free has been called on this arena.</code></span>
+<span class="codeline" id="line-257"><code>	//</code></span>
+<span class="codeline" id="line-258"><code>	// This is just a best-effort way to discover a concurrent allocation</code></span>
+<span class="codeline" id="line-259"><code>	// and free. Also used to detect a double-free.</code></span>
+<span class="codeline" id="line-260"><code>	defunct atomic.Bool</code></span>
+<span class="codeline" id="line-261"><code>}</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>// newUserArena creates a new userArena ready to be used.</code></span>
+<span class="codeline" id="line-264"><code>func newUserArena() *userArena {</code></span>
+<span class="codeline" id="line-265"><code>	a := new(userArena)</code></span>
+<span class="codeline" id="line-266"><code>	SetFinalizer(a, func(a *userArena) {</code></span>
+<span class="codeline" id="line-267"><code>		// If arena handle is dropped without being freed, then call</code></span>
+<span class="codeline" id="line-268"><code>		// free on the arena, so the arena chunks are never reclaimed</code></span>
+<span class="codeline" id="line-269"><code>		// by the garbage collector.</code></span>
+<span class="codeline" id="line-270"><code>		a.free()</code></span>
+<span class="codeline" id="line-271"><code>	})</code></span>
+<span class="codeline" id="line-272"><code>	a.refill()</code></span>
+<span class="codeline" id="line-273"><code>	return a</code></span>
+<span class="codeline" id="line-274"><code>}</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>// new allocates a new object of the provided type into the arena, and returns</code></span>
+<span class="codeline" id="line-277"><code>// its pointer.</code></span>
+<span class="codeline" id="line-278"><code>//</code></span>
+<span class="codeline" id="line-279"><code>// This operation is not safe to call concurrently with other operations on the</code></span>
+<span class="codeline" id="line-280"><code>// same arena.</code></span>
+<span class="codeline" id="line-281"><code>func (a *userArena) new(typ *_type) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-282"><code>	return a.alloc(typ, -1)</code></span>
+<span class="codeline" id="line-283"><code>}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>// slice allocates a new slice backing store. slice must be a pointer to a slice</code></span>
+<span class="codeline" id="line-286"><code>// (i.e. *[]T), because userArenaSlice will update the slice directly.</code></span>
+<span class="codeline" id="line-287"><code>//</code></span>
+<span class="codeline" id="line-288"><code>// cap determines the capacity of the slice backing store and must be non-negative.</code></span>
+<span class="codeline" id="line-289"><code>//</code></span>
+<span class="codeline" id="line-290"><code>// This operation is not safe to call concurrently with other operations on the</code></span>
+<span class="codeline" id="line-291"><code>// same arena.</code></span>
+<span class="codeline" id="line-292"><code>func (a *userArena) slice(sl any, cap int) {</code></span>
+<span class="codeline" id="line-293"><code>	if cap &lt; 0 {</code></span>
+<span class="codeline" id="line-294"><code>		panic("userArena.slice: negative cap")</code></span>
+<span class="codeline" id="line-295"><code>	}</code></span>
+<span class="codeline" id="line-296"><code>	i := efaceOf(&amp;sl)</code></span>
+<span class="codeline" id="line-297"><code>	typ := i._type</code></span>
+<span class="codeline" id="line-298"><code>	if typ.Kind_&amp;kindMask != kindPtr {</code></span>
+<span class="codeline" id="line-299"><code>		panic("slice result of non-ptr type")</code></span>
+<span class="codeline" id="line-300"><code>	}</code></span>
+<span class="codeline" id="line-301"><code>	typ = (*ptrtype)(unsafe.Pointer(typ)).Elem</code></span>
+<span class="codeline" id="line-302"><code>	if typ.Kind_&amp;kindMask != kindSlice {</code></span>
+<span class="codeline" id="line-303"><code>		panic("slice of non-ptr-to-slice type")</code></span>
+<span class="codeline" id="line-304"><code>	}</code></span>
+<span class="codeline" id="line-305"><code>	typ = (*slicetype)(unsafe.Pointer(typ)).Elem</code></span>
+<span class="codeline" id="line-306"><code>	// t is now the element type of the slice we want to allocate.</code></span>
+<span class="codeline" id="line-307"><code></code></span>
+<span class="codeline" id="line-308"><code>	*((*slice)(i.data)) = slice{a.alloc(typ, cap), cap, cap}</code></span>
+<span class="codeline" id="line-309"><code>}</code></span>
+<span class="codeline" id="line-310"><code></code></span>
+<span class="codeline" id="line-311"><code>// free returns the userArena's chunks back to mheap and marks it as defunct.</code></span>
+<span class="codeline" id="line-312"><code>//</code></span>
+<span class="codeline" id="line-313"><code>// Must be called at most once for any given arena.</code></span>
+<span class="codeline" id="line-314"><code>//</code></span>
+<span class="codeline" id="line-315"><code>// This operation is not safe to call concurrently with other operations on the</code></span>
+<span class="codeline" id="line-316"><code>// same arena.</code></span>
+<span class="codeline" id="line-317"><code>func (a *userArena) free() {</code></span>
+<span class="codeline" id="line-318"><code>	// Check for a double-free.</code></span>
+<span class="codeline" id="line-319"><code>	if a.defunct.Load() {</code></span>
+<span class="codeline" id="line-320"><code>		panic("arena double free")</code></span>
+<span class="codeline" id="line-321"><code>	}</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>	// Mark ourselves as defunct.</code></span>
+<span class="codeline" id="line-324"><code>	a.defunct.Store(true)</code></span>
+<span class="codeline" id="line-325"><code>	SetFinalizer(a, nil)</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>	// Free all the full arenas.</code></span>
+<span class="codeline" id="line-328"><code>	//</code></span>
+<span class="codeline" id="line-329"><code>	// The refs on this list are in reverse order from the second-to-last.</code></span>
+<span class="codeline" id="line-330"><code>	s := a.fullList</code></span>
+<span class="codeline" id="line-331"><code>	i := len(a.refs) - 2</code></span>
+<span class="codeline" id="line-332"><code>	for s != nil {</code></span>
+<span class="codeline" id="line-333"><code>		a.fullList = s.next</code></span>
+<span class="codeline" id="line-334"><code>		s.next = nil</code></span>
+<span class="codeline" id="line-335"><code>		freeUserArenaChunk(s, a.refs[i])</code></span>
+<span class="codeline" id="line-336"><code>		s = a.fullList</code></span>
+<span class="codeline" id="line-337"><code>		i--</code></span>
+<span class="codeline" id="line-338"><code>	}</code></span>
+<span class="codeline" id="line-339"><code>	if a.fullList != nil || i &gt;= 0 {</code></span>
+<span class="codeline" id="line-340"><code>		// There's still something left on the full list, or we</code></span>
+<span class="codeline" id="line-341"><code>		// failed to actually iterate over the entire refs list.</code></span>
+<span class="codeline" id="line-342"><code>		throw("full list doesn't match refs list in length")</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code></code></span>
+<span class="codeline" id="line-345"><code>	// Put the active chunk onto the reuse list.</code></span>
+<span class="codeline" id="line-346"><code>	//</code></span>
+<span class="codeline" id="line-347"><code>	// Note that active's reference is always the last reference in refs.</code></span>
+<span class="codeline" id="line-348"><code>	s = a.active</code></span>
+<span class="codeline" id="line-349"><code>	if s != nil {</code></span>
+<span class="codeline" id="line-350"><code>		if raceenabled || msanenabled || asanenabled {</code></span>
+<span class="codeline" id="line-351"><code>			// Don't reuse arenas with sanitizers enabled. We want to catch</code></span>
+<span class="codeline" id="line-352"><code>			// any use-after-free errors aggressively.</code></span>
+<span class="codeline" id="line-353"><code>			freeUserArenaChunk(s, a.refs[len(a.refs)-1])</code></span>
+<span class="codeline" id="line-354"><code>		} else {</code></span>
+<span class="codeline" id="line-355"><code>			lock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-356"><code>			userArenaState.reuse = append(userArenaState.reuse, liveUserArenaChunk{s, a.refs[len(a.refs)-1]})</code></span>
+<span class="codeline" id="line-357"><code>			unlock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-358"><code>		}</code></span>
+<span class="codeline" id="line-359"><code>	}</code></span>
+<span class="codeline" id="line-360"><code>	// nil out a.active so that a race with freeing will more likely cause a crash.</code></span>
+<span class="codeline" id="line-361"><code>	a.active = nil</code></span>
+<span class="codeline" id="line-362"><code>	a.refs = nil</code></span>
+<span class="codeline" id="line-363"><code>}</code></span>
+<span class="codeline" id="line-364"><code></code></span>
+<span class="codeline" id="line-365"><code>// alloc reserves space in the current chunk or calls refill and reserves space</code></span>
+<span class="codeline" id="line-366"><code>// in a new chunk. If cap is negative, the type will be taken literally, otherwise</code></span>
+<span class="codeline" id="line-367"><code>// it will be considered as an element type for a slice backing store with capacity</code></span>
+<span class="codeline" id="line-368"><code>// cap.</code></span>
+<span class="codeline" id="line-369"><code>func (a *userArena) alloc(typ *_type, cap int) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-370"><code>	s := a.active</code></span>
+<span class="codeline" id="line-371"><code>	var x unsafe.Pointer</code></span>
+<span class="codeline" id="line-372"><code>	for {</code></span>
+<span class="codeline" id="line-373"><code>		x = s.userArenaNextFree(typ, cap)</code></span>
+<span class="codeline" id="line-374"><code>		if x != nil {</code></span>
+<span class="codeline" id="line-375"><code>			break</code></span>
+<span class="codeline" id="line-376"><code>		}</code></span>
+<span class="codeline" id="line-377"><code>		s = a.refill()</code></span>
+<span class="codeline" id="line-378"><code>	}</code></span>
+<span class="codeline" id="line-379"><code>	return x</code></span>
+<span class="codeline" id="line-380"><code>}</code></span>
+<span class="codeline" id="line-381"><code></code></span>
+<span class="codeline" id="line-382"><code>// refill inserts the current arena chunk onto the full list and obtains a new</code></span>
+<span class="codeline" id="line-383"><code>// one, either from the partial list or allocating a new one, both from mheap.</code></span>
+<span class="codeline" id="line-384"><code>func (a *userArena) refill() *mspan {</code></span>
+<span class="codeline" id="line-385"><code>	// If there's an active chunk, assume it's full.</code></span>
+<span class="codeline" id="line-386"><code>	s := a.active</code></span>
+<span class="codeline" id="line-387"><code>	if s != nil {</code></span>
+<span class="codeline" id="line-388"><code>		if s.userArenaChunkFree.size() &gt; userArenaChunkMaxAllocBytes {</code></span>
+<span class="codeline" id="line-389"><code>			// It's difficult to tell when we're actually out of memory</code></span>
+<span class="codeline" id="line-390"><code>			// in a chunk because the allocation that failed may still leave</code></span>
+<span class="codeline" id="line-391"><code>			// some free space available. However, that amount of free space</code></span>
+<span class="codeline" id="line-392"><code>			// should never exceed the maximum allocation size.</code></span>
+<span class="codeline" id="line-393"><code>			throw("wasted too much memory in an arena chunk")</code></span>
+<span class="codeline" id="line-394"><code>		}</code></span>
+<span class="codeline" id="line-395"><code>		s.next = a.fullList</code></span>
+<span class="codeline" id="line-396"><code>		a.fullList = s</code></span>
+<span class="codeline" id="line-397"><code>		a.active = nil</code></span>
+<span class="codeline" id="line-398"><code>		s = nil</code></span>
+<span class="codeline" id="line-399"><code>	}</code></span>
+<span class="codeline" id="line-400"><code>	var x unsafe.Pointer</code></span>
+<span class="codeline" id="line-401"><code></code></span>
+<span class="codeline" id="line-402"><code>	// Check the partially-used list.</code></span>
+<span class="codeline" id="line-403"><code>	lock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-404"><code>	if len(userArenaState.reuse) &gt; 0 {</code></span>
+<span class="codeline" id="line-405"><code>		// Pick off the last arena chunk from the list.</code></span>
+<span class="codeline" id="line-406"><code>		n := len(userArenaState.reuse) - 1</code></span>
+<span class="codeline" id="line-407"><code>		x = userArenaState.reuse[n].x</code></span>
+<span class="codeline" id="line-408"><code>		s = userArenaState.reuse[n].mspan</code></span>
+<span class="codeline" id="line-409"><code>		userArenaState.reuse[n].x = nil</code></span>
+<span class="codeline" id="line-410"><code>		userArenaState.reuse[n].mspan = nil</code></span>
+<span class="codeline" id="line-411"><code>		userArenaState.reuse = userArenaState.reuse[:n]</code></span>
+<span class="codeline" id="line-412"><code>	}</code></span>
+<span class="codeline" id="line-413"><code>	unlock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-414"><code>	if s == nil {</code></span>
+<span class="codeline" id="line-415"><code>		// Allocate a new one.</code></span>
+<span class="codeline" id="line-416"><code>		x, s = newUserArenaChunk()</code></span>
+<span class="codeline" id="line-417"><code>		if s == nil {</code></span>
+<span class="codeline" id="line-418"><code>			throw("out of memory")</code></span>
+<span class="codeline" id="line-419"><code>		}</code></span>
+<span class="codeline" id="line-420"><code>	}</code></span>
+<span class="codeline" id="line-421"><code>	a.refs = append(a.refs, x)</code></span>
+<span class="codeline" id="line-422"><code>	a.active = s</code></span>
+<span class="codeline" id="line-423"><code>	return s</code></span>
+<span class="codeline" id="line-424"><code>}</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>type liveUserArenaChunk struct {</code></span>
+<span class="codeline" id="line-427"><code>	*mspan // Must represent a user arena chunk.</code></span>
+<span class="codeline" id="line-428"><code></code></span>
+<span class="codeline" id="line-429"><code>	// Reference to mspan.base() to keep the chunk alive.</code></span>
+<span class="codeline" id="line-430"><code>	x unsafe.Pointer</code></span>
+<span class="codeline" id="line-431"><code>}</code></span>
+<span class="codeline" id="line-432"><code></code></span>
+<span class="codeline" id="line-433"><code>var userArenaState struct {</code></span>
+<span class="codeline" id="line-434"><code>	lock mutex</code></span>
+<span class="codeline" id="line-435"><code></code></span>
+<span class="codeline" id="line-436"><code>	// reuse contains a list of partially-used and already-live</code></span>
+<span class="codeline" id="line-437"><code>	// user arena chunks that can be quickly reused for another</code></span>
+<span class="codeline" id="line-438"><code>	// arena.</code></span>
+<span class="codeline" id="line-439"><code>	//</code></span>
+<span class="codeline" id="line-440"><code>	// Protected by lock.</code></span>
+<span class="codeline" id="line-441"><code>	reuse []liveUserArenaChunk</code></span>
+<span class="codeline" id="line-442"><code></code></span>
+<span class="codeline" id="line-443"><code>	// fault contains full user arena chunks that need to be faulted.</code></span>
+<span class="codeline" id="line-444"><code>	//</code></span>
+<span class="codeline" id="line-445"><code>	// Protected by lock.</code></span>
+<span class="codeline" id="line-446"><code>	fault []liveUserArenaChunk</code></span>
+<span class="codeline" id="line-447"><code>}</code></span>
+<span class="codeline" id="line-448"><code></code></span>
+<span class="codeline" id="line-449"><code>// userArenaNextFree reserves space in the user arena for an item of the specified</code></span>
+<span class="codeline" id="line-450"><code>// type. If cap is not -1, this is for an array of cap elements of type t.</code></span>
+<span class="codeline" id="line-451"><code>func (s *mspan) userArenaNextFree(typ *_type, cap int) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-452"><code>	size := typ.Size_</code></span>
+<span class="codeline" id="line-453"><code>	if cap &gt; 0 {</code></span>
+<span class="codeline" id="line-454"><code>		if size &gt; ^uintptr(0)/uintptr(cap) {</code></span>
+<span class="codeline" id="line-455"><code>			// Overflow.</code></span>
+<span class="codeline" id="line-456"><code>			throw("out of memory")</code></span>
+<span class="codeline" id="line-457"><code>		}</code></span>
+<span class="codeline" id="line-458"><code>		size *= uintptr(cap)</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	if size == 0 || cap == 0 {</code></span>
+<span class="codeline" id="line-461"><code>		return unsafe.Pointer(&amp;zerobase)</code></span>
+<span class="codeline" id="line-462"><code>	}</code></span>
+<span class="codeline" id="line-463"><code>	if size &gt; userArenaChunkMaxAllocBytes {</code></span>
+<span class="codeline" id="line-464"><code>		// Redirect allocations that don't fit into a chunk well directly</code></span>
+<span class="codeline" id="line-465"><code>		// from the heap.</code></span>
+<span class="codeline" id="line-466"><code>		if cap &gt;= 0 {</code></span>
+<span class="codeline" id="line-467"><code>			return newarray(typ, cap)</code></span>
+<span class="codeline" id="line-468"><code>		}</code></span>
+<span class="codeline" id="line-469"><code>		return newobject(typ)</code></span>
+<span class="codeline" id="line-470"><code>	}</code></span>
+<span class="codeline" id="line-471"><code></code></span>
+<span class="codeline" id="line-472"><code>	// Prevent preemption as we set up the space for a new object.</code></span>
+<span class="codeline" id="line-473"><code>	//</code></span>
+<span class="codeline" id="line-474"><code>	// Act like we're allocating.</code></span>
+<span class="codeline" id="line-475"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-476"><code>	if mp.mallocing != 0 {</code></span>
+<span class="codeline" id="line-477"><code>		throw("malloc deadlock")</code></span>
+<span class="codeline" id="line-478"><code>	}</code></span>
+<span class="codeline" id="line-479"><code>	if mp.gsignal == getg() {</code></span>
+<span class="codeline" id="line-480"><code>		throw("malloc during signal")</code></span>
+<span class="codeline" id="line-481"><code>	}</code></span>
+<span class="codeline" id="line-482"><code>	mp.mallocing = 1</code></span>
+<span class="codeline" id="line-483"><code></code></span>
+<span class="codeline" id="line-484"><code>	var ptr unsafe.Pointer</code></span>
+<span class="codeline" id="line-485"><code>	if typ.PtrBytes == 0 {</code></span>
+<span class="codeline" id="line-486"><code>		// Allocate pointer-less objects from the tail end of the chunk.</code></span>
+<span class="codeline" id="line-487"><code>		v, ok := s.userArenaChunkFree.takeFromBack(size, typ.Align_)</code></span>
+<span class="codeline" id="line-488"><code>		if ok {</code></span>
+<span class="codeline" id="line-489"><code>			ptr = unsafe.Pointer(v)</code></span>
+<span class="codeline" id="line-490"><code>		}</code></span>
+<span class="codeline" id="line-491"><code>	} else {</code></span>
+<span class="codeline" id="line-492"><code>		v, ok := s.userArenaChunkFree.takeFromFront(size, typ.Align_)</code></span>
+<span class="codeline" id="line-493"><code>		if ok {</code></span>
+<span class="codeline" id="line-494"><code>			ptr = unsafe.Pointer(v)</code></span>
+<span class="codeline" id="line-495"><code>		}</code></span>
+<span class="codeline" id="line-496"><code>	}</code></span>
+<span class="codeline" id="line-497"><code>	if ptr == nil {</code></span>
+<span class="codeline" id="line-498"><code>		// Failed to allocate.</code></span>
+<span class="codeline" id="line-499"><code>		mp.mallocing = 0</code></span>
+<span class="codeline" id="line-500"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-501"><code>		return nil</code></span>
+<span class="codeline" id="line-502"><code>	}</code></span>
+<span class="codeline" id="line-503"><code>	if s.needzero != 0 {</code></span>
+<span class="codeline" id="line-504"><code>		throw("arena chunk needs zeroing, but should already be zeroed")</code></span>
+<span class="codeline" id="line-505"><code>	}</code></span>
+<span class="codeline" id="line-506"><code>	// Set up heap bitmap and do extra accounting.</code></span>
+<span class="codeline" id="line-507"><code>	if typ.PtrBytes != 0 {</code></span>
+<span class="codeline" id="line-508"><code>		if cap &gt;= 0 {</code></span>
+<span class="codeline" id="line-509"><code>			userArenaHeapBitsSetSliceType(typ, cap, ptr, s)</code></span>
+<span class="codeline" id="line-510"><code>		} else {</code></span>
+<span class="codeline" id="line-511"><code>			userArenaHeapBitsSetType(typ, ptr, s)</code></span>
+<span class="codeline" id="line-512"><code>		}</code></span>
+<span class="codeline" id="line-513"><code>		c := getMCache(mp)</code></span>
+<span class="codeline" id="line-514"><code>		if c == nil {</code></span>
+<span class="codeline" id="line-515"><code>			throw("mallocgc called without a P or outside bootstrapping")</code></span>
+<span class="codeline" id="line-516"><code>		}</code></span>
+<span class="codeline" id="line-517"><code>		if cap &gt; 0 {</code></span>
+<span class="codeline" id="line-518"><code>			c.scanAlloc += size - (typ.Size_ - typ.PtrBytes)</code></span>
+<span class="codeline" id="line-519"><code>		} else {</code></span>
+<span class="codeline" id="line-520"><code>			c.scanAlloc += typ.PtrBytes</code></span>
+<span class="codeline" id="line-521"><code>		}</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>	// Ensure that the stores above that initialize x to</code></span>
+<span class="codeline" id="line-525"><code>	// type-safe memory and set the heap bits occur before</code></span>
+<span class="codeline" id="line-526"><code>	// the caller can make ptr observable to the garbage</code></span>
+<span class="codeline" id="line-527"><code>	// collector. Otherwise, on weakly ordered machines,</code></span>
+<span class="codeline" id="line-528"><code>	// the garbage collector could follow a pointer to x,</code></span>
+<span class="codeline" id="line-529"><code>	// but see uninitialized memory or stale heap bits.</code></span>
+<span class="codeline" id="line-530"><code>	publicationBarrier()</code></span>
+<span class="codeline" id="line-531"><code></code></span>
+<span class="codeline" id="line-532"><code>	mp.mallocing = 0</code></span>
+<span class="codeline" id="line-533"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-534"><code></code></span>
+<span class="codeline" id="line-535"><code>	return ptr</code></span>
+<span class="codeline" id="line-536"><code>}</code></span>
+<span class="codeline" id="line-537"><code></code></span>
+<span class="codeline" id="line-538"><code>// userArenaHeapBitsSetSliceType is the equivalent of heapBitsSetType but for</code></span>
+<span class="codeline" id="line-539"><code>// Go slice backing store values allocated in a user arena chunk. It sets up the</code></span>
+<span class="codeline" id="line-540"><code>// heap bitmap for n consecutive values with type typ allocated at address ptr.</code></span>
+<span class="codeline" id="line-541"><code>func userArenaHeapBitsSetSliceType(typ *_type, n int, ptr unsafe.Pointer, s *mspan) {</code></span>
+<span class="codeline" id="line-542"><code>	mem, overflow := math.MulUintptr(typ.Size_, uintptr(n))</code></span>
+<span class="codeline" id="line-543"><code>	if overflow || n &lt; 0 || mem &gt; maxAlloc {</code></span>
+<span class="codeline" id="line-544"><code>		panic(plainError("runtime: allocation size out of range"))</code></span>
+<span class="codeline" id="line-545"><code>	}</code></span>
+<span class="codeline" id="line-546"><code>	for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-547"><code>		userArenaHeapBitsSetType(typ, add(ptr, uintptr(i)*typ.Size_), s)</code></span>
+<span class="codeline" id="line-548"><code>	}</code></span>
+<span class="codeline" id="line-549"><code>}</code></span>
+<span class="codeline" id="line-550"><code></code></span>
+<span class="codeline" id="line-551"><code>// newUserArenaChunk allocates a user arena chunk, which maps to a single</code></span>
+<span class="codeline" id="line-552"><code>// heap arena and single span. Returns a pointer to the base of the chunk</code></span>
+<span class="codeline" id="line-553"><code>// (this is really important: we need to keep the chunk alive) and the span.</code></span>
+<span class="codeline" id="line-554"><code>func newUserArenaChunk() (unsafe.Pointer, *mspan) {</code></span>
+<span class="codeline" id="line-555"><code>	if gcphase == _GCmarktermination {</code></span>
+<span class="codeline" id="line-556"><code>		throw("newUserArenaChunk called with gcphase == _GCmarktermination")</code></span>
+<span class="codeline" id="line-557"><code>	}</code></span>
+<span class="codeline" id="line-558"><code></code></span>
+<span class="codeline" id="line-559"><code>	// Deduct assist credit. Because user arena chunks are modeled as one</code></span>
+<span class="codeline" id="line-560"><code>	// giant heap object which counts toward heapLive, we're obligated to</code></span>
+<span class="codeline" id="line-561"><code>	// assist the GC proportionally (and it's worth noting that the arena</code></span>
+<span class="codeline" id="line-562"><code>	// does represent additional work for the GC, but we also have no idea</code></span>
+<span class="codeline" id="line-563"><code>	// what that looks like until we actually allocate things into the</code></span>
+<span class="codeline" id="line-564"><code>	// arena).</code></span>
+<span class="codeline" id="line-565"><code>	deductAssistCredit(userArenaChunkBytes)</code></span>
+<span class="codeline" id="line-566"><code></code></span>
+<span class="codeline" id="line-567"><code>	// Set mp.mallocing to keep from being preempted by GC.</code></span>
+<span class="codeline" id="line-568"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-569"><code>	if mp.mallocing != 0 {</code></span>
+<span class="codeline" id="line-570"><code>		throw("malloc deadlock")</code></span>
+<span class="codeline" id="line-571"><code>	}</code></span>
+<span class="codeline" id="line-572"><code>	if mp.gsignal == getg() {</code></span>
+<span class="codeline" id="line-573"><code>		throw("malloc during signal")</code></span>
+<span class="codeline" id="line-574"><code>	}</code></span>
+<span class="codeline" id="line-575"><code>	mp.mallocing = 1</code></span>
+<span class="codeline" id="line-576"><code></code></span>
+<span class="codeline" id="line-577"><code>	// Allocate a new user arena.</code></span>
+<span class="codeline" id="line-578"><code>	var span *mspan</code></span>
+<span class="codeline" id="line-579"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-580"><code>		span = mheap_.allocUserArenaChunk()</code></span>
+<span class="codeline" id="line-581"><code>	})</code></span>
+<span class="codeline" id="line-582"><code>	if span == nil {</code></span>
+<span class="codeline" id="line-583"><code>		throw("out of memory")</code></span>
+<span class="codeline" id="line-584"><code>	}</code></span>
+<span class="codeline" id="line-585"><code>	x := unsafe.Pointer(span.base())</code></span>
+<span class="codeline" id="line-586"><code></code></span>
+<span class="codeline" id="line-587"><code>	// Allocate black during GC.</code></span>
+<span class="codeline" id="line-588"><code>	// All slots hold nil so no scanning is needed.</code></span>
+<span class="codeline" id="line-589"><code>	// This may be racing with GC so do it atomically if there can be</code></span>
+<span class="codeline" id="line-590"><code>	// a race marking the bit.</code></span>
+<span class="codeline" id="line-591"><code>	if gcphase != _GCoff {</code></span>
+<span class="codeline" id="line-592"><code>		gcmarknewobject(span, span.base())</code></span>
+<span class="codeline" id="line-593"><code>	}</code></span>
+<span class="codeline" id="line-594"><code></code></span>
+<span class="codeline" id="line-595"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-596"><code>		// TODO(mknyszek): Track individual objects.</code></span>
+<span class="codeline" id="line-597"><code>		racemalloc(unsafe.Pointer(span.base()), span.elemsize)</code></span>
+<span class="codeline" id="line-598"><code>	}</code></span>
+<span class="codeline" id="line-599"><code></code></span>
+<span class="codeline" id="line-600"><code>	if msanenabled {</code></span>
+<span class="codeline" id="line-601"><code>		// TODO(mknyszek): Track individual objects.</code></span>
+<span class="codeline" id="line-602"><code>		msanmalloc(unsafe.Pointer(span.base()), span.elemsize)</code></span>
+<span class="codeline" id="line-603"><code>	}</code></span>
+<span class="codeline" id="line-604"><code></code></span>
+<span class="codeline" id="line-605"><code>	if asanenabled {</code></span>
+<span class="codeline" id="line-606"><code>		// TODO(mknyszek): Track individual objects.</code></span>
+<span class="codeline" id="line-607"><code>		rzSize := computeRZlog(span.elemsize)</code></span>
+<span class="codeline" id="line-608"><code>		span.elemsize -= rzSize</code></span>
+<span class="codeline" id="line-609"><code>		if goexperiment.AllocHeaders {</code></span>
+<span class="codeline" id="line-610"><code>			span.largeType.Size_ = span.elemsize</code></span>
+<span class="codeline" id="line-611"><code>		}</code></span>
+<span class="codeline" id="line-612"><code>		rzStart := span.base() + span.elemsize</code></span>
+<span class="codeline" id="line-613"><code>		span.userArenaChunkFree = makeAddrRange(span.base(), rzStart)</code></span>
+<span class="codeline" id="line-614"><code>		asanpoison(unsafe.Pointer(rzStart), span.limit-rzStart)</code></span>
+<span class="codeline" id="line-615"><code>		asanunpoison(unsafe.Pointer(span.base()), span.elemsize)</code></span>
+<span class="codeline" id="line-616"><code>	}</code></span>
+<span class="codeline" id="line-617"><code></code></span>
+<span class="codeline" id="line-618"><code>	if rate := MemProfileRate; rate &gt; 0 {</code></span>
+<span class="codeline" id="line-619"><code>		c := getMCache(mp)</code></span>
+<span class="codeline" id="line-620"><code>		if c == nil {</code></span>
+<span class="codeline" id="line-621"><code>			throw("newUserArenaChunk called without a P or outside bootstrapping")</code></span>
+<span class="codeline" id="line-622"><code>		}</code></span>
+<span class="codeline" id="line-623"><code>		// Note cache c only valid while m acquired; see #47302</code></span>
+<span class="codeline" id="line-624"><code>		if rate != 1 &amp;&amp; userArenaChunkBytes &lt; c.nextSample {</code></span>
+<span class="codeline" id="line-625"><code>			c.nextSample -= userArenaChunkBytes</code></span>
+<span class="codeline" id="line-626"><code>		} else {</code></span>
+<span class="codeline" id="line-627"><code>			profilealloc(mp, unsafe.Pointer(span.base()), userArenaChunkBytes)</code></span>
+<span class="codeline" id="line-628"><code>		}</code></span>
+<span class="codeline" id="line-629"><code>	}</code></span>
+<span class="codeline" id="line-630"><code>	mp.mallocing = 0</code></span>
+<span class="codeline" id="line-631"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-632"><code></code></span>
+<span class="codeline" id="line-633"><code>	// Again, because this chunk counts toward heapLive, potentially trigger a GC.</code></span>
+<span class="codeline" id="line-634"><code>	if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {</code></span>
+<span class="codeline" id="line-635"><code>		gcStart(t)</code></span>
+<span class="codeline" id="line-636"><code>	}</code></span>
+<span class="codeline" id="line-637"><code></code></span>
+<span class="codeline" id="line-638"><code>	if debug.malloc {</code></span>
+<span class="codeline" id="line-639"><code>		if debug.allocfreetrace != 0 {</code></span>
+<span class="codeline" id="line-640"><code>			tracealloc(unsafe.Pointer(span.base()), userArenaChunkBytes, nil)</code></span>
+<span class="codeline" id="line-641"><code>		}</code></span>
+<span class="codeline" id="line-642"><code></code></span>
+<span class="codeline" id="line-643"><code>		if inittrace.active &amp;&amp; inittrace.id == getg().goid {</code></span>
+<span class="codeline" id="line-644"><code>			// Init functions are executed sequentially in a single goroutine.</code></span>
+<span class="codeline" id="line-645"><code>			inittrace.bytes += uint64(userArenaChunkBytes)</code></span>
+<span class="codeline" id="line-646"><code>		}</code></span>
+<span class="codeline" id="line-647"><code>	}</code></span>
+<span class="codeline" id="line-648"><code></code></span>
+<span class="codeline" id="line-649"><code>	// Double-check it's aligned to the physical page size. Based on the current</code></span>
+<span class="codeline" id="line-650"><code>	// implementation this is trivially true, but it need not be in the future.</code></span>
+<span class="codeline" id="line-651"><code>	// However, if it's not aligned to the physical page size then we can't properly</code></span>
+<span class="codeline" id="line-652"><code>	// set it to fault later.</code></span>
+<span class="codeline" id="line-653"><code>	if uintptr(x)%physPageSize != 0 {</code></span>
+<span class="codeline" id="line-654"><code>		throw("user arena chunk is not aligned to the physical page size")</code></span>
+<span class="codeline" id="line-655"><code>	}</code></span>
+<span class="codeline" id="line-656"><code></code></span>
+<span class="codeline" id="line-657"><code>	return x, span</code></span>
+<span class="codeline" id="line-658"><code>}</code></span>
+<span class="codeline" id="line-659"><code></code></span>
+<span class="codeline" id="line-660"><code>// isUnusedUserArenaChunk indicates that the arena chunk has been set to fault</code></span>
+<span class="codeline" id="line-661"><code>// and doesn't contain any scannable memory anymore. However, it might still be</code></span>
+<span class="codeline" id="line-662"><code>// mSpanInUse as it sits on the quarantine list, since it needs to be swept.</code></span>
+<span class="codeline" id="line-663"><code>//</code></span>
+<span class="codeline" id="line-664"><code>// This is not safe to execute unless the caller has ownership of the mspan or</code></span>
+<span class="codeline" id="line-665"><code>// the world is stopped (preemption is prevented while the relevant state changes).</code></span>
+<span class="codeline" id="line-666"><code>//</code></span>
+<span class="codeline" id="line-667"><code>// This is really only meant to be used by accounting tests in the runtime to</code></span>
+<span class="codeline" id="line-668"><code>// distinguish when a span shouldn't be counted (since mSpanInUse might not be</code></span>
+<span class="codeline" id="line-669"><code>// enough).</code></span>
+<span class="codeline" id="line-670"><code>func (s *mspan) isUnusedUserArenaChunk() bool {</code></span>
+<span class="codeline" id="line-671"><code>	return s.isUserArenaChunk &amp;&amp; s.spanclass == makeSpanClass(0, true)</code></span>
+<span class="codeline" id="line-672"><code>}</code></span>
+<span class="codeline" id="line-673"><code></code></span>
+<span class="codeline" id="line-674"><code>// setUserArenaChunkToFault sets the address space for the user arena chunk to fault</code></span>
+<span class="codeline" id="line-675"><code>// and releases any underlying memory resources.</code></span>
+<span class="codeline" id="line-676"><code>//</code></span>
+<span class="codeline" id="line-677"><code>// Must be in a non-preemptible state to ensure the consistency of statistics</code></span>
+<span class="codeline" id="line-678"><code>// exported to MemStats.</code></span>
+<span class="codeline" id="line-679"><code>func (s *mspan) setUserArenaChunkToFault() {</code></span>
+<span class="codeline" id="line-680"><code>	if !s.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-681"><code>		throw("invalid span in heapArena for user arena")</code></span>
+<span class="codeline" id="line-682"><code>	}</code></span>
+<span class="codeline" id="line-683"><code>	if s.npages*pageSize != userArenaChunkBytes {</code></span>
+<span class="codeline" id="line-684"><code>		throw("span on userArena.faultList has invalid size")</code></span>
+<span class="codeline" id="line-685"><code>	}</code></span>
+<span class="codeline" id="line-686"><code></code></span>
+<span class="codeline" id="line-687"><code>	// Update the span class to be noscan. What we want to happen is that</code></span>
+<span class="codeline" id="line-688"><code>	// any pointer into the span keeps it from getting recycled, so we want</code></span>
+<span class="codeline" id="line-689"><code>	// the mark bit to get set, but we're about to set the address space to fault,</code></span>
+<span class="codeline" id="line-690"><code>	// so we have to prevent the GC from scanning this memory.</code></span>
+<span class="codeline" id="line-691"><code>	//</code></span>
+<span class="codeline" id="line-692"><code>	// It's OK to set it here because (1) a GC isn't in progress, so the scanning code</code></span>
+<span class="codeline" id="line-693"><code>	// won't make a bad decision, (2) we're currently non-preemptible and in the runtime,</code></span>
+<span class="codeline" id="line-694"><code>	// so a GC is blocked from starting. We might race with sweeping, which could</code></span>
+<span class="codeline" id="line-695"><code>	// put it on the "wrong" sweep list, but really don't care because the chunk is</code></span>
+<span class="codeline" id="line-696"><code>	// treated as a large object span and there's no meaningful difference between scan</code></span>
+<span class="codeline" id="line-697"><code>	// and noscan large objects in the sweeper. The STW at the start of the GC acts as a</code></span>
+<span class="codeline" id="line-698"><code>	// barrier for this update.</code></span>
+<span class="codeline" id="line-699"><code>	s.spanclass = makeSpanClass(0, true)</code></span>
+<span class="codeline" id="line-700"><code></code></span>
+<span class="codeline" id="line-701"><code>	// Actually set the arena chunk to fault, so we'll get dangling pointer errors.</code></span>
+<span class="codeline" id="line-702"><code>	// sysFault currently uses a method on each OS that forces it to evacuate all</code></span>
+<span class="codeline" id="line-703"><code>	// memory backing the chunk.</code></span>
+<span class="codeline" id="line-704"><code>	sysFault(unsafe.Pointer(s.base()), s.npages*pageSize)</code></span>
+<span class="codeline" id="line-705"><code></code></span>
+<span class="codeline" id="line-706"><code>	// Everything on the list is counted as in-use, however sysFault transitions to</code></span>
+<span class="codeline" id="line-707"><code>	// Reserved, not Prepared, so we skip updating heapFree or heapReleased and just</code></span>
+<span class="codeline" id="line-708"><code>	// remove the memory from the total altogether; it's just address space now.</code></span>
+<span class="codeline" id="line-709"><code>	gcController.heapInUse.add(-int64(s.npages * pageSize))</code></span>
+<span class="codeline" id="line-710"><code></code></span>
+<span class="codeline" id="line-711"><code>	// Count this as a free of an object right now as opposed to when</code></span>
+<span class="codeline" id="line-712"><code>	// the span gets off the quarantine list. The main reason is so that the</code></span>
+<span class="codeline" id="line-713"><code>	// amount of bytes allocated doesn't exceed how much is counted as</code></span>
+<span class="codeline" id="line-714"><code>	// "mapped ready," which could cause a deadlock in the pacer.</code></span>
+<span class="codeline" id="line-715"><code>	gcController.totalFree.Add(int64(s.elemsize))</code></span>
+<span class="codeline" id="line-716"><code></code></span>
+<span class="codeline" id="line-717"><code>	// Update consistent stats to match.</code></span>
+<span class="codeline" id="line-718"><code>	//</code></span>
+<span class="codeline" id="line-719"><code>	// We're non-preemptible, so it's safe to update consistent stats (our P</code></span>
+<span class="codeline" id="line-720"><code>	// won't change out from under us).</code></span>
+<span class="codeline" id="line-721"><code>	stats := memstats.heapStats.acquire()</code></span>
+<span class="codeline" id="line-722"><code>	atomic.Xaddint64(&amp;stats.committed, -int64(s.npages*pageSize))</code></span>
+<span class="codeline" id="line-723"><code>	atomic.Xaddint64(&amp;stats.inHeap, -int64(s.npages*pageSize))</code></span>
+<span class="codeline" id="line-724"><code>	atomic.Xadd64(&amp;stats.largeFreeCount, 1)</code></span>
+<span class="codeline" id="line-725"><code>	atomic.Xadd64(&amp;stats.largeFree, int64(s.elemsize))</code></span>
+<span class="codeline" id="line-726"><code>	memstats.heapStats.release()</code></span>
+<span class="codeline" id="line-727"><code></code></span>
+<span class="codeline" id="line-728"><code>	// This counts as a free, so update heapLive.</code></span>
+<span class="codeline" id="line-729"><code>	gcController.update(-int64(s.elemsize), 0)</code></span>
+<span class="codeline" id="line-730"><code></code></span>
+<span class="codeline" id="line-731"><code>	// Mark it as free for the race detector.</code></span>
+<span class="codeline" id="line-732"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-733"><code>		racefree(unsafe.Pointer(s.base()), s.elemsize)</code></span>
+<span class="codeline" id="line-734"><code>	}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-737"><code>		// Add the user arena to the quarantine list.</code></span>
+<span class="codeline" id="line-738"><code>		lock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-739"><code>		mheap_.userArena.quarantineList.insert(s)</code></span>
+<span class="codeline" id="line-740"><code>		unlock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-741"><code>	})</code></span>
+<span class="codeline" id="line-742"><code>}</code></span>
+<span class="codeline" id="line-743"><code></code></span>
+<span class="codeline" id="line-744"><code>// inUserArenaChunk returns true if p points to a user arena chunk.</code></span>
+<span class="codeline" id="line-745"><code>func inUserArenaChunk(p uintptr) bool {</code></span>
+<span class="codeline" id="line-746"><code>	s := spanOf(p)</code></span>
+<span class="codeline" id="line-747"><code>	if s == nil {</code></span>
+<span class="codeline" id="line-748"><code>		return false</code></span>
+<span class="codeline" id="line-749"><code>	}</code></span>
+<span class="codeline" id="line-750"><code>	return s.isUserArenaChunk</code></span>
+<span class="codeline" id="line-751"><code>}</code></span>
+<span class="codeline" id="line-752"><code></code></span>
+<span class="codeline" id="line-753"><code>// freeUserArenaChunk releases the user arena represented by s back to the runtime.</code></span>
+<span class="codeline" id="line-754"><code>//</code></span>
+<span class="codeline" id="line-755"><code>// x must be a live pointer within s.</code></span>
+<span class="codeline" id="line-756"><code>//</code></span>
+<span class="codeline" id="line-757"><code>// The runtime will set the user arena to fault once it's safe (the GC is no longer running)</code></span>
+<span class="codeline" id="line-758"><code>// and then once the user arena is no longer referenced by the application, will allow it to</code></span>
+<span class="codeline" id="line-759"><code>// be reused.</code></span>
+<span class="codeline" id="line-760"><code>func freeUserArenaChunk(s *mspan, x unsafe.Pointer) {</code></span>
+<span class="codeline" id="line-761"><code>	if !s.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-762"><code>		throw("span is not for a user arena")</code></span>
+<span class="codeline" id="line-763"><code>	}</code></span>
+<span class="codeline" id="line-764"><code>	if s.npages*pageSize != userArenaChunkBytes {</code></span>
+<span class="codeline" id="line-765"><code>		throw("invalid user arena span size")</code></span>
+<span class="codeline" id="line-766"><code>	}</code></span>
+<span class="codeline" id="line-767"><code></code></span>
+<span class="codeline" id="line-768"><code>	// Mark the region as free to various santizers immediately instead</code></span>
+<span class="codeline" id="line-769"><code>	// of handling them at sweep time.</code></span>
+<span class="codeline" id="line-770"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-771"><code>		racefree(unsafe.Pointer(s.base()), s.elemsize)</code></span>
+<span class="codeline" id="line-772"><code>	}</code></span>
+<span class="codeline" id="line-773"><code>	if msanenabled {</code></span>
+<span class="codeline" id="line-774"><code>		msanfree(unsafe.Pointer(s.base()), s.elemsize)</code></span>
+<span class="codeline" id="line-775"><code>	}</code></span>
+<span class="codeline" id="line-776"><code>	if asanenabled {</code></span>
+<span class="codeline" id="line-777"><code>		asanpoison(unsafe.Pointer(s.base()), s.elemsize)</code></span>
+<span class="codeline" id="line-778"><code>	}</code></span>
+<span class="codeline" id="line-779"><code></code></span>
+<span class="codeline" id="line-780"><code>	// Make ourselves non-preemptible as we manipulate state and statistics.</code></span>
+<span class="codeline" id="line-781"><code>	//</code></span>
+<span class="codeline" id="line-782"><code>	// Also required by setUserArenaChunksToFault.</code></span>
+<span class="codeline" id="line-783"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-784"><code></code></span>
+<span class="codeline" id="line-785"><code>	// We can only set user arenas to fault if we're in the _GCoff phase.</code></span>
+<span class="codeline" id="line-786"><code>	if gcphase == _GCoff {</code></span>
+<span class="codeline" id="line-787"><code>		lock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-788"><code>		faultList := userArenaState.fault</code></span>
+<span class="codeline" id="line-789"><code>		userArenaState.fault = nil</code></span>
+<span class="codeline" id="line-790"><code>		unlock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-791"><code></code></span>
+<span class="codeline" id="line-792"><code>		s.setUserArenaChunkToFault()</code></span>
+<span class="codeline" id="line-793"><code>		for _, lc := range faultList {</code></span>
+<span class="codeline" id="line-794"><code>			lc.mspan.setUserArenaChunkToFault()</code></span>
+<span class="codeline" id="line-795"><code>		}</code></span>
+<span class="codeline" id="line-796"><code></code></span>
+<span class="codeline" id="line-797"><code>		// Until the chunks are set to fault, keep them alive via the fault list.</code></span>
+<span class="codeline" id="line-798"><code>		KeepAlive(x)</code></span>
+<span class="codeline" id="line-799"><code>		KeepAlive(faultList)</code></span>
+<span class="codeline" id="line-800"><code>	} else {</code></span>
+<span class="codeline" id="line-801"><code>		// Put the user arena on the fault list.</code></span>
+<span class="codeline" id="line-802"><code>		lock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-803"><code>		userArenaState.fault = append(userArenaState.fault, liveUserArenaChunk{s, x})</code></span>
+<span class="codeline" id="line-804"><code>		unlock(&amp;userArenaState.lock)</code></span>
+<span class="codeline" id="line-805"><code>	}</code></span>
+<span class="codeline" id="line-806"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-807"><code>}</code></span>
+<span class="codeline" id="line-808"><code></code></span>
+<span class="codeline" id="line-809"><code>// allocUserArenaChunk attempts to reuse a free user arena chunk represented</code></span>
+<span class="codeline" id="line-810"><code>// as a span.</code></span>
+<span class="codeline" id="line-811"><code>//</code></span>
+<span class="codeline" id="line-812"><code>// Must be in a non-preemptible state to ensure the consistency of statistics</code></span>
+<span class="codeline" id="line-813"><code>// exported to MemStats.</code></span>
+<span class="codeline" id="line-814"><code>//</code></span>
+<span class="codeline" id="line-815"><code>// Acquires the heap lock. Must run on the system stack for that reason.</code></span>
+<span class="codeline" id="line-816"><code>//</code></span>
+<span class="codeline" id="line-817"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-818"><code>func (h *mheap) allocUserArenaChunk() *mspan {</code></span>
+<span class="codeline" id="line-819"><code>	var s *mspan</code></span>
+<span class="codeline" id="line-820"><code>	var base uintptr</code></span>
+<span class="codeline" id="line-821"><code></code></span>
+<span class="codeline" id="line-822"><code>	// First check the free list.</code></span>
+<span class="codeline" id="line-823"><code>	lock(&amp;h.lock)</code></span>
+<span class="codeline" id="line-824"><code>	if !h.userArena.readyList.isEmpty() {</code></span>
+<span class="codeline" id="line-825"><code>		s = h.userArena.readyList.first</code></span>
+<span class="codeline" id="line-826"><code>		h.userArena.readyList.remove(s)</code></span>
+<span class="codeline" id="line-827"><code>		base = s.base()</code></span>
+<span class="codeline" id="line-828"><code>	} else {</code></span>
+<span class="codeline" id="line-829"><code>		// Free list was empty, so allocate a new arena.</code></span>
+<span class="codeline" id="line-830"><code>		hintList := &amp;h.userArena.arenaHints</code></span>
+<span class="codeline" id="line-831"><code>		if raceenabled {</code></span>
+<span class="codeline" id="line-832"><code>			// In race mode just use the regular heap hints. We might fragment</code></span>
+<span class="codeline" id="line-833"><code>			// the address space, but the race detector requires that the heap</code></span>
+<span class="codeline" id="line-834"><code>			// is mapped contiguously.</code></span>
+<span class="codeline" id="line-835"><code>			hintList = &amp;h.arenaHints</code></span>
+<span class="codeline" id="line-836"><code>		}</code></span>
+<span class="codeline" id="line-837"><code>		v, size := h.sysAlloc(userArenaChunkBytes, hintList, false)</code></span>
+<span class="codeline" id="line-838"><code>		if size%userArenaChunkBytes != 0 {</code></span>
+<span class="codeline" id="line-839"><code>			throw("sysAlloc size is not divisible by userArenaChunkBytes")</code></span>
+<span class="codeline" id="line-840"><code>		}</code></span>
+<span class="codeline" id="line-841"><code>		if size &gt; userArenaChunkBytes {</code></span>
+<span class="codeline" id="line-842"><code>			// We got more than we asked for. This can happen if</code></span>
+<span class="codeline" id="line-843"><code>			// heapArenaSize &gt; userArenaChunkSize, or if sysAlloc just returns</code></span>
+<span class="codeline" id="line-844"><code>			// some extra as a result of trying to find an aligned region.</code></span>
+<span class="codeline" id="line-845"><code>			//</code></span>
+<span class="codeline" id="line-846"><code>			// Divide it up and put it on the ready list.</code></span>
+<span class="codeline" id="line-847"><code>			for i := userArenaChunkBytes; i &lt; size; i += userArenaChunkBytes {</code></span>
+<span class="codeline" id="line-848"><code>				s := h.allocMSpanLocked()</code></span>
+<span class="codeline" id="line-849"><code>				s.init(uintptr(v)+i, userArenaChunkPages)</code></span>
+<span class="codeline" id="line-850"><code>				h.userArena.readyList.insertBack(s)</code></span>
+<span class="codeline" id="line-851"><code>			}</code></span>
+<span class="codeline" id="line-852"><code>			size = userArenaChunkBytes</code></span>
+<span class="codeline" id="line-853"><code>		}</code></span>
+<span class="codeline" id="line-854"><code>		base = uintptr(v)</code></span>
+<span class="codeline" id="line-855"><code>		if base == 0 {</code></span>
+<span class="codeline" id="line-856"><code>			// Out of memory.</code></span>
+<span class="codeline" id="line-857"><code>			unlock(&amp;h.lock)</code></span>
+<span class="codeline" id="line-858"><code>			return nil</code></span>
+<span class="codeline" id="line-859"><code>		}</code></span>
+<span class="codeline" id="line-860"><code>		s = h.allocMSpanLocked()</code></span>
+<span class="codeline" id="line-861"><code>	}</code></span>
+<span class="codeline" id="line-862"><code>	unlock(&amp;h.lock)</code></span>
+<span class="codeline" id="line-863"><code></code></span>
+<span class="codeline" id="line-864"><code>	// sysAlloc returns Reserved address space, and any span we're</code></span>
+<span class="codeline" id="line-865"><code>	// reusing is set to fault (so, also Reserved), so transition</code></span>
+<span class="codeline" id="line-866"><code>	// it to Prepared and then Ready.</code></span>
+<span class="codeline" id="line-867"><code>	//</code></span>
+<span class="codeline" id="line-868"><code>	// Unlike (*mheap).grow, just map in everything that we</code></span>
+<span class="codeline" id="line-869"><code>	// asked for. We're likely going to use it all.</code></span>
+<span class="codeline" id="line-870"><code>	sysMap(unsafe.Pointer(base), userArenaChunkBytes, &amp;gcController.heapReleased)</code></span>
+<span class="codeline" id="line-871"><code>	sysUsed(unsafe.Pointer(base), userArenaChunkBytes, userArenaChunkBytes)</code></span>
+<span class="codeline" id="line-872"><code></code></span>
+<span class="codeline" id="line-873"><code>	// Model the user arena as a heap span for a large object.</code></span>
+<span class="codeline" id="line-874"><code>	spc := makeSpanClass(0, false)</code></span>
+<span class="codeline" id="line-875"><code>	h.initSpan(s, spanAllocHeap, spc, base, userArenaChunkPages)</code></span>
+<span class="codeline" id="line-876"><code>	s.isUserArenaChunk = true</code></span>
+<span class="codeline" id="line-877"><code>	s.elemsize -= userArenaChunkReserveBytes()</code></span>
+<span class="codeline" id="line-878"><code>	s.limit = s.base() + s.elemsize</code></span>
+<span class="codeline" id="line-879"><code>	s.freeindex = 1</code></span>
+<span class="codeline" id="line-880"><code>	s.allocCount = 1</code></span>
+<span class="codeline" id="line-881"><code></code></span>
+<span class="codeline" id="line-882"><code>	// Account for this new arena chunk memory.</code></span>
+<span class="codeline" id="line-883"><code>	gcController.heapInUse.add(int64(userArenaChunkBytes))</code></span>
+<span class="codeline" id="line-884"><code>	gcController.heapReleased.add(-int64(userArenaChunkBytes))</code></span>
+<span class="codeline" id="line-885"><code></code></span>
+<span class="codeline" id="line-886"><code>	stats := memstats.heapStats.acquire()</code></span>
+<span class="codeline" id="line-887"><code>	atomic.Xaddint64(&amp;stats.inHeap, int64(userArenaChunkBytes))</code></span>
+<span class="codeline" id="line-888"><code>	atomic.Xaddint64(&amp;stats.committed, int64(userArenaChunkBytes))</code></span>
+<span class="codeline" id="line-889"><code></code></span>
+<span class="codeline" id="line-890"><code>	// Model the arena as a single large malloc.</code></span>
+<span class="codeline" id="line-891"><code>	atomic.Xadd64(&amp;stats.largeAlloc, int64(s.elemsize))</code></span>
+<span class="codeline" id="line-892"><code>	atomic.Xadd64(&amp;stats.largeAllocCount, 1)</code></span>
+<span class="codeline" id="line-893"><code>	memstats.heapStats.release()</code></span>
+<span class="codeline" id="line-894"><code></code></span>
+<span class="codeline" id="line-895"><code>	// Count the alloc in inconsistent, internal stats.</code></span>
+<span class="codeline" id="line-896"><code>	gcController.totalAlloc.Add(int64(s.elemsize))</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>	// Update heapLive.</code></span>
+<span class="codeline" id="line-899"><code>	gcController.update(int64(s.elemsize), 0)</code></span>
+<span class="codeline" id="line-900"><code></code></span>
+<span class="codeline" id="line-901"><code>	// This must clear the entire heap bitmap so that it's safe</code></span>
+<span class="codeline" id="line-902"><code>	// to allocate noscan data without writing anything out.</code></span>
+<span class="codeline" id="line-903"><code>	s.initHeapBits(true)</code></span>
+<span class="codeline" id="line-904"><code></code></span>
+<span class="codeline" id="line-905"><code>	// Clear the span preemptively. It's an arena chunk, so let's assume</code></span>
+<span class="codeline" id="line-906"><code>	// everything is going to be used.</code></span>
+<span class="codeline" id="line-907"><code>	//</code></span>
+<span class="codeline" id="line-908"><code>	// This also seems to make a massive difference as to whether or</code></span>
+<span class="codeline" id="line-909"><code>	// not Linux decides to back this memory with transparent huge</code></span>
+<span class="codeline" id="line-910"><code>	// pages. There's latency involved in this zeroing, but the hugepage</code></span>
+<span class="codeline" id="line-911"><code>	// gains are almost always worth it. Note: it's important that we</code></span>
+<span class="codeline" id="line-912"><code>	// clear even if it's freshly mapped and we know there's no point</code></span>
+<span class="codeline" id="line-913"><code>	// to zeroing as *that* is the critical signal to use huge pages.</code></span>
+<span class="codeline" id="line-914"><code>	memclrNoHeapPointers(unsafe.Pointer(s.base()), s.elemsize)</code></span>
+<span class="codeline" id="line-915"><code>	s.needzero = 0</code></span>
+<span class="codeline" id="line-916"><code></code></span>
+<span class="codeline" id="line-917"><code>	s.freeIndexForScan = 1</code></span>
+<span class="codeline" id="line-918"><code></code></span>
+<span class="codeline" id="line-919"><code>	// Set up the range for allocation.</code></span>
+<span class="codeline" id="line-920"><code>	s.userArenaChunkFree = makeAddrRange(base, base+s.elemsize)</code></span>
+<span class="codeline" id="line-921"><code></code></span>
+<span class="codeline" id="line-922"><code>	// Put the large span in the mcentral swept list so that it's</code></span>
+<span class="codeline" id="line-923"><code>	// visible to the background sweeper.</code></span>
+<span class="codeline" id="line-924"><code>	h.central[spc].mcentral.fullSwept(h.sweepgen).push(s)</code></span>
+<span class="codeline" id="line-925"><code></code></span>
+<span class="codeline" id="line-926"><code>	if goexperiment.AllocHeaders {</code></span>
+<span class="codeline" id="line-927"><code>		// Set up an allocation header. Avoid write barriers here because this type</code></span>
+<span class="codeline" id="line-928"><code>		// is not a real type, and it exists in an invalid location.</code></span>
+<span class="codeline" id="line-929"><code>		*(*uintptr)(unsafe.Pointer(&amp;s.largeType)) = uintptr(unsafe.Pointer(s.limit))</code></span>
+<span class="codeline" id="line-930"><code>		*(*uintptr)(unsafe.Pointer(&amp;s.largeType.GCData)) = s.limit + unsafe.Sizeof(_type{})</code></span>
+<span class="codeline" id="line-931"><code>		s.largeType.PtrBytes = 0</code></span>
+<span class="codeline" id="line-932"><code>		s.largeType.Size_ = s.elemsize</code></span>
+<span class="codeline" id="line-933"><code>	}</code></span>
+<span class="codeline" id="line-934"><code>	return s</code></span>
+<span class="codeline" id="line-935"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,1162 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: transfer.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	transfer.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package http</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bufio"</code></span>
+<span class="codeline" id="line-9"><code>	"bytes"</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"internal/godebug"</code></span>
+<span class="codeline" id="line-13"><code>	"io"</code></span>
+<span class="codeline" id="line-14"><code>	"net/http/httptrace"</code></span>
+<span class="codeline" id="line-15"><code>	"net/http/internal"</code></span>
+<span class="codeline" id="line-16"><code>	"net/http/internal/ascii"</code></span>
+<span class="codeline" id="line-17"><code>	"net/textproto"</code></span>
+<span class="codeline" id="line-18"><code>	"reflect"</code></span>
+<span class="codeline" id="line-19"><code>	"sort"</code></span>
+<span class="codeline" id="line-20"><code>	"strconv"</code></span>
+<span class="codeline" id="line-21"><code>	"strings"</code></span>
+<span class="codeline" id="line-22"><code>	"sync"</code></span>
+<span class="codeline" id="line-23"><code>	"time"</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>	"golang.org/x/net/http/httpguts"</code></span>
+<span class="codeline" id="line-26"><code>)</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// ErrLineTooLong is returned when reading request or response bodies</code></span>
+<span class="codeline" id="line-29"><code>// with malformed chunked encoding.</code></span>
+<span class="codeline" id="line-30"><code>var ErrLineTooLong = internal.ErrLineTooLong</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>type errorReader struct {</code></span>
+<span class="codeline" id="line-33"><code>	err error</code></span>
+<span class="codeline" id="line-34"><code>}</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>func (r errorReader) Read(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-37"><code>	return 0, r.err</code></span>
+<span class="codeline" id="line-38"><code>}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>type byteReader struct {</code></span>
+<span class="codeline" id="line-41"><code>	b    byte</code></span>
+<span class="codeline" id="line-42"><code>	done bool</code></span>
+<span class="codeline" id="line-43"><code>}</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>func (br *byteReader) Read(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-46"><code>	if br.done {</code></span>
+<span class="codeline" id="line-47"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-48"><code>	}</code></span>
+<span class="codeline" id="line-49"><code>	if len(p) == 0 {</code></span>
+<span class="codeline" id="line-50"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-51"><code>	}</code></span>
+<span class="codeline" id="line-52"><code>	br.done = true</code></span>
+<span class="codeline" id="line-53"><code>	p[0] = br.b</code></span>
+<span class="codeline" id="line-54"><code>	return 1, io.EOF</code></span>
+<span class="codeline" id="line-55"><code>}</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>// transferWriter inspects the fields of a user-supplied Request or Response,</code></span>
+<span class="codeline" id="line-58"><code>// sanitizes them without changing the user object and provides methods for</code></span>
+<span class="codeline" id="line-59"><code>// writing the respective header, body and trailer in wire format.</code></span>
+<span class="codeline" id="line-60"><code>type transferWriter struct {</code></span>
+<span class="codeline" id="line-61"><code>	Method           string</code></span>
+<span class="codeline" id="line-62"><code>	Body             io.Reader</code></span>
+<span class="codeline" id="line-63"><code>	BodyCloser       io.Closer</code></span>
+<span class="codeline" id="line-64"><code>	ResponseToHEAD   bool</code></span>
+<span class="codeline" id="line-65"><code>	ContentLength    int64 // -1 means unknown, 0 means exactly none</code></span>
+<span class="codeline" id="line-66"><code>	Close            bool</code></span>
+<span class="codeline" id="line-67"><code>	TransferEncoding []string</code></span>
+<span class="codeline" id="line-68"><code>	Header           Header</code></span>
+<span class="codeline" id="line-69"><code>	Trailer          Header</code></span>
+<span class="codeline" id="line-70"><code>	IsResponse       bool</code></span>
+<span class="codeline" id="line-71"><code>	bodyReadError    error // any non-EOF error from reading Body</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>	FlushHeaders bool            // flush headers to network before body</code></span>
+<span class="codeline" id="line-74"><code>	ByteReadCh   chan readResult // non-nil if probeRequestBody called</code></span>
+<span class="codeline" id="line-75"><code>}</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>func newTransferWriter(r any) (t *transferWriter, err error) {</code></span>
+<span class="codeline" id="line-78"><code>	t = &amp;transferWriter{}</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>	// Extract relevant fields</code></span>
+<span class="codeline" id="line-81"><code>	atLeastHTTP11 := false</code></span>
+<span class="codeline" id="line-82"><code>	switch rr := r.(type) {</code></span>
+<span class="codeline" id="line-83"><code>	case *Request:</code></span>
+<span class="codeline" id="line-84"><code>		if rr.ContentLength != 0 &amp;&amp; rr.Body == nil {</code></span>
+<span class="codeline" id="line-85"><code>			return nil, fmt.Errorf("http: Request.ContentLength=%d with nil Body", rr.ContentLength)</code></span>
+<span class="codeline" id="line-86"><code>		}</code></span>
+<span class="codeline" id="line-87"><code>		t.Method = valueOrDefault(rr.Method, "GET")</code></span>
+<span class="codeline" id="line-88"><code>		t.Close = rr.Close</code></span>
+<span class="codeline" id="line-89"><code>		t.TransferEncoding = rr.TransferEncoding</code></span>
+<span class="codeline" id="line-90"><code>		t.Header = rr.Header</code></span>
+<span class="codeline" id="line-91"><code>		t.Trailer = rr.Trailer</code></span>
+<span class="codeline" id="line-92"><code>		t.Body = rr.Body</code></span>
+<span class="codeline" id="line-93"><code>		t.BodyCloser = rr.Body</code></span>
+<span class="codeline" id="line-94"><code>		t.ContentLength = rr.outgoingLength()</code></span>
+<span class="codeline" id="line-95"><code>		if t.ContentLength &lt; 0 &amp;&amp; len(t.TransferEncoding) == 0 &amp;&amp; t.shouldSendChunkedRequestBody() {</code></span>
+<span class="codeline" id="line-96"><code>			t.TransferEncoding = []string{"chunked"}</code></span>
+<span class="codeline" id="line-97"><code>		}</code></span>
+<span class="codeline" id="line-98"><code>		// If there's a body, conservatively flush the headers</code></span>
+<span class="codeline" id="line-99"><code>		// to any bufio.Writer we're writing to, just in case</code></span>
+<span class="codeline" id="line-100"><code>		// the server needs the headers early, before we copy</code></span>
+<span class="codeline" id="line-101"><code>		// the body and possibly block. We make an exception</code></span>
+<span class="codeline" id="line-102"><code>		// for the common standard library in-memory types,</code></span>
+<span class="codeline" id="line-103"><code>		// though, to avoid unnecessary TCP packets on the</code></span>
+<span class="codeline" id="line-104"><code>		// wire. (Issue 22088.)</code></span>
+<span class="codeline" id="line-105"><code>		if t.ContentLength != 0 &amp;&amp; !isKnownInMemoryReader(t.Body) {</code></span>
+<span class="codeline" id="line-106"><code>			t.FlushHeaders = true</code></span>
+<span class="codeline" id="line-107"><code>		}</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>		atLeastHTTP11 = true // Transport requests are always 1.1 or 2.0</code></span>
+<span class="codeline" id="line-110"><code>	case *Response:</code></span>
+<span class="codeline" id="line-111"><code>		t.IsResponse = true</code></span>
+<span class="codeline" id="line-112"><code>		if rr.Request != nil {</code></span>
+<span class="codeline" id="line-113"><code>			t.Method = rr.Request.Method</code></span>
+<span class="codeline" id="line-114"><code>		}</code></span>
+<span class="codeline" id="line-115"><code>		t.Body = rr.Body</code></span>
+<span class="codeline" id="line-116"><code>		t.BodyCloser = rr.Body</code></span>
+<span class="codeline" id="line-117"><code>		t.ContentLength = rr.ContentLength</code></span>
+<span class="codeline" id="line-118"><code>		t.Close = rr.Close</code></span>
+<span class="codeline" id="line-119"><code>		t.TransferEncoding = rr.TransferEncoding</code></span>
+<span class="codeline" id="line-120"><code>		t.Header = rr.Header</code></span>
+<span class="codeline" id="line-121"><code>		t.Trailer = rr.Trailer</code></span>
+<span class="codeline" id="line-122"><code>		atLeastHTTP11 = rr.ProtoAtLeast(1, 1)</code></span>
+<span class="codeline" id="line-123"><code>		t.ResponseToHEAD = noResponseBodyExpected(t.Method)</code></span>
+<span class="codeline" id="line-124"><code>	}</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	// Sanitize Body,ContentLength,TransferEncoding</code></span>
+<span class="codeline" id="line-127"><code>	if t.ResponseToHEAD {</code></span>
+<span class="codeline" id="line-128"><code>		t.Body = nil</code></span>
+<span class="codeline" id="line-129"><code>		if chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-130"><code>			t.ContentLength = -1</code></span>
+<span class="codeline" id="line-131"><code>		}</code></span>
+<span class="codeline" id="line-132"><code>	} else {</code></span>
+<span class="codeline" id="line-133"><code>		if !atLeastHTTP11 || t.Body == nil {</code></span>
+<span class="codeline" id="line-134"><code>			t.TransferEncoding = nil</code></span>
+<span class="codeline" id="line-135"><code>		}</code></span>
+<span class="codeline" id="line-136"><code>		if chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-137"><code>			t.ContentLength = -1</code></span>
+<span class="codeline" id="line-138"><code>		} else if t.Body == nil { // no chunking, no body</code></span>
+<span class="codeline" id="line-139"><code>			t.ContentLength = 0</code></span>
+<span class="codeline" id="line-140"><code>		}</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>	// Sanitize Trailer</code></span>
+<span class="codeline" id="line-144"><code>	if !chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-145"><code>		t.Trailer = nil</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>	return t, nil</code></span>
+<span class="codeline" id="line-149"><code>}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>// shouldSendChunkedRequestBody reports whether we should try to send a</code></span>
+<span class="codeline" id="line-152"><code>// chunked request body to the server. In particular, the case we really</code></span>
+<span class="codeline" id="line-153"><code>// want to prevent is sending a GET or other typically-bodyless request to a</code></span>
+<span class="codeline" id="line-154"><code>// server with a chunked body when the body has zero bytes, since GETs with</code></span>
+<span class="codeline" id="line-155"><code>// bodies (while acceptable according to specs), even zero-byte chunked</code></span>
+<span class="codeline" id="line-156"><code>// bodies, are approximately never seen in the wild and confuse most</code></span>
+<span class="codeline" id="line-157"><code>// servers. See Issue 18257, as one example.</code></span>
+<span class="codeline" id="line-158"><code>//</code></span>
+<span class="codeline" id="line-159"><code>// The only reason we'd send such a request is if the user set the Body to a</code></span>
+<span class="codeline" id="line-160"><code>// non-nil value (say, io.NopCloser(bytes.NewReader(nil))) and didn't</code></span>
+<span class="codeline" id="line-161"><code>// set ContentLength, or NewRequest set it to -1 (unknown), so then we assume</code></span>
+<span class="codeline" id="line-162"><code>// there's bytes to send.</code></span>
+<span class="codeline" id="line-163"><code>//</code></span>
+<span class="codeline" id="line-164"><code>// This code tries to read a byte from the Request.Body in such cases to see</code></span>
+<span class="codeline" id="line-165"><code>// whether the body actually has content (super rare) or is actually just</code></span>
+<span class="codeline" id="line-166"><code>// a non-nil content-less ReadCloser (the more common case). In that more</code></span>
+<span class="codeline" id="line-167"><code>// common case, we act as if their Body were nil instead, and don't send</code></span>
+<span class="codeline" id="line-168"><code>// a body.</code></span>
+<span class="codeline" id="line-169"><code>func (t *transferWriter) shouldSendChunkedRequestBody() bool {</code></span>
+<span class="codeline" id="line-170"><code>	// Note that t.ContentLength is the corrected content length</code></span>
+<span class="codeline" id="line-171"><code>	// from rr.outgoingLength, so 0 actually means zero, not unknown.</code></span>
+<span class="codeline" id="line-172"><code>	if t.ContentLength &gt;= 0 || t.Body == nil { // redundant checks; caller did them</code></span>
+<span class="codeline" id="line-173"><code>		return false</code></span>
+<span class="codeline" id="line-174"><code>	}</code></span>
+<span class="codeline" id="line-175"><code>	if t.Method == "CONNECT" {</code></span>
+<span class="codeline" id="line-176"><code>		return false</code></span>
+<span class="codeline" id="line-177"><code>	}</code></span>
+<span class="codeline" id="line-178"><code>	if requestMethodUsuallyLacksBody(t.Method) {</code></span>
+<span class="codeline" id="line-179"><code>		// Only probe the Request.Body for GET/HEAD/DELETE/etc</code></span>
+<span class="codeline" id="line-180"><code>		// requests, because it's only those types of requests</code></span>
+<span class="codeline" id="line-181"><code>		// that confuse servers.</code></span>
+<span class="codeline" id="line-182"><code>		t.probeRequestBody() // adjusts t.Body, t.ContentLength</code></span>
+<span class="codeline" id="line-183"><code>		return t.Body != nil</code></span>
+<span class="codeline" id="line-184"><code>	}</code></span>
+<span class="codeline" id="line-185"><code>	// For all other request types (PUT, POST, PATCH, or anything</code></span>
+<span class="codeline" id="line-186"><code>	// made-up we've never heard of), assume it's normal and the server</code></span>
+<span class="codeline" id="line-187"><code>	// can deal with a chunked request body. Maybe we'll adjust this</code></span>
+<span class="codeline" id="line-188"><code>	// later.</code></span>
+<span class="codeline" id="line-189"><code>	return true</code></span>
+<span class="codeline" id="line-190"><code>}</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>// probeRequestBody reads a byte from t.Body to see whether it's empty</code></span>
+<span class="codeline" id="line-193"><code>// (returns io.EOF right away).</code></span>
+<span class="codeline" id="line-194"><code>//</code></span>
+<span class="codeline" id="line-195"><code>// But because we've had problems with this blocking users in the past</code></span>
+<span class="codeline" id="line-196"><code>// (issue 17480) when the body is a pipe (perhaps waiting on the response</code></span>
+<span class="codeline" id="line-197"><code>// headers before the pipe is fed data), we need to be careful and bound how</code></span>
+<span class="codeline" id="line-198"><code>// long we wait for it. This delay will only affect users if all the following</code></span>
+<span class="codeline" id="line-199"><code>// are true:</code></span>
+<span class="codeline" id="line-200"><code>//   - the request body blocks</code></span>
+<span class="codeline" id="line-201"><code>//   - the content length is not set (or set to -1)</code></span>
+<span class="codeline" id="line-202"><code>//   - the method doesn't usually have a body (GET, HEAD, DELETE, ...)</code></span>
+<span class="codeline" id="line-203"><code>//   - there is no transfer-encoding=chunked already set.</code></span>
+<span class="codeline" id="line-204"><code>//</code></span>
+<span class="codeline" id="line-205"><code>// In other words, this delay will not normally affect anybody, and there</code></span>
+<span class="codeline" id="line-206"><code>// are workarounds if it does.</code></span>
+<span class="codeline" id="line-207"><code>func (t *transferWriter) probeRequestBody() {</code></span>
+<span class="codeline" id="line-208"><code>	t.ByteReadCh = make(chan readResult, 1)</code></span>
+<span class="codeline" id="line-209"><code>	go func(body io.Reader) {</code></span>
+<span class="codeline" id="line-210"><code>		var buf [1]byte</code></span>
+<span class="codeline" id="line-211"><code>		var rres readResult</code></span>
+<span class="codeline" id="line-212"><code>		rres.n, rres.err = body.Read(buf[:])</code></span>
+<span class="codeline" id="line-213"><code>		if rres.n == 1 {</code></span>
+<span class="codeline" id="line-214"><code>			rres.b = buf[0]</code></span>
+<span class="codeline" id="line-215"><code>		}</code></span>
+<span class="codeline" id="line-216"><code>		t.ByteReadCh &lt;- rres</code></span>
+<span class="codeline" id="line-217"><code>		close(t.ByteReadCh)</code></span>
+<span class="codeline" id="line-218"><code>	}(t.Body)</code></span>
+<span class="codeline" id="line-219"><code>	timer := time.NewTimer(200 * time.Millisecond)</code></span>
+<span class="codeline" id="line-220"><code>	select {</code></span>
+<span class="codeline" id="line-221"><code>	case rres := &lt;-t.ByteReadCh:</code></span>
+<span class="codeline" id="line-222"><code>		timer.Stop()</code></span>
+<span class="codeline" id="line-223"><code>		if rres.n == 0 &amp;&amp; rres.err == io.EOF {</code></span>
+<span class="codeline" id="line-224"><code>			// It was empty.</code></span>
+<span class="codeline" id="line-225"><code>			t.Body = nil</code></span>
+<span class="codeline" id="line-226"><code>			t.ContentLength = 0</code></span>
+<span class="codeline" id="line-227"><code>		} else if rres.n == 1 {</code></span>
+<span class="codeline" id="line-228"><code>			if rres.err != nil {</code></span>
+<span class="codeline" id="line-229"><code>				t.Body = io.MultiReader(&amp;byteReader{b: rres.b}, errorReader{rres.err})</code></span>
+<span class="codeline" id="line-230"><code>			} else {</code></span>
+<span class="codeline" id="line-231"><code>				t.Body = io.MultiReader(&amp;byteReader{b: rres.b}, t.Body)</code></span>
+<span class="codeline" id="line-232"><code>			}</code></span>
+<span class="codeline" id="line-233"><code>		} else if rres.err != nil {</code></span>
+<span class="codeline" id="line-234"><code>			t.Body = errorReader{rres.err}</code></span>
+<span class="codeline" id="line-235"><code>		}</code></span>
+<span class="codeline" id="line-236"><code>	case &lt;-timer.C:</code></span>
+<span class="codeline" id="line-237"><code>		// Too slow. Don't wait. Read it later, and keep</code></span>
+<span class="codeline" id="line-238"><code>		// assuming that this is ContentLength == -1</code></span>
+<span class="codeline" id="line-239"><code>		// (unknown), which means we'll send a</code></span>
+<span class="codeline" id="line-240"><code>		// "Transfer-Encoding: chunked" header.</code></span>
+<span class="codeline" id="line-241"><code>		t.Body = io.MultiReader(finishAsyncByteRead{t}, t.Body)</code></span>
+<span class="codeline" id="line-242"><code>		// Request that Request.Write flush the headers to the</code></span>
+<span class="codeline" id="line-243"><code>		// network before writing the body, since our body may not</code></span>
+<span class="codeline" id="line-244"><code>		// become readable until it's seen the response headers.</code></span>
+<span class="codeline" id="line-245"><code>		t.FlushHeaders = true</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code>}</code></span>
+<span class="codeline" id="line-248"><code></code></span>
+<span class="codeline" id="line-249"><code>func noResponseBodyExpected(requestMethod string) bool {</code></span>
+<span class="codeline" id="line-250"><code>	return requestMethod == "HEAD"</code></span>
+<span class="codeline" id="line-251"><code>}</code></span>
+<span class="codeline" id="line-252"><code></code></span>
+<span class="codeline" id="line-253"><code>func (t *transferWriter) shouldSendContentLength() bool {</code></span>
+<span class="codeline" id="line-254"><code>	if chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-255"><code>		return false</code></span>
+<span class="codeline" id="line-256"><code>	}</code></span>
+<span class="codeline" id="line-257"><code>	if t.ContentLength &gt; 0 {</code></span>
+<span class="codeline" id="line-258"><code>		return true</code></span>
+<span class="codeline" id="line-259"><code>	}</code></span>
+<span class="codeline" id="line-260"><code>	if t.ContentLength &lt; 0 {</code></span>
+<span class="codeline" id="line-261"><code>		return false</code></span>
+<span class="codeline" id="line-262"><code>	}</code></span>
+<span class="codeline" id="line-263"><code>	// Many servers expect a Content-Length for these methods</code></span>
+<span class="codeline" id="line-264"><code>	if t.Method == "POST" || t.Method == "PUT" || t.Method == "PATCH" {</code></span>
+<span class="codeline" id="line-265"><code>		return true</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code>	if t.ContentLength == 0 &amp;&amp; isIdentity(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-268"><code>		if t.Method == "GET" || t.Method == "HEAD" {</code></span>
+<span class="codeline" id="line-269"><code>			return false</code></span>
+<span class="codeline" id="line-270"><code>		}</code></span>
+<span class="codeline" id="line-271"><code>		return true</code></span>
+<span class="codeline" id="line-272"><code>	}</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>	return false</code></span>
+<span class="codeline" id="line-275"><code>}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>func (t *transferWriter) writeHeader(w io.Writer, trace *httptrace.ClientTrace) error {</code></span>
+<span class="codeline" id="line-278"><code>	if t.Close &amp;&amp; !hasToken(t.Header.get("Connection"), "close") {</code></span>
+<span class="codeline" id="line-279"><code>		if _, err := io.WriteString(w, "Connection: close\r\n"); err != nil {</code></span>
+<span class="codeline" id="line-280"><code>			return err</code></span>
+<span class="codeline" id="line-281"><code>		}</code></span>
+<span class="codeline" id="line-282"><code>		if trace != nil &amp;&amp; trace.WroteHeaderField != nil {</code></span>
+<span class="codeline" id="line-283"><code>			trace.WroteHeaderField("Connection", []string{"close"})</code></span>
+<span class="codeline" id="line-284"><code>		}</code></span>
+<span class="codeline" id="line-285"><code>	}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>	// Write Content-Length and/or Transfer-Encoding whose values are a</code></span>
+<span class="codeline" id="line-288"><code>	// function of the sanitized field triple (Body, ContentLength,</code></span>
+<span class="codeline" id="line-289"><code>	// TransferEncoding)</code></span>
+<span class="codeline" id="line-290"><code>	if t.shouldSendContentLength() {</code></span>
+<span class="codeline" id="line-291"><code>		if _, err := io.WriteString(w, "Content-Length: "); err != nil {</code></span>
+<span class="codeline" id="line-292"><code>			return err</code></span>
+<span class="codeline" id="line-293"><code>		}</code></span>
+<span class="codeline" id="line-294"><code>		if _, err := io.WriteString(w, strconv.FormatInt(t.ContentLength, 10)+"\r\n"); err != nil {</code></span>
+<span class="codeline" id="line-295"><code>			return err</code></span>
+<span class="codeline" id="line-296"><code>		}</code></span>
+<span class="codeline" id="line-297"><code>		if trace != nil &amp;&amp; trace.WroteHeaderField != nil {</code></span>
+<span class="codeline" id="line-298"><code>			trace.WroteHeaderField("Content-Length", []string{strconv.FormatInt(t.ContentLength, 10)})</code></span>
+<span class="codeline" id="line-299"><code>		}</code></span>
+<span class="codeline" id="line-300"><code>	} else if chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-301"><code>		if _, err := io.WriteString(w, "Transfer-Encoding: chunked\r\n"); err != nil {</code></span>
+<span class="codeline" id="line-302"><code>			return err</code></span>
+<span class="codeline" id="line-303"><code>		}</code></span>
+<span class="codeline" id="line-304"><code>		if trace != nil &amp;&amp; trace.WroteHeaderField != nil {</code></span>
+<span class="codeline" id="line-305"><code>			trace.WroteHeaderField("Transfer-Encoding", []string{"chunked"})</code></span>
+<span class="codeline" id="line-306"><code>		}</code></span>
+<span class="codeline" id="line-307"><code>	}</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>	// Write Trailer header</code></span>
+<span class="codeline" id="line-310"><code>	if t.Trailer != nil {</code></span>
+<span class="codeline" id="line-311"><code>		keys := make([]string, 0, len(t.Trailer))</code></span>
+<span class="codeline" id="line-312"><code>		for k := range t.Trailer {</code></span>
+<span class="codeline" id="line-313"><code>			k = CanonicalHeaderKey(k)</code></span>
+<span class="codeline" id="line-314"><code>			switch k {</code></span>
+<span class="codeline" id="line-315"><code>			case "Transfer-Encoding", "Trailer", "Content-Length":</code></span>
+<span class="codeline" id="line-316"><code>				return badStringError("invalid Trailer key", k)</code></span>
+<span class="codeline" id="line-317"><code>			}</code></span>
+<span class="codeline" id="line-318"><code>			keys = append(keys, k)</code></span>
+<span class="codeline" id="line-319"><code>		}</code></span>
+<span class="codeline" id="line-320"><code>		if len(keys) &gt; 0 {</code></span>
+<span class="codeline" id="line-321"><code>			sort.Strings(keys)</code></span>
+<span class="codeline" id="line-322"><code>			// TODO: could do better allocation-wise here, but trailers are rare,</code></span>
+<span class="codeline" id="line-323"><code>			// so being lazy for now.</code></span>
+<span class="codeline" id="line-324"><code>			if _, err := io.WriteString(w, "Trailer: "+strings.Join(keys, ",")+"\r\n"); err != nil {</code></span>
+<span class="codeline" id="line-325"><code>				return err</code></span>
+<span class="codeline" id="line-326"><code>			}</code></span>
+<span class="codeline" id="line-327"><code>			if trace != nil &amp;&amp; trace.WroteHeaderField != nil {</code></span>
+<span class="codeline" id="line-328"><code>				trace.WroteHeaderField("Trailer", keys)</code></span>
+<span class="codeline" id="line-329"><code>			}</code></span>
+<span class="codeline" id="line-330"><code>		}</code></span>
+<span class="codeline" id="line-331"><code>	}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>	return nil</code></span>
+<span class="codeline" id="line-334"><code>}</code></span>
+<span class="codeline" id="line-335"><code></code></span>
+<span class="codeline" id="line-336"><code>// always closes t.BodyCloser</code></span>
+<span class="codeline" id="line-337"><code>func (t *transferWriter) writeBody(w io.Writer) (err error) {</code></span>
+<span class="codeline" id="line-338"><code>	var ncopy int64</code></span>
+<span class="codeline" id="line-339"><code>	closed := false</code></span>
+<span class="codeline" id="line-340"><code>	defer func() {</code></span>
+<span class="codeline" id="line-341"><code>		if closed || t.BodyCloser == nil {</code></span>
+<span class="codeline" id="line-342"><code>			return</code></span>
+<span class="codeline" id="line-343"><code>		}</code></span>
+<span class="codeline" id="line-344"><code>		if closeErr := t.BodyCloser.Close(); closeErr != nil &amp;&amp; err == nil {</code></span>
+<span class="codeline" id="line-345"><code>			err = closeErr</code></span>
+<span class="codeline" id="line-346"><code>		}</code></span>
+<span class="codeline" id="line-347"><code>	}()</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>	// Write body. We "unwrap" the body first if it was wrapped in a</code></span>
+<span class="codeline" id="line-350"><code>	// nopCloser or readTrackingBody. This is to ensure that we can take advantage of</code></span>
+<span class="codeline" id="line-351"><code>	// OS-level optimizations in the event that the body is an</code></span>
+<span class="codeline" id="line-352"><code>	// *os.File.</code></span>
+<span class="codeline" id="line-353"><code>	if t.Body != nil {</code></span>
+<span class="codeline" id="line-354"><code>		var body = t.unwrapBody()</code></span>
+<span class="codeline" id="line-355"><code>		if chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-356"><code>			if bw, ok := w.(*bufio.Writer); ok &amp;&amp; !t.IsResponse {</code></span>
+<span class="codeline" id="line-357"><code>				w = &amp;internal.FlushAfterChunkWriter{Writer: bw}</code></span>
+<span class="codeline" id="line-358"><code>			}</code></span>
+<span class="codeline" id="line-359"><code>			cw := internal.NewChunkedWriter(w)</code></span>
+<span class="codeline" id="line-360"><code>			_, err = t.doBodyCopy(cw, body)</code></span>
+<span class="codeline" id="line-361"><code>			if err == nil {</code></span>
+<span class="codeline" id="line-362"><code>				err = cw.Close()</code></span>
+<span class="codeline" id="line-363"><code>			}</code></span>
+<span class="codeline" id="line-364"><code>		} else if t.ContentLength == -1 {</code></span>
+<span class="codeline" id="line-365"><code>			dst := w</code></span>
+<span class="codeline" id="line-366"><code>			if t.Method == "CONNECT" {</code></span>
+<span class="codeline" id="line-367"><code>				dst = bufioFlushWriter{dst}</code></span>
+<span class="codeline" id="line-368"><code>			}</code></span>
+<span class="codeline" id="line-369"><code>			ncopy, err = t.doBodyCopy(dst, body)</code></span>
+<span class="codeline" id="line-370"><code>		} else {</code></span>
+<span class="codeline" id="line-371"><code>			ncopy, err = t.doBodyCopy(w, io.LimitReader(body, t.ContentLength))</code></span>
+<span class="codeline" id="line-372"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-373"><code>				return err</code></span>
+<span class="codeline" id="line-374"><code>			}</code></span>
+<span class="codeline" id="line-375"><code>			var nextra int64</code></span>
+<span class="codeline" id="line-376"><code>			nextra, err = t.doBodyCopy(io.Discard, body)</code></span>
+<span class="codeline" id="line-377"><code>			ncopy += nextra</code></span>
+<span class="codeline" id="line-378"><code>		}</code></span>
+<span class="codeline" id="line-379"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-380"><code>			return err</code></span>
+<span class="codeline" id="line-381"><code>		}</code></span>
+<span class="codeline" id="line-382"><code>	}</code></span>
+<span class="codeline" id="line-383"><code>	if t.BodyCloser != nil {</code></span>
+<span class="codeline" id="line-384"><code>		closed = true</code></span>
+<span class="codeline" id="line-385"><code>		if err := t.BodyCloser.Close(); err != nil {</code></span>
+<span class="codeline" id="line-386"><code>			return err</code></span>
+<span class="codeline" id="line-387"><code>		}</code></span>
+<span class="codeline" id="line-388"><code>	}</code></span>
+<span class="codeline" id="line-389"><code></code></span>
+<span class="codeline" id="line-390"><code>	if !t.ResponseToHEAD &amp;&amp; t.ContentLength != -1 &amp;&amp; t.ContentLength != ncopy {</code></span>
+<span class="codeline" id="line-391"><code>		return fmt.Errorf("http: ContentLength=%d with Body length %d",</code></span>
+<span class="codeline" id="line-392"><code>			t.ContentLength, ncopy)</code></span>
+<span class="codeline" id="line-393"><code>	}</code></span>
+<span class="codeline" id="line-394"><code></code></span>
+<span class="codeline" id="line-395"><code>	if chunked(t.TransferEncoding) {</code></span>
+<span class="codeline" id="line-396"><code>		// Write Trailer header</code></span>
+<span class="codeline" id="line-397"><code>		if t.Trailer != nil {</code></span>
+<span class="codeline" id="line-398"><code>			if err := t.Trailer.Write(w); err != nil {</code></span>
+<span class="codeline" id="line-399"><code>				return err</code></span>
+<span class="codeline" id="line-400"><code>			}</code></span>
+<span class="codeline" id="line-401"><code>		}</code></span>
+<span class="codeline" id="line-402"><code>		// Last chunk, empty trailer</code></span>
+<span class="codeline" id="line-403"><code>		_, err = io.WriteString(w, "\r\n")</code></span>
+<span class="codeline" id="line-404"><code>	}</code></span>
+<span class="codeline" id="line-405"><code>	return err</code></span>
+<span class="codeline" id="line-406"><code>}</code></span>
+<span class="codeline" id="line-407"><code></code></span>
+<span class="codeline" id="line-408"><code>// doBodyCopy wraps a copy operation, with any resulting error also</code></span>
+<span class="codeline" id="line-409"><code>// being saved in bodyReadError.</code></span>
+<span class="codeline" id="line-410"><code>//</code></span>
+<span class="codeline" id="line-411"><code>// This function is only intended for use in writeBody.</code></span>
+<span class="codeline" id="line-412"><code>func (t *transferWriter) doBodyCopy(dst io.Writer, src io.Reader) (n int64, err error) {</code></span>
+<span class="codeline" id="line-413"><code>	buf := getCopyBuf()</code></span>
+<span class="codeline" id="line-414"><code>	defer putCopyBuf(buf)</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>	n, err = io.CopyBuffer(dst, src, buf)</code></span>
+<span class="codeline" id="line-417"><code>	if err != nil &amp;&amp; err != io.EOF {</code></span>
+<span class="codeline" id="line-418"><code>		t.bodyReadError = err</code></span>
+<span class="codeline" id="line-419"><code>	}</code></span>
+<span class="codeline" id="line-420"><code>	return</code></span>
+<span class="codeline" id="line-421"><code>}</code></span>
+<span class="codeline" id="line-422"><code></code></span>
+<span class="codeline" id="line-423"><code>// unwrapBody unwraps the body's inner reader if it's a</code></span>
+<span class="codeline" id="line-424"><code>// nopCloser. This is to ensure that body writes sourced from local</code></span>
+<span class="codeline" id="line-425"><code>// files (*os.File types) are properly optimized.</code></span>
+<span class="codeline" id="line-426"><code>//</code></span>
+<span class="codeline" id="line-427"><code>// This function is only intended for use in writeBody.</code></span>
+<span class="codeline" id="line-428"><code>func (t *transferWriter) unwrapBody() io.Reader {</code></span>
+<span class="codeline" id="line-429"><code>	if r, ok := unwrapNopCloser(t.Body); ok {</code></span>
+<span class="codeline" id="line-430"><code>		return r</code></span>
+<span class="codeline" id="line-431"><code>	}</code></span>
+<span class="codeline" id="line-432"><code>	if r, ok := t.Body.(*readTrackingBody); ok {</code></span>
+<span class="codeline" id="line-433"><code>		r.didRead = true</code></span>
+<span class="codeline" id="line-434"><code>		return r.ReadCloser</code></span>
+<span class="codeline" id="line-435"><code>	}</code></span>
+<span class="codeline" id="line-436"><code>	return t.Body</code></span>
+<span class="codeline" id="line-437"><code>}</code></span>
+<span class="codeline" id="line-438"><code></code></span>
+<span class="codeline" id="line-439"><code>type transferReader struct {</code></span>
+<span class="codeline" id="line-440"><code>	// Input</code></span>
+<span class="codeline" id="line-441"><code>	Header        Header</code></span>
+<span class="codeline" id="line-442"><code>	StatusCode    int</code></span>
+<span class="codeline" id="line-443"><code>	RequestMethod string</code></span>
+<span class="codeline" id="line-444"><code>	ProtoMajor    int</code></span>
+<span class="codeline" id="line-445"><code>	ProtoMinor    int</code></span>
+<span class="codeline" id="line-446"><code>	// Output</code></span>
+<span class="codeline" id="line-447"><code>	Body          io.ReadCloser</code></span>
+<span class="codeline" id="line-448"><code>	ContentLength int64</code></span>
+<span class="codeline" id="line-449"><code>	Chunked       bool</code></span>
+<span class="codeline" id="line-450"><code>	Close         bool</code></span>
+<span class="codeline" id="line-451"><code>	Trailer       Header</code></span>
+<span class="codeline" id="line-452"><code>}</code></span>
+<span class="codeline" id="line-453"><code></code></span>
+<span class="codeline" id="line-454"><code>func (t *transferReader) protoAtLeast(m, n int) bool {</code></span>
+<span class="codeline" id="line-455"><code>	return t.ProtoMajor &gt; m || (t.ProtoMajor == m &amp;&amp; t.ProtoMinor &gt;= n)</code></span>
+<span class="codeline" id="line-456"><code>}</code></span>
+<span class="codeline" id="line-457"><code></code></span>
+<span class="codeline" id="line-458"><code>// bodyAllowedForStatus reports whether a given response status code</code></span>
+<span class="codeline" id="line-459"><code>// permits a body. See RFC 7230, section 3.3.</code></span>
+<span class="codeline" id="line-460"><code>func bodyAllowedForStatus(status int) bool {</code></span>
+<span class="codeline" id="line-461"><code>	switch {</code></span>
+<span class="codeline" id="line-462"><code>	case status &gt;= 100 &amp;&amp; status &lt;= 199:</code></span>
+<span class="codeline" id="line-463"><code>		return false</code></span>
+<span class="codeline" id="line-464"><code>	case status == 204:</code></span>
+<span class="codeline" id="line-465"><code>		return false</code></span>
+<span class="codeline" id="line-466"><code>	case status == 304:</code></span>
+<span class="codeline" id="line-467"><code>		return false</code></span>
+<span class="codeline" id="line-468"><code>	}</code></span>
+<span class="codeline" id="line-469"><code>	return true</code></span>
+<span class="codeline" id="line-470"><code>}</code></span>
+<span class="codeline" id="line-471"><code></code></span>
+<span class="codeline" id="line-472"><code>var (</code></span>
+<span class="codeline" id="line-473"><code>	suppressedHeaders304    = []string{"Content-Type", "Content-Length", "Transfer-Encoding"}</code></span>
+<span class="codeline" id="line-474"><code>	suppressedHeadersNoBody = []string{"Content-Length", "Transfer-Encoding"}</code></span>
+<span class="codeline" id="line-475"><code>	excludedHeadersNoBody   = map[string]bool{"Content-Length": true, "Transfer-Encoding": true}</code></span>
+<span class="codeline" id="line-476"><code>)</code></span>
+<span class="codeline" id="line-477"><code></code></span>
+<span class="codeline" id="line-478"><code>func suppressedHeaders(status int) []string {</code></span>
+<span class="codeline" id="line-479"><code>	switch {</code></span>
+<span class="codeline" id="line-480"><code>	case status == 304:</code></span>
+<span class="codeline" id="line-481"><code>		// RFC 7232 section 4.1</code></span>
+<span class="codeline" id="line-482"><code>		return suppressedHeaders304</code></span>
+<span class="codeline" id="line-483"><code>	case !bodyAllowedForStatus(status):</code></span>
+<span class="codeline" id="line-484"><code>		return suppressedHeadersNoBody</code></span>
+<span class="codeline" id="line-485"><code>	}</code></span>
+<span class="codeline" id="line-486"><code>	return nil</code></span>
+<span class="codeline" id="line-487"><code>}</code></span>
+<span class="codeline" id="line-488"><code></code></span>
+<span class="codeline" id="line-489"><code>// msg is *Request or *Response.</code></span>
+<span class="codeline" id="line-490"><code>func readTransfer(msg any, r *bufio.Reader) (err error) {</code></span>
+<span class="codeline" id="line-491"><code>	t := &amp;transferReader{RequestMethod: "GET"}</code></span>
+<span class="codeline" id="line-492"><code></code></span>
+<span class="codeline" id="line-493"><code>	// Unify input</code></span>
+<span class="codeline" id="line-494"><code>	isResponse := false</code></span>
+<span class="codeline" id="line-495"><code>	switch rr := msg.(type) {</code></span>
+<span class="codeline" id="line-496"><code>	case *Response:</code></span>
+<span class="codeline" id="line-497"><code>		t.Header = rr.Header</code></span>
+<span class="codeline" id="line-498"><code>		t.StatusCode = rr.StatusCode</code></span>
+<span class="codeline" id="line-499"><code>		t.ProtoMajor = rr.ProtoMajor</code></span>
+<span class="codeline" id="line-500"><code>		t.ProtoMinor = rr.ProtoMinor</code></span>
+<span class="codeline" id="line-501"><code>		t.Close = shouldClose(t.ProtoMajor, t.ProtoMinor, t.Header, true)</code></span>
+<span class="codeline" id="line-502"><code>		isResponse = true</code></span>
+<span class="codeline" id="line-503"><code>		if rr.Request != nil {</code></span>
+<span class="codeline" id="line-504"><code>			t.RequestMethod = rr.Request.Method</code></span>
+<span class="codeline" id="line-505"><code>		}</code></span>
+<span class="codeline" id="line-506"><code>	case *Request:</code></span>
+<span class="codeline" id="line-507"><code>		t.Header = rr.Header</code></span>
+<span class="codeline" id="line-508"><code>		t.RequestMethod = rr.Method</code></span>
+<span class="codeline" id="line-509"><code>		t.ProtoMajor = rr.ProtoMajor</code></span>
+<span class="codeline" id="line-510"><code>		t.ProtoMinor = rr.ProtoMinor</code></span>
+<span class="codeline" id="line-511"><code>		// Transfer semantics for Requests are exactly like those for</code></span>
+<span class="codeline" id="line-512"><code>		// Responses with status code 200, responding to a GET method</code></span>
+<span class="codeline" id="line-513"><code>		t.StatusCode = 200</code></span>
+<span class="codeline" id="line-514"><code>		t.Close = rr.Close</code></span>
+<span class="codeline" id="line-515"><code>	default:</code></span>
+<span class="codeline" id="line-516"><code>		panic("unexpected type")</code></span>
+<span class="codeline" id="line-517"><code>	}</code></span>
+<span class="codeline" id="line-518"><code></code></span>
+<span class="codeline" id="line-519"><code>	// Default to HTTP/1.1</code></span>
+<span class="codeline" id="line-520"><code>	if t.ProtoMajor == 0 &amp;&amp; t.ProtoMinor == 0 {</code></span>
+<span class="codeline" id="line-521"><code>		t.ProtoMajor, t.ProtoMinor = 1, 1</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>	// Transfer-Encoding: chunked, and overriding Content-Length.</code></span>
+<span class="codeline" id="line-525"><code>	if err := t.parseTransferEncoding(); err != nil {</code></span>
+<span class="codeline" id="line-526"><code>		return err</code></span>
+<span class="codeline" id="line-527"><code>	}</code></span>
+<span class="codeline" id="line-528"><code></code></span>
+<span class="codeline" id="line-529"><code>	realLength, err := fixLength(isResponse, t.StatusCode, t.RequestMethod, t.Header, t.Chunked)</code></span>
+<span class="codeline" id="line-530"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-531"><code>		return err</code></span>
+<span class="codeline" id="line-532"><code>	}</code></span>
+<span class="codeline" id="line-533"><code>	if isResponse &amp;&amp; t.RequestMethod == "HEAD" {</code></span>
+<span class="codeline" id="line-534"><code>		if n, err := parseContentLength(t.Header["Content-Length"]); err != nil {</code></span>
+<span class="codeline" id="line-535"><code>			return err</code></span>
+<span class="codeline" id="line-536"><code>		} else {</code></span>
+<span class="codeline" id="line-537"><code>			t.ContentLength = n</code></span>
+<span class="codeline" id="line-538"><code>		}</code></span>
+<span class="codeline" id="line-539"><code>	} else {</code></span>
+<span class="codeline" id="line-540"><code>		t.ContentLength = realLength</code></span>
+<span class="codeline" id="line-541"><code>	}</code></span>
+<span class="codeline" id="line-542"><code></code></span>
+<span class="codeline" id="line-543"><code>	// Trailer</code></span>
+<span class="codeline" id="line-544"><code>	t.Trailer, err = fixTrailer(t.Header, t.Chunked)</code></span>
+<span class="codeline" id="line-545"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-546"><code>		return err</code></span>
+<span class="codeline" id="line-547"><code>	}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>	// If there is no Content-Length or chunked Transfer-Encoding on a *Response</code></span>
+<span class="codeline" id="line-550"><code>	// and the status is not 1xx, 204 or 304, then the body is unbounded.</code></span>
+<span class="codeline" id="line-551"><code>	// See RFC 7230, section 3.3.</code></span>
+<span class="codeline" id="line-552"><code>	switch msg.(type) {</code></span>
+<span class="codeline" id="line-553"><code>	case *Response:</code></span>
+<span class="codeline" id="line-554"><code>		if realLength == -1 &amp;&amp; !t.Chunked &amp;&amp; bodyAllowedForStatus(t.StatusCode) {</code></span>
+<span class="codeline" id="line-555"><code>			// Unbounded body.</code></span>
+<span class="codeline" id="line-556"><code>			t.Close = true</code></span>
+<span class="codeline" id="line-557"><code>		}</code></span>
+<span class="codeline" id="line-558"><code>	}</code></span>
+<span class="codeline" id="line-559"><code></code></span>
+<span class="codeline" id="line-560"><code>	// Prepare body reader. ContentLength &lt; 0 means chunked encoding</code></span>
+<span class="codeline" id="line-561"><code>	// or close connection when finished, since multipart is not supported yet</code></span>
+<span class="codeline" id="line-562"><code>	switch {</code></span>
+<span class="codeline" id="line-563"><code>	case t.Chunked:</code></span>
+<span class="codeline" id="line-564"><code>		if isResponse &amp;&amp; (noResponseBodyExpected(t.RequestMethod) || !bodyAllowedForStatus(t.StatusCode)) {</code></span>
+<span class="codeline" id="line-565"><code>			t.Body = NoBody</code></span>
+<span class="codeline" id="line-566"><code>		} else {</code></span>
+<span class="codeline" id="line-567"><code>			t.Body = &amp;body{src: internal.NewChunkedReader(r), hdr: msg, r: r, closing: t.Close}</code></span>
+<span class="codeline" id="line-568"><code>		}</code></span>
+<span class="codeline" id="line-569"><code>	case realLength == 0:</code></span>
+<span class="codeline" id="line-570"><code>		t.Body = NoBody</code></span>
+<span class="codeline" id="line-571"><code>	case realLength &gt; 0:</code></span>
+<span class="codeline" id="line-572"><code>		t.Body = &amp;body{src: io.LimitReader(r, realLength), closing: t.Close}</code></span>
+<span class="codeline" id="line-573"><code>	default:</code></span>
+<span class="codeline" id="line-574"><code>		// realLength &lt; 0, i.e. "Content-Length" not mentioned in header</code></span>
+<span class="codeline" id="line-575"><code>		if t.Close {</code></span>
+<span class="codeline" id="line-576"><code>			// Close semantics (i.e. HTTP/1.0)</code></span>
+<span class="codeline" id="line-577"><code>			t.Body = &amp;body{src: r, closing: t.Close}</code></span>
+<span class="codeline" id="line-578"><code>		} else {</code></span>
+<span class="codeline" id="line-579"><code>			// Persistent connection (i.e. HTTP/1.1)</code></span>
+<span class="codeline" id="line-580"><code>			t.Body = NoBody</code></span>
+<span class="codeline" id="line-581"><code>		}</code></span>
+<span class="codeline" id="line-582"><code>	}</code></span>
+<span class="codeline" id="line-583"><code></code></span>
+<span class="codeline" id="line-584"><code>	// Unify output</code></span>
+<span class="codeline" id="line-585"><code>	switch rr := msg.(type) {</code></span>
+<span class="codeline" id="line-586"><code>	case *Request:</code></span>
+<span class="codeline" id="line-587"><code>		rr.Body = t.Body</code></span>
+<span class="codeline" id="line-588"><code>		rr.ContentLength = t.ContentLength</code></span>
+<span class="codeline" id="line-589"><code>		if t.Chunked {</code></span>
+<span class="codeline" id="line-590"><code>			rr.TransferEncoding = []string{"chunked"}</code></span>
+<span class="codeline" id="line-591"><code>		}</code></span>
+<span class="codeline" id="line-592"><code>		rr.Close = t.Close</code></span>
+<span class="codeline" id="line-593"><code>		rr.Trailer = t.Trailer</code></span>
+<span class="codeline" id="line-594"><code>	case *Response:</code></span>
+<span class="codeline" id="line-595"><code>		rr.Body = t.Body</code></span>
+<span class="codeline" id="line-596"><code>		rr.ContentLength = t.ContentLength</code></span>
+<span class="codeline" id="line-597"><code>		if t.Chunked {</code></span>
+<span class="codeline" id="line-598"><code>			rr.TransferEncoding = []string{"chunked"}</code></span>
+<span class="codeline" id="line-599"><code>		}</code></span>
+<span class="codeline" id="line-600"><code>		rr.Close = t.Close</code></span>
+<span class="codeline" id="line-601"><code>		rr.Trailer = t.Trailer</code></span>
+<span class="codeline" id="line-602"><code>	}</code></span>
+<span class="codeline" id="line-603"><code></code></span>
+<span class="codeline" id="line-604"><code>	return nil</code></span>
+<span class="codeline" id="line-605"><code>}</code></span>
+<span class="codeline" id="line-606"><code></code></span>
+<span class="codeline" id="line-607"><code>// Checks whether chunked is part of the encodings stack.</code></span>
+<span class="codeline" id="line-608"><code>func chunked(te []string) bool { return len(te) &gt; 0 &amp;&amp; te[0] == "chunked" }</code></span>
+<span class="codeline" id="line-609"><code></code></span>
+<span class="codeline" id="line-610"><code>// Checks whether the encoding is explicitly "identity".</code></span>
+<span class="codeline" id="line-611"><code>func isIdentity(te []string) bool { return len(te) == 1 &amp;&amp; te[0] == "identity" }</code></span>
+<span class="codeline" id="line-612"><code></code></span>
+<span class="codeline" id="line-613"><code>// unsupportedTEError reports unsupported transfer-encodings.</code></span>
+<span class="codeline" id="line-614"><code>type unsupportedTEError struct {</code></span>
+<span class="codeline" id="line-615"><code>	err string</code></span>
+<span class="codeline" id="line-616"><code>}</code></span>
+<span class="codeline" id="line-617"><code></code></span>
+<span class="codeline" id="line-618"><code>func (uste *unsupportedTEError) Error() string {</code></span>
+<span class="codeline" id="line-619"><code>	return uste.err</code></span>
+<span class="codeline" id="line-620"><code>}</code></span>
+<span class="codeline" id="line-621"><code></code></span>
+<span class="codeline" id="line-622"><code>// isUnsupportedTEError checks if the error is of type</code></span>
+<span class="codeline" id="line-623"><code>// unsupportedTEError. It is usually invoked with a non-nil err.</code></span>
+<span class="codeline" id="line-624"><code>func isUnsupportedTEError(err error) bool {</code></span>
+<span class="codeline" id="line-625"><code>	_, ok := err.(*unsupportedTEError)</code></span>
+<span class="codeline" id="line-626"><code>	return ok</code></span>
+<span class="codeline" id="line-627"><code>}</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>// parseTransferEncoding sets t.Chunked based on the Transfer-Encoding header.</code></span>
+<span class="codeline" id="line-630"><code>func (t *transferReader) parseTransferEncoding() error {</code></span>
+<span class="codeline" id="line-631"><code>	raw, present := t.Header["Transfer-Encoding"]</code></span>
+<span class="codeline" id="line-632"><code>	if !present {</code></span>
+<span class="codeline" id="line-633"><code>		return nil</code></span>
+<span class="codeline" id="line-634"><code>	}</code></span>
+<span class="codeline" id="line-635"><code>	delete(t.Header, "Transfer-Encoding")</code></span>
+<span class="codeline" id="line-636"><code></code></span>
+<span class="codeline" id="line-637"><code>	// Issue 12785; ignore Transfer-Encoding on HTTP/1.0 requests.</code></span>
+<span class="codeline" id="line-638"><code>	if !t.protoAtLeast(1, 1) {</code></span>
+<span class="codeline" id="line-639"><code>		return nil</code></span>
+<span class="codeline" id="line-640"><code>	}</code></span>
+<span class="codeline" id="line-641"><code></code></span>
+<span class="codeline" id="line-642"><code>	// Like nginx, we only support a single Transfer-Encoding header field, and</code></span>
+<span class="codeline" id="line-643"><code>	// only if set to "chunked". This is one of the most security sensitive</code></span>
+<span class="codeline" id="line-644"><code>	// surfaces in HTTP/1.1 due to the risk of request smuggling, so we keep it</code></span>
+<span class="codeline" id="line-645"><code>	// strict and simple.</code></span>
+<span class="codeline" id="line-646"><code>	if len(raw) != 1 {</code></span>
+<span class="codeline" id="line-647"><code>		return &amp;unsupportedTEError{fmt.Sprintf("too many transfer encodings: %q", raw)}</code></span>
+<span class="codeline" id="line-648"><code>	}</code></span>
+<span class="codeline" id="line-649"><code>	if !ascii.EqualFold(raw[0], "chunked") {</code></span>
+<span class="codeline" id="line-650"><code>		return &amp;unsupportedTEError{fmt.Sprintf("unsupported transfer encoding: %q", raw[0])}</code></span>
+<span class="codeline" id="line-651"><code>	}</code></span>
+<span class="codeline" id="line-652"><code></code></span>
+<span class="codeline" id="line-653"><code>	// RFC 7230 3.3.2 says "A sender MUST NOT send a Content-Length header field</code></span>
+<span class="codeline" id="line-654"><code>	// in any message that contains a Transfer-Encoding header field."</code></span>
+<span class="codeline" id="line-655"><code>	//</code></span>
+<span class="codeline" id="line-656"><code>	// but also: "If a message is received with both a Transfer-Encoding and a</code></span>
+<span class="codeline" id="line-657"><code>	// Content-Length header field, the Transfer-Encoding overrides the</code></span>
+<span class="codeline" id="line-658"><code>	// Content-Length. Such a message might indicate an attempt to perform</code></span>
+<span class="codeline" id="line-659"><code>	// request smuggling (Section 9.5) or response splitting (Section 9.4) and</code></span>
+<span class="codeline" id="line-660"><code>	// ought to be handled as an error. A sender MUST remove the received</code></span>
+<span class="codeline" id="line-661"><code>	// Content-Length field prior to forwarding such a message downstream."</code></span>
+<span class="codeline" id="line-662"><code>	//</code></span>
+<span class="codeline" id="line-663"><code>	// Reportedly, these appear in the wild.</code></span>
+<span class="codeline" id="line-664"><code>	delete(t.Header, "Content-Length")</code></span>
+<span class="codeline" id="line-665"><code></code></span>
+<span class="codeline" id="line-666"><code>	t.Chunked = true</code></span>
+<span class="codeline" id="line-667"><code>	return nil</code></span>
+<span class="codeline" id="line-668"><code>}</code></span>
+<span class="codeline" id="line-669"><code></code></span>
+<span class="codeline" id="line-670"><code>// Determine the expected body length, using RFC 7230 Section 3.3. This</code></span>
+<span class="codeline" id="line-671"><code>// function is not a method, because ultimately it should be shared by</code></span>
+<span class="codeline" id="line-672"><code>// ReadResponse and ReadRequest.</code></span>
+<span class="codeline" id="line-673"><code>func fixLength(isResponse bool, status int, requestMethod string, header Header, chunked bool) (int64, error) {</code></span>
+<span class="codeline" id="line-674"><code>	isRequest := !isResponse</code></span>
+<span class="codeline" id="line-675"><code>	contentLens := header["Content-Length"]</code></span>
+<span class="codeline" id="line-676"><code></code></span>
+<span class="codeline" id="line-677"><code>	// Hardening against HTTP request smuggling</code></span>
+<span class="codeline" id="line-678"><code>	if len(contentLens) &gt; 1 {</code></span>
+<span class="codeline" id="line-679"><code>		// Per RFC 7230 Section 3.3.2, prevent multiple</code></span>
+<span class="codeline" id="line-680"><code>		// Content-Length headers if they differ in value.</code></span>
+<span class="codeline" id="line-681"><code>		// If there are dups of the value, remove the dups.</code></span>
+<span class="codeline" id="line-682"><code>		// See Issue 16490.</code></span>
+<span class="codeline" id="line-683"><code>		first := textproto.TrimString(contentLens[0])</code></span>
+<span class="codeline" id="line-684"><code>		for _, ct := range contentLens[1:] {</code></span>
+<span class="codeline" id="line-685"><code>			if first != textproto.TrimString(ct) {</code></span>
+<span class="codeline" id="line-686"><code>				return 0, fmt.Errorf("http: message cannot contain multiple Content-Length headers; got %q", contentLens)</code></span>
+<span class="codeline" id="line-687"><code>			}</code></span>
+<span class="codeline" id="line-688"><code>		}</code></span>
+<span class="codeline" id="line-689"><code></code></span>
+<span class="codeline" id="line-690"><code>		// deduplicate Content-Length</code></span>
+<span class="codeline" id="line-691"><code>		header.Del("Content-Length")</code></span>
+<span class="codeline" id="line-692"><code>		header.Add("Content-Length", first)</code></span>
+<span class="codeline" id="line-693"><code></code></span>
+<span class="codeline" id="line-694"><code>		contentLens = header["Content-Length"]</code></span>
+<span class="codeline" id="line-695"><code>	}</code></span>
+<span class="codeline" id="line-696"><code></code></span>
+<span class="codeline" id="line-697"><code>	// Logic based on response type or status</code></span>
+<span class="codeline" id="line-698"><code>	if isResponse &amp;&amp; noResponseBodyExpected(requestMethod) {</code></span>
+<span class="codeline" id="line-699"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-700"><code>	}</code></span>
+<span class="codeline" id="line-701"><code>	if status/100 == 1 {</code></span>
+<span class="codeline" id="line-702"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-703"><code>	}</code></span>
+<span class="codeline" id="line-704"><code>	switch status {</code></span>
+<span class="codeline" id="line-705"><code>	case 204, 304:</code></span>
+<span class="codeline" id="line-706"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-707"><code>	}</code></span>
+<span class="codeline" id="line-708"><code></code></span>
+<span class="codeline" id="line-709"><code>	// Logic based on Transfer-Encoding</code></span>
+<span class="codeline" id="line-710"><code>	if chunked {</code></span>
+<span class="codeline" id="line-711"><code>		return -1, nil</code></span>
+<span class="codeline" id="line-712"><code>	}</code></span>
+<span class="codeline" id="line-713"><code></code></span>
+<span class="codeline" id="line-714"><code>	if len(contentLens) &gt; 0 {</code></span>
+<span class="codeline" id="line-715"><code>		// Logic based on Content-Length</code></span>
+<span class="codeline" id="line-716"><code>		n, err := parseContentLength(contentLens)</code></span>
+<span class="codeline" id="line-717"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-718"><code>			return -1, err</code></span>
+<span class="codeline" id="line-719"><code>		}</code></span>
+<span class="codeline" id="line-720"><code>		return n, nil</code></span>
+<span class="codeline" id="line-721"><code>	}</code></span>
+<span class="codeline" id="line-722"><code></code></span>
+<span class="codeline" id="line-723"><code>	header.Del("Content-Length")</code></span>
+<span class="codeline" id="line-724"><code></code></span>
+<span class="codeline" id="line-725"><code>	if isRequest {</code></span>
+<span class="codeline" id="line-726"><code>		// RFC 7230 neither explicitly permits nor forbids an</code></span>
+<span class="codeline" id="line-727"><code>		// entity-body on a GET request so we permit one if</code></span>
+<span class="codeline" id="line-728"><code>		// declared, but we default to 0 here (not -1 below)</code></span>
+<span class="codeline" id="line-729"><code>		// if there's no mention of a body.</code></span>
+<span class="codeline" id="line-730"><code>		// Likewise, all other request methods are assumed to have</code></span>
+<span class="codeline" id="line-731"><code>		// no body if neither Transfer-Encoding chunked nor a</code></span>
+<span class="codeline" id="line-732"><code>		// Content-Length are set.</code></span>
+<span class="codeline" id="line-733"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-734"><code>	}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>	// Body-EOF logic based on other methods (like closing, or chunked coding)</code></span>
+<span class="codeline" id="line-737"><code>	return -1, nil</code></span>
+<span class="codeline" id="line-738"><code>}</code></span>
+<span class="codeline" id="line-739"><code></code></span>
+<span class="codeline" id="line-740"><code>// Determine whether to hang up after sending a request and body, or</code></span>
+<span class="codeline" id="line-741"><code>// receiving a response and body</code></span>
+<span class="codeline" id="line-742"><code>// 'header' is the request headers.</code></span>
+<span class="codeline" id="line-743"><code>func shouldClose(major, minor int, header Header, removeCloseHeader bool) bool {</code></span>
+<span class="codeline" id="line-744"><code>	if major &lt; 1 {</code></span>
+<span class="codeline" id="line-745"><code>		return true</code></span>
+<span class="codeline" id="line-746"><code>	}</code></span>
+<span class="codeline" id="line-747"><code></code></span>
+<span class="codeline" id="line-748"><code>	conv := header["Connection"]</code></span>
+<span class="codeline" id="line-749"><code>	hasClose := httpguts.HeaderValuesContainsToken(conv, "close")</code></span>
+<span class="codeline" id="line-750"><code>	if major == 1 &amp;&amp; minor == 0 {</code></span>
+<span class="codeline" id="line-751"><code>		return hasClose || !httpguts.HeaderValuesContainsToken(conv, "keep-alive")</code></span>
+<span class="codeline" id="line-752"><code>	}</code></span>
+<span class="codeline" id="line-753"><code></code></span>
+<span class="codeline" id="line-754"><code>	if hasClose &amp;&amp; removeCloseHeader {</code></span>
+<span class="codeline" id="line-755"><code>		header.Del("Connection")</code></span>
+<span class="codeline" id="line-756"><code>	}</code></span>
+<span class="codeline" id="line-757"><code></code></span>
+<span class="codeline" id="line-758"><code>	return hasClose</code></span>
+<span class="codeline" id="line-759"><code>}</code></span>
+<span class="codeline" id="line-760"><code></code></span>
+<span class="codeline" id="line-761"><code>// Parse the trailer header.</code></span>
+<span class="codeline" id="line-762"><code>func fixTrailer(header Header, chunked bool) (Header, error) {</code></span>
+<span class="codeline" id="line-763"><code>	vv, ok := header["Trailer"]</code></span>
+<span class="codeline" id="line-764"><code>	if !ok {</code></span>
+<span class="codeline" id="line-765"><code>		return nil, nil</code></span>
+<span class="codeline" id="line-766"><code>	}</code></span>
+<span class="codeline" id="line-767"><code>	if !chunked {</code></span>
+<span class="codeline" id="line-768"><code>		// Trailer and no chunking:</code></span>
+<span class="codeline" id="line-769"><code>		// this is an invalid use case for trailer header.</code></span>
+<span class="codeline" id="line-770"><code>		// Nevertheless, no error will be returned and we</code></span>
+<span class="codeline" id="line-771"><code>		// let users decide if this is a valid HTTP message.</code></span>
+<span class="codeline" id="line-772"><code>		// The Trailer header will be kept in Response.Header</code></span>
+<span class="codeline" id="line-773"><code>		// but not populate Response.Trailer.</code></span>
+<span class="codeline" id="line-774"><code>		// See issue #27197.</code></span>
+<span class="codeline" id="line-775"><code>		return nil, nil</code></span>
+<span class="codeline" id="line-776"><code>	}</code></span>
+<span class="codeline" id="line-777"><code>	header.Del("Trailer")</code></span>
+<span class="codeline" id="line-778"><code></code></span>
+<span class="codeline" id="line-779"><code>	trailer := make(Header)</code></span>
+<span class="codeline" id="line-780"><code>	var err error</code></span>
+<span class="codeline" id="line-781"><code>	for _, v := range vv {</code></span>
+<span class="codeline" id="line-782"><code>		foreachHeaderElement(v, func(key string) {</code></span>
+<span class="codeline" id="line-783"><code>			key = CanonicalHeaderKey(key)</code></span>
+<span class="codeline" id="line-784"><code>			switch key {</code></span>
+<span class="codeline" id="line-785"><code>			case "Transfer-Encoding", "Trailer", "Content-Length":</code></span>
+<span class="codeline" id="line-786"><code>				if err == nil {</code></span>
+<span class="codeline" id="line-787"><code>					err = badStringError("bad trailer key", key)</code></span>
+<span class="codeline" id="line-788"><code>					return</code></span>
+<span class="codeline" id="line-789"><code>				}</code></span>
+<span class="codeline" id="line-790"><code>			}</code></span>
+<span class="codeline" id="line-791"><code>			trailer[key] = nil</code></span>
+<span class="codeline" id="line-792"><code>		})</code></span>
+<span class="codeline" id="line-793"><code>	}</code></span>
+<span class="codeline" id="line-794"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-795"><code>		return nil, err</code></span>
+<span class="codeline" id="line-796"><code>	}</code></span>
+<span class="codeline" id="line-797"><code>	if len(trailer) == 0 {</code></span>
+<span class="codeline" id="line-798"><code>		return nil, nil</code></span>
+<span class="codeline" id="line-799"><code>	}</code></span>
+<span class="codeline" id="line-800"><code>	return trailer, nil</code></span>
+<span class="codeline" id="line-801"><code>}</code></span>
+<span class="codeline" id="line-802"><code></code></span>
+<span class="codeline" id="line-803"><code>// body turns a Reader into a ReadCloser.</code></span>
+<span class="codeline" id="line-804"><code>// Close ensures that the body has been fully read</code></span>
+<span class="codeline" id="line-805"><code>// and then reads the trailer if necessary.</code></span>
+<span class="codeline" id="line-806"><code>type body struct {</code></span>
+<span class="codeline" id="line-807"><code>	src          io.Reader</code></span>
+<span class="codeline" id="line-808"><code>	hdr          any           // non-nil (Response or Request) value means read trailer</code></span>
+<span class="codeline" id="line-809"><code>	r            *bufio.Reader // underlying wire-format reader for the trailer</code></span>
+<span class="codeline" id="line-810"><code>	closing      bool          // is the connection to be closed after reading body?</code></span>
+<span class="codeline" id="line-811"><code>	doEarlyClose bool          // whether Close should stop early</code></span>
+<span class="codeline" id="line-812"><code></code></span>
+<span class="codeline" id="line-813"><code>	mu         sync.Mutex // guards following, and calls to Read and Close</code></span>
+<span class="codeline" id="line-814"><code>	sawEOF     bool</code></span>
+<span class="codeline" id="line-815"><code>	closed     bool</code></span>
+<span class="codeline" id="line-816"><code>	earlyClose bool   // Close called and we didn't read to the end of src</code></span>
+<span class="codeline" id="line-817"><code>	onHitEOF   func() // if non-nil, func to call when EOF is Read</code></span>
+<span class="codeline" id="line-818"><code>}</code></span>
+<span class="codeline" id="line-819"><code></code></span>
+<span class="codeline" id="line-820"><code>// ErrBodyReadAfterClose is returned when reading a [Request] or [Response]</code></span>
+<span class="codeline" id="line-821"><code>// Body after the body has been closed. This typically happens when the body is</code></span>
+<span class="codeline" id="line-822"><code>// read after an HTTP [Handler] calls WriteHeader or Write on its</code></span>
+<span class="codeline" id="line-823"><code>// [ResponseWriter].</code></span>
+<span class="codeline" id="line-824"><code>var ErrBodyReadAfterClose = errors.New("http: invalid Read on closed Body")</code></span>
+<span class="codeline" id="line-825"><code></code></span>
+<span class="codeline" id="line-826"><code>func (b *body) Read(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-827"><code>	b.mu.Lock()</code></span>
+<span class="codeline" id="line-828"><code>	defer b.mu.Unlock()</code></span>
+<span class="codeline" id="line-829"><code>	if b.closed {</code></span>
+<span class="codeline" id="line-830"><code>		return 0, ErrBodyReadAfterClose</code></span>
+<span class="codeline" id="line-831"><code>	}</code></span>
+<span class="codeline" id="line-832"><code>	return b.readLocked(p)</code></span>
+<span class="codeline" id="line-833"><code>}</code></span>
+<span class="codeline" id="line-834"><code></code></span>
+<span class="codeline" id="line-835"><code>// Must hold b.mu.</code></span>
+<span class="codeline" id="line-836"><code>func (b *body) readLocked(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-837"><code>	if b.sawEOF {</code></span>
+<span class="codeline" id="line-838"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-839"><code>	}</code></span>
+<span class="codeline" id="line-840"><code>	n, err = b.src.Read(p)</code></span>
+<span class="codeline" id="line-841"><code></code></span>
+<span class="codeline" id="line-842"><code>	if err == io.EOF {</code></span>
+<span class="codeline" id="line-843"><code>		b.sawEOF = true</code></span>
+<span class="codeline" id="line-844"><code>		// Chunked case. Read the trailer.</code></span>
+<span class="codeline" id="line-845"><code>		if b.hdr != nil {</code></span>
+<span class="codeline" id="line-846"><code>			if e := b.readTrailer(); e != nil {</code></span>
+<span class="codeline" id="line-847"><code>				err = e</code></span>
+<span class="codeline" id="line-848"><code>				// Something went wrong in the trailer, we must not allow any</code></span>
+<span class="codeline" id="line-849"><code>				// further reads of any kind to succeed from body, nor any</code></span>
+<span class="codeline" id="line-850"><code>				// subsequent requests on the server connection. See</code></span>
+<span class="codeline" id="line-851"><code>				// golang.org/issue/12027</code></span>
+<span class="codeline" id="line-852"><code>				b.sawEOF = false</code></span>
+<span class="codeline" id="line-853"><code>				b.closed = true</code></span>
+<span class="codeline" id="line-854"><code>			}</code></span>
+<span class="codeline" id="line-855"><code>			b.hdr = nil</code></span>
+<span class="codeline" id="line-856"><code>		} else {</code></span>
+<span class="codeline" id="line-857"><code>			// If the server declared the Content-Length, our body is a LimitedReader</code></span>
+<span class="codeline" id="line-858"><code>			// and we need to check whether this EOF arrived early.</code></span>
+<span class="codeline" id="line-859"><code>			if lr, ok := b.src.(*io.LimitedReader); ok &amp;&amp; lr.N &gt; 0 {</code></span>
+<span class="codeline" id="line-860"><code>				err = io.ErrUnexpectedEOF</code></span>
+<span class="codeline" id="line-861"><code>			}</code></span>
+<span class="codeline" id="line-862"><code>		}</code></span>
+<span class="codeline" id="line-863"><code>	}</code></span>
+<span class="codeline" id="line-864"><code></code></span>
+<span class="codeline" id="line-865"><code>	// If we can return an EOF here along with the read data, do</code></span>
+<span class="codeline" id="line-866"><code>	// so. This is optional per the io.Reader contract, but doing</code></span>
+<span class="codeline" id="line-867"><code>	// so helps the HTTP transport code recycle its connection</code></span>
+<span class="codeline" id="line-868"><code>	// earlier (since it will see this EOF itself), even if the</code></span>
+<span class="codeline" id="line-869"><code>	// client doesn't do future reads or Close.</code></span>
+<span class="codeline" id="line-870"><code>	if err == nil &amp;&amp; n &gt; 0 {</code></span>
+<span class="codeline" id="line-871"><code>		if lr, ok := b.src.(*io.LimitedReader); ok &amp;&amp; lr.N == 0 {</code></span>
+<span class="codeline" id="line-872"><code>			err = io.EOF</code></span>
+<span class="codeline" id="line-873"><code>			b.sawEOF = true</code></span>
+<span class="codeline" id="line-874"><code>		}</code></span>
+<span class="codeline" id="line-875"><code>	}</code></span>
+<span class="codeline" id="line-876"><code></code></span>
+<span class="codeline" id="line-877"><code>	if b.sawEOF &amp;&amp; b.onHitEOF != nil {</code></span>
+<span class="codeline" id="line-878"><code>		b.onHitEOF()</code></span>
+<span class="codeline" id="line-879"><code>	}</code></span>
+<span class="codeline" id="line-880"><code></code></span>
+<span class="codeline" id="line-881"><code>	return n, err</code></span>
+<span class="codeline" id="line-882"><code>}</code></span>
+<span class="codeline" id="line-883"><code></code></span>
+<span class="codeline" id="line-884"><code>var (</code></span>
+<span class="codeline" id="line-885"><code>	singleCRLF = []byte("\r\n")</code></span>
+<span class="codeline" id="line-886"><code>	doubleCRLF = []byte("\r\n\r\n")</code></span>
+<span class="codeline" id="line-887"><code>)</code></span>
+<span class="codeline" id="line-888"><code></code></span>
+<span class="codeline" id="line-889"><code>func seeUpcomingDoubleCRLF(r *bufio.Reader) bool {</code></span>
+<span class="codeline" id="line-890"><code>	for peekSize := 4; ; peekSize++ {</code></span>
+<span class="codeline" id="line-891"><code>		// This loop stops when Peek returns an error,</code></span>
+<span class="codeline" id="line-892"><code>		// which it does when r's buffer has been filled.</code></span>
+<span class="codeline" id="line-893"><code>		buf, err := r.Peek(peekSize)</code></span>
+<span class="codeline" id="line-894"><code>		if bytes.HasSuffix(buf, doubleCRLF) {</code></span>
+<span class="codeline" id="line-895"><code>			return true</code></span>
+<span class="codeline" id="line-896"><code>		}</code></span>
+<span class="codeline" id="line-897"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-898"><code>			break</code></span>
+<span class="codeline" id="line-899"><code>		}</code></span>
+<span class="codeline" id="line-900"><code>	}</code></span>
+<span class="codeline" id="line-901"><code>	return false</code></span>
+<span class="codeline" id="line-902"><code>}</code></span>
+<span class="codeline" id="line-903"><code></code></span>
+<span class="codeline" id="line-904"><code>var errTrailerEOF = errors.New("http: unexpected EOF reading trailer")</code></span>
+<span class="codeline" id="line-905"><code></code></span>
+<span class="codeline" id="line-906"><code>func (b *body) readTrailer() error {</code></span>
+<span class="codeline" id="line-907"><code>	// The common case, since nobody uses trailers.</code></span>
+<span class="codeline" id="line-908"><code>	buf, err := b.r.Peek(2)</code></span>
+<span class="codeline" id="line-909"><code>	if bytes.Equal(buf, singleCRLF) {</code></span>
+<span class="codeline" id="line-910"><code>		b.r.Discard(2)</code></span>
+<span class="codeline" id="line-911"><code>		return nil</code></span>
+<span class="codeline" id="line-912"><code>	}</code></span>
+<span class="codeline" id="line-913"><code>	if len(buf) &lt; 2 {</code></span>
+<span class="codeline" id="line-914"><code>		return errTrailerEOF</code></span>
+<span class="codeline" id="line-915"><code>	}</code></span>
+<span class="codeline" id="line-916"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-917"><code>		return err</code></span>
+<span class="codeline" id="line-918"><code>	}</code></span>
+<span class="codeline" id="line-919"><code></code></span>
+<span class="codeline" id="line-920"><code>	// Make sure there's a header terminator coming up, to prevent</code></span>
+<span class="codeline" id="line-921"><code>	// a DoS with an unbounded size Trailer. It's not easy to</code></span>
+<span class="codeline" id="line-922"><code>	// slip in a LimitReader here, as textproto.NewReader requires</code></span>
+<span class="codeline" id="line-923"><code>	// a concrete *bufio.Reader. Also, we can't get all the way</code></span>
+<span class="codeline" id="line-924"><code>	// back up to our conn's LimitedReader that *might* be backing</code></span>
+<span class="codeline" id="line-925"><code>	// this bufio.Reader. Instead, a hack: we iteratively Peek up</code></span>
+<span class="codeline" id="line-926"><code>	// to the bufio.Reader's max size, looking for a double CRLF.</code></span>
+<span class="codeline" id="line-927"><code>	// This limits the trailer to the underlying buffer size, typically 4kB.</code></span>
+<span class="codeline" id="line-928"><code>	if !seeUpcomingDoubleCRLF(b.r) {</code></span>
+<span class="codeline" id="line-929"><code>		return errors.New("http: suspiciously long trailer after chunked body")</code></span>
+<span class="codeline" id="line-930"><code>	}</code></span>
+<span class="codeline" id="line-931"><code></code></span>
+<span class="codeline" id="line-932"><code>	hdr, err := textproto.NewReader(b.r).ReadMIMEHeader()</code></span>
+<span class="codeline" id="line-933"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-934"><code>		if err == io.EOF {</code></span>
+<span class="codeline" id="line-935"><code>			return errTrailerEOF</code></span>
+<span class="codeline" id="line-936"><code>		}</code></span>
+<span class="codeline" id="line-937"><code>		return err</code></span>
+<span class="codeline" id="line-938"><code>	}</code></span>
+<span class="codeline" id="line-939"><code>	switch rr := b.hdr.(type) {</code></span>
+<span class="codeline" id="line-940"><code>	case *Request:</code></span>
+<span class="codeline" id="line-941"><code>		mergeSetHeader(&amp;rr.Trailer, Header(hdr))</code></span>
+<span class="codeline" id="line-942"><code>	case *Response:</code></span>
+<span class="codeline" id="line-943"><code>		mergeSetHeader(&amp;rr.Trailer, Header(hdr))</code></span>
+<span class="codeline" id="line-944"><code>	}</code></span>
+<span class="codeline" id="line-945"><code>	return nil</code></span>
+<span class="codeline" id="line-946"><code>}</code></span>
+<span class="codeline" id="line-947"><code></code></span>
+<span class="codeline" id="line-948"><code>func mergeSetHeader(dst *Header, src Header) {</code></span>
+<span class="codeline" id="line-949"><code>	if *dst == nil {</code></span>
+<span class="codeline" id="line-950"><code>		*dst = src</code></span>
+<span class="codeline" id="line-951"><code>		return</code></span>
+<span class="codeline" id="line-952"><code>	}</code></span>
+<span class="codeline" id="line-953"><code>	for k, vv := range src {</code></span>
+<span class="codeline" id="line-954"><code>		(*dst)[k] = vv</code></span>
+<span class="codeline" id="line-955"><code>	}</code></span>
+<span class="codeline" id="line-956"><code>}</code></span>
+<span class="codeline" id="line-957"><code></code></span>
+<span class="codeline" id="line-958"><code>// unreadDataSizeLocked returns the number of bytes of unread input.</code></span>
+<span class="codeline" id="line-959"><code>// It returns -1 if unknown.</code></span>
+<span class="codeline" id="line-960"><code>// b.mu must be held.</code></span>
+<span class="codeline" id="line-961"><code>func (b *body) unreadDataSizeLocked() int64 {</code></span>
+<span class="codeline" id="line-962"><code>	if lr, ok := b.src.(*io.LimitedReader); ok {</code></span>
+<span class="codeline" id="line-963"><code>		return lr.N</code></span>
+<span class="codeline" id="line-964"><code>	}</code></span>
+<span class="codeline" id="line-965"><code>	return -1</code></span>
+<span class="codeline" id="line-966"><code>}</code></span>
+<span class="codeline" id="line-967"><code></code></span>
+<span class="codeline" id="line-968"><code>func (b *body) Close() error {</code></span>
+<span class="codeline" id="line-969"><code>	b.mu.Lock()</code></span>
+<span class="codeline" id="line-970"><code>	defer b.mu.Unlock()</code></span>
+<span class="codeline" id="line-971"><code>	if b.closed {</code></span>
+<span class="codeline" id="line-972"><code>		return nil</code></span>
+<span class="codeline" id="line-973"><code>	}</code></span>
+<span class="codeline" id="line-974"><code>	var err error</code></span>
+<span class="codeline" id="line-975"><code>	switch {</code></span>
+<span class="codeline" id="line-976"><code>	case b.sawEOF:</code></span>
+<span class="codeline" id="line-977"><code>		// Already saw EOF, so no need going to look for it.</code></span>
+<span class="codeline" id="line-978"><code>	case b.hdr == nil &amp;&amp; b.closing:</code></span>
+<span class="codeline" id="line-979"><code>		// no trailer and closing the connection next.</code></span>
+<span class="codeline" id="line-980"><code>		// no point in reading to EOF.</code></span>
+<span class="codeline" id="line-981"><code>	case b.doEarlyClose:</code></span>
+<span class="codeline" id="line-982"><code>		// Read up to maxPostHandlerReadBytes bytes of the body, looking</code></span>
+<span class="codeline" id="line-983"><code>		// for EOF (and trailers), so we can re-use this connection.</code></span>
+<span class="codeline" id="line-984"><code>		if lr, ok := b.src.(*io.LimitedReader); ok &amp;&amp; lr.N &gt; maxPostHandlerReadBytes {</code></span>
+<span class="codeline" id="line-985"><code>			// There was a declared Content-Length, and we have more bytes remaining</code></span>
+<span class="codeline" id="line-986"><code>			// than our maxPostHandlerReadBytes tolerance. So, give up.</code></span>
+<span class="codeline" id="line-987"><code>			b.earlyClose = true</code></span>
+<span class="codeline" id="line-988"><code>		} else {</code></span>
+<span class="codeline" id="line-989"><code>			var n int64</code></span>
+<span class="codeline" id="line-990"><code>			// Consume the body, or, which will also lead to us reading</code></span>
+<span class="codeline" id="line-991"><code>			// the trailer headers after the body, if present.</code></span>
+<span class="codeline" id="line-992"><code>			n, err = io.CopyN(io.Discard, bodyLocked{b}, maxPostHandlerReadBytes)</code></span>
+<span class="codeline" id="line-993"><code>			if err == io.EOF {</code></span>
+<span class="codeline" id="line-994"><code>				err = nil</code></span>
+<span class="codeline" id="line-995"><code>			}</code></span>
+<span class="codeline" id="line-996"><code>			if n == maxPostHandlerReadBytes {</code></span>
+<span class="codeline" id="line-997"><code>				b.earlyClose = true</code></span>
+<span class="codeline" id="line-998"><code>			}</code></span>
+<span class="codeline" id="line-999"><code>		}</code></span>
+<span class="codeline" id="line-1000"><code>	default:</code></span>
+<span class="codeline" id="line-1001"><code>		// Fully consume the body, which will also lead to us reading</code></span>
+<span class="codeline" id="line-1002"><code>		// the trailer headers after the body, if present.</code></span>
+<span class="codeline" id="line-1003"><code>		_, err = io.Copy(io.Discard, bodyLocked{b})</code></span>
+<span class="codeline" id="line-1004"><code>	}</code></span>
+<span class="codeline" id="line-1005"><code>	b.closed = true</code></span>
+<span class="codeline" id="line-1006"><code>	return err</code></span>
+<span class="codeline" id="line-1007"><code>}</code></span>
+<span class="codeline" id="line-1008"><code></code></span>
+<span class="codeline" id="line-1009"><code>func (b *body) didEarlyClose() bool {</code></span>
+<span class="codeline" id="line-1010"><code>	b.mu.Lock()</code></span>
+<span class="codeline" id="line-1011"><code>	defer b.mu.Unlock()</code></span>
+<span class="codeline" id="line-1012"><code>	return b.earlyClose</code></span>
+<span class="codeline" id="line-1013"><code>}</code></span>
+<span class="codeline" id="line-1014"><code></code></span>
+<span class="codeline" id="line-1015"><code>// bodyRemains reports whether future Read calls might</code></span>
+<span class="codeline" id="line-1016"><code>// yield data.</code></span>
+<span class="codeline" id="line-1017"><code>func (b *body) bodyRemains() bool {</code></span>
+<span class="codeline" id="line-1018"><code>	b.mu.Lock()</code></span>
+<span class="codeline" id="line-1019"><code>	defer b.mu.Unlock()</code></span>
+<span class="codeline" id="line-1020"><code>	return !b.sawEOF</code></span>
+<span class="codeline" id="line-1021"><code>}</code></span>
+<span class="codeline" id="line-1022"><code></code></span>
+<span class="codeline" id="line-1023"><code>func (b *body) registerOnHitEOF(fn func()) {</code></span>
+<span class="codeline" id="line-1024"><code>	b.mu.Lock()</code></span>
+<span class="codeline" id="line-1025"><code>	defer b.mu.Unlock()</code></span>
+<span class="codeline" id="line-1026"><code>	b.onHitEOF = fn</code></span>
+<span class="codeline" id="line-1027"><code>}</code></span>
+<span class="codeline" id="line-1028"><code></code></span>
+<span class="codeline" id="line-1029"><code>// bodyLocked is an io.Reader reading from a *body when its mutex is</code></span>
+<span class="codeline" id="line-1030"><code>// already held.</code></span>
+<span class="codeline" id="line-1031"><code>type bodyLocked struct {</code></span>
+<span class="codeline" id="line-1032"><code>	b *body</code></span>
+<span class="codeline" id="line-1033"><code>}</code></span>
+<span class="codeline" id="line-1034"><code></code></span>
+<span class="codeline" id="line-1035"><code>func (bl bodyLocked) Read(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-1036"><code>	if bl.b.closed {</code></span>
+<span class="codeline" id="line-1037"><code>		return 0, ErrBodyReadAfterClose</code></span>
+<span class="codeline" id="line-1038"><code>	}</code></span>
+<span class="codeline" id="line-1039"><code>	return bl.b.readLocked(p)</code></span>
+<span class="codeline" id="line-1040"><code>}</code></span>
+<span class="codeline" id="line-1041"><code></code></span>
+<span class="codeline" id="line-1042"><code>var laxContentLength = godebug.New("httplaxcontentlength")</code></span>
+<span class="codeline" id="line-1043"><code></code></span>
+<span class="codeline" id="line-1044"><code>// parseContentLength checks that the header is valid and then trims</code></span>
+<span class="codeline" id="line-1045"><code>// whitespace. It returns -1 if no value is set otherwise the value</code></span>
+<span class="codeline" id="line-1046"><code>// if it's &gt;= 0.</code></span>
+<span class="codeline" id="line-1047"><code>func parseContentLength(clHeaders []string) (int64, error) {</code></span>
+<span class="codeline" id="line-1048"><code>	if len(clHeaders) == 0 {</code></span>
+<span class="codeline" id="line-1049"><code>		return -1, nil</code></span>
+<span class="codeline" id="line-1050"><code>	}</code></span>
+<span class="codeline" id="line-1051"><code>	cl := textproto.TrimString(clHeaders[0])</code></span>
+<span class="codeline" id="line-1052"><code></code></span>
+<span class="codeline" id="line-1053"><code>	// The Content-Length must be a valid numeric value.</code></span>
+<span class="codeline" id="line-1054"><code>	// See: https://datatracker.ietf.org/doc/html/rfc2616/#section-14.13</code></span>
+<span class="codeline" id="line-1055"><code>	if cl == "" {</code></span>
+<span class="codeline" id="line-1056"><code>		if laxContentLength.Value() == "1" {</code></span>
+<span class="codeline" id="line-1057"><code>			laxContentLength.IncNonDefault()</code></span>
+<span class="codeline" id="line-1058"><code>			return -1, nil</code></span>
+<span class="codeline" id="line-1059"><code>		}</code></span>
+<span class="codeline" id="line-1060"><code>		return 0, badStringError("invalid empty Content-Length", cl)</code></span>
+<span class="codeline" id="line-1061"><code>	}</code></span>
+<span class="codeline" id="line-1062"><code>	n, err := strconv.ParseUint(cl, 10, 63)</code></span>
+<span class="codeline" id="line-1063"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1064"><code>		return 0, badStringError("bad Content-Length", cl)</code></span>
+<span class="codeline" id="line-1065"><code>	}</code></span>
+<span class="codeline" id="line-1066"><code>	return int64(n), nil</code></span>
+<span class="codeline" id="line-1067"><code>}</code></span>
+<span class="codeline" id="line-1068"><code></code></span>
+<span class="codeline" id="line-1069"><code>// finishAsyncByteRead finishes reading the 1-byte sniff</code></span>
+<span class="codeline" id="line-1070"><code>// from the ContentLength==0, Body!=nil case.</code></span>
+<span class="codeline" id="line-1071"><code>type finishAsyncByteRead struct {</code></span>
+<span class="codeline" id="line-1072"><code>	tw *transferWriter</code></span>
+<span class="codeline" id="line-1073"><code>}</code></span>
+<span class="codeline" id="line-1074"><code></code></span>
+<span class="codeline" id="line-1075"><code>func (fr finishAsyncByteRead) Read(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-1076"><code>	if len(p) == 0 {</code></span>
+<span class="codeline" id="line-1077"><code>		return</code></span>
+<span class="codeline" id="line-1078"><code>	}</code></span>
+<span class="codeline" id="line-1079"><code>	rres := &lt;-fr.tw.ByteReadCh</code></span>
+<span class="codeline" id="line-1080"><code>	n, err = rres.n, rres.err</code></span>
+<span class="codeline" id="line-1081"><code>	if n == 1 {</code></span>
+<span class="codeline" id="line-1082"><code>		p[0] = rres.b</code></span>
+<span class="codeline" id="line-1083"><code>	}</code></span>
+<span class="codeline" id="line-1084"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-1085"><code>		err = io.EOF</code></span>
+<span class="codeline" id="line-1086"><code>	}</code></span>
+<span class="codeline" id="line-1087"><code>	return</code></span>
+<span class="codeline" id="line-1088"><code>}</code></span>
+<span class="codeline" id="line-1089"><code></code></span>
+<span class="codeline" id="line-1090"><code>var nopCloserType = reflect.TypeOf(io.NopCloser(nil))</code></span>
+<span class="codeline" id="line-1091"><code>var nopCloserWriterToType = reflect.TypeOf(io.NopCloser(struct {</code></span>
+<span class="codeline" id="line-1092"><code>	io.Reader</code></span>
+<span class="codeline" id="line-1093"><code>	io.WriterTo</code></span>
+<span class="codeline" id="line-1094"><code>}{}))</code></span>
+<span class="codeline" id="line-1095"><code></code></span>
+<span class="codeline" id="line-1096"><code>// unwrapNopCloser return the underlying reader and true if r is a NopCloser</code></span>
+<span class="codeline" id="line-1097"><code>// else it return false.</code></span>
+<span class="codeline" id="line-1098"><code>func unwrapNopCloser(r io.Reader) (underlyingReader io.Reader, isNopCloser bool) {</code></span>
+<span class="codeline" id="line-1099"><code>	switch reflect.TypeOf(r) {</code></span>
+<span class="codeline" id="line-1100"><code>	case nopCloserType, nopCloserWriterToType:</code></span>
+<span class="codeline" id="line-1101"><code>		return reflect.ValueOf(r).Field(0).Interface().(io.Reader), true</code></span>
+<span class="codeline" id="line-1102"><code>	default:</code></span>
+<span class="codeline" id="line-1103"><code>		return nil, false</code></span>
+<span class="codeline" id="line-1104"><code>	}</code></span>
+<span class="codeline" id="line-1105"><code>}</code></span>
+<span class="codeline" id="line-1106"><code></code></span>
+<span class="codeline" id="line-1107"><code>// isKnownInMemoryReader reports whether r is a type known to not</code></span>
+<span class="codeline" id="line-1108"><code>// block on Read. Its caller uses this as an optional optimization to</code></span>
+<span class="codeline" id="line-1109"><code>// send fewer TCP packets.</code></span>
+<span class="codeline" id="line-1110"><code>func isKnownInMemoryReader(r io.Reader) bool {</code></span>
+<span class="codeline" id="line-1111"><code>	switch r.(type) {</code></span>
+<span class="codeline" id="line-1112"><code>	case *bytes.Reader, *bytes.Buffer, *strings.Reader:</code></span>
+<span class="codeline" id="line-1113"><code>		return true</code></span>
+<span class="codeline" id="line-1114"><code>	}</code></span>
+<span class="codeline" id="line-1115"><code>	if r, ok := unwrapNopCloser(r); ok {</code></span>
+<span class="codeline" id="line-1116"><code>		return isKnownInMemoryReader(r)</code></span>
+<span class="codeline" id="line-1117"><code>	}</code></span>
+<span class="codeline" id="line-1118"><code>	if r, ok := r.(*readTrackingBody); ok {</code></span>
+<span class="codeline" id="line-1119"><code>		return isKnownInMemoryReader(r.ReadCloser)</code></span>
+<span class="codeline" id="line-1120"><code>	}</code></span>
+<span class="codeline" id="line-1121"><code>	return false</code></span>
+<span class="codeline" id="line-1122"><code>}</code></span>
+<span class="codeline" id="line-1123"><code></code></span>
+<span class="codeline" id="line-1124"><code>// bufioFlushWriter is an io.Writer wrapper that flushes all writes</code></span>
+<span class="codeline" id="line-1125"><code>// on its wrapped writer if it's a *bufio.Writer.</code></span>
+<span class="codeline" id="line-1126"><code>type bufioFlushWriter struct{ w io.Writer }</code></span>
+<span class="codeline" id="line-1127"><code></code></span>
+<span class="codeline" id="line-1128"><code>func (fw bufioFlushWriter) Write(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-1129"><code>	n, err = fw.w.Write(p)</code></span>
+<span class="codeline" id="line-1130"><code>	if bw, ok := fw.w.(*bufio.Writer); n &gt; 0 &amp;&amp; ok {</code></span>
+<span class="codeline" id="line-1131"><code>		ferr := bw.Flush()</code></span>
+<span class="codeline" id="line-1132"><code>		if ferr != nil &amp;&amp; err == nil {</code></span>
+<span class="codeline" id="line-1133"><code>			err = ferr</code></span>
+<span class="codeline" id="line-1134"><code>		}</code></span>
+<span class="codeline" id="line-1135"><code>	}</code></span>
+<span class="codeline" id="line-1136"><code>	return</code></span>
+<span class="codeline" id="line-1137"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

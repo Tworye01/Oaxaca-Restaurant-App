@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: routing_tree.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	routing_tree.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// This file implements a decision tree for fast matching of requests to</code></span>
+<span class="codeline" id="line-6"><code>// patterns.</code></span>
+<span class="codeline" id="line-7"><code>//</code></span>
+<span class="codeline" id="line-8"><code>// The root of the tree branches on the host of the request.</code></span>
+<span class="codeline" id="line-9"><code>// The next level branches on the method.</code></span>
+<span class="codeline" id="line-10"><code>// The remaining levels branch on consecutive segments of the path.</code></span>
+<span class="codeline" id="line-11"><code>//</code></span>
+<span class="codeline" id="line-12"><code>// The "more specific wins" precedence rule can result in backtracking.</code></span>
+<span class="codeline" id="line-13"><code>// For example, given the patterns</code></span>
+<span class="codeline" id="line-14"><code>//     /a/b/z</code></span>
+<span class="codeline" id="line-15"><code>//     /a/{x}/c</code></span>
+<span class="codeline" id="line-16"><code>// we will first try to match the path "/a/b/c" with /a/b/z, and</code></span>
+<span class="codeline" id="line-17"><code>// when that fails we will try against /a/{x}/c.</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>package http</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>import (</code></span>
+<span class="codeline" id="line-22"><code>	"strings"</code></span>
+<span class="codeline" id="line-23"><code>)</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>// A routingNode is a node in the decision tree.</code></span>
+<span class="codeline" id="line-26"><code>// The same struct is used for leaf and interior nodes.</code></span>
+<span class="codeline" id="line-27"><code>type routingNode struct {</code></span>
+<span class="codeline" id="line-28"><code>	// A leaf node holds a single pattern and the Handler it was registered</code></span>
+<span class="codeline" id="line-29"><code>	// with.</code></span>
+<span class="codeline" id="line-30"><code>	pattern *pattern</code></span>
+<span class="codeline" id="line-31"><code>	handler Handler</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>	// An interior node maps parts of the incoming request to child nodes.</code></span>
+<span class="codeline" id="line-34"><code>	// special children keys:</code></span>
+<span class="codeline" id="line-35"><code>	//     "/"	trailing slash (resulting from {$})</code></span>
+<span class="codeline" id="line-36"><code>	//	   ""   single wildcard</code></span>
+<span class="codeline" id="line-37"><code>	//	   "*"  multi wildcard</code></span>
+<span class="codeline" id="line-38"><code>	children   mapping[string, *routingNode]</code></span>
+<span class="codeline" id="line-39"><code>	emptyChild *routingNode // optimization: child with key ""</code></span>
+<span class="codeline" id="line-40"><code>}</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>// addPattern adds a pattern and its associated Handler to the tree</code></span>
+<span class="codeline" id="line-43"><code>// at root.</code></span>
+<span class="codeline" id="line-44"><code>func (root *routingNode) addPattern(p *pattern, h Handler) {</code></span>
+<span class="codeline" id="line-45"><code>	// First level of tree is host.</code></span>
+<span class="codeline" id="line-46"><code>	n := root.addChild(p.host)</code></span>
+<span class="codeline" id="line-47"><code>	// Second level of tree is method.</code></span>
+<span class="codeline" id="line-48"><code>	n = n.addChild(p.method)</code></span>
+<span class="codeline" id="line-49"><code>	// Remaining levels are path.</code></span>
+<span class="codeline" id="line-50"><code>	n.addSegments(p.segments, p, h)</code></span>
+<span class="codeline" id="line-51"><code>}</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>// addSegments adds the given segments to the tree rooted at n.</code></span>
+<span class="codeline" id="line-54"><code>// If there are no segments, then n is a leaf node that holds</code></span>
+<span class="codeline" id="line-55"><code>// the given pattern and handler.</code></span>
+<span class="codeline" id="line-56"><code>func (n *routingNode) addSegments(segs []segment, p *pattern, h Handler) {</code></span>
+<span class="codeline" id="line-57"><code>	if len(segs) == 0 {</code></span>
+<span class="codeline" id="line-58"><code>		n.set(p, h)</code></span>
+<span class="codeline" id="line-59"><code>		return</code></span>
+<span class="codeline" id="line-60"><code>	}</code></span>
+<span class="codeline" id="line-61"><code>	seg := segs[0]</code></span>
+<span class="codeline" id="line-62"><code>	if seg.multi {</code></span>
+<span class="codeline" id="line-63"><code>		if len(segs) != 1 {</code></span>
+<span class="codeline" id="line-64"><code>			panic("multi wildcard not last")</code></span>
+<span class="codeline" id="line-65"><code>		}</code></span>
+<span class="codeline" id="line-66"><code>		n.addChild("*").set(p, h)</code></span>
+<span class="codeline" id="line-67"><code>	} else if seg.wild {</code></span>
+<span class="codeline" id="line-68"><code>		n.addChild("").addSegments(segs[1:], p, h)</code></span>
+<span class="codeline" id="line-69"><code>	} else {</code></span>
+<span class="codeline" id="line-70"><code>		n.addChild(seg.s).addSegments(segs[1:], p, h)</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>// set sets the pattern and handler for n, which</code></span>
+<span class="codeline" id="line-75"><code>// must be a leaf node.</code></span>
+<span class="codeline" id="line-76"><code>func (n *routingNode) set(p *pattern, h Handler) {</code></span>
+<span class="codeline" id="line-77"><code>	if n.pattern != nil || n.handler != nil {</code></span>
+<span class="codeline" id="line-78"><code>		panic("non-nil leaf fields")</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code>	n.pattern = p</code></span>
+<span class="codeline" id="line-81"><code>	n.handler = h</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// addChild adds a child node with the given key to n</code></span>
+<span class="codeline" id="line-85"><code>// if one does not exist, and returns the child.</code></span>
+<span class="codeline" id="line-86"><code>func (n *routingNode) addChild(key string) *routingNode {</code></span>
+<span class="codeline" id="line-87"><code>	if key == "" {</code></span>
+<span class="codeline" id="line-88"><code>		if n.emptyChild == nil {</code></span>
+<span class="codeline" id="line-89"><code>			n.emptyChild = &amp;routingNode{}</code></span>
+<span class="codeline" id="line-90"><code>		}</code></span>
+<span class="codeline" id="line-91"><code>		return n.emptyChild</code></span>
+<span class="codeline" id="line-92"><code>	}</code></span>
+<span class="codeline" id="line-93"><code>	if c := n.findChild(key); c != nil {</code></span>
+<span class="codeline" id="line-94"><code>		return c</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>	c := &amp;routingNode{}</code></span>
+<span class="codeline" id="line-97"><code>	n.children.add(key, c)</code></span>
+<span class="codeline" id="line-98"><code>	return c</code></span>
+<span class="codeline" id="line-99"><code>}</code></span>
+<span class="codeline" id="line-100"><code></code></span>
+<span class="codeline" id="line-101"><code>// findChild returns the child of n with the given key, or nil</code></span>
+<span class="codeline" id="line-102"><code>// if there is no child with that key.</code></span>
+<span class="codeline" id="line-103"><code>func (n *routingNode) findChild(key string) *routingNode {</code></span>
+<span class="codeline" id="line-104"><code>	if key == "" {</code></span>
+<span class="codeline" id="line-105"><code>		return n.emptyChild</code></span>
+<span class="codeline" id="line-106"><code>	}</code></span>
+<span class="codeline" id="line-107"><code>	r, _ := n.children.find(key)</code></span>
+<span class="codeline" id="line-108"><code>	return r</code></span>
+<span class="codeline" id="line-109"><code>}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>// match returns the leaf node under root that matches the arguments, and a list</code></span>
+<span class="codeline" id="line-112"><code>// of values for pattern wildcards in the order that the wildcards appear.</code></span>
+<span class="codeline" id="line-113"><code>// For example, if the request path is "/a/b/c" and the pattern is "/{x}/b/{y}",</code></span>
+<span class="codeline" id="line-114"><code>// then the second return value will be []string{"a", "c"}.</code></span>
+<span class="codeline" id="line-115"><code>func (root *routingNode) match(host, method, path string) (*routingNode, []string) {</code></span>
+<span class="codeline" id="line-116"><code>	if host != "" {</code></span>
+<span class="codeline" id="line-117"><code>		// There is a host. If there is a pattern that specifies that host and it</code></span>
+<span class="codeline" id="line-118"><code>		// matches, we are done. If the pattern doesn't match, fall through to</code></span>
+<span class="codeline" id="line-119"><code>		// try patterns with no host.</code></span>
+<span class="codeline" id="line-120"><code>		if l, m := root.findChild(host).matchMethodAndPath(method, path); l != nil {</code></span>
+<span class="codeline" id="line-121"><code>			return l, m</code></span>
+<span class="codeline" id="line-122"><code>		}</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	return root.emptyChild.matchMethodAndPath(method, path)</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>// matchMethodAndPath matches the method and path.</code></span>
+<span class="codeline" id="line-128"><code>// Its return values are the same as [routingNode.match].</code></span>
+<span class="codeline" id="line-129"><code>// The receiver should be a child of the root.</code></span>
+<span class="codeline" id="line-130"><code>func (n *routingNode) matchMethodAndPath(method, path string) (*routingNode, []string) {</code></span>
+<span class="codeline" id="line-131"><code>	if n == nil {</code></span>
+<span class="codeline" id="line-132"><code>		return nil, nil</code></span>
+<span class="codeline" id="line-133"><code>	}</code></span>
+<span class="codeline" id="line-134"><code>	if l, m := n.findChild(method).matchPath(path, nil); l != nil {</code></span>
+<span class="codeline" id="line-135"><code>		// Exact match of method name.</code></span>
+<span class="codeline" id="line-136"><code>		return l, m</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code>	if method == "HEAD" {</code></span>
+<span class="codeline" id="line-139"><code>		// GET matches HEAD too.</code></span>
+<span class="codeline" id="line-140"><code>		if l, m := n.findChild("GET").matchPath(path, nil); l != nil {</code></span>
+<span class="codeline" id="line-141"><code>			return l, m</code></span>
+<span class="codeline" id="line-142"><code>		}</code></span>
+<span class="codeline" id="line-143"><code>	}</code></span>
+<span class="codeline" id="line-144"><code>	// No exact match; try patterns with no method.</code></span>
+<span class="codeline" id="line-145"><code>	return n.emptyChild.matchPath(path, nil)</code></span>
+<span class="codeline" id="line-146"><code>}</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>// matchPath matches a path.</code></span>
+<span class="codeline" id="line-149"><code>// Its return values are the same as [routingNode.match].</code></span>
+<span class="codeline" id="line-150"><code>// matchPath calls itself recursively. The matches argument holds the wildcard matches</code></span>
+<span class="codeline" id="line-151"><code>// found so far.</code></span>
+<span class="codeline" id="line-152"><code>func (n *routingNode) matchPath(path string, matches []string) (*routingNode, []string) {</code></span>
+<span class="codeline" id="line-153"><code>	if n == nil {</code></span>
+<span class="codeline" id="line-154"><code>		return nil, nil</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code>	// If path is empty, then we are done.</code></span>
+<span class="codeline" id="line-157"><code>	// If n is a leaf node, we found a match; return it.</code></span>
+<span class="codeline" id="line-158"><code>	// If n is an interior node (which means it has a nil pattern),</code></span>
+<span class="codeline" id="line-159"><code>	// then we failed to match.</code></span>
+<span class="codeline" id="line-160"><code>	if path == "" {</code></span>
+<span class="codeline" id="line-161"><code>		if n.pattern == nil {</code></span>
+<span class="codeline" id="line-162"><code>			return nil, nil</code></span>
+<span class="codeline" id="line-163"><code>		}</code></span>
+<span class="codeline" id="line-164"><code>		return n, matches</code></span>
+<span class="codeline" id="line-165"><code>	}</code></span>
+<span class="codeline" id="line-166"><code>	// Get the first segment of path.</code></span>
+<span class="codeline" id="line-167"><code>	seg, rest := firstSegment(path)</code></span>
+<span class="codeline" id="line-168"><code>	// First try matching against patterns that have a literal for this position.</code></span>
+<span class="codeline" id="line-169"><code>	// We know by construction that such patterns are more specific than those</code></span>
+<span class="codeline" id="line-170"><code>	// with a wildcard at this position (they are either more specific, equivalent,</code></span>
+<span class="codeline" id="line-171"><code>	// or overlap, and we ruled out the first two when the patterns were registered).</code></span>
+<span class="codeline" id="line-172"><code>	if n, m := n.findChild(seg).matchPath(rest, matches); n != nil {</code></span>
+<span class="codeline" id="line-173"><code>		return n, m</code></span>
+<span class="codeline" id="line-174"><code>	}</code></span>
+<span class="codeline" id="line-175"><code>	// If matching a literal fails, try again with patterns that have a single</code></span>
+<span class="codeline" id="line-176"><code>	// wildcard (represented by an empty string in the child mapping).</code></span>
+<span class="codeline" id="line-177"><code>	// Again, by construction, patterns with a single wildcard must be more specific than</code></span>
+<span class="codeline" id="line-178"><code>	// those with a multi wildcard.</code></span>
+<span class="codeline" id="line-179"><code>	// We skip this step if the segment is a trailing slash, because single wildcards</code></span>
+<span class="codeline" id="line-180"><code>	// don't match trailing slashes.</code></span>
+<span class="codeline" id="line-181"><code>	if seg != "/" {</code></span>
+<span class="codeline" id="line-182"><code>		if n, m := n.emptyChild.matchPath(rest, append(matches, seg)); n != nil {</code></span>
+<span class="codeline" id="line-183"><code>			return n, m</code></span>
+<span class="codeline" id="line-184"><code>		}</code></span>
+<span class="codeline" id="line-185"><code>	}</code></span>
+<span class="codeline" id="line-186"><code>	// Lastly, match the pattern (there can be at most one) that has a multi</code></span>
+<span class="codeline" id="line-187"><code>	// wildcard in this position to the rest of the path.</code></span>
+<span class="codeline" id="line-188"><code>	if c := n.findChild("*"); c != nil {</code></span>
+<span class="codeline" id="line-189"><code>		// Don't record a match for a nameless wildcard (which arises from a</code></span>
+<span class="codeline" id="line-190"><code>		// trailing slash in the pattern).</code></span>
+<span class="codeline" id="line-191"><code>		if c.pattern.lastSegment().s != "" {</code></span>
+<span class="codeline" id="line-192"><code>			matches = append(matches, pathUnescape(path[1:])) // remove initial slash</code></span>
+<span class="codeline" id="line-193"><code>		}</code></span>
+<span class="codeline" id="line-194"><code>		return c, matches</code></span>
+<span class="codeline" id="line-195"><code>	}</code></span>
+<span class="codeline" id="line-196"><code>	return nil, nil</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>// firstSegment splits path into its first segment, and the rest.</code></span>
+<span class="codeline" id="line-200"><code>// The path must begin with "/".</code></span>
+<span class="codeline" id="line-201"><code>// If path consists of only a slash, firstSegment returns ("/", "").</code></span>
+<span class="codeline" id="line-202"><code>// The segment is returned unescaped, if possible.</code></span>
+<span class="codeline" id="line-203"><code>func firstSegment(path string) (seg, rest string) {</code></span>
+<span class="codeline" id="line-204"><code>	if path == "/" {</code></span>
+<span class="codeline" id="line-205"><code>		return "/", ""</code></span>
+<span class="codeline" id="line-206"><code>	}</code></span>
+<span class="codeline" id="line-207"><code>	path = path[1:] // drop initial slash</code></span>
+<span class="codeline" id="line-208"><code>	i := strings.IndexByte(path, '/')</code></span>
+<span class="codeline" id="line-209"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-210"><code>		i = len(path)</code></span>
+<span class="codeline" id="line-211"><code>	}</code></span>
+<span class="codeline" id="line-212"><code>	return pathUnescape(path[:i]), path[i:]</code></span>
+<span class="codeline" id="line-213"><code>}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>// matchingMethods adds to methodSet all the methods that would result in a</code></span>
+<span class="codeline" id="line-216"><code>// match if passed to routingNode.match with the given host and path.</code></span>
+<span class="codeline" id="line-217"><code>func (root *routingNode) matchingMethods(host, path string, methodSet map[string]bool) {</code></span>
+<span class="codeline" id="line-218"><code>	if host != "" {</code></span>
+<span class="codeline" id="line-219"><code>		root.findChild(host).matchingMethodsPath(path, methodSet)</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code>	root.emptyChild.matchingMethodsPath(path, methodSet)</code></span>
+<span class="codeline" id="line-222"><code>	if methodSet["GET"] {</code></span>
+<span class="codeline" id="line-223"><code>		methodSet["HEAD"] = true</code></span>
+<span class="codeline" id="line-224"><code>	}</code></span>
+<span class="codeline" id="line-225"><code>}</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>func (n *routingNode) matchingMethodsPath(path string, set map[string]bool) {</code></span>
+<span class="codeline" id="line-228"><code>	if n == nil {</code></span>
+<span class="codeline" id="line-229"><code>		return</code></span>
+<span class="codeline" id="line-230"><code>	}</code></span>
+<span class="codeline" id="line-231"><code>	n.children.eachPair(func(method string, c *routingNode) bool {</code></span>
+<span class="codeline" id="line-232"><code>		if p, _ := c.matchPath(path, nil); p != nil {</code></span>
+<span class="codeline" id="line-233"><code>			set[method] = true</code></span>
+<span class="codeline" id="line-234"><code>		}</code></span>
+<span class="codeline" id="line-235"><code>		return true</code></span>
+<span class="codeline" id="line-236"><code>	})</code></span>
+<span class="codeline" id="line-237"><code>	// Don't look at the empty child. If there were an empty</code></span>
+<span class="codeline" id="line-238"><code>	// child, it would match on any method, but we only</code></span>
+<span class="codeline" id="line-239"><code>	// call this when we fail to match on a method.</code></span>
+<span class="codeline" id="line-240"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

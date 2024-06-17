@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: fe.go in package crypto/internal/edwards25519/field</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	fe.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/crypto/internal/edwards25519/field.html">crypto/internal/edwards25519/field</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright (c) 2017 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package field implements fast arithmetic modulo 2^255-19.</code></span></div><span class="codeline" id="line-6"><code>package field</code></span>
+<span class="codeline" id="line-7"><code></code></span>
+<span class="codeline" id="line-8"><code>import (</code></span>
+<span class="codeline" id="line-9"><code>	"crypto/subtle"</code></span>
+<span class="codeline" id="line-10"><code>	"encoding/binary"</code></span>
+<span class="codeline" id="line-11"><code>	"errors"</code></span>
+<span class="codeline" id="line-12"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>// Element represents an element of the field GF(2^255-19). Note that this</code></span>
+<span class="codeline" id="line-16"><code>// is not a cryptographically secure group, and should only be used to interact</code></span>
+<span class="codeline" id="line-17"><code>// with edwards25519.Point coordinates.</code></span>
+<span class="codeline" id="line-18"><code>//</code></span>
+<span class="codeline" id="line-19"><code>// This type works similarly to math/big.Int, and all arguments and receivers</code></span>
+<span class="codeline" id="line-20"><code>// are allowed to alias.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// The zero value is a valid zero element.</code></span>
+<span class="codeline" id="line-23"><code>type Element struct {</code></span>
+<span class="codeline" id="line-24"><code>	// An element t represents the integer</code></span>
+<span class="codeline" id="line-25"><code>	//     t.l0 + t.l1*2^51 + t.l2*2^102 + t.l3*2^153 + t.l4*2^204</code></span>
+<span class="codeline" id="line-26"><code>	//</code></span>
+<span class="codeline" id="line-27"><code>	// Between operations, all limbs are expected to be lower than 2^52.</code></span>
+<span class="codeline" id="line-28"><code>	l0 uint64</code></span>
+<span class="codeline" id="line-29"><code>	l1 uint64</code></span>
+<span class="codeline" id="line-30"><code>	l2 uint64</code></span>
+<span class="codeline" id="line-31"><code>	l3 uint64</code></span>
+<span class="codeline" id="line-32"><code>	l4 uint64</code></span>
+<span class="codeline" id="line-33"><code>}</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>const maskLow51Bits uint64 = (1 &lt;&lt; 51) - 1</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>var feZero = &amp;Element{0, 0, 0, 0, 0}</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>// Zero sets v = 0, and returns v.</code></span>
+<span class="codeline" id="line-40"><code>func (v *Element) Zero() *Element {</code></span>
+<span class="codeline" id="line-41"><code>	*v = *feZero</code></span>
+<span class="codeline" id="line-42"><code>	return v</code></span>
+<span class="codeline" id="line-43"><code>}</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>var feOne = &amp;Element{1, 0, 0, 0, 0}</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>// One sets v = 1, and returns v.</code></span>
+<span class="codeline" id="line-48"><code>func (v *Element) One() *Element {</code></span>
+<span class="codeline" id="line-49"><code>	*v = *feOne</code></span>
+<span class="codeline" id="line-50"><code>	return v</code></span>
+<span class="codeline" id="line-51"><code>}</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>// reduce reduces v modulo 2^255 - 19 and returns it.</code></span>
+<span class="codeline" id="line-54"><code>func (v *Element) reduce() *Element {</code></span>
+<span class="codeline" id="line-55"><code>	v.carryPropagate()</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>	// After the light reduction we now have a field element representation</code></span>
+<span class="codeline" id="line-58"><code>	// v &lt; 2^255 + 2^13 * 19, but need v &lt; 2^255 - 19.</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// If v &gt;= 2^255 - 19, then v + 19 &gt;= 2^255, which would overflow 2^255 - 1,</code></span>
+<span class="codeline" id="line-61"><code>	// generating a carry. That is, c will be 0 if v &lt; 2^255 - 19, and 1 otherwise.</code></span>
+<span class="codeline" id="line-62"><code>	c := (v.l0 + 19) &gt;&gt; 51</code></span>
+<span class="codeline" id="line-63"><code>	c = (v.l1 + c) &gt;&gt; 51</code></span>
+<span class="codeline" id="line-64"><code>	c = (v.l2 + c) &gt;&gt; 51</code></span>
+<span class="codeline" id="line-65"><code>	c = (v.l3 + c) &gt;&gt; 51</code></span>
+<span class="codeline" id="line-66"><code>	c = (v.l4 + c) &gt;&gt; 51</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>	// If v &lt; 2^255 - 19 and c = 0, this will be a no-op. Otherwise, it's</code></span>
+<span class="codeline" id="line-69"><code>	// effectively applying the reduction identity to the carry.</code></span>
+<span class="codeline" id="line-70"><code>	v.l0 += 19 * c</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	v.l1 += v.l0 &gt;&gt; 51</code></span>
+<span class="codeline" id="line-73"><code>	v.l0 = v.l0 &amp; maskLow51Bits</code></span>
+<span class="codeline" id="line-74"><code>	v.l2 += v.l1 &gt;&gt; 51</code></span>
+<span class="codeline" id="line-75"><code>	v.l1 = v.l1 &amp; maskLow51Bits</code></span>
+<span class="codeline" id="line-76"><code>	v.l3 += v.l2 &gt;&gt; 51</code></span>
+<span class="codeline" id="line-77"><code>	v.l2 = v.l2 &amp; maskLow51Bits</code></span>
+<span class="codeline" id="line-78"><code>	v.l4 += v.l3 &gt;&gt; 51</code></span>
+<span class="codeline" id="line-79"><code>	v.l3 = v.l3 &amp; maskLow51Bits</code></span>
+<span class="codeline" id="line-80"><code>	// no additional carry</code></span>
+<span class="codeline" id="line-81"><code>	v.l4 = v.l4 &amp; maskLow51Bits</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	return v</code></span>
+<span class="codeline" id="line-84"><code>}</code></span>
+<span class="codeline" id="line-85"><code></code></span>
+<span class="codeline" id="line-86"><code>// Add sets v = a + b, and returns v.</code></span>
+<span class="codeline" id="line-87"><code>func (v *Element) Add(a, b *Element) *Element {</code></span>
+<span class="codeline" id="line-88"><code>	v.l0 = a.l0 + b.l0</code></span>
+<span class="codeline" id="line-89"><code>	v.l1 = a.l1 + b.l1</code></span>
+<span class="codeline" id="line-90"><code>	v.l2 = a.l2 + b.l2</code></span>
+<span class="codeline" id="line-91"><code>	v.l3 = a.l3 + b.l3</code></span>
+<span class="codeline" id="line-92"><code>	v.l4 = a.l4 + b.l4</code></span>
+<span class="codeline" id="line-93"><code>	// Using the generic implementation here is actually faster than the</code></span>
+<span class="codeline" id="line-94"><code>	// assembly. Probably because the body of this function is so simple that</code></span>
+<span class="codeline" id="line-95"><code>	// the compiler can figure out better optimizations by inlining the carry</code></span>
+<span class="codeline" id="line-96"><code>	// propagation.</code></span>
+<span class="codeline" id="line-97"><code>	return v.carryPropagateGeneric()</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// Subtract sets v = a - b, and returns v.</code></span>
+<span class="codeline" id="line-101"><code>func (v *Element) Subtract(a, b *Element) *Element {</code></span>
+<span class="codeline" id="line-102"><code>	// We first add 2 * p, to guarantee the subtraction won't underflow, and</code></span>
+<span class="codeline" id="line-103"><code>	// then subtract b (which can be up to 2^255 + 2^13 * 19).</code></span>
+<span class="codeline" id="line-104"><code>	v.l0 = (a.l0 + 0xFFFFFFFFFFFDA) - b.l0</code></span>
+<span class="codeline" id="line-105"><code>	v.l1 = (a.l1 + 0xFFFFFFFFFFFFE) - b.l1</code></span>
+<span class="codeline" id="line-106"><code>	v.l2 = (a.l2 + 0xFFFFFFFFFFFFE) - b.l2</code></span>
+<span class="codeline" id="line-107"><code>	v.l3 = (a.l3 + 0xFFFFFFFFFFFFE) - b.l3</code></span>
+<span class="codeline" id="line-108"><code>	v.l4 = (a.l4 + 0xFFFFFFFFFFFFE) - b.l4</code></span>
+<span class="codeline" id="line-109"><code>	return v.carryPropagate()</code></span>
+<span class="codeline" id="line-110"><code>}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>// Negate sets v = -a, and returns v.</code></span>
+<span class="codeline" id="line-113"><code>func (v *Element) Negate(a *Element) *Element {</code></span>
+<span class="codeline" id="line-114"><code>	return v.Subtract(feZero, a)</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>// Invert sets v = 1/z mod p, and returns v.</code></span>
+<span class="codeline" id="line-118"><code>//</code></span>
+<span class="codeline" id="line-119"><code>// If z == 0, Invert returns v = 0.</code></span>
+<span class="codeline" id="line-120"><code>func (v *Element) Invert(z *Element) *Element {</code></span>
+<span class="codeline" id="line-121"><code>	// Inversion is implemented as exponentiation with exponent p − 2. It uses the</code></span>
+<span class="codeline" id="line-122"><code>	// same sequence of 255 squarings and 11 multiplications as [Curve25519].</code></span>
+<span class="codeline" id="line-123"><code>	var z2, z9, z11, z2_5_0, z2_10_0, z2_20_0, z2_50_0, z2_100_0, t Element</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>	z2.Square(z)             // 2</code></span>
+<span class="codeline" id="line-126"><code>	t.Square(&amp;z2)            // 4</code></span>
+<span class="codeline" id="line-127"><code>	t.Square(&amp;t)             // 8</code></span>
+<span class="codeline" id="line-128"><code>	z9.Multiply(&amp;t, z)       // 9</code></span>
+<span class="codeline" id="line-129"><code>	z11.Multiply(&amp;z9, &amp;z2)   // 11</code></span>
+<span class="codeline" id="line-130"><code>	t.Square(&amp;z11)           // 22</code></span>
+<span class="codeline" id="line-131"><code>	z2_5_0.Multiply(&amp;t, &amp;z9) // 31 = 2^5 - 2^0</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>	t.Square(&amp;z2_5_0) // 2^6 - 2^1</code></span>
+<span class="codeline" id="line-134"><code>	for i := 0; i &lt; 4; i++ {</code></span>
+<span class="codeline" id="line-135"><code>		t.Square(&amp;t) // 2^10 - 2^5</code></span>
+<span class="codeline" id="line-136"><code>	}</code></span>
+<span class="codeline" id="line-137"><code>	z2_10_0.Multiply(&amp;t, &amp;z2_5_0) // 2^10 - 2^0</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	t.Square(&amp;z2_10_0) // 2^11 - 2^1</code></span>
+<span class="codeline" id="line-140"><code>	for i := 0; i &lt; 9; i++ {</code></span>
+<span class="codeline" id="line-141"><code>		t.Square(&amp;t) // 2^20 - 2^10</code></span>
+<span class="codeline" id="line-142"><code>	}</code></span>
+<span class="codeline" id="line-143"><code>	z2_20_0.Multiply(&amp;t, &amp;z2_10_0) // 2^20 - 2^0</code></span>
+<span class="codeline" id="line-144"><code></code></span>
+<span class="codeline" id="line-145"><code>	t.Square(&amp;z2_20_0) // 2^21 - 2^1</code></span>
+<span class="codeline" id="line-146"><code>	for i := 0; i &lt; 19; i++ {</code></span>
+<span class="codeline" id="line-147"><code>		t.Square(&amp;t) // 2^40 - 2^20</code></span>
+<span class="codeline" id="line-148"><code>	}</code></span>
+<span class="codeline" id="line-149"><code>	t.Multiply(&amp;t, &amp;z2_20_0) // 2^40 - 2^0</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	t.Square(&amp;t) // 2^41 - 2^1</code></span>
+<span class="codeline" id="line-152"><code>	for i := 0; i &lt; 9; i++ {</code></span>
+<span class="codeline" id="line-153"><code>		t.Square(&amp;t) // 2^50 - 2^10</code></span>
+<span class="codeline" id="line-154"><code>	}</code></span>
+<span class="codeline" id="line-155"><code>	z2_50_0.Multiply(&amp;t, &amp;z2_10_0) // 2^50 - 2^0</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>	t.Square(&amp;z2_50_0) // 2^51 - 2^1</code></span>
+<span class="codeline" id="line-158"><code>	for i := 0; i &lt; 49; i++ {</code></span>
+<span class="codeline" id="line-159"><code>		t.Square(&amp;t) // 2^100 - 2^50</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code>	z2_100_0.Multiply(&amp;t, &amp;z2_50_0) // 2^100 - 2^0</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>	t.Square(&amp;z2_100_0) // 2^101 - 2^1</code></span>
+<span class="codeline" id="line-164"><code>	for i := 0; i &lt; 99; i++ {</code></span>
+<span class="codeline" id="line-165"><code>		t.Square(&amp;t) // 2^200 - 2^100</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>	t.Multiply(&amp;t, &amp;z2_100_0) // 2^200 - 2^0</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>	t.Square(&amp;t) // 2^201 - 2^1</code></span>
+<span class="codeline" id="line-170"><code>	for i := 0; i &lt; 49; i++ {</code></span>
+<span class="codeline" id="line-171"><code>		t.Square(&amp;t) // 2^250 - 2^50</code></span>
+<span class="codeline" id="line-172"><code>	}</code></span>
+<span class="codeline" id="line-173"><code>	t.Multiply(&amp;t, &amp;z2_50_0) // 2^250 - 2^0</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>	t.Square(&amp;t) // 2^251 - 2^1</code></span>
+<span class="codeline" id="line-176"><code>	t.Square(&amp;t) // 2^252 - 2^2</code></span>
+<span class="codeline" id="line-177"><code>	t.Square(&amp;t) // 2^253 - 2^3</code></span>
+<span class="codeline" id="line-178"><code>	t.Square(&amp;t) // 2^254 - 2^4</code></span>
+<span class="codeline" id="line-179"><code>	t.Square(&amp;t) // 2^255 - 2^5</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>	return v.Multiply(&amp;t, &amp;z11) // 2^255 - 21</code></span>
+<span class="codeline" id="line-182"><code>}</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>// Set sets v = a, and returns v.</code></span>
+<span class="codeline" id="line-185"><code>func (v *Element) Set(a *Element) *Element {</code></span>
+<span class="codeline" id="line-186"><code>	*v = *a</code></span>
+<span class="codeline" id="line-187"><code>	return v</code></span>
+<span class="codeline" id="line-188"><code>}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>// SetBytes sets v to x, where x is a 32-byte little-endian encoding. If x is</code></span>
+<span class="codeline" id="line-191"><code>// not of the right length, SetBytes returns nil and an error, and the</code></span>
+<span class="codeline" id="line-192"><code>// receiver is unchanged.</code></span>
+<span class="codeline" id="line-193"><code>//</code></span>
+<span class="codeline" id="line-194"><code>// Consistent with RFC 7748, the most significant bit (the high bit of the</code></span>
+<span class="codeline" id="line-195"><code>// last byte) is ignored, and non-canonical values (2^255-19 through 2^255-1)</code></span>
+<span class="codeline" id="line-196"><code>// are accepted. Note that this is laxer than specified by RFC 8032, but</code></span>
+<span class="codeline" id="line-197"><code>// consistent with most Ed25519 implementations.</code></span>
+<span class="codeline" id="line-198"><code>func (v *Element) SetBytes(x []byte) (*Element, error) {</code></span>
+<span class="codeline" id="line-199"><code>	if len(x) != 32 {</code></span>
+<span class="codeline" id="line-200"><code>		return nil, errors.New("edwards25519: invalid field element input size")</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>	// Bits 0:51 (bytes 0:8, bits 0:64, shift 0, mask 51).</code></span>
+<span class="codeline" id="line-204"><code>	v.l0 = binary.LittleEndian.Uint64(x[0:8])</code></span>
+<span class="codeline" id="line-205"><code>	v.l0 &amp;= maskLow51Bits</code></span>
+<span class="codeline" id="line-206"><code>	// Bits 51:102 (bytes 6:14, bits 48:112, shift 3, mask 51).</code></span>
+<span class="codeline" id="line-207"><code>	v.l1 = binary.LittleEndian.Uint64(x[6:14]) &gt;&gt; 3</code></span>
+<span class="codeline" id="line-208"><code>	v.l1 &amp;= maskLow51Bits</code></span>
+<span class="codeline" id="line-209"><code>	// Bits 102:153 (bytes 12:20, bits 96:160, shift 6, mask 51).</code></span>
+<span class="codeline" id="line-210"><code>	v.l2 = binary.LittleEndian.Uint64(x[12:20]) &gt;&gt; 6</code></span>
+<span class="codeline" id="line-211"><code>	v.l2 &amp;= maskLow51Bits</code></span>
+<span class="codeline" id="line-212"><code>	// Bits 153:204 (bytes 19:27, bits 152:216, shift 1, mask 51).</code></span>
+<span class="codeline" id="line-213"><code>	v.l3 = binary.LittleEndian.Uint64(x[19:27]) &gt;&gt; 1</code></span>
+<span class="codeline" id="line-214"><code>	v.l3 &amp;= maskLow51Bits</code></span>
+<span class="codeline" id="line-215"><code>	// Bits 204:255 (bytes 24:32, bits 192:256, shift 12, mask 51).</code></span>
+<span class="codeline" id="line-216"><code>	// Note: not bytes 25:33, shift 4, to avoid overread.</code></span>
+<span class="codeline" id="line-217"><code>	v.l4 = binary.LittleEndian.Uint64(x[24:32]) &gt;&gt; 12</code></span>
+<span class="codeline" id="line-218"><code>	v.l4 &amp;= maskLow51Bits</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>	return v, nil</code></span>
+<span class="codeline" id="line-221"><code>}</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>// Bytes returns the canonical 32-byte little-endian encoding of v.</code></span>
+<span class="codeline" id="line-224"><code>func (v *Element) Bytes() []byte {</code></span>
+<span class="codeline" id="line-225"><code>	// This function is outlined to make the allocations inline in the caller</code></span>
+<span class="codeline" id="line-226"><code>	// rather than happen on the heap.</code></span>
+<span class="codeline" id="line-227"><code>	var out [32]byte</code></span>
+<span class="codeline" id="line-228"><code>	return v.bytes(&amp;out)</code></span>
+<span class="codeline" id="line-229"><code>}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>func (v *Element) bytes(out *[32]byte) []byte {</code></span>
+<span class="codeline" id="line-232"><code>	t := *v</code></span>
+<span class="codeline" id="line-233"><code>	t.reduce()</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>	var buf [8]byte</code></span>
+<span class="codeline" id="line-236"><code>	for i, l := range [5]uint64{t.l0, t.l1, t.l2, t.l3, t.l4} {</code></span>
+<span class="codeline" id="line-237"><code>		bitsOffset := i * 51</code></span>
+<span class="codeline" id="line-238"><code>		binary.LittleEndian.PutUint64(buf[:], l&lt;&lt;uint(bitsOffset%8))</code></span>
+<span class="codeline" id="line-239"><code>		for i, bb := range buf {</code></span>
+<span class="codeline" id="line-240"><code>			off := bitsOffset/8 + i</code></span>
+<span class="codeline" id="line-241"><code>			if off &gt;= len(out) {</code></span>
+<span class="codeline" id="line-242"><code>				break</code></span>
+<span class="codeline" id="line-243"><code>			}</code></span>
+<span class="codeline" id="line-244"><code>			out[off] |= bb</code></span>
+<span class="codeline" id="line-245"><code>		}</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code></code></span>
+<span class="codeline" id="line-248"><code>	return out[:]</code></span>
+<span class="codeline" id="line-249"><code>}</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>// Equal returns 1 if v and u are equal, and 0 otherwise.</code></span>
+<span class="codeline" id="line-252"><code>func (v *Element) Equal(u *Element) int {</code></span>
+<span class="codeline" id="line-253"><code>	sa, sv := u.Bytes(), v.Bytes()</code></span>
+<span class="codeline" id="line-254"><code>	return subtle.ConstantTimeCompare(sa, sv)</code></span>
+<span class="codeline" id="line-255"><code>}</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>// mask64Bits returns 0xffffffff if cond is 1, and 0 otherwise.</code></span>
+<span class="codeline" id="line-258"><code>func mask64Bits(cond int) uint64 { return ^(uint64(cond) - 1) }</code></span>
+<span class="codeline" id="line-259"><code></code></span>
+<span class="codeline" id="line-260"><code>// Select sets v to a if cond == 1, and to b if cond == 0.</code></span>
+<span class="codeline" id="line-261"><code>func (v *Element) Select(a, b *Element, cond int) *Element {</code></span>
+<span class="codeline" id="line-262"><code>	m := mask64Bits(cond)</code></span>
+<span class="codeline" id="line-263"><code>	v.l0 = (m &amp; a.l0) | (^m &amp; b.l0)</code></span>
+<span class="codeline" id="line-264"><code>	v.l1 = (m &amp; a.l1) | (^m &amp; b.l1)</code></span>
+<span class="codeline" id="line-265"><code>	v.l2 = (m &amp; a.l2) | (^m &amp; b.l2)</code></span>
+<span class="codeline" id="line-266"><code>	v.l3 = (m &amp; a.l3) | (^m &amp; b.l3)</code></span>
+<span class="codeline" id="line-267"><code>	v.l4 = (m &amp; a.l4) | (^m &amp; b.l4)</code></span>
+<span class="codeline" id="line-268"><code>	return v</code></span>
+<span class="codeline" id="line-269"><code>}</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>// Swap swaps v and u if cond == 1 or leaves them unchanged if cond == 0, and returns v.</code></span>
+<span class="codeline" id="line-272"><code>func (v *Element) Swap(u *Element, cond int) {</code></span>
+<span class="codeline" id="line-273"><code>	m := mask64Bits(cond)</code></span>
+<span class="codeline" id="line-274"><code>	t := m &amp; (v.l0 ^ u.l0)</code></span>
+<span class="codeline" id="line-275"><code>	v.l0 ^= t</code></span>
+<span class="codeline" id="line-276"><code>	u.l0 ^= t</code></span>
+<span class="codeline" id="line-277"><code>	t = m &amp; (v.l1 ^ u.l1)</code></span>
+<span class="codeline" id="line-278"><code>	v.l1 ^= t</code></span>
+<span class="codeline" id="line-279"><code>	u.l1 ^= t</code></span>
+<span class="codeline" id="line-280"><code>	t = m &amp; (v.l2 ^ u.l2)</code></span>
+<span class="codeline" id="line-281"><code>	v.l2 ^= t</code></span>
+<span class="codeline" id="line-282"><code>	u.l2 ^= t</code></span>
+<span class="codeline" id="line-283"><code>	t = m &amp; (v.l3 ^ u.l3)</code></span>
+<span class="codeline" id="line-284"><code>	v.l3 ^= t</code></span>
+<span class="codeline" id="line-285"><code>	u.l3 ^= t</code></span>
+<span class="codeline" id="line-286"><code>	t = m &amp; (v.l4 ^ u.l4)</code></span>
+<span class="codeline" id="line-287"><code>	v.l4 ^= t</code></span>
+<span class="codeline" id="line-288"><code>	u.l4 ^= t</code></span>
+<span class="codeline" id="line-289"><code>}</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>// IsNegative returns 1 if v is negative, and 0 otherwise.</code></span>
+<span class="codeline" id="line-292"><code>func (v *Element) IsNegative() int {</code></span>
+<span class="codeline" id="line-293"><code>	return int(v.Bytes()[0] &amp; 1)</code></span>
+<span class="codeline" id="line-294"><code>}</code></span>
+<span class="codeline" id="line-295"><code></code></span>
+<span class="codeline" id="line-296"><code>// Absolute sets v to |u|, and returns v.</code></span>
+<span class="codeline" id="line-297"><code>func (v *Element) Absolute(u *Element) *Element {</code></span>
+<span class="codeline" id="line-298"><code>	return v.Select(new(Element).Negate(u), u, u.IsNegative())</code></span>
+<span class="codeline" id="line-299"><code>}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>// Multiply sets v = x * y, and returns v.</code></span>
+<span class="codeline" id="line-302"><code>func (v *Element) Multiply(x, y *Element) *Element {</code></span>
+<span class="codeline" id="line-303"><code>	feMul(v, x, y)</code></span>
+<span class="codeline" id="line-304"><code>	return v</code></span>
+<span class="codeline" id="line-305"><code>}</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>// Square sets v = x * x, and returns v.</code></span>
+<span class="codeline" id="line-308"><code>func (v *Element) Square(x *Element) *Element {</code></span>
+<span class="codeline" id="line-309"><code>	feSquare(v, x)</code></span>
+<span class="codeline" id="line-310"><code>	return v</code></span>
+<span class="codeline" id="line-311"><code>}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>// Mult32 sets v = x * y, and returns v.</code></span>
+<span class="codeline" id="line-314"><code>func (v *Element) Mult32(x *Element, y uint32) *Element {</code></span>
+<span class="codeline" id="line-315"><code>	x0lo, x0hi := mul51(x.l0, y)</code></span>
+<span class="codeline" id="line-316"><code>	x1lo, x1hi := mul51(x.l1, y)</code></span>
+<span class="codeline" id="line-317"><code>	x2lo, x2hi := mul51(x.l2, y)</code></span>
+<span class="codeline" id="line-318"><code>	x3lo, x3hi := mul51(x.l3, y)</code></span>
+<span class="codeline" id="line-319"><code>	x4lo, x4hi := mul51(x.l4, y)</code></span>
+<span class="codeline" id="line-320"><code>	v.l0 = x0lo + 19*x4hi // carried over per the reduction identity</code></span>
+<span class="codeline" id="line-321"><code>	v.l1 = x1lo + x0hi</code></span>
+<span class="codeline" id="line-322"><code>	v.l2 = x2lo + x1hi</code></span>
+<span class="codeline" id="line-323"><code>	v.l3 = x3lo + x2hi</code></span>
+<span class="codeline" id="line-324"><code>	v.l4 = x4lo + x3hi</code></span>
+<span class="codeline" id="line-325"><code>	// The hi portions are going to be only 32 bits, plus any previous excess,</code></span>
+<span class="codeline" id="line-326"><code>	// so we can skip the carry propagation.</code></span>
+<span class="codeline" id="line-327"><code>	return v</code></span>
+<span class="codeline" id="line-328"><code>}</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>// mul51 returns lo + hi * 2⁵¹ = a * b.</code></span>
+<span class="codeline" id="line-331"><code>func mul51(a uint64, b uint32) (lo uint64, hi uint64) {</code></span>
+<span class="codeline" id="line-332"><code>	mh, ml := bits.Mul64(a, uint64(b))</code></span>
+<span class="codeline" id="line-333"><code>	lo = ml &amp; maskLow51Bits</code></span>
+<span class="codeline" id="line-334"><code>	hi = (mh &lt;&lt; 13) | (ml &gt;&gt; 51)</code></span>
+<span class="codeline" id="line-335"><code>	return</code></span>
+<span class="codeline" id="line-336"><code>}</code></span>
+<span class="codeline" id="line-337"><code></code></span>
+<span class="codeline" id="line-338"><code>// Pow22523 set v = x^((p-5)/8), and returns v. (p-5)/8 is 2^252-3.</code></span>
+<span class="codeline" id="line-339"><code>func (v *Element) Pow22523(x *Element) *Element {</code></span>
+<span class="codeline" id="line-340"><code>	var t0, t1, t2 Element</code></span>
+<span class="codeline" id="line-341"><code></code></span>
+<span class="codeline" id="line-342"><code>	t0.Square(x)             // x^2</code></span>
+<span class="codeline" id="line-343"><code>	t1.Square(&amp;t0)           // x^4</code></span>
+<span class="codeline" id="line-344"><code>	t1.Square(&amp;t1)           // x^8</code></span>
+<span class="codeline" id="line-345"><code>	t1.Multiply(x, &amp;t1)      // x^9</code></span>
+<span class="codeline" id="line-346"><code>	t0.Multiply(&amp;t0, &amp;t1)    // x^11</code></span>
+<span class="codeline" id="line-347"><code>	t0.Square(&amp;t0)           // x^22</code></span>
+<span class="codeline" id="line-348"><code>	t0.Multiply(&amp;t1, &amp;t0)    // x^31</code></span>
+<span class="codeline" id="line-349"><code>	t1.Square(&amp;t0)           // x^62</code></span>
+<span class="codeline" id="line-350"><code>	for i := 1; i &lt; 5; i++ { // x^992</code></span>
+<span class="codeline" id="line-351"><code>		t1.Square(&amp;t1)</code></span>
+<span class="codeline" id="line-352"><code>	}</code></span>
+<span class="codeline" id="line-353"><code>	t0.Multiply(&amp;t1, &amp;t0)     // x^1023 -&gt; 1023 = 2^10 - 1</code></span>
+<span class="codeline" id="line-354"><code>	t1.Square(&amp;t0)            // 2^11 - 2</code></span>
+<span class="codeline" id="line-355"><code>	for i := 1; i &lt; 10; i++ { // 2^20 - 2^10</code></span>
+<span class="codeline" id="line-356"><code>		t1.Square(&amp;t1)</code></span>
+<span class="codeline" id="line-357"><code>	}</code></span>
+<span class="codeline" id="line-358"><code>	t1.Multiply(&amp;t1, &amp;t0)     // 2^20 - 1</code></span>
+<span class="codeline" id="line-359"><code>	t2.Square(&amp;t1)            // 2^21 - 2</code></span>
+<span class="codeline" id="line-360"><code>	for i := 1; i &lt; 20; i++ { // 2^40 - 2^20</code></span>
+<span class="codeline" id="line-361"><code>		t2.Square(&amp;t2)</code></span>
+<span class="codeline" id="line-362"><code>	}</code></span>
+<span class="codeline" id="line-363"><code>	t1.Multiply(&amp;t2, &amp;t1)     // 2^40 - 1</code></span>
+<span class="codeline" id="line-364"><code>	t1.Square(&amp;t1)            // 2^41 - 2</code></span>
+<span class="codeline" id="line-365"><code>	for i := 1; i &lt; 10; i++ { // 2^50 - 2^10</code></span>
+<span class="codeline" id="line-366"><code>		t1.Square(&amp;t1)</code></span>
+<span class="codeline" id="line-367"><code>	}</code></span>
+<span class="codeline" id="line-368"><code>	t0.Multiply(&amp;t1, &amp;t0)     // 2^50 - 1</code></span>
+<span class="codeline" id="line-369"><code>	t1.Square(&amp;t0)            // 2^51 - 2</code></span>
+<span class="codeline" id="line-370"><code>	for i := 1; i &lt; 50; i++ { // 2^100 - 2^50</code></span>
+<span class="codeline" id="line-371"><code>		t1.Square(&amp;t1)</code></span>
+<span class="codeline" id="line-372"><code>	}</code></span>
+<span class="codeline" id="line-373"><code>	t1.Multiply(&amp;t1, &amp;t0)      // 2^100 - 1</code></span>
+<span class="codeline" id="line-374"><code>	t2.Square(&amp;t1)             // 2^101 - 2</code></span>
+<span class="codeline" id="line-375"><code>	for i := 1; i &lt; 100; i++ { // 2^200 - 2^100</code></span>
+<span class="codeline" id="line-376"><code>		t2.Square(&amp;t2)</code></span>
+<span class="codeline" id="line-377"><code>	}</code></span>
+<span class="codeline" id="line-378"><code>	t1.Multiply(&amp;t2, &amp;t1)     // 2^200 - 1</code></span>
+<span class="codeline" id="line-379"><code>	t1.Square(&amp;t1)            // 2^201 - 2</code></span>
+<span class="codeline" id="line-380"><code>	for i := 1; i &lt; 50; i++ { // 2^250 - 2^50</code></span>
+<span class="codeline" id="line-381"><code>		t1.Square(&amp;t1)</code></span>
+<span class="codeline" id="line-382"><code>	}</code></span>
+<span class="codeline" id="line-383"><code>	t0.Multiply(&amp;t1, &amp;t0)     // 2^250 - 1</code></span>
+<span class="codeline" id="line-384"><code>	t0.Square(&amp;t0)            // 2^251 - 2</code></span>
+<span class="codeline" id="line-385"><code>	t0.Square(&amp;t0)            // 2^252 - 4</code></span>
+<span class="codeline" id="line-386"><code>	return v.Multiply(&amp;t0, x) // 2^252 - 3 -&gt; x^(2^252-3)</code></span>
+<span class="codeline" id="line-387"><code>}</code></span>
+<span class="codeline" id="line-388"><code></code></span>
+<span class="codeline" id="line-389"><code>// sqrtM1 is 2^((p-1)/4), which squared is equal to -1 by Euler's Criterion.</code></span>
+<span class="codeline" id="line-390"><code>var sqrtM1 = &amp;Element{1718705420411056, 234908883556509,</code></span>
+<span class="codeline" id="line-391"><code>	2233514472574048, 2117202627021982, 765476049583133}</code></span>
+<span class="codeline" id="line-392"><code></code></span>
+<span class="codeline" id="line-393"><code>// SqrtRatio sets r to the non-negative square root of the ratio of u and v.</code></span>
+<span class="codeline" id="line-394"><code>//</code></span>
+<span class="codeline" id="line-395"><code>// If u/v is square, SqrtRatio returns r and 1. If u/v is not square, SqrtRatio</code></span>
+<span class="codeline" id="line-396"><code>// sets r according to Section 4.3 of draft-irtf-cfrg-ristretto255-decaf448-00,</code></span>
+<span class="codeline" id="line-397"><code>// and returns r and 0.</code></span>
+<span class="codeline" id="line-398"><code>func (r *Element) SqrtRatio(u, v *Element) (R *Element, wasSquare int) {</code></span>
+<span class="codeline" id="line-399"><code>	t0 := new(Element)</code></span>
+<span class="codeline" id="line-400"><code></code></span>
+<span class="codeline" id="line-401"><code>	// r = (u * v3) * (u * v7)^((p-5)/8)</code></span>
+<span class="codeline" id="line-402"><code>	v2 := new(Element).Square(v)</code></span>
+<span class="codeline" id="line-403"><code>	uv3 := new(Element).Multiply(u, t0.Multiply(v2, v))</code></span>
+<span class="codeline" id="line-404"><code>	uv7 := new(Element).Multiply(uv3, t0.Square(v2))</code></span>
+<span class="codeline" id="line-405"><code>	rr := new(Element).Multiply(uv3, t0.Pow22523(uv7))</code></span>
+<span class="codeline" id="line-406"><code></code></span>
+<span class="codeline" id="line-407"><code>	check := new(Element).Multiply(v, t0.Square(rr)) // check = v * r^2</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>	uNeg := new(Element).Negate(u)</code></span>
+<span class="codeline" id="line-410"><code>	correctSignSqrt := check.Equal(u)</code></span>
+<span class="codeline" id="line-411"><code>	flippedSignSqrt := check.Equal(uNeg)</code></span>
+<span class="codeline" id="line-412"><code>	flippedSignSqrtI := check.Equal(t0.Multiply(uNeg, sqrtM1))</code></span>
+<span class="codeline" id="line-413"><code></code></span>
+<span class="codeline" id="line-414"><code>	rPrime := new(Element).Multiply(rr, sqrtM1) // r_prime = SQRT_M1 * r</code></span>
+<span class="codeline" id="line-415"><code>	// r = CT_SELECT(r_prime IF flipped_sign_sqrt | flipped_sign_sqrt_i ELSE r)</code></span>
+<span class="codeline" id="line-416"><code>	rr.Select(rPrime, rr, flippedSignSqrt|flippedSignSqrtI)</code></span>
+<span class="codeline" id="line-417"><code></code></span>
+<span class="codeline" id="line-418"><code>	r.Absolute(rr) // Choose the nonnegative square root.</code></span>
+<span class="codeline" id="line-419"><code>	return r, correctSignSqrt | flippedSignSqrt</code></span>
+<span class="codeline" id="line-420"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

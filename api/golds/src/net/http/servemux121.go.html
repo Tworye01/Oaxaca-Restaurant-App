@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: servemux121.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	servemux121.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package http</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// This file implements ServeMux behavior as in Go 1.21.</code></span>
+<span class="codeline" id="line-8"><code>// The behavior is controlled by a GODEBUG setting.</code></span>
+<span class="codeline" id="line-9"><code>// Most of this code is derived from commit 08e35cc334.</code></span>
+<span class="codeline" id="line-10"><code>// Changes are minimal: aside from the different receiver type,</code></span>
+<span class="codeline" id="line-11"><code>// they mostly involve renaming functions, usually by unexporting them.</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>import (</code></span>
+<span class="codeline" id="line-14"><code>	"internal/godebug"</code></span>
+<span class="codeline" id="line-15"><code>	"net/url"</code></span>
+<span class="codeline" id="line-16"><code>	"sort"</code></span>
+<span class="codeline" id="line-17"><code>	"strings"</code></span>
+<span class="codeline" id="line-18"><code>	"sync"</code></span>
+<span class="codeline" id="line-19"><code>)</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>var httpmuxgo121 = godebug.New("httpmuxgo121")</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>var use121 bool</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>// Read httpmuxgo121 once at startup, since dealing with changes to it during</code></span>
+<span class="codeline" id="line-26"><code>// program execution is too complex and error-prone.</code></span>
+<span class="codeline" id="line-27"><code>func init() {</code></span>
+<span class="codeline" id="line-28"><code>	if httpmuxgo121.Value() == "1" {</code></span>
+<span class="codeline" id="line-29"><code>		use121 = true</code></span>
+<span class="codeline" id="line-30"><code>		httpmuxgo121.IncNonDefault()</code></span>
+<span class="codeline" id="line-31"><code>	}</code></span>
+<span class="codeline" id="line-32"><code>}</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>// serveMux121 holds the state of a ServeMux needed for Go 1.21 behavior.</code></span>
+<span class="codeline" id="line-35"><code>type serveMux121 struct {</code></span>
+<span class="codeline" id="line-36"><code>	mu    sync.RWMutex</code></span>
+<span class="codeline" id="line-37"><code>	m     map[string]muxEntry</code></span>
+<span class="codeline" id="line-38"><code>	es    []muxEntry // slice of entries sorted from longest to shortest.</code></span>
+<span class="codeline" id="line-39"><code>	hosts bool       // whether any patterns contain hostnames</code></span>
+<span class="codeline" id="line-40"><code>}</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>type muxEntry struct {</code></span>
+<span class="codeline" id="line-43"><code>	h       Handler</code></span>
+<span class="codeline" id="line-44"><code>	pattern string</code></span>
+<span class="codeline" id="line-45"><code>}</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>// Formerly ServeMux.Handle.</code></span>
+<span class="codeline" id="line-48"><code>func (mux *serveMux121) handle(pattern string, handler Handler) {</code></span>
+<span class="codeline" id="line-49"><code>	mux.mu.Lock()</code></span>
+<span class="codeline" id="line-50"><code>	defer mux.mu.Unlock()</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>	if pattern == "" {</code></span>
+<span class="codeline" id="line-53"><code>		panic("http: invalid pattern")</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code>	if handler == nil {</code></span>
+<span class="codeline" id="line-56"><code>		panic("http: nil handler")</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	if _, exist := mux.m[pattern]; exist {</code></span>
+<span class="codeline" id="line-59"><code>		panic("http: multiple registrations for " + pattern)</code></span>
+<span class="codeline" id="line-60"><code>	}</code></span>
+<span class="codeline" id="line-61"><code></code></span>
+<span class="codeline" id="line-62"><code>	if mux.m == nil {</code></span>
+<span class="codeline" id="line-63"><code>		mux.m = make(map[string]muxEntry)</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code>	e := muxEntry{h: handler, pattern: pattern}</code></span>
+<span class="codeline" id="line-66"><code>	mux.m[pattern] = e</code></span>
+<span class="codeline" id="line-67"><code>	if pattern[len(pattern)-1] == '/' {</code></span>
+<span class="codeline" id="line-68"><code>		mux.es = appendSorted(mux.es, e)</code></span>
+<span class="codeline" id="line-69"><code>	}</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>	if pattern[0] != '/' {</code></span>
+<span class="codeline" id="line-72"><code>		mux.hosts = true</code></span>
+<span class="codeline" id="line-73"><code>	}</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>func appendSorted(es []muxEntry, e muxEntry) []muxEntry {</code></span>
+<span class="codeline" id="line-77"><code>	n := len(es)</code></span>
+<span class="codeline" id="line-78"><code>	i := sort.Search(n, func(i int) bool {</code></span>
+<span class="codeline" id="line-79"><code>		return len(es[i].pattern) &lt; len(e.pattern)</code></span>
+<span class="codeline" id="line-80"><code>	})</code></span>
+<span class="codeline" id="line-81"><code>	if i == n {</code></span>
+<span class="codeline" id="line-82"><code>		return append(es, e)</code></span>
+<span class="codeline" id="line-83"><code>	}</code></span>
+<span class="codeline" id="line-84"><code>	// we now know that i points at where we want to insert</code></span>
+<span class="codeline" id="line-85"><code>	es = append(es, muxEntry{}) // try to grow the slice in place, any entry works.</code></span>
+<span class="codeline" id="line-86"><code>	copy(es[i+1:], es[i:])      // Move shorter entries down</code></span>
+<span class="codeline" id="line-87"><code>	es[i] = e</code></span>
+<span class="codeline" id="line-88"><code>	return es</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>// Formerly ServeMux.HandleFunc.</code></span>
+<span class="codeline" id="line-92"><code>func (mux *serveMux121) handleFunc(pattern string, handler func(ResponseWriter, *Request)) {</code></span>
+<span class="codeline" id="line-93"><code>	if handler == nil {</code></span>
+<span class="codeline" id="line-94"><code>		panic("http: nil handler")</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>	mux.handle(pattern, HandlerFunc(handler))</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>// Formerly ServeMux.Handler.</code></span>
+<span class="codeline" id="line-100"><code>func (mux *serveMux121) findHandler(r *Request) (h Handler, pattern string) {</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>	// CONNECT requests are not canonicalized.</code></span>
+<span class="codeline" id="line-103"><code>	if r.Method == "CONNECT" {</code></span>
+<span class="codeline" id="line-104"><code>		// If r.URL.Path is /tree and its handler is not registered,</code></span>
+<span class="codeline" id="line-105"><code>		// the /tree -&gt; /tree/ redirect applies to CONNECT requests</code></span>
+<span class="codeline" id="line-106"><code>		// but the path canonicalization does not.</code></span>
+<span class="codeline" id="line-107"><code>		if u, ok := mux.redirectToPathSlash(r.URL.Host, r.URL.Path, r.URL); ok {</code></span>
+<span class="codeline" id="line-108"><code>			return RedirectHandler(u.String(), StatusMovedPermanently), u.Path</code></span>
+<span class="codeline" id="line-109"><code>		}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>		return mux.handler(r.Host, r.URL.Path)</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>	// All other requests have any port stripped and path cleaned</code></span>
+<span class="codeline" id="line-115"><code>	// before passing to mux.handler.</code></span>
+<span class="codeline" id="line-116"><code>	host := stripHostPort(r.Host)</code></span>
+<span class="codeline" id="line-117"><code>	path := cleanPath(r.URL.Path)</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>	// If the given path is /tree and its handler is not registered,</code></span>
+<span class="codeline" id="line-120"><code>	// redirect for /tree/.</code></span>
+<span class="codeline" id="line-121"><code>	if u, ok := mux.redirectToPathSlash(host, path, r.URL); ok {</code></span>
+<span class="codeline" id="line-122"><code>		return RedirectHandler(u.String(), StatusMovedPermanently), u.Path</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>	if path != r.URL.Path {</code></span>
+<span class="codeline" id="line-126"><code>		_, pattern = mux.handler(host, path)</code></span>
+<span class="codeline" id="line-127"><code>		u := &amp;url.URL{Path: path, RawQuery: r.URL.RawQuery}</code></span>
+<span class="codeline" id="line-128"><code>		return RedirectHandler(u.String(), StatusMovedPermanently), pattern</code></span>
+<span class="codeline" id="line-129"><code>	}</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>	return mux.handler(host, r.URL.Path)</code></span>
+<span class="codeline" id="line-132"><code>}</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>// handler is the main implementation of findHandler.</code></span>
+<span class="codeline" id="line-135"><code>// The path is known to be in canonical form, except for CONNECT methods.</code></span>
+<span class="codeline" id="line-136"><code>func (mux *serveMux121) handler(host, path string) (h Handler, pattern string) {</code></span>
+<span class="codeline" id="line-137"><code>	mux.mu.RLock()</code></span>
+<span class="codeline" id="line-138"><code>	defer mux.mu.RUnlock()</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>	// Host-specific pattern takes precedence over generic ones</code></span>
+<span class="codeline" id="line-141"><code>	if mux.hosts {</code></span>
+<span class="codeline" id="line-142"><code>		h, pattern = mux.match(host + path)</code></span>
+<span class="codeline" id="line-143"><code>	}</code></span>
+<span class="codeline" id="line-144"><code>	if h == nil {</code></span>
+<span class="codeline" id="line-145"><code>		h, pattern = mux.match(path)</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	if h == nil {</code></span>
+<span class="codeline" id="line-148"><code>		h, pattern = NotFoundHandler(), ""</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code>	return</code></span>
+<span class="codeline" id="line-151"><code>}</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>// Find a handler on a handler map given a path string.</code></span>
+<span class="codeline" id="line-154"><code>// Most-specific (longest) pattern wins.</code></span>
+<span class="codeline" id="line-155"><code>func (mux *serveMux121) match(path string) (h Handler, pattern string) {</code></span>
+<span class="codeline" id="line-156"><code>	// Check for exact match first.</code></span>
+<span class="codeline" id="line-157"><code>	v, ok := mux.m[path]</code></span>
+<span class="codeline" id="line-158"><code>	if ok {</code></span>
+<span class="codeline" id="line-159"><code>		return v.h, v.pattern</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>	// Check for longest valid match.  mux.es contains all patterns</code></span>
+<span class="codeline" id="line-163"><code>	// that end in / sorted from longest to shortest.</code></span>
+<span class="codeline" id="line-164"><code>	for _, e := range mux.es {</code></span>
+<span class="codeline" id="line-165"><code>		if strings.HasPrefix(path, e.pattern) {</code></span>
+<span class="codeline" id="line-166"><code>			return e.h, e.pattern</code></span>
+<span class="codeline" id="line-167"><code>		}</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code>	return nil, ""</code></span>
+<span class="codeline" id="line-170"><code>}</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>// redirectToPathSlash determines if the given path needs appending "/" to it.</code></span>
+<span class="codeline" id="line-173"><code>// This occurs when a handler for path + "/" was already registered, but</code></span>
+<span class="codeline" id="line-174"><code>// not for path itself. If the path needs appending to, it creates a new</code></span>
+<span class="codeline" id="line-175"><code>// URL, setting the path to u.Path + "/" and returning true to indicate so.</code></span>
+<span class="codeline" id="line-176"><code>func (mux *serveMux121) redirectToPathSlash(host, path string, u *url.URL) (*url.URL, bool) {</code></span>
+<span class="codeline" id="line-177"><code>	mux.mu.RLock()</code></span>
+<span class="codeline" id="line-178"><code>	shouldRedirect := mux.shouldRedirectRLocked(host, path)</code></span>
+<span class="codeline" id="line-179"><code>	mux.mu.RUnlock()</code></span>
+<span class="codeline" id="line-180"><code>	if !shouldRedirect {</code></span>
+<span class="codeline" id="line-181"><code>		return u, false</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	path = path + "/"</code></span>
+<span class="codeline" id="line-184"><code>	u = &amp;url.URL{Path: path, RawQuery: u.RawQuery}</code></span>
+<span class="codeline" id="line-185"><code>	return u, true</code></span>
+<span class="codeline" id="line-186"><code>}</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>// shouldRedirectRLocked reports whether the given path and host should be redirected to</code></span>
+<span class="codeline" id="line-189"><code>// path+"/". This should happen if a handler is registered for path+"/" but</code></span>
+<span class="codeline" id="line-190"><code>// not path -- see comments at ServeMux.</code></span>
+<span class="codeline" id="line-191"><code>func (mux *serveMux121) shouldRedirectRLocked(host, path string) bool {</code></span>
+<span class="codeline" id="line-192"><code>	p := []string{path, host + path}</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>	for _, c := range p {</code></span>
+<span class="codeline" id="line-195"><code>		if _, exist := mux.m[c]; exist {</code></span>
+<span class="codeline" id="line-196"><code>			return false</code></span>
+<span class="codeline" id="line-197"><code>		}</code></span>
+<span class="codeline" id="line-198"><code>	}</code></span>
+<span class="codeline" id="line-199"><code></code></span>
+<span class="codeline" id="line-200"><code>	n := len(path)</code></span>
+<span class="codeline" id="line-201"><code>	if n == 0 {</code></span>
+<span class="codeline" id="line-202"><code>		return false</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code>	for _, c := range p {</code></span>
+<span class="codeline" id="line-205"><code>		if _, exist := mux.m[c+"/"]; exist {</code></span>
+<span class="codeline" id="line-206"><code>			return path[n-1] != '/'</code></span>
+<span class="codeline" id="line-207"><code>		}</code></span>
+<span class="codeline" id="line-208"><code>	}</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>	return false</code></span>
+<span class="codeline" id="line-211"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

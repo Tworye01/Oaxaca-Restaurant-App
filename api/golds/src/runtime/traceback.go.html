@@ -1,0 +1,1673 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: traceback.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	traceback.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/abi"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/bytealg"</code></span>
+<span class="codeline" id="line-10"><code>	"internal/goarch"</code></span>
+<span class="codeline" id="line-11"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-12"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>// The code in this file implements stack trace walking for all architectures.</code></span>
+<span class="codeline" id="line-16"><code>// The most important fact about a given architecture is whether it uses a link register.</code></span>
+<span class="codeline" id="line-17"><code>// On systems with link registers, the prologue for a non-leaf function stores the</code></span>
+<span class="codeline" id="line-18"><code>// incoming value of LR at the bottom of the newly allocated stack frame.</code></span>
+<span class="codeline" id="line-19"><code>// On systems without link registers (x86), the architecture pushes a return PC during</code></span>
+<span class="codeline" id="line-20"><code>// the call instruction, so the return PC ends up above the stack frame.</code></span>
+<span class="codeline" id="line-21"><code>// In this file, the return PC is always called LR, no matter how it was found.</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>const usesLR = sys.MinFrameSize &gt; 0</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>const (</code></span>
+<span class="codeline" id="line-26"><code>	// tracebackInnerFrames is the number of innermost frames to print in a</code></span>
+<span class="codeline" id="line-27"><code>	// stack trace. The total maximum frames is tracebackInnerFrames +</code></span>
+<span class="codeline" id="line-28"><code>	// tracebackOuterFrames.</code></span>
+<span class="codeline" id="line-29"><code>	tracebackInnerFrames = 50</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>	// tracebackOuterFrames is the number of outermost frames to print in a</code></span>
+<span class="codeline" id="line-32"><code>	// stack trace.</code></span>
+<span class="codeline" id="line-33"><code>	tracebackOuterFrames = 50</code></span>
+<span class="codeline" id="line-34"><code>)</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// unwindFlags control the behavior of various unwinders.</code></span>
+<span class="codeline" id="line-37"><code>type unwindFlags uint8</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>const (</code></span>
+<span class="codeline" id="line-40"><code>	// unwindPrintErrors indicates that if unwinding encounters an error, it</code></span>
+<span class="codeline" id="line-41"><code>	// should print a message and stop without throwing. This is used for things</code></span>
+<span class="codeline" id="line-42"><code>	// like stack printing, where it's better to get incomplete information than</code></span>
+<span class="codeline" id="line-43"><code>	// to crash. This is also used in situations where everything may not be</code></span>
+<span class="codeline" id="line-44"><code>	// stopped nicely and the stack walk may not be able to complete, such as</code></span>
+<span class="codeline" id="line-45"><code>	// during profiling signals or during a crash.</code></span>
+<span class="codeline" id="line-46"><code>	//</code></span>
+<span class="codeline" id="line-47"><code>	// If neither unwindPrintErrors or unwindSilentErrors are set, unwinding</code></span>
+<span class="codeline" id="line-48"><code>	// performs extra consistency checks and throws on any error.</code></span>
+<span class="codeline" id="line-49"><code>	//</code></span>
+<span class="codeline" id="line-50"><code>	// Note that there are a small number of fatal situations that will throw</code></span>
+<span class="codeline" id="line-51"><code>	// regardless of unwindPrintErrors or unwindSilentErrors.</code></span>
+<span class="codeline" id="line-52"><code>	unwindPrintErrors unwindFlags = 1 &lt;&lt; iota</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>	// unwindSilentErrors silently ignores errors during unwinding.</code></span>
+<span class="codeline" id="line-55"><code>	unwindSilentErrors</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>	// unwindTrap indicates that the initial PC and SP are from a trap, not a</code></span>
+<span class="codeline" id="line-58"><code>	// return PC from a call.</code></span>
+<span class="codeline" id="line-59"><code>	//</code></span>
+<span class="codeline" id="line-60"><code>	// The unwindTrap flag is updated during unwinding. If set, frame.pc is the</code></span>
+<span class="codeline" id="line-61"><code>	// address of a faulting instruction instead of the return address of a</code></span>
+<span class="codeline" id="line-62"><code>	// call. It also means the liveness at pc may not be known.</code></span>
+<span class="codeline" id="line-63"><code>	//</code></span>
+<span class="codeline" id="line-64"><code>	// TODO: Distinguish frame.continpc, which is really the stack map PC, from</code></span>
+<span class="codeline" id="line-65"><code>	// the actual continuation PC, which is computed differently depending on</code></span>
+<span class="codeline" id="line-66"><code>	// this flag and a few other things.</code></span>
+<span class="codeline" id="line-67"><code>	unwindTrap</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>	// unwindJumpStack indicates that, if the traceback is on a system stack, it</code></span>
+<span class="codeline" id="line-70"><code>	// should resume tracing at the user stack when the system stack is</code></span>
+<span class="codeline" id="line-71"><code>	// exhausted.</code></span>
+<span class="codeline" id="line-72"><code>	unwindJumpStack</code></span>
+<span class="codeline" id="line-73"><code>)</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>// An unwinder iterates the physical stack frames of a Go sack.</code></span>
+<span class="codeline" id="line-76"><code>//</code></span>
+<span class="codeline" id="line-77"><code>// Typical use of an unwinder looks like:</code></span>
+<span class="codeline" id="line-78"><code>//</code></span>
+<span class="codeline" id="line-79"><code>//	var u unwinder</code></span>
+<span class="codeline" id="line-80"><code>//	for u.init(gp, 0); u.valid(); u.next() {</code></span>
+<span class="codeline" id="line-81"><code>//		// ... use frame info in u ...</code></span>
+<span class="codeline" id="line-82"><code>//	}</code></span>
+<span class="codeline" id="line-83"><code>//</code></span>
+<span class="codeline" id="line-84"><code>// Implementation note: This is carefully structured to be pointer-free because</code></span>
+<span class="codeline" id="line-85"><code>// tracebacks happen in places that disallow write barriers (e.g., signals).</code></span>
+<span class="codeline" id="line-86"><code>// Even if this is stack-allocated, its pointer-receiver methods don't know that</code></span>
+<span class="codeline" id="line-87"><code>// their receiver is on the stack, so they still emit write barriers. Here we</code></span>
+<span class="codeline" id="line-88"><code>// address that by carefully avoiding any pointers in this type. Another</code></span>
+<span class="codeline" id="line-89"><code>// approach would be to split this into a mutable part that's passed by pointer</code></span>
+<span class="codeline" id="line-90"><code>// but contains no pointers itself and an immutable part that's passed and</code></span>
+<span class="codeline" id="line-91"><code>// returned by value and can contain pointers. We could potentially hide that</code></span>
+<span class="codeline" id="line-92"><code>// we're doing that in trivial methods that are inlined into the caller that has</code></span>
+<span class="codeline" id="line-93"><code>// the stack allocation, but that's fragile.</code></span>
+<span class="codeline" id="line-94"><code>type unwinder struct {</code></span>
+<span class="codeline" id="line-95"><code>	// frame is the current physical stack frame, or all 0s if</code></span>
+<span class="codeline" id="line-96"><code>	// there is no frame.</code></span>
+<span class="codeline" id="line-97"><code>	frame stkframe</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>	// g is the G who's stack is being unwound. If the</code></span>
+<span class="codeline" id="line-100"><code>	// unwindJumpStack flag is set and the unwinder jumps stacks,</code></span>
+<span class="codeline" id="line-101"><code>	// this will be different from the initial G.</code></span>
+<span class="codeline" id="line-102"><code>	g guintptr</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	// cgoCtxt is the index into g.cgoCtxt of the next frame on the cgo stack.</code></span>
+<span class="codeline" id="line-105"><code>	// The cgo stack is unwound in tandem with the Go stack as we find marker frames.</code></span>
+<span class="codeline" id="line-106"><code>	cgoCtxt int</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	// calleeFuncID is the function ID of the caller of the current</code></span>
+<span class="codeline" id="line-109"><code>	// frame.</code></span>
+<span class="codeline" id="line-110"><code>	calleeFuncID abi.FuncID</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	// flags are the flags to this unwind. Some of these are updated as we</code></span>
+<span class="codeline" id="line-113"><code>	// unwind (see the flags documentation).</code></span>
+<span class="codeline" id="line-114"><code>	flags unwindFlags</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>// init initializes u to start unwinding gp's stack and positions the</code></span>
+<span class="codeline" id="line-118"><code>// iterator on gp's innermost frame. gp must not be the current G.</code></span>
+<span class="codeline" id="line-119"><code>//</code></span>
+<span class="codeline" id="line-120"><code>// A single unwinder can be reused for multiple unwinds.</code></span>
+<span class="codeline" id="line-121"><code>func (u *unwinder) init(gp *g, flags unwindFlags) {</code></span>
+<span class="codeline" id="line-122"><code>	// Implementation note: This starts the iterator on the first frame and we</code></span>
+<span class="codeline" id="line-123"><code>	// provide a "valid" method. Alternatively, this could start in a "before</code></span>
+<span class="codeline" id="line-124"><code>	// the first frame" state and "next" could return whether it was able to</code></span>
+<span class="codeline" id="line-125"><code>	// move to the next frame, but that's both more awkward to use in a "for"</code></span>
+<span class="codeline" id="line-126"><code>	// loop and is harder to implement because we have to do things differently</code></span>
+<span class="codeline" id="line-127"><code>	// for the first frame.</code></span>
+<span class="codeline" id="line-128"><code>	u.initAt(^uintptr(0), ^uintptr(0), ^uintptr(0), gp, flags)</code></span>
+<span class="codeline" id="line-129"><code>}</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>func (u *unwinder) initAt(pc0, sp0, lr0 uintptr, gp *g, flags unwindFlags) {</code></span>
+<span class="codeline" id="line-132"><code>	// Don't call this "g"; it's too easy get "g" and "gp" confused.</code></span>
+<span class="codeline" id="line-133"><code>	if ourg := getg(); ourg == gp &amp;&amp; ourg == ourg.m.curg {</code></span>
+<span class="codeline" id="line-134"><code>		// The starting sp has been passed in as a uintptr, and the caller may</code></span>
+<span class="codeline" id="line-135"><code>		// have other uintptr-typed stack references as well.</code></span>
+<span class="codeline" id="line-136"><code>		// If during one of the calls that got us here or during one of the</code></span>
+<span class="codeline" id="line-137"><code>		// callbacks below the stack must be grown, all these uintptr references</code></span>
+<span class="codeline" id="line-138"><code>		// to the stack will not be updated, and traceback will continue</code></span>
+<span class="codeline" id="line-139"><code>		// to inspect the old stack memory, which may no longer be valid.</code></span>
+<span class="codeline" id="line-140"><code>		// Even if all the variables were updated correctly, it is not clear that</code></span>
+<span class="codeline" id="line-141"><code>		// we want to expose a traceback that begins on one stack and ends</code></span>
+<span class="codeline" id="line-142"><code>		// on another stack. That could confuse callers quite a bit.</code></span>
+<span class="codeline" id="line-143"><code>		// Instead, we require that initAt and any other function that</code></span>
+<span class="codeline" id="line-144"><code>		// accepts an sp for the current goroutine (typically obtained by</code></span>
+<span class="codeline" id="line-145"><code>		// calling getcallersp) must not run on that goroutine's stack but</code></span>
+<span class="codeline" id="line-146"><code>		// instead on the g0 stack.</code></span>
+<span class="codeline" id="line-147"><code>		throw("cannot trace user goroutine on its own stack")</code></span>
+<span class="codeline" id="line-148"><code>	}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>	if pc0 == ^uintptr(0) &amp;&amp; sp0 == ^uintptr(0) { // Signal to fetch saved values from gp.</code></span>
+<span class="codeline" id="line-151"><code>		if gp.syscallsp != 0 {</code></span>
+<span class="codeline" id="line-152"><code>			pc0 = gp.syscallpc</code></span>
+<span class="codeline" id="line-153"><code>			sp0 = gp.syscallsp</code></span>
+<span class="codeline" id="line-154"><code>			if usesLR {</code></span>
+<span class="codeline" id="line-155"><code>				lr0 = 0</code></span>
+<span class="codeline" id="line-156"><code>			}</code></span>
+<span class="codeline" id="line-157"><code>		} else {</code></span>
+<span class="codeline" id="line-158"><code>			pc0 = gp.sched.pc</code></span>
+<span class="codeline" id="line-159"><code>			sp0 = gp.sched.sp</code></span>
+<span class="codeline" id="line-160"><code>			if usesLR {</code></span>
+<span class="codeline" id="line-161"><code>				lr0 = gp.sched.lr</code></span>
+<span class="codeline" id="line-162"><code>			}</code></span>
+<span class="codeline" id="line-163"><code>		}</code></span>
+<span class="codeline" id="line-164"><code>	}</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>	var frame stkframe</code></span>
+<span class="codeline" id="line-167"><code>	frame.pc = pc0</code></span>
+<span class="codeline" id="line-168"><code>	frame.sp = sp0</code></span>
+<span class="codeline" id="line-169"><code>	if usesLR {</code></span>
+<span class="codeline" id="line-170"><code>		frame.lr = lr0</code></span>
+<span class="codeline" id="line-171"><code>	}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>	// If the PC is zero, it's likely a nil function call.</code></span>
+<span class="codeline" id="line-174"><code>	// Start in the caller's frame.</code></span>
+<span class="codeline" id="line-175"><code>	if frame.pc == 0 {</code></span>
+<span class="codeline" id="line-176"><code>		if usesLR {</code></span>
+<span class="codeline" id="line-177"><code>			frame.pc = *(*uintptr)(unsafe.Pointer(frame.sp))</code></span>
+<span class="codeline" id="line-178"><code>			frame.lr = 0</code></span>
+<span class="codeline" id="line-179"><code>		} else {</code></span>
+<span class="codeline" id="line-180"><code>			frame.pc = *(*uintptr)(unsafe.Pointer(frame.sp))</code></span>
+<span class="codeline" id="line-181"><code>			frame.sp += goarch.PtrSize</code></span>
+<span class="codeline" id="line-182"><code>		}</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code></code></span>
+<span class="codeline" id="line-185"><code>	// runtime/internal/atomic functions call into kernel helpers on</code></span>
+<span class="codeline" id="line-186"><code>	// arm &lt; 7. See runtime/internal/atomic/sys_linux_arm.s.</code></span>
+<span class="codeline" id="line-187"><code>	//</code></span>
+<span class="codeline" id="line-188"><code>	// Start in the caller's frame.</code></span>
+<span class="codeline" id="line-189"><code>	if GOARCH == "arm" &amp;&amp; goarm &lt; 7 &amp;&amp; GOOS == "linux" &amp;&amp; frame.pc&amp;0xffff0000 == 0xffff0000 {</code></span>
+<span class="codeline" id="line-190"><code>		// Note that the calls are simple BL without pushing the return</code></span>
+<span class="codeline" id="line-191"><code>		// address, so we use LR directly.</code></span>
+<span class="codeline" id="line-192"><code>		//</code></span>
+<span class="codeline" id="line-193"><code>		// The kernel helpers are frameless leaf functions, so SP and</code></span>
+<span class="codeline" id="line-194"><code>		// LR are not touched.</code></span>
+<span class="codeline" id="line-195"><code>		frame.pc = frame.lr</code></span>
+<span class="codeline" id="line-196"><code>		frame.lr = 0</code></span>
+<span class="codeline" id="line-197"><code>	}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>	f := findfunc(frame.pc)</code></span>
+<span class="codeline" id="line-200"><code>	if !f.valid() {</code></span>
+<span class="codeline" id="line-201"><code>		if flags&amp;unwindSilentErrors == 0 {</code></span>
+<span class="codeline" id="line-202"><code>			print("runtime: g ", gp.goid, " gp=", gp, ": unknown pc ", hex(frame.pc), "\n")</code></span>
+<span class="codeline" id="line-203"><code>			tracebackHexdump(gp.stack, &amp;frame, 0)</code></span>
+<span class="codeline" id="line-204"><code>		}</code></span>
+<span class="codeline" id="line-205"><code>		if flags&amp;(unwindPrintErrors|unwindSilentErrors) == 0 {</code></span>
+<span class="codeline" id="line-206"><code>			throw("unknown pc")</code></span>
+<span class="codeline" id="line-207"><code>		}</code></span>
+<span class="codeline" id="line-208"><code>		*u = unwinder{}</code></span>
+<span class="codeline" id="line-209"><code>		return</code></span>
+<span class="codeline" id="line-210"><code>	}</code></span>
+<span class="codeline" id="line-211"><code>	frame.fn = f</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>	// Populate the unwinder.</code></span>
+<span class="codeline" id="line-214"><code>	*u = unwinder{</code></span>
+<span class="codeline" id="line-215"><code>		frame:        frame,</code></span>
+<span class="codeline" id="line-216"><code>		g:            gp.guintptr(),</code></span>
+<span class="codeline" id="line-217"><code>		cgoCtxt:      len(gp.cgoCtxt) - 1,</code></span>
+<span class="codeline" id="line-218"><code>		calleeFuncID: abi.FuncIDNormal,</code></span>
+<span class="codeline" id="line-219"><code>		flags:        flags,</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>	isSyscall := frame.pc == pc0 &amp;&amp; frame.sp == sp0 &amp;&amp; pc0 == gp.syscallpc &amp;&amp; sp0 == gp.syscallsp</code></span>
+<span class="codeline" id="line-223"><code>	u.resolveInternal(true, isSyscall)</code></span>
+<span class="codeline" id="line-224"><code>}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>func (u *unwinder) valid() bool {</code></span>
+<span class="codeline" id="line-227"><code>	return u.frame.pc != 0</code></span>
+<span class="codeline" id="line-228"><code>}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>// resolveInternal fills in u.frame based on u.frame.fn, pc, and sp.</code></span>
+<span class="codeline" id="line-231"><code>//</code></span>
+<span class="codeline" id="line-232"><code>// innermost indicates that this is the first resolve on this stack. If</code></span>
+<span class="codeline" id="line-233"><code>// innermost is set, isSyscall indicates that the PC/SP was retrieved from</code></span>
+<span class="codeline" id="line-234"><code>// gp.syscall*; this is otherwise ignored.</code></span>
+<span class="codeline" id="line-235"><code>//</code></span>
+<span class="codeline" id="line-236"><code>// On entry, u.frame contains:</code></span>
+<span class="codeline" id="line-237"><code>//   - fn is the running function.</code></span>
+<span class="codeline" id="line-238"><code>//   - pc is the PC in the running function.</code></span>
+<span class="codeline" id="line-239"><code>//   - sp is the stack pointer at that program counter.</code></span>
+<span class="codeline" id="line-240"><code>//   - For the innermost frame on LR machines, lr is the program counter that called fn.</code></span>
+<span class="codeline" id="line-241"><code>//</code></span>
+<span class="codeline" id="line-242"><code>// On return, u.frame contains:</code></span>
+<span class="codeline" id="line-243"><code>//   - fp is the stack pointer of the caller.</code></span>
+<span class="codeline" id="line-244"><code>//   - lr is the program counter that called fn.</code></span>
+<span class="codeline" id="line-245"><code>//   - varp, argp, and continpc are populated for the current frame.</code></span>
+<span class="codeline" id="line-246"><code>//</code></span>
+<span class="codeline" id="line-247"><code>// If fn is a stack-jumping function, resolveInternal can change the entire</code></span>
+<span class="codeline" id="line-248"><code>// frame state to follow that stack jump.</code></span>
+<span class="codeline" id="line-249"><code>//</code></span>
+<span class="codeline" id="line-250"><code>// This is internal to unwinder.</code></span>
+<span class="codeline" id="line-251"><code>func (u *unwinder) resolveInternal(innermost, isSyscall bool) {</code></span>
+<span class="codeline" id="line-252"><code>	frame := &amp;u.frame</code></span>
+<span class="codeline" id="line-253"><code>	gp := u.g.ptr()</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>	f := frame.fn</code></span>
+<span class="codeline" id="line-256"><code>	if f.pcsp == 0 {</code></span>
+<span class="codeline" id="line-257"><code>		// No frame information, must be external function, like race support.</code></span>
+<span class="codeline" id="line-258"><code>		// See golang.org/issue/13568.</code></span>
+<span class="codeline" id="line-259"><code>		u.finishInternal()</code></span>
+<span class="codeline" id="line-260"><code>		return</code></span>
+<span class="codeline" id="line-261"><code>	}</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>	// Compute function info flags.</code></span>
+<span class="codeline" id="line-264"><code>	flag := f.flag</code></span>
+<span class="codeline" id="line-265"><code>	if f.funcID == abi.FuncID_cgocallback {</code></span>
+<span class="codeline" id="line-266"><code>		// cgocallback does write SP to switch from the g0 to the curg stack,</code></span>
+<span class="codeline" id="line-267"><code>		// but it carefully arranges that during the transition BOTH stacks</code></span>
+<span class="codeline" id="line-268"><code>		// have cgocallback frame valid for unwinding through.</code></span>
+<span class="codeline" id="line-269"><code>		// So we don't need to exclude it with the other SP-writing functions.</code></span>
+<span class="codeline" id="line-270"><code>		flag &amp;^= abi.FuncFlagSPWrite</code></span>
+<span class="codeline" id="line-271"><code>	}</code></span>
+<span class="codeline" id="line-272"><code>	if isSyscall {</code></span>
+<span class="codeline" id="line-273"><code>		// Some Syscall functions write to SP, but they do so only after</code></span>
+<span class="codeline" id="line-274"><code>		// saving the entry PC/SP using entersyscall.</code></span>
+<span class="codeline" id="line-275"><code>		// Since we are using the entry PC/SP, the later SP write doesn't matter.</code></span>
+<span class="codeline" id="line-276"><code>		flag &amp;^= abi.FuncFlagSPWrite</code></span>
+<span class="codeline" id="line-277"><code>	}</code></span>
+<span class="codeline" id="line-278"><code></code></span>
+<span class="codeline" id="line-279"><code>	// Found an actual function.</code></span>
+<span class="codeline" id="line-280"><code>	// Derive frame pointer.</code></span>
+<span class="codeline" id="line-281"><code>	if frame.fp == 0 {</code></span>
+<span class="codeline" id="line-282"><code>		// Jump over system stack transitions. If we're on g0 and there's a user</code></span>
+<span class="codeline" id="line-283"><code>		// goroutine, try to jump. Otherwise this is a regular call.</code></span>
+<span class="codeline" id="line-284"><code>		// We also defensively check that this won't switch M's on us,</code></span>
+<span class="codeline" id="line-285"><code>		// which could happen at critical points in the scheduler.</code></span>
+<span class="codeline" id="line-286"><code>		// This ensures gp.m doesn't change from a stack jump.</code></span>
+<span class="codeline" id="line-287"><code>		if u.flags&amp;unwindJumpStack != 0 &amp;&amp; gp == gp.m.g0 &amp;&amp; gp.m.curg != nil &amp;&amp; gp.m.curg.m == gp.m {</code></span>
+<span class="codeline" id="line-288"><code>			switch f.funcID {</code></span>
+<span class="codeline" id="line-289"><code>			case abi.FuncID_morestack:</code></span>
+<span class="codeline" id="line-290"><code>				// morestack does not return normally -- newstack()</code></span>
+<span class="codeline" id="line-291"><code>				// gogo's to curg.sched. Match that.</code></span>
+<span class="codeline" id="line-292"><code>				// This keeps morestack() from showing up in the backtrace,</code></span>
+<span class="codeline" id="line-293"><code>				// but that makes some sense since it'll never be returned</code></span>
+<span class="codeline" id="line-294"><code>				// to.</code></span>
+<span class="codeline" id="line-295"><code>				gp = gp.m.curg</code></span>
+<span class="codeline" id="line-296"><code>				u.g.set(gp)</code></span>
+<span class="codeline" id="line-297"><code>				frame.pc = gp.sched.pc</code></span>
+<span class="codeline" id="line-298"><code>				frame.fn = findfunc(frame.pc)</code></span>
+<span class="codeline" id="line-299"><code>				f = frame.fn</code></span>
+<span class="codeline" id="line-300"><code>				flag = f.flag</code></span>
+<span class="codeline" id="line-301"><code>				frame.lr = gp.sched.lr</code></span>
+<span class="codeline" id="line-302"><code>				frame.sp = gp.sched.sp</code></span>
+<span class="codeline" id="line-303"><code>				u.cgoCtxt = len(gp.cgoCtxt) - 1</code></span>
+<span class="codeline" id="line-304"><code>			case abi.FuncID_systemstack:</code></span>
+<span class="codeline" id="line-305"><code>				// systemstack returns normally, so just follow the</code></span>
+<span class="codeline" id="line-306"><code>				// stack transition.</code></span>
+<span class="codeline" id="line-307"><code>				if usesLR &amp;&amp; funcspdelta(f, frame.pc) == 0 {</code></span>
+<span class="codeline" id="line-308"><code>					// We're at the function prologue and the stack</code></span>
+<span class="codeline" id="line-309"><code>					// switch hasn't happened, or epilogue where we're</code></span>
+<span class="codeline" id="line-310"><code>					// about to return. Just unwind normally.</code></span>
+<span class="codeline" id="line-311"><code>					// Do this only on LR machines because on x86</code></span>
+<span class="codeline" id="line-312"><code>					// systemstack doesn't have an SP delta (the CALL</code></span>
+<span class="codeline" id="line-313"><code>					// instruction opens the frame), therefore no way</code></span>
+<span class="codeline" id="line-314"><code>					// to check.</code></span>
+<span class="codeline" id="line-315"><code>					flag &amp;^= abi.FuncFlagSPWrite</code></span>
+<span class="codeline" id="line-316"><code>					break</code></span>
+<span class="codeline" id="line-317"><code>				}</code></span>
+<span class="codeline" id="line-318"><code>				gp = gp.m.curg</code></span>
+<span class="codeline" id="line-319"><code>				u.g.set(gp)</code></span>
+<span class="codeline" id="line-320"><code>				frame.sp = gp.sched.sp</code></span>
+<span class="codeline" id="line-321"><code>				u.cgoCtxt = len(gp.cgoCtxt) - 1</code></span>
+<span class="codeline" id="line-322"><code>				flag &amp;^= abi.FuncFlagSPWrite</code></span>
+<span class="codeline" id="line-323"><code>			}</code></span>
+<span class="codeline" id="line-324"><code>		}</code></span>
+<span class="codeline" id="line-325"><code>		frame.fp = frame.sp + uintptr(funcspdelta(f, frame.pc))</code></span>
+<span class="codeline" id="line-326"><code>		if !usesLR {</code></span>
+<span class="codeline" id="line-327"><code>			// On x86, call instruction pushes return PC before entering new function.</code></span>
+<span class="codeline" id="line-328"><code>			frame.fp += goarch.PtrSize</code></span>
+<span class="codeline" id="line-329"><code>		}</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>	// Derive link register.</code></span>
+<span class="codeline" id="line-333"><code>	if flag&amp;abi.FuncFlagTopFrame != 0 {</code></span>
+<span class="codeline" id="line-334"><code>		// This function marks the top of the stack. Stop the traceback.</code></span>
+<span class="codeline" id="line-335"><code>		frame.lr = 0</code></span>
+<span class="codeline" id="line-336"><code>	} else if flag&amp;abi.FuncFlagSPWrite != 0 &amp;&amp; (!innermost || u.flags&amp;(unwindPrintErrors|unwindSilentErrors) != 0) {</code></span>
+<span class="codeline" id="line-337"><code>		// The function we are in does a write to SP that we don't know</code></span>
+<span class="codeline" id="line-338"><code>		// how to encode in the spdelta table. Examples include context</code></span>
+<span class="codeline" id="line-339"><code>		// switch routines like runtime.gogo but also any code that switches</code></span>
+<span class="codeline" id="line-340"><code>		// to the g0 stack to run host C code.</code></span>
+<span class="codeline" id="line-341"><code>		// We can't reliably unwind the SP (we might not even be on</code></span>
+<span class="codeline" id="line-342"><code>		// the stack we think we are), so stop the traceback here.</code></span>
+<span class="codeline" id="line-343"><code>		//</code></span>
+<span class="codeline" id="line-344"><code>		// The one exception (encoded in the complex condition above) is that</code></span>
+<span class="codeline" id="line-345"><code>		// we assume if we're doing a precise traceback, and this is the</code></span>
+<span class="codeline" id="line-346"><code>		// innermost frame, that the SPWRITE function voluntarily preempted itself on entry</code></span>
+<span class="codeline" id="line-347"><code>		// during the stack growth check. In that case, the function has</code></span>
+<span class="codeline" id="line-348"><code>		// not yet had a chance to do any writes to SP and is safe to unwind.</code></span>
+<span class="codeline" id="line-349"><code>		// isAsyncSafePoint does not allow assembly functions to be async preempted,</code></span>
+<span class="codeline" id="line-350"><code>		// and preemptPark double-checks that SPWRITE functions are not async preempted.</code></span>
+<span class="codeline" id="line-351"><code>		// So for GC stack traversal, we can safely ignore SPWRITE for the innermost frame,</code></span>
+<span class="codeline" id="line-352"><code>		// but farther up the stack we'd better not find any.</code></span>
+<span class="codeline" id="line-353"><code>		// This is somewhat imprecise because we're just guessing that we're in the stack</code></span>
+<span class="codeline" id="line-354"><code>		// growth check. It would be better if SPWRITE were encoded in the spdelta</code></span>
+<span class="codeline" id="line-355"><code>		// table so we would know for sure that we were still in safe code.</code></span>
+<span class="codeline" id="line-356"><code>		//</code></span>
+<span class="codeline" id="line-357"><code>		// uSE uPE inn | action</code></span>
+<span class="codeline" id="line-358"><code>		//  T   _   _  | frame.lr = 0</code></span>
+<span class="codeline" id="line-359"><code>		//  F   T   _  | frame.lr = 0</code></span>
+<span class="codeline" id="line-360"><code>		//  F   F   F  | print; panic</code></span>
+<span class="codeline" id="line-361"><code>		//  F   F   T  | ignore SPWrite</code></span>
+<span class="codeline" id="line-362"><code>		if u.flags&amp;(unwindPrintErrors|unwindSilentErrors) == 0 &amp;&amp; !innermost {</code></span>
+<span class="codeline" id="line-363"><code>			println("traceback: unexpected SPWRITE function", funcname(f))</code></span>
+<span class="codeline" id="line-364"><code>			throw("traceback")</code></span>
+<span class="codeline" id="line-365"><code>		}</code></span>
+<span class="codeline" id="line-366"><code>		frame.lr = 0</code></span>
+<span class="codeline" id="line-367"><code>	} else {</code></span>
+<span class="codeline" id="line-368"><code>		var lrPtr uintptr</code></span>
+<span class="codeline" id="line-369"><code>		if usesLR {</code></span>
+<span class="codeline" id="line-370"><code>			if innermost &amp;&amp; frame.sp &lt; frame.fp || frame.lr == 0 {</code></span>
+<span class="codeline" id="line-371"><code>				lrPtr = frame.sp</code></span>
+<span class="codeline" id="line-372"><code>				frame.lr = *(*uintptr)(unsafe.Pointer(lrPtr))</code></span>
+<span class="codeline" id="line-373"><code>			}</code></span>
+<span class="codeline" id="line-374"><code>		} else {</code></span>
+<span class="codeline" id="line-375"><code>			if frame.lr == 0 {</code></span>
+<span class="codeline" id="line-376"><code>				lrPtr = frame.fp - goarch.PtrSize</code></span>
+<span class="codeline" id="line-377"><code>				frame.lr = *(*uintptr)(unsafe.Pointer(lrPtr))</code></span>
+<span class="codeline" id="line-378"><code>			}</code></span>
+<span class="codeline" id="line-379"><code>		}</code></span>
+<span class="codeline" id="line-380"><code>	}</code></span>
+<span class="codeline" id="line-381"><code></code></span>
+<span class="codeline" id="line-382"><code>	frame.varp = frame.fp</code></span>
+<span class="codeline" id="line-383"><code>	if !usesLR {</code></span>
+<span class="codeline" id="line-384"><code>		// On x86, call instruction pushes return PC before entering new function.</code></span>
+<span class="codeline" id="line-385"><code>		frame.varp -= goarch.PtrSize</code></span>
+<span class="codeline" id="line-386"><code>	}</code></span>
+<span class="codeline" id="line-387"><code></code></span>
+<span class="codeline" id="line-388"><code>	// For architectures with frame pointers, if there's</code></span>
+<span class="codeline" id="line-389"><code>	// a frame, then there's a saved frame pointer here.</code></span>
+<span class="codeline" id="line-390"><code>	//</code></span>
+<span class="codeline" id="line-391"><code>	// NOTE: This code is not as general as it looks.</code></span>
+<span class="codeline" id="line-392"><code>	// On x86, the ABI is to save the frame pointer word at the</code></span>
+<span class="codeline" id="line-393"><code>	// top of the stack frame, so we have to back down over it.</code></span>
+<span class="codeline" id="line-394"><code>	// On arm64, the frame pointer should be at the bottom of</code></span>
+<span class="codeline" id="line-395"><code>	// the stack (with R29 (aka FP) = RSP), in which case we would</code></span>
+<span class="codeline" id="line-396"><code>	// not want to do the subtraction here. But we started out without</code></span>
+<span class="codeline" id="line-397"><code>	// any frame pointer, and when we wanted to add it, we didn't</code></span>
+<span class="codeline" id="line-398"><code>	// want to break all the assembly doing direct writes to 8(RSP)</code></span>
+<span class="codeline" id="line-399"><code>	// to set the first parameter to a called function.</code></span>
+<span class="codeline" id="line-400"><code>	// So we decided to write the FP link *below* the stack pointer</code></span>
+<span class="codeline" id="line-401"><code>	// (with R29 = RSP - 8 in Go functions).</code></span>
+<span class="codeline" id="line-402"><code>	// This is technically ABI-compatible but not standard.</code></span>
+<span class="codeline" id="line-403"><code>	// And it happens to end up mimicking the x86 layout.</code></span>
+<span class="codeline" id="line-404"><code>	// Other architectures may make different decisions.</code></span>
+<span class="codeline" id="line-405"><code>	if frame.varp &gt; frame.sp &amp;&amp; framepointer_enabled {</code></span>
+<span class="codeline" id="line-406"><code>		frame.varp -= goarch.PtrSize</code></span>
+<span class="codeline" id="line-407"><code>	}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>	frame.argp = frame.fp + sys.MinFrameSize</code></span>
+<span class="codeline" id="line-410"><code></code></span>
+<span class="codeline" id="line-411"><code>	// Determine frame's 'continuation PC', where it can continue.</code></span>
+<span class="codeline" id="line-412"><code>	// Normally this is the return address on the stack, but if sigpanic</code></span>
+<span class="codeline" id="line-413"><code>	// is immediately below this function on the stack, then the frame</code></span>
+<span class="codeline" id="line-414"><code>	// stopped executing due to a trap, and frame.pc is probably not</code></span>
+<span class="codeline" id="line-415"><code>	// a safe point for looking up liveness information. In this panicking case,</code></span>
+<span class="codeline" id="line-416"><code>	// the function either doesn't return at all (if it has no defers or if the</code></span>
+<span class="codeline" id="line-417"><code>	// defers do not recover) or it returns from one of the calls to</code></span>
+<span class="codeline" id="line-418"><code>	// deferproc a second time (if the corresponding deferred func recovers).</code></span>
+<span class="codeline" id="line-419"><code>	// In the latter case, use a deferreturn call site as the continuation pc.</code></span>
+<span class="codeline" id="line-420"><code>	frame.continpc = frame.pc</code></span>
+<span class="codeline" id="line-421"><code>	if u.calleeFuncID == abi.FuncID_sigpanic {</code></span>
+<span class="codeline" id="line-422"><code>		if frame.fn.deferreturn != 0 {</code></span>
+<span class="codeline" id="line-423"><code>			frame.continpc = frame.fn.entry() + uintptr(frame.fn.deferreturn) + 1</code></span>
+<span class="codeline" id="line-424"><code>			// Note: this may perhaps keep return variables alive longer than</code></span>
+<span class="codeline" id="line-425"><code>			// strictly necessary, as we are using "function has a defer statement"</code></span>
+<span class="codeline" id="line-426"><code>			// as a proxy for "function actually deferred something". It seems</code></span>
+<span class="codeline" id="line-427"><code>			// to be a minor drawback. (We used to actually look through the</code></span>
+<span class="codeline" id="line-428"><code>			// gp._defer for a defer corresponding to this function, but that</code></span>
+<span class="codeline" id="line-429"><code>			// is hard to do with defer records on the stack during a stack copy.)</code></span>
+<span class="codeline" id="line-430"><code>			// Note: the +1 is to offset the -1 that</code></span>
+<span class="codeline" id="line-431"><code>			// stack.go:getStackMap does to back up a return</code></span>
+<span class="codeline" id="line-432"><code>			// address make sure the pc is in the CALL instruction.</code></span>
+<span class="codeline" id="line-433"><code>		} else {</code></span>
+<span class="codeline" id="line-434"><code>			frame.continpc = 0</code></span>
+<span class="codeline" id="line-435"><code>		}</code></span>
+<span class="codeline" id="line-436"><code>	}</code></span>
+<span class="codeline" id="line-437"><code>}</code></span>
+<span class="codeline" id="line-438"><code></code></span>
+<span class="codeline" id="line-439"><code>func (u *unwinder) next() {</code></span>
+<span class="codeline" id="line-440"><code>	frame := &amp;u.frame</code></span>
+<span class="codeline" id="line-441"><code>	f := frame.fn</code></span>
+<span class="codeline" id="line-442"><code>	gp := u.g.ptr()</code></span>
+<span class="codeline" id="line-443"><code></code></span>
+<span class="codeline" id="line-444"><code>	// Do not unwind past the bottom of the stack.</code></span>
+<span class="codeline" id="line-445"><code>	if frame.lr == 0 {</code></span>
+<span class="codeline" id="line-446"><code>		u.finishInternal()</code></span>
+<span class="codeline" id="line-447"><code>		return</code></span>
+<span class="codeline" id="line-448"><code>	}</code></span>
+<span class="codeline" id="line-449"><code>	flr := findfunc(frame.lr)</code></span>
+<span class="codeline" id="line-450"><code>	if !flr.valid() {</code></span>
+<span class="codeline" id="line-451"><code>		// This happens if you get a profiling interrupt at just the wrong time.</code></span>
+<span class="codeline" id="line-452"><code>		// In that context it is okay to stop early.</code></span>
+<span class="codeline" id="line-453"><code>		// But if no error flags are set, we're doing a garbage collection and must</code></span>
+<span class="codeline" id="line-454"><code>		// get everything, so crash loudly.</code></span>
+<span class="codeline" id="line-455"><code>		fail := u.flags&amp;(unwindPrintErrors|unwindSilentErrors) == 0</code></span>
+<span class="codeline" id="line-456"><code>		doPrint := u.flags&amp;unwindSilentErrors == 0</code></span>
+<span class="codeline" id="line-457"><code>		if doPrint &amp;&amp; gp.m.incgo &amp;&amp; f.funcID == abi.FuncID_sigpanic {</code></span>
+<span class="codeline" id="line-458"><code>			// We can inject sigpanic</code></span>
+<span class="codeline" id="line-459"><code>			// calls directly into C code,</code></span>
+<span class="codeline" id="line-460"><code>			// in which case we'll see a C</code></span>
+<span class="codeline" id="line-461"><code>			// return PC. Don't complain.</code></span>
+<span class="codeline" id="line-462"><code>			doPrint = false</code></span>
+<span class="codeline" id="line-463"><code>		}</code></span>
+<span class="codeline" id="line-464"><code>		if fail || doPrint {</code></span>
+<span class="codeline" id="line-465"><code>			print("runtime: g ", gp.goid, ": unexpected return pc for ", funcname(f), " called from ", hex(frame.lr), "\n")</code></span>
+<span class="codeline" id="line-466"><code>			tracebackHexdump(gp.stack, frame, 0)</code></span>
+<span class="codeline" id="line-467"><code>		}</code></span>
+<span class="codeline" id="line-468"><code>		if fail {</code></span>
+<span class="codeline" id="line-469"><code>			throw("unknown caller pc")</code></span>
+<span class="codeline" id="line-470"><code>		}</code></span>
+<span class="codeline" id="line-471"><code>		frame.lr = 0</code></span>
+<span class="codeline" id="line-472"><code>		u.finishInternal()</code></span>
+<span class="codeline" id="line-473"><code>		return</code></span>
+<span class="codeline" id="line-474"><code>	}</code></span>
+<span class="codeline" id="line-475"><code></code></span>
+<span class="codeline" id="line-476"><code>	if frame.pc == frame.lr &amp;&amp; frame.sp == frame.fp {</code></span>
+<span class="codeline" id="line-477"><code>		// If the next frame is identical to the current frame, we cannot make progress.</code></span>
+<span class="codeline" id="line-478"><code>		print("runtime: traceback stuck. pc=", hex(frame.pc), " sp=", hex(frame.sp), "\n")</code></span>
+<span class="codeline" id="line-479"><code>		tracebackHexdump(gp.stack, frame, frame.sp)</code></span>
+<span class="codeline" id="line-480"><code>		throw("traceback stuck")</code></span>
+<span class="codeline" id="line-481"><code>	}</code></span>
+<span class="codeline" id="line-482"><code></code></span>
+<span class="codeline" id="line-483"><code>	injectedCall := f.funcID == abi.FuncID_sigpanic || f.funcID == abi.FuncID_asyncPreempt || f.funcID == abi.FuncID_debugCallV2</code></span>
+<span class="codeline" id="line-484"><code>	if injectedCall {</code></span>
+<span class="codeline" id="line-485"><code>		u.flags |= unwindTrap</code></span>
+<span class="codeline" id="line-486"><code>	} else {</code></span>
+<span class="codeline" id="line-487"><code>		u.flags &amp;^= unwindTrap</code></span>
+<span class="codeline" id="line-488"><code>	}</code></span>
+<span class="codeline" id="line-489"><code></code></span>
+<span class="codeline" id="line-490"><code>	// Unwind to next frame.</code></span>
+<span class="codeline" id="line-491"><code>	u.calleeFuncID = f.funcID</code></span>
+<span class="codeline" id="line-492"><code>	frame.fn = flr</code></span>
+<span class="codeline" id="line-493"><code>	frame.pc = frame.lr</code></span>
+<span class="codeline" id="line-494"><code>	frame.lr = 0</code></span>
+<span class="codeline" id="line-495"><code>	frame.sp = frame.fp</code></span>
+<span class="codeline" id="line-496"><code>	frame.fp = 0</code></span>
+<span class="codeline" id="line-497"><code></code></span>
+<span class="codeline" id="line-498"><code>	// On link register architectures, sighandler saves the LR on stack</code></span>
+<span class="codeline" id="line-499"><code>	// before faking a call.</code></span>
+<span class="codeline" id="line-500"><code>	if usesLR &amp;&amp; injectedCall {</code></span>
+<span class="codeline" id="line-501"><code>		x := *(*uintptr)(unsafe.Pointer(frame.sp))</code></span>
+<span class="codeline" id="line-502"><code>		frame.sp += alignUp(sys.MinFrameSize, sys.StackAlign)</code></span>
+<span class="codeline" id="line-503"><code>		f = findfunc(frame.pc)</code></span>
+<span class="codeline" id="line-504"><code>		frame.fn = f</code></span>
+<span class="codeline" id="line-505"><code>		if !f.valid() {</code></span>
+<span class="codeline" id="line-506"><code>			frame.pc = x</code></span>
+<span class="codeline" id="line-507"><code>		} else if funcspdelta(f, frame.pc) == 0 {</code></span>
+<span class="codeline" id="line-508"><code>			frame.lr = x</code></span>
+<span class="codeline" id="line-509"><code>		}</code></span>
+<span class="codeline" id="line-510"><code>	}</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>	u.resolveInternal(false, false)</code></span>
+<span class="codeline" id="line-513"><code>}</code></span>
+<span class="codeline" id="line-514"><code></code></span>
+<span class="codeline" id="line-515"><code>// finishInternal is an unwinder-internal helper called after the stack has been</code></span>
+<span class="codeline" id="line-516"><code>// exhausted. It sets the unwinder to an invalid state and checks that it</code></span>
+<span class="codeline" id="line-517"><code>// successfully unwound the entire stack.</code></span>
+<span class="codeline" id="line-518"><code>func (u *unwinder) finishInternal() {</code></span>
+<span class="codeline" id="line-519"><code>	u.frame.pc = 0</code></span>
+<span class="codeline" id="line-520"><code></code></span>
+<span class="codeline" id="line-521"><code>	// Note that panic != nil is okay here: there can be leftover panics,</code></span>
+<span class="codeline" id="line-522"><code>	// because the defers on the panic stack do not nest in frame order as</code></span>
+<span class="codeline" id="line-523"><code>	// they do on the defer stack. If you have:</code></span>
+<span class="codeline" id="line-524"><code>	//</code></span>
+<span class="codeline" id="line-525"><code>	//	frame 1 defers d1</code></span>
+<span class="codeline" id="line-526"><code>	//	frame 2 defers d2</code></span>
+<span class="codeline" id="line-527"><code>	//	frame 3 defers d3</code></span>
+<span class="codeline" id="line-528"><code>	//	frame 4 panics</code></span>
+<span class="codeline" id="line-529"><code>	//	frame 4's panic starts running defers</code></span>
+<span class="codeline" id="line-530"><code>	//	frame 5, running d3, defers d4</code></span>
+<span class="codeline" id="line-531"><code>	//	frame 5 panics</code></span>
+<span class="codeline" id="line-532"><code>	//	frame 5's panic starts running defers</code></span>
+<span class="codeline" id="line-533"><code>	//	frame 6, running d4, garbage collects</code></span>
+<span class="codeline" id="line-534"><code>	//	frame 6, running d2, garbage collects</code></span>
+<span class="codeline" id="line-535"><code>	//</code></span>
+<span class="codeline" id="line-536"><code>	// During the execution of d4, the panic stack is d4 -&gt; d3, which</code></span>
+<span class="codeline" id="line-537"><code>	// is nested properly, and we'll treat frame 3 as resumable, because we</code></span>
+<span class="codeline" id="line-538"><code>	// can find d3. (And in fact frame 3 is resumable. If d4 recovers</code></span>
+<span class="codeline" id="line-539"><code>	// and frame 5 continues running, d3, d3 can recover and we'll</code></span>
+<span class="codeline" id="line-540"><code>	// resume execution in (returning from) frame 3.)</code></span>
+<span class="codeline" id="line-541"><code>	//</code></span>
+<span class="codeline" id="line-542"><code>	// During the execution of d2, however, the panic stack is d2 -&gt; d3,</code></span>
+<span class="codeline" id="line-543"><code>	// which is inverted. The scan will match d2 to frame 2 but having</code></span>
+<span class="codeline" id="line-544"><code>	// d2 on the stack until then means it will not match d3 to frame 3.</code></span>
+<span class="codeline" id="line-545"><code>	// This is okay: if we're running d2, then all the defers after d2 have</code></span>
+<span class="codeline" id="line-546"><code>	// completed and their corresponding frames are dead. Not finding d3</code></span>
+<span class="codeline" id="line-547"><code>	// for frame 3 means we'll set frame 3's continpc == 0, which is correct</code></span>
+<span class="codeline" id="line-548"><code>	// (frame 3 is dead). At the end of the walk the panic stack can thus</code></span>
+<span class="codeline" id="line-549"><code>	// contain defers (d3 in this case) for dead frames. The inversion here</code></span>
+<span class="codeline" id="line-550"><code>	// always indicates a dead frame, and the effect of the inversion on the</code></span>
+<span class="codeline" id="line-551"><code>	// scan is to hide those dead frames, so the scan is still okay:</code></span>
+<span class="codeline" id="line-552"><code>	// what's left on the panic stack are exactly (and only) the dead frames.</code></span>
+<span class="codeline" id="line-553"><code>	//</code></span>
+<span class="codeline" id="line-554"><code>	// We require callback != nil here because only when callback != nil</code></span>
+<span class="codeline" id="line-555"><code>	// do we know that gentraceback is being called in a "must be correct"</code></span>
+<span class="codeline" id="line-556"><code>	// context as opposed to a "best effort" context. The tracebacks with</code></span>
+<span class="codeline" id="line-557"><code>	// callbacks only happen when everything is stopped nicely.</code></span>
+<span class="codeline" id="line-558"><code>	// At other times, such as when gathering a stack for a profiling signal</code></span>
+<span class="codeline" id="line-559"><code>	// or when printing a traceback during a crash, everything may not be</code></span>
+<span class="codeline" id="line-560"><code>	// stopped nicely, and the stack walk may not be able to complete.</code></span>
+<span class="codeline" id="line-561"><code>	gp := u.g.ptr()</code></span>
+<span class="codeline" id="line-562"><code>	if u.flags&amp;(unwindPrintErrors|unwindSilentErrors) == 0 &amp;&amp; u.frame.sp != gp.stktopsp {</code></span>
+<span class="codeline" id="line-563"><code>		print("runtime: g", gp.goid, ": frame.sp=", hex(u.frame.sp), " top=", hex(gp.stktopsp), "\n")</code></span>
+<span class="codeline" id="line-564"><code>		print("\tstack=[", hex(gp.stack.lo), "-", hex(gp.stack.hi), "\n")</code></span>
+<span class="codeline" id="line-565"><code>		throw("traceback did not unwind completely")</code></span>
+<span class="codeline" id="line-566"><code>	}</code></span>
+<span class="codeline" id="line-567"><code>}</code></span>
+<span class="codeline" id="line-568"><code></code></span>
+<span class="codeline" id="line-569"><code>// symPC returns the PC that should be used for symbolizing the current frame.</code></span>
+<span class="codeline" id="line-570"><code>// Specifically, this is the PC of the last instruction executed in this frame.</code></span>
+<span class="codeline" id="line-571"><code>//</code></span>
+<span class="codeline" id="line-572"><code>// If this frame did a normal call, then frame.pc is a return PC, so this will</code></span>
+<span class="codeline" id="line-573"><code>// return frame.pc-1, which points into the CALL instruction. If the frame was</code></span>
+<span class="codeline" id="line-574"><code>// interrupted by a signal (e.g., profiler, segv, etc) then frame.pc is for the</code></span>
+<span class="codeline" id="line-575"><code>// trapped instruction, so this returns frame.pc. See issue #34123. Finally,</code></span>
+<span class="codeline" id="line-576"><code>// frame.pc can be at function entry when the frame is initialized without</code></span>
+<span class="codeline" id="line-577"><code>// actually running code, like in runtime.mstart, in which case this returns</code></span>
+<span class="codeline" id="line-578"><code>// frame.pc because that's the best we can do.</code></span>
+<span class="codeline" id="line-579"><code>func (u *unwinder) symPC() uintptr {</code></span>
+<span class="codeline" id="line-580"><code>	if u.flags&amp;unwindTrap == 0 &amp;&amp; u.frame.pc &gt; u.frame.fn.entry() {</code></span>
+<span class="codeline" id="line-581"><code>		// Regular call.</code></span>
+<span class="codeline" id="line-582"><code>		return u.frame.pc - 1</code></span>
+<span class="codeline" id="line-583"><code>	}</code></span>
+<span class="codeline" id="line-584"><code>	// Trapping instruction or we're at the function entry point.</code></span>
+<span class="codeline" id="line-585"><code>	return u.frame.pc</code></span>
+<span class="codeline" id="line-586"><code>}</code></span>
+<span class="codeline" id="line-587"><code></code></span>
+<span class="codeline" id="line-588"><code>// cgoCallers populates pcBuf with the cgo callers of the current frame using</code></span>
+<span class="codeline" id="line-589"><code>// the registered cgo unwinder. It returns the number of PCs written to pcBuf.</code></span>
+<span class="codeline" id="line-590"><code>// If the current frame is not a cgo frame or if there's no registered cgo</code></span>
+<span class="codeline" id="line-591"><code>// unwinder, it returns 0.</code></span>
+<span class="codeline" id="line-592"><code>func (u *unwinder) cgoCallers(pcBuf []uintptr) int {</code></span>
+<span class="codeline" id="line-593"><code>	if cgoTraceback == nil || u.frame.fn.funcID != abi.FuncID_cgocallback || u.cgoCtxt &lt; 0 {</code></span>
+<span class="codeline" id="line-594"><code>		// We don't have a cgo unwinder (typical case), or we do but we're not</code></span>
+<span class="codeline" id="line-595"><code>		// in a cgo frame or we're out of cgo context.</code></span>
+<span class="codeline" id="line-596"><code>		return 0</code></span>
+<span class="codeline" id="line-597"><code>	}</code></span>
+<span class="codeline" id="line-598"><code></code></span>
+<span class="codeline" id="line-599"><code>	ctxt := u.g.ptr().cgoCtxt[u.cgoCtxt]</code></span>
+<span class="codeline" id="line-600"><code>	u.cgoCtxt--</code></span>
+<span class="codeline" id="line-601"><code>	cgoContextPCs(ctxt, pcBuf)</code></span>
+<span class="codeline" id="line-602"><code>	for i, pc := range pcBuf {</code></span>
+<span class="codeline" id="line-603"><code>		if pc == 0 {</code></span>
+<span class="codeline" id="line-604"><code>			return i</code></span>
+<span class="codeline" id="line-605"><code>		}</code></span>
+<span class="codeline" id="line-606"><code>	}</code></span>
+<span class="codeline" id="line-607"><code>	return len(pcBuf)</code></span>
+<span class="codeline" id="line-608"><code>}</code></span>
+<span class="codeline" id="line-609"><code></code></span>
+<span class="codeline" id="line-610"><code>// tracebackPCs populates pcBuf with the return addresses for each frame from u</code></span>
+<span class="codeline" id="line-611"><code>// and returns the number of PCs written to pcBuf. The returned PCs correspond</code></span>
+<span class="codeline" id="line-612"><code>// to "logical frames" rather than "physical frames"; that is if A is inlined</code></span>
+<span class="codeline" id="line-613"><code>// into B, this will still return a PCs for both A and B. This also includes PCs</code></span>
+<span class="codeline" id="line-614"><code>// generated by the cgo unwinder, if one is registered.</code></span>
+<span class="codeline" id="line-615"><code>//</code></span>
+<span class="codeline" id="line-616"><code>// If skip != 0, this skips this many logical frames.</code></span>
+<span class="codeline" id="line-617"><code>//</code></span>
+<span class="codeline" id="line-618"><code>// Callers should set the unwindSilentErrors flag on u.</code></span>
+<span class="codeline" id="line-619"><code>func tracebackPCs(u *unwinder, skip int, pcBuf []uintptr) int {</code></span>
+<span class="codeline" id="line-620"><code>	var cgoBuf [32]uintptr</code></span>
+<span class="codeline" id="line-621"><code>	n := 0</code></span>
+<span class="codeline" id="line-622"><code>	for ; n &lt; len(pcBuf) &amp;&amp; u.valid(); u.next() {</code></span>
+<span class="codeline" id="line-623"><code>		f := u.frame.fn</code></span>
+<span class="codeline" id="line-624"><code>		cgoN := u.cgoCallers(cgoBuf[:])</code></span>
+<span class="codeline" id="line-625"><code></code></span>
+<span class="codeline" id="line-626"><code>		// TODO: Why does &amp;u.cache cause u to escape? (Same in traceback2)</code></span>
+<span class="codeline" id="line-627"><code>		for iu, uf := newInlineUnwinder(f, u.symPC()); n &lt; len(pcBuf) &amp;&amp; uf.valid(); uf = iu.next(uf) {</code></span>
+<span class="codeline" id="line-628"><code>			sf := iu.srcFunc(uf)</code></span>
+<span class="codeline" id="line-629"><code>			if sf.funcID == abi.FuncIDWrapper &amp;&amp; elideWrapperCalling(u.calleeFuncID) {</code></span>
+<span class="codeline" id="line-630"><code>				// ignore wrappers</code></span>
+<span class="codeline" id="line-631"><code>			} else if skip &gt; 0 {</code></span>
+<span class="codeline" id="line-632"><code>				skip--</code></span>
+<span class="codeline" id="line-633"><code>			} else {</code></span>
+<span class="codeline" id="line-634"><code>				// Callers expect the pc buffer to contain return addresses</code></span>
+<span class="codeline" id="line-635"><code>				// and do the -1 themselves, so we add 1 to the call PC to</code></span>
+<span class="codeline" id="line-636"><code>				// create a return PC.</code></span>
+<span class="codeline" id="line-637"><code>				pcBuf[n] = uf.pc + 1</code></span>
+<span class="codeline" id="line-638"><code>				n++</code></span>
+<span class="codeline" id="line-639"><code>			}</code></span>
+<span class="codeline" id="line-640"><code>			u.calleeFuncID = sf.funcID</code></span>
+<span class="codeline" id="line-641"><code>		}</code></span>
+<span class="codeline" id="line-642"><code>		// Add cgo frames (if we're done skipping over the requested number of</code></span>
+<span class="codeline" id="line-643"><code>		// Go frames).</code></span>
+<span class="codeline" id="line-644"><code>		if skip == 0 {</code></span>
+<span class="codeline" id="line-645"><code>			n += copy(pcBuf[n:], cgoBuf[:cgoN])</code></span>
+<span class="codeline" id="line-646"><code>		}</code></span>
+<span class="codeline" id="line-647"><code>	}</code></span>
+<span class="codeline" id="line-648"><code>	return n</code></span>
+<span class="codeline" id="line-649"><code>}</code></span>
+<span class="codeline" id="line-650"><code></code></span>
+<span class="codeline" id="line-651"><code>// printArgs prints function arguments in traceback.</code></span>
+<span class="codeline" id="line-652"><code>func printArgs(f funcInfo, argp unsafe.Pointer, pc uintptr) {</code></span>
+<span class="codeline" id="line-653"><code>	// The "instruction" of argument printing is encoded in _FUNCDATA_ArgInfo.</code></span>
+<span class="codeline" id="line-654"><code>	// See cmd/compile/internal/ssagen.emitArgInfo for the description of the</code></span>
+<span class="codeline" id="line-655"><code>	// encoding.</code></span>
+<span class="codeline" id="line-656"><code>	// These constants need to be in sync with the compiler.</code></span>
+<span class="codeline" id="line-657"><code>	const (</code></span>
+<span class="codeline" id="line-658"><code>		_endSeq         = 0xff</code></span>
+<span class="codeline" id="line-659"><code>		_startAgg       = 0xfe</code></span>
+<span class="codeline" id="line-660"><code>		_endAgg         = 0xfd</code></span>
+<span class="codeline" id="line-661"><code>		_dotdotdot      = 0xfc</code></span>
+<span class="codeline" id="line-662"><code>		_offsetTooLarge = 0xfb</code></span>
+<span class="codeline" id="line-663"><code>	)</code></span>
+<span class="codeline" id="line-664"><code></code></span>
+<span class="codeline" id="line-665"><code>	const (</code></span>
+<span class="codeline" id="line-666"><code>		limit    = 10                       // print no more than 10 args/components</code></span>
+<span class="codeline" id="line-667"><code>		maxDepth = 5                        // no more than 5 layers of nesting</code></span>
+<span class="codeline" id="line-668"><code>		maxLen   = (maxDepth*3+2)*limit + 1 // max length of _FUNCDATA_ArgInfo (see the compiler side for reasoning)</code></span>
+<span class="codeline" id="line-669"><code>	)</code></span>
+<span class="codeline" id="line-670"><code></code></span>
+<span class="codeline" id="line-671"><code>	p := (*[maxLen]uint8)(funcdata(f, abi.FUNCDATA_ArgInfo))</code></span>
+<span class="codeline" id="line-672"><code>	if p == nil {</code></span>
+<span class="codeline" id="line-673"><code>		return</code></span>
+<span class="codeline" id="line-674"><code>	}</code></span>
+<span class="codeline" id="line-675"><code></code></span>
+<span class="codeline" id="line-676"><code>	liveInfo := funcdata(f, abi.FUNCDATA_ArgLiveInfo)</code></span>
+<span class="codeline" id="line-677"><code>	liveIdx := pcdatavalue(f, abi.PCDATA_ArgLiveIndex, pc)</code></span>
+<span class="codeline" id="line-678"><code>	startOffset := uint8(0xff) // smallest offset that needs liveness info (slots with a lower offset is always live)</code></span>
+<span class="codeline" id="line-679"><code>	if liveInfo != nil {</code></span>
+<span class="codeline" id="line-680"><code>		startOffset = *(*uint8)(liveInfo)</code></span>
+<span class="codeline" id="line-681"><code>	}</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>	isLive := func(off, slotIdx uint8) bool {</code></span>
+<span class="codeline" id="line-684"><code>		if liveInfo == nil || liveIdx &lt;= 0 {</code></span>
+<span class="codeline" id="line-685"><code>			return true // no liveness info, always live</code></span>
+<span class="codeline" id="line-686"><code>		}</code></span>
+<span class="codeline" id="line-687"><code>		if off &lt; startOffset {</code></span>
+<span class="codeline" id="line-688"><code>			return true</code></span>
+<span class="codeline" id="line-689"><code>		}</code></span>
+<span class="codeline" id="line-690"><code>		bits := *(*uint8)(add(liveInfo, uintptr(liveIdx)+uintptr(slotIdx/8)))</code></span>
+<span class="codeline" id="line-691"><code>		return bits&amp;(1&lt;&lt;(slotIdx%8)) != 0</code></span>
+<span class="codeline" id="line-692"><code>	}</code></span>
+<span class="codeline" id="line-693"><code></code></span>
+<span class="codeline" id="line-694"><code>	print1 := func(off, sz, slotIdx uint8) {</code></span>
+<span class="codeline" id="line-695"><code>		x := readUnaligned64(add(argp, uintptr(off)))</code></span>
+<span class="codeline" id="line-696"><code>		// mask out irrelevant bits</code></span>
+<span class="codeline" id="line-697"><code>		if sz &lt; 8 {</code></span>
+<span class="codeline" id="line-698"><code>			shift := 64 - sz*8</code></span>
+<span class="codeline" id="line-699"><code>			if goarch.BigEndian {</code></span>
+<span class="codeline" id="line-700"><code>				x = x &gt;&gt; shift</code></span>
+<span class="codeline" id="line-701"><code>			} else {</code></span>
+<span class="codeline" id="line-702"><code>				x = x &lt;&lt; shift &gt;&gt; shift</code></span>
+<span class="codeline" id="line-703"><code>			}</code></span>
+<span class="codeline" id="line-704"><code>		}</code></span>
+<span class="codeline" id="line-705"><code>		print(hex(x))</code></span>
+<span class="codeline" id="line-706"><code>		if !isLive(off, slotIdx) {</code></span>
+<span class="codeline" id="line-707"><code>			print("?")</code></span>
+<span class="codeline" id="line-708"><code>		}</code></span>
+<span class="codeline" id="line-709"><code>	}</code></span>
+<span class="codeline" id="line-710"><code></code></span>
+<span class="codeline" id="line-711"><code>	start := true</code></span>
+<span class="codeline" id="line-712"><code>	printcomma := func() {</code></span>
+<span class="codeline" id="line-713"><code>		if !start {</code></span>
+<span class="codeline" id="line-714"><code>			print(", ")</code></span>
+<span class="codeline" id="line-715"><code>		}</code></span>
+<span class="codeline" id="line-716"><code>	}</code></span>
+<span class="codeline" id="line-717"><code>	pi := 0</code></span>
+<span class="codeline" id="line-718"><code>	slotIdx := uint8(0) // register arg spill slot index</code></span>
+<span class="codeline" id="line-719"><code>printloop:</code></span>
+<span class="codeline" id="line-720"><code>	for {</code></span>
+<span class="codeline" id="line-721"><code>		o := p[pi]</code></span>
+<span class="codeline" id="line-722"><code>		pi++</code></span>
+<span class="codeline" id="line-723"><code>		switch o {</code></span>
+<span class="codeline" id="line-724"><code>		case _endSeq:</code></span>
+<span class="codeline" id="line-725"><code>			break printloop</code></span>
+<span class="codeline" id="line-726"><code>		case _startAgg:</code></span>
+<span class="codeline" id="line-727"><code>			printcomma()</code></span>
+<span class="codeline" id="line-728"><code>			print("{")</code></span>
+<span class="codeline" id="line-729"><code>			start = true</code></span>
+<span class="codeline" id="line-730"><code>			continue</code></span>
+<span class="codeline" id="line-731"><code>		case _endAgg:</code></span>
+<span class="codeline" id="line-732"><code>			print("}")</code></span>
+<span class="codeline" id="line-733"><code>		case _dotdotdot:</code></span>
+<span class="codeline" id="line-734"><code>			printcomma()</code></span>
+<span class="codeline" id="line-735"><code>			print("...")</code></span>
+<span class="codeline" id="line-736"><code>		case _offsetTooLarge:</code></span>
+<span class="codeline" id="line-737"><code>			printcomma()</code></span>
+<span class="codeline" id="line-738"><code>			print("_")</code></span>
+<span class="codeline" id="line-739"><code>		default:</code></span>
+<span class="codeline" id="line-740"><code>			printcomma()</code></span>
+<span class="codeline" id="line-741"><code>			sz := p[pi]</code></span>
+<span class="codeline" id="line-742"><code>			pi++</code></span>
+<span class="codeline" id="line-743"><code>			print1(o, sz, slotIdx)</code></span>
+<span class="codeline" id="line-744"><code>			if o &gt;= startOffset {</code></span>
+<span class="codeline" id="line-745"><code>				slotIdx++</code></span>
+<span class="codeline" id="line-746"><code>			}</code></span>
+<span class="codeline" id="line-747"><code>		}</code></span>
+<span class="codeline" id="line-748"><code>		start = false</code></span>
+<span class="codeline" id="line-749"><code>	}</code></span>
+<span class="codeline" id="line-750"><code>}</code></span>
+<span class="codeline" id="line-751"><code></code></span>
+<span class="codeline" id="line-752"><code>// funcNamePiecesForPrint returns the function name for printing to the user.</code></span>
+<span class="codeline" id="line-753"><code>// It returns three pieces so it doesn't need an allocation for string</code></span>
+<span class="codeline" id="line-754"><code>// concatenation.</code></span>
+<span class="codeline" id="line-755"><code>func funcNamePiecesForPrint(name string) (string, string, string) {</code></span>
+<span class="codeline" id="line-756"><code>	// Replace the shape name in generic function with "...".</code></span>
+<span class="codeline" id="line-757"><code>	i := bytealg.IndexByteString(name, '[')</code></span>
+<span class="codeline" id="line-758"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-759"><code>		return name, "", ""</code></span>
+<span class="codeline" id="line-760"><code>	}</code></span>
+<span class="codeline" id="line-761"><code>	j := len(name) - 1</code></span>
+<span class="codeline" id="line-762"><code>	for name[j] != ']' {</code></span>
+<span class="codeline" id="line-763"><code>		j--</code></span>
+<span class="codeline" id="line-764"><code>	}</code></span>
+<span class="codeline" id="line-765"><code>	if j &lt;= i {</code></span>
+<span class="codeline" id="line-766"><code>		return name, "", ""</code></span>
+<span class="codeline" id="line-767"><code>	}</code></span>
+<span class="codeline" id="line-768"><code>	return name[:i], "[...]", name[j+1:]</code></span>
+<span class="codeline" id="line-769"><code>}</code></span>
+<span class="codeline" id="line-770"><code></code></span>
+<span class="codeline" id="line-771"><code>// funcNameForPrint returns the function name for printing to the user.</code></span>
+<span class="codeline" id="line-772"><code>func funcNameForPrint(name string) string {</code></span>
+<span class="codeline" id="line-773"><code>	a, b, c := funcNamePiecesForPrint(name)</code></span>
+<span class="codeline" id="line-774"><code>	return a + b + c</code></span>
+<span class="codeline" id="line-775"><code>}</code></span>
+<span class="codeline" id="line-776"><code></code></span>
+<span class="codeline" id="line-777"><code>// printFuncName prints a function name. name is the function name in</code></span>
+<span class="codeline" id="line-778"><code>// the binary's func data table.</code></span>
+<span class="codeline" id="line-779"><code>func printFuncName(name string) {</code></span>
+<span class="codeline" id="line-780"><code>	if name == "runtime.gopanic" {</code></span>
+<span class="codeline" id="line-781"><code>		print("panic")</code></span>
+<span class="codeline" id="line-782"><code>		return</code></span>
+<span class="codeline" id="line-783"><code>	}</code></span>
+<span class="codeline" id="line-784"><code>	a, b, c := funcNamePiecesForPrint(name)</code></span>
+<span class="codeline" id="line-785"><code>	print(a, b, c)</code></span>
+<span class="codeline" id="line-786"><code>}</code></span>
+<span class="codeline" id="line-787"><code></code></span>
+<span class="codeline" id="line-788"><code>func printcreatedby(gp *g) {</code></span>
+<span class="codeline" id="line-789"><code>	// Show what created goroutine, except main goroutine (goid 1).</code></span>
+<span class="codeline" id="line-790"><code>	pc := gp.gopc</code></span>
+<span class="codeline" id="line-791"><code>	f := findfunc(pc)</code></span>
+<span class="codeline" id="line-792"><code>	if f.valid() &amp;&amp; showframe(f.srcFunc(), gp, false, abi.FuncIDNormal) &amp;&amp; gp.goid != 1 {</code></span>
+<span class="codeline" id="line-793"><code>		printcreatedby1(f, pc, gp.parentGoid)</code></span>
+<span class="codeline" id="line-794"><code>	}</code></span>
+<span class="codeline" id="line-795"><code>}</code></span>
+<span class="codeline" id="line-796"><code></code></span>
+<span class="codeline" id="line-797"><code>func printcreatedby1(f funcInfo, pc uintptr, goid uint64) {</code></span>
+<span class="codeline" id="line-798"><code>	print("created by ")</code></span>
+<span class="codeline" id="line-799"><code>	printFuncName(funcname(f))</code></span>
+<span class="codeline" id="line-800"><code>	if goid != 0 {</code></span>
+<span class="codeline" id="line-801"><code>		print(" in goroutine ", goid)</code></span>
+<span class="codeline" id="line-802"><code>	}</code></span>
+<span class="codeline" id="line-803"><code>	print("\n")</code></span>
+<span class="codeline" id="line-804"><code>	tracepc := pc // back up to CALL instruction for funcline.</code></span>
+<span class="codeline" id="line-805"><code>	if pc &gt; f.entry() {</code></span>
+<span class="codeline" id="line-806"><code>		tracepc -= sys.PCQuantum</code></span>
+<span class="codeline" id="line-807"><code>	}</code></span>
+<span class="codeline" id="line-808"><code>	file, line := funcline(f, tracepc)</code></span>
+<span class="codeline" id="line-809"><code>	print("\t", file, ":", line)</code></span>
+<span class="codeline" id="line-810"><code>	if pc &gt; f.entry() {</code></span>
+<span class="codeline" id="line-811"><code>		print(" +", hex(pc-f.entry()))</code></span>
+<span class="codeline" id="line-812"><code>	}</code></span>
+<span class="codeline" id="line-813"><code>	print("\n")</code></span>
+<span class="codeline" id="line-814"><code>}</code></span>
+<span class="codeline" id="line-815"><code></code></span>
+<span class="codeline" id="line-816"><code>func traceback(pc, sp, lr uintptr, gp *g) {</code></span>
+<span class="codeline" id="line-817"><code>	traceback1(pc, sp, lr, gp, 0)</code></span>
+<span class="codeline" id="line-818"><code>}</code></span>
+<span class="codeline" id="line-819"><code></code></span>
+<span class="codeline" id="line-820"><code>// tracebacktrap is like traceback but expects that the PC and SP were obtained</code></span>
+<span class="codeline" id="line-821"><code>// from a trap, not from gp-&gt;sched or gp-&gt;syscallpc/gp-&gt;syscallsp or getcallerpc/getcallersp.</code></span>
+<span class="codeline" id="line-822"><code>// Because they are from a trap instead of from a saved pair,</code></span>
+<span class="codeline" id="line-823"><code>// the initial PC must not be rewound to the previous instruction.</code></span>
+<span class="codeline" id="line-824"><code>// (All the saved pairs record a PC that is a return address, so we</code></span>
+<span class="codeline" id="line-825"><code>// rewind it into the CALL instruction.)</code></span>
+<span class="codeline" id="line-826"><code>// If gp.m.libcall{g,pc,sp} information is available, it uses that information in preference to</code></span>
+<span class="codeline" id="line-827"><code>// the pc/sp/lr passed in.</code></span>
+<span class="codeline" id="line-828"><code>func tracebacktrap(pc, sp, lr uintptr, gp *g) {</code></span>
+<span class="codeline" id="line-829"><code>	if gp.m.libcallsp != 0 {</code></span>
+<span class="codeline" id="line-830"><code>		// We're in C code somewhere, traceback from the saved position.</code></span>
+<span class="codeline" id="line-831"><code>		traceback1(gp.m.libcallpc, gp.m.libcallsp, 0, gp.m.libcallg.ptr(), 0)</code></span>
+<span class="codeline" id="line-832"><code>		return</code></span>
+<span class="codeline" id="line-833"><code>	}</code></span>
+<span class="codeline" id="line-834"><code>	traceback1(pc, sp, lr, gp, unwindTrap)</code></span>
+<span class="codeline" id="line-835"><code>}</code></span>
+<span class="codeline" id="line-836"><code></code></span>
+<span class="codeline" id="line-837"><code>func traceback1(pc, sp, lr uintptr, gp *g, flags unwindFlags) {</code></span>
+<span class="codeline" id="line-838"><code>	// If the goroutine is in cgo, and we have a cgo traceback, print that.</code></span>
+<span class="codeline" id="line-839"><code>	if iscgo &amp;&amp; gp.m != nil &amp;&amp; gp.m.ncgo &gt; 0 &amp;&amp; gp.syscallsp != 0 &amp;&amp; gp.m.cgoCallers != nil &amp;&amp; gp.m.cgoCallers[0] != 0 {</code></span>
+<span class="codeline" id="line-840"><code>		// Lock cgoCallers so that a signal handler won't</code></span>
+<span class="codeline" id="line-841"><code>		// change it, copy the array, reset it, unlock it.</code></span>
+<span class="codeline" id="line-842"><code>		// We are locked to the thread and are not running</code></span>
+<span class="codeline" id="line-843"><code>		// concurrently with a signal handler.</code></span>
+<span class="codeline" id="line-844"><code>		// We just have to stop a signal handler from interrupting</code></span>
+<span class="codeline" id="line-845"><code>		// in the middle of our copy.</code></span>
+<span class="codeline" id="line-846"><code>		gp.m.cgoCallersUse.Store(1)</code></span>
+<span class="codeline" id="line-847"><code>		cgoCallers := *gp.m.cgoCallers</code></span>
+<span class="codeline" id="line-848"><code>		gp.m.cgoCallers[0] = 0</code></span>
+<span class="codeline" id="line-849"><code>		gp.m.cgoCallersUse.Store(0)</code></span>
+<span class="codeline" id="line-850"><code></code></span>
+<span class="codeline" id="line-851"><code>		printCgoTraceback(&amp;cgoCallers)</code></span>
+<span class="codeline" id="line-852"><code>	}</code></span>
+<span class="codeline" id="line-853"><code></code></span>
+<span class="codeline" id="line-854"><code>	if readgstatus(gp)&amp;^_Gscan == _Gsyscall {</code></span>
+<span class="codeline" id="line-855"><code>		// Override registers if blocked in system call.</code></span>
+<span class="codeline" id="line-856"><code>		pc = gp.syscallpc</code></span>
+<span class="codeline" id="line-857"><code>		sp = gp.syscallsp</code></span>
+<span class="codeline" id="line-858"><code>		flags &amp;^= unwindTrap</code></span>
+<span class="codeline" id="line-859"><code>	}</code></span>
+<span class="codeline" id="line-860"><code>	if gp.m != nil &amp;&amp; gp.m.vdsoSP != 0 {</code></span>
+<span class="codeline" id="line-861"><code>		// Override registers if running in VDSO. This comes after the</code></span>
+<span class="codeline" id="line-862"><code>		// _Gsyscall check to cover VDSO calls after entersyscall.</code></span>
+<span class="codeline" id="line-863"><code>		pc = gp.m.vdsoPC</code></span>
+<span class="codeline" id="line-864"><code>		sp = gp.m.vdsoSP</code></span>
+<span class="codeline" id="line-865"><code>		flags &amp;^= unwindTrap</code></span>
+<span class="codeline" id="line-866"><code>	}</code></span>
+<span class="codeline" id="line-867"><code></code></span>
+<span class="codeline" id="line-868"><code>	// Print traceback.</code></span>
+<span class="codeline" id="line-869"><code>	//</code></span>
+<span class="codeline" id="line-870"><code>	// We print the first tracebackInnerFrames frames, and the last</code></span>
+<span class="codeline" id="line-871"><code>	// tracebackOuterFrames frames. There are many possible approaches to this.</code></span>
+<span class="codeline" id="line-872"><code>	// There are various complications to this:</code></span>
+<span class="codeline" id="line-873"><code>	//</code></span>
+<span class="codeline" id="line-874"><code>	// - We'd prefer to walk the stack once because in really bad situations</code></span>
+<span class="codeline" id="line-875"><code>	//   traceback may crash (and we want as much output as possible) or the stack</code></span>
+<span class="codeline" id="line-876"><code>	//   may be changing.</code></span>
+<span class="codeline" id="line-877"><code>	//</code></span>
+<span class="codeline" id="line-878"><code>	// - Each physical frame can represent several logical frames, so we might</code></span>
+<span class="codeline" id="line-879"><code>	//   have to pause in the middle of a physical frame and pick up in the middle</code></span>
+<span class="codeline" id="line-880"><code>	//   of a physical frame.</code></span>
+<span class="codeline" id="line-881"><code>	//</code></span>
+<span class="codeline" id="line-882"><code>	// - The cgo symbolizer can expand a cgo PC to more than one logical frame,</code></span>
+<span class="codeline" id="line-883"><code>	//   and involves juggling state on the C side that we don't manage. Since its</code></span>
+<span class="codeline" id="line-884"><code>	//   expansion state is managed on the C side, we can't capture the expansion</code></span>
+<span class="codeline" id="line-885"><code>	//   state part way through, and because the output strings are managed on the</code></span>
+<span class="codeline" id="line-886"><code>	//   C side, we can't capture the output. Thus, our only choice is to replay a</code></span>
+<span class="codeline" id="line-887"><code>	//   whole expansion, potentially discarding some of it.</code></span>
+<span class="codeline" id="line-888"><code>	//</code></span>
+<span class="codeline" id="line-889"><code>	// Rejected approaches:</code></span>
+<span class="codeline" id="line-890"><code>	//</code></span>
+<span class="codeline" id="line-891"><code>	// - Do two passes where the first pass just counts and the second pass does</code></span>
+<span class="codeline" id="line-892"><code>	//   all the printing. This is undesirable if the stack is corrupted or changing</code></span>
+<span class="codeline" id="line-893"><code>	//   because we won't see a partial stack if we panic.</code></span>
+<span class="codeline" id="line-894"><code>	//</code></span>
+<span class="codeline" id="line-895"><code>	// - Keep a ring buffer of the last N logical frames and use this to print</code></span>
+<span class="codeline" id="line-896"><code>	//   the bottom frames once we reach the end of the stack. This works, but</code></span>
+<span class="codeline" id="line-897"><code>	//   requires keeping a surprising amount of state on the stack, and we have</code></span>
+<span class="codeline" id="line-898"><code>	//   to run the cgo symbolizer twice—once to count frames, and a second to</code></span>
+<span class="codeline" id="line-899"><code>	//   print them—since we can't retain the strings it returns.</code></span>
+<span class="codeline" id="line-900"><code>	//</code></span>
+<span class="codeline" id="line-901"><code>	// Instead, we print the outer frames, and if we reach that limit, we clone</code></span>
+<span class="codeline" id="line-902"><code>	// the unwinder, count the remaining frames, and then skip forward and</code></span>
+<span class="codeline" id="line-903"><code>	// finish printing from the clone. This makes two passes over the outer part</code></span>
+<span class="codeline" id="line-904"><code>	// of the stack, but the single pass over the inner part ensures that's</code></span>
+<span class="codeline" id="line-905"><code>	// printed immediately and not revisited. It keeps minimal state on the</code></span>
+<span class="codeline" id="line-906"><code>	// stack. And through a combination of skip counts and limits, we can do all</code></span>
+<span class="codeline" id="line-907"><code>	// of the steps we need with a single traceback printer implementation.</code></span>
+<span class="codeline" id="line-908"><code>	//</code></span>
+<span class="codeline" id="line-909"><code>	// We could be more lax about exactly how many frames we print, for example</code></span>
+<span class="codeline" id="line-910"><code>	// always stopping and resuming on physical frame boundaries, or at least</code></span>
+<span class="codeline" id="line-911"><code>	// cgo expansion boundaries. It's not clear that's much simpler.</code></span>
+<span class="codeline" id="line-912"><code>	flags |= unwindPrintErrors</code></span>
+<span class="codeline" id="line-913"><code>	var u unwinder</code></span>
+<span class="codeline" id="line-914"><code>	tracebackWithRuntime := func(showRuntime bool) int {</code></span>
+<span class="codeline" id="line-915"><code>		const maxInt int = 0x7fffffff</code></span>
+<span class="codeline" id="line-916"><code>		u.initAt(pc, sp, lr, gp, flags)</code></span>
+<span class="codeline" id="line-917"><code>		n, lastN := traceback2(&amp;u, showRuntime, 0, tracebackInnerFrames)</code></span>
+<span class="codeline" id="line-918"><code>		if n &lt; tracebackInnerFrames {</code></span>
+<span class="codeline" id="line-919"><code>			// We printed the whole stack.</code></span>
+<span class="codeline" id="line-920"><code>			return n</code></span>
+<span class="codeline" id="line-921"><code>		}</code></span>
+<span class="codeline" id="line-922"><code>		// Clone the unwinder and figure out how many frames are left. This</code></span>
+<span class="codeline" id="line-923"><code>		// count will include any logical frames already printed for u's current</code></span>
+<span class="codeline" id="line-924"><code>		// physical frame.</code></span>
+<span class="codeline" id="line-925"><code>		u2 := u</code></span>
+<span class="codeline" id="line-926"><code>		remaining, _ := traceback2(&amp;u, showRuntime, maxInt, 0)</code></span>
+<span class="codeline" id="line-927"><code>		elide := remaining - lastN - tracebackOuterFrames</code></span>
+<span class="codeline" id="line-928"><code>		if elide &gt; 0 {</code></span>
+<span class="codeline" id="line-929"><code>			print("...", elide, " frames elided...\n")</code></span>
+<span class="codeline" id="line-930"><code>			traceback2(&amp;u2, showRuntime, lastN+elide, tracebackOuterFrames)</code></span>
+<span class="codeline" id="line-931"><code>		} else if elide &lt;= 0 {</code></span>
+<span class="codeline" id="line-932"><code>			// There are tracebackOuterFrames or fewer frames left to print.</code></span>
+<span class="codeline" id="line-933"><code>			// Just print the rest of the stack.</code></span>
+<span class="codeline" id="line-934"><code>			traceback2(&amp;u2, showRuntime, lastN, tracebackOuterFrames)</code></span>
+<span class="codeline" id="line-935"><code>		}</code></span>
+<span class="codeline" id="line-936"><code>		return n</code></span>
+<span class="codeline" id="line-937"><code>	}</code></span>
+<span class="codeline" id="line-938"><code>	// By default, omits runtime frames. If that means we print nothing at all,</code></span>
+<span class="codeline" id="line-939"><code>	// repeat forcing all frames printed.</code></span>
+<span class="codeline" id="line-940"><code>	if tracebackWithRuntime(false) == 0 {</code></span>
+<span class="codeline" id="line-941"><code>		tracebackWithRuntime(true)</code></span>
+<span class="codeline" id="line-942"><code>	}</code></span>
+<span class="codeline" id="line-943"><code>	printcreatedby(gp)</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>	if gp.ancestors == nil {</code></span>
+<span class="codeline" id="line-946"><code>		return</code></span>
+<span class="codeline" id="line-947"><code>	}</code></span>
+<span class="codeline" id="line-948"><code>	for _, ancestor := range *gp.ancestors {</code></span>
+<span class="codeline" id="line-949"><code>		printAncestorTraceback(ancestor)</code></span>
+<span class="codeline" id="line-950"><code>	}</code></span>
+<span class="codeline" id="line-951"><code>}</code></span>
+<span class="codeline" id="line-952"><code></code></span>
+<span class="codeline" id="line-953"><code>// traceback2 prints a stack trace starting at u. It skips the first "skip"</code></span>
+<span class="codeline" id="line-954"><code>// logical frames, after which it prints at most "max" logical frames. It</code></span>
+<span class="codeline" id="line-955"><code>// returns n, which is the number of logical frames skipped and printed, and</code></span>
+<span class="codeline" id="line-956"><code>// lastN, which is the number of logical frames skipped or printed just in the</code></span>
+<span class="codeline" id="line-957"><code>// physical frame that u references.</code></span>
+<span class="codeline" id="line-958"><code>func traceback2(u *unwinder, showRuntime bool, skip, max int) (n, lastN int) {</code></span>
+<span class="codeline" id="line-959"><code>	// commitFrame commits to a logical frame and returns whether this frame</code></span>
+<span class="codeline" id="line-960"><code>	// should be printed and whether iteration should stop.</code></span>
+<span class="codeline" id="line-961"><code>	commitFrame := func() (pr, stop bool) {</code></span>
+<span class="codeline" id="line-962"><code>		if skip == 0 &amp;&amp; max == 0 {</code></span>
+<span class="codeline" id="line-963"><code>			// Stop</code></span>
+<span class="codeline" id="line-964"><code>			return false, true</code></span>
+<span class="codeline" id="line-965"><code>		}</code></span>
+<span class="codeline" id="line-966"><code>		n++</code></span>
+<span class="codeline" id="line-967"><code>		lastN++</code></span>
+<span class="codeline" id="line-968"><code>		if skip &gt; 0 {</code></span>
+<span class="codeline" id="line-969"><code>			// Skip</code></span>
+<span class="codeline" id="line-970"><code>			skip--</code></span>
+<span class="codeline" id="line-971"><code>			return false, false</code></span>
+<span class="codeline" id="line-972"><code>		}</code></span>
+<span class="codeline" id="line-973"><code>		// Print</code></span>
+<span class="codeline" id="line-974"><code>		max--</code></span>
+<span class="codeline" id="line-975"><code>		return true, false</code></span>
+<span class="codeline" id="line-976"><code>	}</code></span>
+<span class="codeline" id="line-977"><code></code></span>
+<span class="codeline" id="line-978"><code>	gp := u.g.ptr()</code></span>
+<span class="codeline" id="line-979"><code>	level, _, _ := gotraceback()</code></span>
+<span class="codeline" id="line-980"><code>	var cgoBuf [32]uintptr</code></span>
+<span class="codeline" id="line-981"><code>	for ; u.valid(); u.next() {</code></span>
+<span class="codeline" id="line-982"><code>		lastN = 0</code></span>
+<span class="codeline" id="line-983"><code>		f := u.frame.fn</code></span>
+<span class="codeline" id="line-984"><code>		for iu, uf := newInlineUnwinder(f, u.symPC()); uf.valid(); uf = iu.next(uf) {</code></span>
+<span class="codeline" id="line-985"><code>			sf := iu.srcFunc(uf)</code></span>
+<span class="codeline" id="line-986"><code>			callee := u.calleeFuncID</code></span>
+<span class="codeline" id="line-987"><code>			u.calleeFuncID = sf.funcID</code></span>
+<span class="codeline" id="line-988"><code>			if !(showRuntime || showframe(sf, gp, n == 0, callee)) {</code></span>
+<span class="codeline" id="line-989"><code>				continue</code></span>
+<span class="codeline" id="line-990"><code>			}</code></span>
+<span class="codeline" id="line-991"><code></code></span>
+<span class="codeline" id="line-992"><code>			if pr, stop := commitFrame(); stop {</code></span>
+<span class="codeline" id="line-993"><code>				return</code></span>
+<span class="codeline" id="line-994"><code>			} else if !pr {</code></span>
+<span class="codeline" id="line-995"><code>				continue</code></span>
+<span class="codeline" id="line-996"><code>			}</code></span>
+<span class="codeline" id="line-997"><code></code></span>
+<span class="codeline" id="line-998"><code>			name := sf.name()</code></span>
+<span class="codeline" id="line-999"><code>			file, line := iu.fileLine(uf)</code></span>
+<span class="codeline" id="line-1000"><code>			// Print during crash.</code></span>
+<span class="codeline" id="line-1001"><code>			//	main(0x1, 0x2, 0x3)</code></span>
+<span class="codeline" id="line-1002"><code>			//		/home/rsc/go/src/runtime/x.go:23 +0xf</code></span>
+<span class="codeline" id="line-1003"><code>			//</code></span>
+<span class="codeline" id="line-1004"><code>			printFuncName(name)</code></span>
+<span class="codeline" id="line-1005"><code>			print("(")</code></span>
+<span class="codeline" id="line-1006"><code>			if iu.isInlined(uf) {</code></span>
+<span class="codeline" id="line-1007"><code>				print("...")</code></span>
+<span class="codeline" id="line-1008"><code>			} else {</code></span>
+<span class="codeline" id="line-1009"><code>				argp := unsafe.Pointer(u.frame.argp)</code></span>
+<span class="codeline" id="line-1010"><code>				printArgs(f, argp, u.symPC())</code></span>
+<span class="codeline" id="line-1011"><code>			}</code></span>
+<span class="codeline" id="line-1012"><code>			print(")\n")</code></span>
+<span class="codeline" id="line-1013"><code>			print("\t", file, ":", line)</code></span>
+<span class="codeline" id="line-1014"><code>			if !iu.isInlined(uf) {</code></span>
+<span class="codeline" id="line-1015"><code>				if u.frame.pc &gt; f.entry() {</code></span>
+<span class="codeline" id="line-1016"><code>					print(" +", hex(u.frame.pc-f.entry()))</code></span>
+<span class="codeline" id="line-1017"><code>				}</code></span>
+<span class="codeline" id="line-1018"><code>				if gp.m != nil &amp;&amp; gp.m.throwing &gt;= throwTypeRuntime &amp;&amp; gp == gp.m.curg || level &gt;= 2 {</code></span>
+<span class="codeline" id="line-1019"><code>					print(" fp=", hex(u.frame.fp), " sp=", hex(u.frame.sp), " pc=", hex(u.frame.pc))</code></span>
+<span class="codeline" id="line-1020"><code>				}</code></span>
+<span class="codeline" id="line-1021"><code>			}</code></span>
+<span class="codeline" id="line-1022"><code>			print("\n")</code></span>
+<span class="codeline" id="line-1023"><code>		}</code></span>
+<span class="codeline" id="line-1024"><code></code></span>
+<span class="codeline" id="line-1025"><code>		// Print cgo frames.</code></span>
+<span class="codeline" id="line-1026"><code>		if cgoN := u.cgoCallers(cgoBuf[:]); cgoN &gt; 0 {</code></span>
+<span class="codeline" id="line-1027"><code>			var arg cgoSymbolizerArg</code></span>
+<span class="codeline" id="line-1028"><code>			anySymbolized := false</code></span>
+<span class="codeline" id="line-1029"><code>			stop := false</code></span>
+<span class="codeline" id="line-1030"><code>			for _, pc := range cgoBuf[:cgoN] {</code></span>
+<span class="codeline" id="line-1031"><code>				if cgoSymbolizer == nil {</code></span>
+<span class="codeline" id="line-1032"><code>					if pr, stop := commitFrame(); stop {</code></span>
+<span class="codeline" id="line-1033"><code>						break</code></span>
+<span class="codeline" id="line-1034"><code>					} else if pr {</code></span>
+<span class="codeline" id="line-1035"><code>						print("non-Go function at pc=", hex(pc), "\n")</code></span>
+<span class="codeline" id="line-1036"><code>					}</code></span>
+<span class="codeline" id="line-1037"><code>				} else {</code></span>
+<span class="codeline" id="line-1038"><code>					stop = printOneCgoTraceback(pc, commitFrame, &amp;arg)</code></span>
+<span class="codeline" id="line-1039"><code>					anySymbolized = true</code></span>
+<span class="codeline" id="line-1040"><code>					if stop {</code></span>
+<span class="codeline" id="line-1041"><code>						break</code></span>
+<span class="codeline" id="line-1042"><code>					}</code></span>
+<span class="codeline" id="line-1043"><code>				}</code></span>
+<span class="codeline" id="line-1044"><code>			}</code></span>
+<span class="codeline" id="line-1045"><code>			if anySymbolized {</code></span>
+<span class="codeline" id="line-1046"><code>				// Free symbolization state.</code></span>
+<span class="codeline" id="line-1047"><code>				arg.pc = 0</code></span>
+<span class="codeline" id="line-1048"><code>				callCgoSymbolizer(&amp;arg)</code></span>
+<span class="codeline" id="line-1049"><code>			}</code></span>
+<span class="codeline" id="line-1050"><code>			if stop {</code></span>
+<span class="codeline" id="line-1051"><code>				return</code></span>
+<span class="codeline" id="line-1052"><code>			}</code></span>
+<span class="codeline" id="line-1053"><code>		}</code></span>
+<span class="codeline" id="line-1054"><code>	}</code></span>
+<span class="codeline" id="line-1055"><code>	return n, 0</code></span>
+<span class="codeline" id="line-1056"><code>}</code></span>
+<span class="codeline" id="line-1057"><code></code></span>
+<span class="codeline" id="line-1058"><code>// printAncestorTraceback prints the traceback of the given ancestor.</code></span>
+<span class="codeline" id="line-1059"><code>// TODO: Unify this with gentraceback and CallersFrames.</code></span>
+<span class="codeline" id="line-1060"><code>func printAncestorTraceback(ancestor ancestorInfo) {</code></span>
+<span class="codeline" id="line-1061"><code>	print("[originating from goroutine ", ancestor.goid, "]:\n")</code></span>
+<span class="codeline" id="line-1062"><code>	for fidx, pc := range ancestor.pcs {</code></span>
+<span class="codeline" id="line-1063"><code>		f := findfunc(pc) // f previously validated</code></span>
+<span class="codeline" id="line-1064"><code>		if showfuncinfo(f.srcFunc(), fidx == 0, abi.FuncIDNormal) {</code></span>
+<span class="codeline" id="line-1065"><code>			printAncestorTracebackFuncInfo(f, pc)</code></span>
+<span class="codeline" id="line-1066"><code>		}</code></span>
+<span class="codeline" id="line-1067"><code>	}</code></span>
+<span class="codeline" id="line-1068"><code>	if len(ancestor.pcs) == tracebackInnerFrames {</code></span>
+<span class="codeline" id="line-1069"><code>		print("...additional frames elided...\n")</code></span>
+<span class="codeline" id="line-1070"><code>	}</code></span>
+<span class="codeline" id="line-1071"><code>	// Show what created goroutine, except main goroutine (goid 1).</code></span>
+<span class="codeline" id="line-1072"><code>	f := findfunc(ancestor.gopc)</code></span>
+<span class="codeline" id="line-1073"><code>	if f.valid() &amp;&amp; showfuncinfo(f.srcFunc(), false, abi.FuncIDNormal) &amp;&amp; ancestor.goid != 1 {</code></span>
+<span class="codeline" id="line-1074"><code>		// In ancestor mode, we'll already print the goroutine ancestor.</code></span>
+<span class="codeline" id="line-1075"><code>		// Pass 0 for the goid parameter so we don't print it again.</code></span>
+<span class="codeline" id="line-1076"><code>		printcreatedby1(f, ancestor.gopc, 0)</code></span>
+<span class="codeline" id="line-1077"><code>	}</code></span>
+<span class="codeline" id="line-1078"><code>}</code></span>
+<span class="codeline" id="line-1079"><code></code></span>
+<span class="codeline" id="line-1080"><code>// printAncestorTracebackFuncInfo prints the given function info at a given pc</code></span>
+<span class="codeline" id="line-1081"><code>// within an ancestor traceback. The precision of this info is reduced</code></span>
+<span class="codeline" id="line-1082"><code>// due to only have access to the pcs at the time of the caller</code></span>
+<span class="codeline" id="line-1083"><code>// goroutine being created.</code></span>
+<span class="codeline" id="line-1084"><code>func printAncestorTracebackFuncInfo(f funcInfo, pc uintptr) {</code></span>
+<span class="codeline" id="line-1085"><code>	u, uf := newInlineUnwinder(f, pc)</code></span>
+<span class="codeline" id="line-1086"><code>	file, line := u.fileLine(uf)</code></span>
+<span class="codeline" id="line-1087"><code>	printFuncName(u.srcFunc(uf).name())</code></span>
+<span class="codeline" id="line-1088"><code>	print("(...)\n")</code></span>
+<span class="codeline" id="line-1089"><code>	print("\t", file, ":", line)</code></span>
+<span class="codeline" id="line-1090"><code>	if pc &gt; f.entry() {</code></span>
+<span class="codeline" id="line-1091"><code>		print(" +", hex(pc-f.entry()))</code></span>
+<span class="codeline" id="line-1092"><code>	}</code></span>
+<span class="codeline" id="line-1093"><code>	print("\n")</code></span>
+<span class="codeline" id="line-1094"><code>}</code></span>
+<span class="codeline" id="line-1095"><code></code></span>
+<span class="codeline" id="line-1096"><code>func callers(skip int, pcbuf []uintptr) int {</code></span>
+<span class="codeline" id="line-1097"><code>	sp := getcallersp()</code></span>
+<span class="codeline" id="line-1098"><code>	pc := getcallerpc()</code></span>
+<span class="codeline" id="line-1099"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-1100"><code>	var n int</code></span>
+<span class="codeline" id="line-1101"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1102"><code>		var u unwinder</code></span>
+<span class="codeline" id="line-1103"><code>		u.initAt(pc, sp, 0, gp, unwindSilentErrors)</code></span>
+<span class="codeline" id="line-1104"><code>		n = tracebackPCs(&amp;u, skip, pcbuf)</code></span>
+<span class="codeline" id="line-1105"><code>	})</code></span>
+<span class="codeline" id="line-1106"><code>	return n</code></span>
+<span class="codeline" id="line-1107"><code>}</code></span>
+<span class="codeline" id="line-1108"><code></code></span>
+<span class="codeline" id="line-1109"><code>func gcallers(gp *g, skip int, pcbuf []uintptr) int {</code></span>
+<span class="codeline" id="line-1110"><code>	var u unwinder</code></span>
+<span class="codeline" id="line-1111"><code>	u.init(gp, unwindSilentErrors)</code></span>
+<span class="codeline" id="line-1112"><code>	return tracebackPCs(&amp;u, skip, pcbuf)</code></span>
+<span class="codeline" id="line-1113"><code>}</code></span>
+<span class="codeline" id="line-1114"><code></code></span>
+<span class="codeline" id="line-1115"><code>// showframe reports whether the frame with the given characteristics should</code></span>
+<span class="codeline" id="line-1116"><code>// be printed during a traceback.</code></span>
+<span class="codeline" id="line-1117"><code>func showframe(sf srcFunc, gp *g, firstFrame bool, calleeID abi.FuncID) bool {</code></span>
+<span class="codeline" id="line-1118"><code>	mp := getg().m</code></span>
+<span class="codeline" id="line-1119"><code>	if mp.throwing &gt;= throwTypeRuntime &amp;&amp; gp != nil &amp;&amp; (gp == mp.curg || gp == mp.caughtsig.ptr()) {</code></span>
+<span class="codeline" id="line-1120"><code>		return true</code></span>
+<span class="codeline" id="line-1121"><code>	}</code></span>
+<span class="codeline" id="line-1122"><code>	return showfuncinfo(sf, firstFrame, calleeID)</code></span>
+<span class="codeline" id="line-1123"><code>}</code></span>
+<span class="codeline" id="line-1124"><code></code></span>
+<span class="codeline" id="line-1125"><code>// showfuncinfo reports whether a function with the given characteristics should</code></span>
+<span class="codeline" id="line-1126"><code>// be printed during a traceback.</code></span>
+<span class="codeline" id="line-1127"><code>func showfuncinfo(sf srcFunc, firstFrame bool, calleeID abi.FuncID) bool {</code></span>
+<span class="codeline" id="line-1128"><code>	level, _, _ := gotraceback()</code></span>
+<span class="codeline" id="line-1129"><code>	if level &gt; 1 {</code></span>
+<span class="codeline" id="line-1130"><code>		// Show all frames.</code></span>
+<span class="codeline" id="line-1131"><code>		return true</code></span>
+<span class="codeline" id="line-1132"><code>	}</code></span>
+<span class="codeline" id="line-1133"><code></code></span>
+<span class="codeline" id="line-1134"><code>	if sf.funcID == abi.FuncIDWrapper &amp;&amp; elideWrapperCalling(calleeID) {</code></span>
+<span class="codeline" id="line-1135"><code>		return false</code></span>
+<span class="codeline" id="line-1136"><code>	}</code></span>
+<span class="codeline" id="line-1137"><code></code></span>
+<span class="codeline" id="line-1138"><code>	name := sf.name()</code></span>
+<span class="codeline" id="line-1139"><code></code></span>
+<span class="codeline" id="line-1140"><code>	// Special case: always show runtime.gopanic frame</code></span>
+<span class="codeline" id="line-1141"><code>	// in the middle of a stack trace, so that we can</code></span>
+<span class="codeline" id="line-1142"><code>	// see the boundary between ordinary code and</code></span>
+<span class="codeline" id="line-1143"><code>	// panic-induced deferred code.</code></span>
+<span class="codeline" id="line-1144"><code>	// See golang.org/issue/5832.</code></span>
+<span class="codeline" id="line-1145"><code>	if name == "runtime.gopanic" &amp;&amp; !firstFrame {</code></span>
+<span class="codeline" id="line-1146"><code>		return true</code></span>
+<span class="codeline" id="line-1147"><code>	}</code></span>
+<span class="codeline" id="line-1148"><code></code></span>
+<span class="codeline" id="line-1149"><code>	return bytealg.IndexByteString(name, '.') &gt;= 0 &amp;&amp; (!hasPrefix(name, "runtime.") || isExportedRuntime(name))</code></span>
+<span class="codeline" id="line-1150"><code>}</code></span>
+<span class="codeline" id="line-1151"><code></code></span>
+<span class="codeline" id="line-1152"><code>// isExportedRuntime reports whether name is an exported runtime function.</code></span>
+<span class="codeline" id="line-1153"><code>// It is only for runtime functions, so ASCII A-Z is fine.</code></span>
+<span class="codeline" id="line-1154"><code>// TODO: this handles exported functions but not exported methods.</code></span>
+<span class="codeline" id="line-1155"><code>func isExportedRuntime(name string) bool {</code></span>
+<span class="codeline" id="line-1156"><code>	const n = len("runtime.")</code></span>
+<span class="codeline" id="line-1157"><code>	return len(name) &gt; n &amp;&amp; name[:n] == "runtime." &amp;&amp; 'A' &lt;= name[n] &amp;&amp; name[n] &lt;= 'Z'</code></span>
+<span class="codeline" id="line-1158"><code>}</code></span>
+<span class="codeline" id="line-1159"><code></code></span>
+<span class="codeline" id="line-1160"><code>// elideWrapperCalling reports whether a wrapper function that called</code></span>
+<span class="codeline" id="line-1161"><code>// function id should be elided from stack traces.</code></span>
+<span class="codeline" id="line-1162"><code>func elideWrapperCalling(id abi.FuncID) bool {</code></span>
+<span class="codeline" id="line-1163"><code>	// If the wrapper called a panic function instead of the</code></span>
+<span class="codeline" id="line-1164"><code>	// wrapped function, we want to include it in stacks.</code></span>
+<span class="codeline" id="line-1165"><code>	return !(id == abi.FuncID_gopanic || id == abi.FuncID_sigpanic || id == abi.FuncID_panicwrap)</code></span>
+<span class="codeline" id="line-1166"><code>}</code></span>
+<span class="codeline" id="line-1167"><code></code></span>
+<span class="codeline" id="line-1168"><code>var gStatusStrings = [...]string{</code></span>
+<span class="codeline" id="line-1169"><code>	_Gidle:      "idle",</code></span>
+<span class="codeline" id="line-1170"><code>	_Grunnable:  "runnable",</code></span>
+<span class="codeline" id="line-1171"><code>	_Grunning:   "running",</code></span>
+<span class="codeline" id="line-1172"><code>	_Gsyscall:   "syscall",</code></span>
+<span class="codeline" id="line-1173"><code>	_Gwaiting:   "waiting",</code></span>
+<span class="codeline" id="line-1174"><code>	_Gdead:      "dead",</code></span>
+<span class="codeline" id="line-1175"><code>	_Gcopystack: "copystack",</code></span>
+<span class="codeline" id="line-1176"><code>	_Gpreempted: "preempted",</code></span>
+<span class="codeline" id="line-1177"><code>}</code></span>
+<span class="codeline" id="line-1178"><code></code></span>
+<span class="codeline" id="line-1179"><code>func goroutineheader(gp *g) {</code></span>
+<span class="codeline" id="line-1180"><code>	level, _, _ := gotraceback()</code></span>
+<span class="codeline" id="line-1181"><code></code></span>
+<span class="codeline" id="line-1182"><code>	gpstatus := readgstatus(gp)</code></span>
+<span class="codeline" id="line-1183"><code></code></span>
+<span class="codeline" id="line-1184"><code>	isScan := gpstatus&amp;_Gscan != 0</code></span>
+<span class="codeline" id="line-1185"><code>	gpstatus &amp;^= _Gscan // drop the scan bit</code></span>
+<span class="codeline" id="line-1186"><code></code></span>
+<span class="codeline" id="line-1187"><code>	// Basic string status</code></span>
+<span class="codeline" id="line-1188"><code>	var status string</code></span>
+<span class="codeline" id="line-1189"><code>	if 0 &lt;= gpstatus &amp;&amp; gpstatus &lt; uint32(len(gStatusStrings)) {</code></span>
+<span class="codeline" id="line-1190"><code>		status = gStatusStrings[gpstatus]</code></span>
+<span class="codeline" id="line-1191"><code>	} else {</code></span>
+<span class="codeline" id="line-1192"><code>		status = "???"</code></span>
+<span class="codeline" id="line-1193"><code>	}</code></span>
+<span class="codeline" id="line-1194"><code></code></span>
+<span class="codeline" id="line-1195"><code>	// Override.</code></span>
+<span class="codeline" id="line-1196"><code>	if gpstatus == _Gwaiting &amp;&amp; gp.waitreason != waitReasonZero {</code></span>
+<span class="codeline" id="line-1197"><code>		status = gp.waitreason.String()</code></span>
+<span class="codeline" id="line-1198"><code>	}</code></span>
+<span class="codeline" id="line-1199"><code></code></span>
+<span class="codeline" id="line-1200"><code>	// approx time the G is blocked, in minutes</code></span>
+<span class="codeline" id="line-1201"><code>	var waitfor int64</code></span>
+<span class="codeline" id="line-1202"><code>	if (gpstatus == _Gwaiting || gpstatus == _Gsyscall) &amp;&amp; gp.waitsince != 0 {</code></span>
+<span class="codeline" id="line-1203"><code>		waitfor = (nanotime() - gp.waitsince) / 60e9</code></span>
+<span class="codeline" id="line-1204"><code>	}</code></span>
+<span class="codeline" id="line-1205"><code>	print("goroutine ", gp.goid)</code></span>
+<span class="codeline" id="line-1206"><code>	if gp.m != nil &amp;&amp; gp.m.throwing &gt;= throwTypeRuntime &amp;&amp; gp == gp.m.curg || level &gt;= 2 {</code></span>
+<span class="codeline" id="line-1207"><code>		print(" gp=", gp)</code></span>
+<span class="codeline" id="line-1208"><code>		if gp.m != nil {</code></span>
+<span class="codeline" id="line-1209"><code>			print(" m=", gp.m.id, " mp=", gp.m)</code></span>
+<span class="codeline" id="line-1210"><code>		} else {</code></span>
+<span class="codeline" id="line-1211"><code>			print(" m=nil")</code></span>
+<span class="codeline" id="line-1212"><code>		}</code></span>
+<span class="codeline" id="line-1213"><code>	}</code></span>
+<span class="codeline" id="line-1214"><code>	print(" [", status)</code></span>
+<span class="codeline" id="line-1215"><code>	if isScan {</code></span>
+<span class="codeline" id="line-1216"><code>		print(" (scan)")</code></span>
+<span class="codeline" id="line-1217"><code>	}</code></span>
+<span class="codeline" id="line-1218"><code>	if waitfor &gt;= 1 {</code></span>
+<span class="codeline" id="line-1219"><code>		print(", ", waitfor, " minutes")</code></span>
+<span class="codeline" id="line-1220"><code>	}</code></span>
+<span class="codeline" id="line-1221"><code>	if gp.lockedm != 0 {</code></span>
+<span class="codeline" id="line-1222"><code>		print(", locked to thread")</code></span>
+<span class="codeline" id="line-1223"><code>	}</code></span>
+<span class="codeline" id="line-1224"><code>	print("]:\n")</code></span>
+<span class="codeline" id="line-1225"><code>}</code></span>
+<span class="codeline" id="line-1226"><code></code></span>
+<span class="codeline" id="line-1227"><code>func tracebackothers(me *g) {</code></span>
+<span class="codeline" id="line-1228"><code>	level, _, _ := gotraceback()</code></span>
+<span class="codeline" id="line-1229"><code></code></span>
+<span class="codeline" id="line-1230"><code>	// Show the current goroutine first, if we haven't already.</code></span>
+<span class="codeline" id="line-1231"><code>	curgp := getg().m.curg</code></span>
+<span class="codeline" id="line-1232"><code>	if curgp != nil &amp;&amp; curgp != me {</code></span>
+<span class="codeline" id="line-1233"><code>		print("\n")</code></span>
+<span class="codeline" id="line-1234"><code>		goroutineheader(curgp)</code></span>
+<span class="codeline" id="line-1235"><code>		traceback(^uintptr(0), ^uintptr(0), 0, curgp)</code></span>
+<span class="codeline" id="line-1236"><code>	}</code></span>
+<span class="codeline" id="line-1237"><code></code></span>
+<span class="codeline" id="line-1238"><code>	// We can't call locking forEachG here because this may be during fatal</code></span>
+<span class="codeline" id="line-1239"><code>	// throw/panic, where locking could be out-of-order or a direct</code></span>
+<span class="codeline" id="line-1240"><code>	// deadlock.</code></span>
+<span class="codeline" id="line-1241"><code>	//</code></span>
+<span class="codeline" id="line-1242"><code>	// Instead, use forEachGRace, which requires no locking. We don't lock</code></span>
+<span class="codeline" id="line-1243"><code>	// against concurrent creation of new Gs, but even with allglock we may</code></span>
+<span class="codeline" id="line-1244"><code>	// miss Gs created after this loop.</code></span>
+<span class="codeline" id="line-1245"><code>	forEachGRace(func(gp *g) {</code></span>
+<span class="codeline" id="line-1246"><code>		if gp == me || gp == curgp || readgstatus(gp) == _Gdead || isSystemGoroutine(gp, false) &amp;&amp; level &lt; 2 {</code></span>
+<span class="codeline" id="line-1247"><code>			return</code></span>
+<span class="codeline" id="line-1248"><code>		}</code></span>
+<span class="codeline" id="line-1249"><code>		print("\n")</code></span>
+<span class="codeline" id="line-1250"><code>		goroutineheader(gp)</code></span>
+<span class="codeline" id="line-1251"><code>		// Note: gp.m == getg().m occurs when tracebackothers is called</code></span>
+<span class="codeline" id="line-1252"><code>		// from a signal handler initiated during a systemstack call.</code></span>
+<span class="codeline" id="line-1253"><code>		// The original G is still in the running state, and we want to</code></span>
+<span class="codeline" id="line-1254"><code>		// print its stack.</code></span>
+<span class="codeline" id="line-1255"><code>		if gp.m != getg().m &amp;&amp; readgstatus(gp)&amp;^_Gscan == _Grunning {</code></span>
+<span class="codeline" id="line-1256"><code>			print("\tgoroutine running on other thread; stack unavailable\n")</code></span>
+<span class="codeline" id="line-1257"><code>			printcreatedby(gp)</code></span>
+<span class="codeline" id="line-1258"><code>		} else {</code></span>
+<span class="codeline" id="line-1259"><code>			traceback(^uintptr(0), ^uintptr(0), 0, gp)</code></span>
+<span class="codeline" id="line-1260"><code>		}</code></span>
+<span class="codeline" id="line-1261"><code>	})</code></span>
+<span class="codeline" id="line-1262"><code>}</code></span>
+<span class="codeline" id="line-1263"><code></code></span>
+<span class="codeline" id="line-1264"><code>// tracebackHexdump hexdumps part of stk around frame.sp and frame.fp</code></span>
+<span class="codeline" id="line-1265"><code>// for debugging purposes. If the address bad is included in the</code></span>
+<span class="codeline" id="line-1266"><code>// hexdumped range, it will mark it as well.</code></span>
+<span class="codeline" id="line-1267"><code>func tracebackHexdump(stk stack, frame *stkframe, bad uintptr) {</code></span>
+<span class="codeline" id="line-1268"><code>	const expand = 32 * goarch.PtrSize</code></span>
+<span class="codeline" id="line-1269"><code>	const maxExpand = 256 * goarch.PtrSize</code></span>
+<span class="codeline" id="line-1270"><code>	// Start around frame.sp.</code></span>
+<span class="codeline" id="line-1271"><code>	lo, hi := frame.sp, frame.sp</code></span>
+<span class="codeline" id="line-1272"><code>	// Expand to include frame.fp.</code></span>
+<span class="codeline" id="line-1273"><code>	if frame.fp != 0 &amp;&amp; frame.fp &lt; lo {</code></span>
+<span class="codeline" id="line-1274"><code>		lo = frame.fp</code></span>
+<span class="codeline" id="line-1275"><code>	}</code></span>
+<span class="codeline" id="line-1276"><code>	if frame.fp != 0 &amp;&amp; frame.fp &gt; hi {</code></span>
+<span class="codeline" id="line-1277"><code>		hi = frame.fp</code></span>
+<span class="codeline" id="line-1278"><code>	}</code></span>
+<span class="codeline" id="line-1279"><code>	// Expand a bit more.</code></span>
+<span class="codeline" id="line-1280"><code>	lo, hi = lo-expand, hi+expand</code></span>
+<span class="codeline" id="line-1281"><code>	// But don't go too far from frame.sp.</code></span>
+<span class="codeline" id="line-1282"><code>	if lo &lt; frame.sp-maxExpand {</code></span>
+<span class="codeline" id="line-1283"><code>		lo = frame.sp - maxExpand</code></span>
+<span class="codeline" id="line-1284"><code>	}</code></span>
+<span class="codeline" id="line-1285"><code>	if hi &gt; frame.sp+maxExpand {</code></span>
+<span class="codeline" id="line-1286"><code>		hi = frame.sp + maxExpand</code></span>
+<span class="codeline" id="line-1287"><code>	}</code></span>
+<span class="codeline" id="line-1288"><code>	// And don't go outside the stack bounds.</code></span>
+<span class="codeline" id="line-1289"><code>	if lo &lt; stk.lo {</code></span>
+<span class="codeline" id="line-1290"><code>		lo = stk.lo</code></span>
+<span class="codeline" id="line-1291"><code>	}</code></span>
+<span class="codeline" id="line-1292"><code>	if hi &gt; stk.hi {</code></span>
+<span class="codeline" id="line-1293"><code>		hi = stk.hi</code></span>
+<span class="codeline" id="line-1294"><code>	}</code></span>
+<span class="codeline" id="line-1295"><code></code></span>
+<span class="codeline" id="line-1296"><code>	// Print the hex dump.</code></span>
+<span class="codeline" id="line-1297"><code>	print("stack: frame={sp:", hex(frame.sp), ", fp:", hex(frame.fp), "} stack=[", hex(stk.lo), ",", hex(stk.hi), ")\n")</code></span>
+<span class="codeline" id="line-1298"><code>	hexdumpWords(lo, hi, func(p uintptr) byte {</code></span>
+<span class="codeline" id="line-1299"><code>		switch p {</code></span>
+<span class="codeline" id="line-1300"><code>		case frame.fp:</code></span>
+<span class="codeline" id="line-1301"><code>			return '&gt;'</code></span>
+<span class="codeline" id="line-1302"><code>		case frame.sp:</code></span>
+<span class="codeline" id="line-1303"><code>			return '&lt;'</code></span>
+<span class="codeline" id="line-1304"><code>		case bad:</code></span>
+<span class="codeline" id="line-1305"><code>			return '!'</code></span>
+<span class="codeline" id="line-1306"><code>		}</code></span>
+<span class="codeline" id="line-1307"><code>		return 0</code></span>
+<span class="codeline" id="line-1308"><code>	})</code></span>
+<span class="codeline" id="line-1309"><code>}</code></span>
+<span class="codeline" id="line-1310"><code></code></span>
+<span class="codeline" id="line-1311"><code>// isSystemGoroutine reports whether the goroutine g must be omitted</code></span>
+<span class="codeline" id="line-1312"><code>// in stack dumps and deadlock detector. This is any goroutine that</code></span>
+<span class="codeline" id="line-1313"><code>// starts at a runtime.* entry point, except for runtime.main,</code></span>
+<span class="codeline" id="line-1314"><code>// runtime.handleAsyncEvent (wasm only) and sometimes runtime.runfinq.</code></span>
+<span class="codeline" id="line-1315"><code>//</code></span>
+<span class="codeline" id="line-1316"><code>// If fixed is true, any goroutine that can vary between user and</code></span>
+<span class="codeline" id="line-1317"><code>// system (that is, the finalizer goroutine) is considered a user</code></span>
+<span class="codeline" id="line-1318"><code>// goroutine.</code></span>
+<span class="codeline" id="line-1319"><code>func isSystemGoroutine(gp *g, fixed bool) bool {</code></span>
+<span class="codeline" id="line-1320"><code>	// Keep this in sync with internal/trace.IsSystemGoroutine.</code></span>
+<span class="codeline" id="line-1321"><code>	f := findfunc(gp.startpc)</code></span>
+<span class="codeline" id="line-1322"><code>	if !f.valid() {</code></span>
+<span class="codeline" id="line-1323"><code>		return false</code></span>
+<span class="codeline" id="line-1324"><code>	}</code></span>
+<span class="codeline" id="line-1325"><code>	if f.funcID == abi.FuncID_runtime_main || f.funcID == abi.FuncID_corostart || f.funcID == abi.FuncID_handleAsyncEvent {</code></span>
+<span class="codeline" id="line-1326"><code>		return false</code></span>
+<span class="codeline" id="line-1327"><code>	}</code></span>
+<span class="codeline" id="line-1328"><code>	if f.funcID == abi.FuncID_runfinq {</code></span>
+<span class="codeline" id="line-1329"><code>		// We include the finalizer goroutine if it's calling</code></span>
+<span class="codeline" id="line-1330"><code>		// back into user code.</code></span>
+<span class="codeline" id="line-1331"><code>		if fixed {</code></span>
+<span class="codeline" id="line-1332"><code>			// This goroutine can vary. In fixed mode,</code></span>
+<span class="codeline" id="line-1333"><code>			// always consider it a user goroutine.</code></span>
+<span class="codeline" id="line-1334"><code>			return false</code></span>
+<span class="codeline" id="line-1335"><code>		}</code></span>
+<span class="codeline" id="line-1336"><code>		return fingStatus.Load()&amp;fingRunningFinalizer == 0</code></span>
+<span class="codeline" id="line-1337"><code>	}</code></span>
+<span class="codeline" id="line-1338"><code>	return hasPrefix(funcname(f), "runtime.")</code></span>
+<span class="codeline" id="line-1339"><code>}</code></span>
+<span class="codeline" id="line-1340"><code></code></span>
+<span class="codeline" id="line-1341"><code>// SetCgoTraceback records three C functions to use to gather</code></span>
+<span class="codeline" id="line-1342"><code>// traceback information from C code and to convert that traceback</code></span>
+<span class="codeline" id="line-1343"><code>// information into symbolic information. These are used when printing</code></span>
+<span class="codeline" id="line-1344"><code>// stack traces for a program that uses cgo.</code></span>
+<span class="codeline" id="line-1345"><code>//</code></span>
+<span class="codeline" id="line-1346"><code>// The traceback and context functions may be called from a signal</code></span>
+<span class="codeline" id="line-1347"><code>// handler, and must therefore use only async-signal safe functions.</code></span>
+<span class="codeline" id="line-1348"><code>// The symbolizer function may be called while the program is</code></span>
+<span class="codeline" id="line-1349"><code>// crashing, and so must be cautious about using memory.  None of the</code></span>
+<span class="codeline" id="line-1350"><code>// functions may call back into Go.</code></span>
+<span class="codeline" id="line-1351"><code>//</code></span>
+<span class="codeline" id="line-1352"><code>// The context function will be called with a single argument, a</code></span>
+<span class="codeline" id="line-1353"><code>// pointer to a struct:</code></span>
+<span class="codeline" id="line-1354"><code>//</code></span>
+<span class="codeline" id="line-1355"><code>//	struct {</code></span>
+<span class="codeline" id="line-1356"><code>//		Context uintptr</code></span>
+<span class="codeline" id="line-1357"><code>//	}</code></span>
+<span class="codeline" id="line-1358"><code>//</code></span>
+<span class="codeline" id="line-1359"><code>// In C syntax, this struct will be</code></span>
+<span class="codeline" id="line-1360"><code>//</code></span>
+<span class="codeline" id="line-1361"><code>//	struct {</code></span>
+<span class="codeline" id="line-1362"><code>//		uintptr_t Context;</code></span>
+<span class="codeline" id="line-1363"><code>//	};</code></span>
+<span class="codeline" id="line-1364"><code>//</code></span>
+<span class="codeline" id="line-1365"><code>// If the Context field is 0, the context function is being called to</code></span>
+<span class="codeline" id="line-1366"><code>// record the current traceback context. It should record in the</code></span>
+<span class="codeline" id="line-1367"><code>// Context field whatever information is needed about the current</code></span>
+<span class="codeline" id="line-1368"><code>// point of execution to later produce a stack trace, probably the</code></span>
+<span class="codeline" id="line-1369"><code>// stack pointer and PC. In this case the context function will be</code></span>
+<span class="codeline" id="line-1370"><code>// called from C code.</code></span>
+<span class="codeline" id="line-1371"><code>//</code></span>
+<span class="codeline" id="line-1372"><code>// If the Context field is not 0, then it is a value returned by a</code></span>
+<span class="codeline" id="line-1373"><code>// previous call to the context function. This case is called when the</code></span>
+<span class="codeline" id="line-1374"><code>// context is no longer needed; that is, when the Go code is returning</code></span>
+<span class="codeline" id="line-1375"><code>// to its C code caller. This permits the context function to release</code></span>
+<span class="codeline" id="line-1376"><code>// any associated resources.</code></span>
+<span class="codeline" id="line-1377"><code>//</code></span>
+<span class="codeline" id="line-1378"><code>// While it would be correct for the context function to record a</code></span>
+<span class="codeline" id="line-1379"><code>// complete a stack trace whenever it is called, and simply copy that</code></span>
+<span class="codeline" id="line-1380"><code>// out in the traceback function, in a typical program the context</code></span>
+<span class="codeline" id="line-1381"><code>// function will be called many times without ever recording a</code></span>
+<span class="codeline" id="line-1382"><code>// traceback for that context. Recording a complete stack trace in a</code></span>
+<span class="codeline" id="line-1383"><code>// call to the context function is likely to be inefficient.</code></span>
+<span class="codeline" id="line-1384"><code>//</code></span>
+<span class="codeline" id="line-1385"><code>// The traceback function will be called with a single argument, a</code></span>
+<span class="codeline" id="line-1386"><code>// pointer to a struct:</code></span>
+<span class="codeline" id="line-1387"><code>//</code></span>
+<span class="codeline" id="line-1388"><code>//	struct {</code></span>
+<span class="codeline" id="line-1389"><code>//		Context    uintptr</code></span>
+<span class="codeline" id="line-1390"><code>//		SigContext uintptr</code></span>
+<span class="codeline" id="line-1391"><code>//		Buf        *uintptr</code></span>
+<span class="codeline" id="line-1392"><code>//		Max        uintptr</code></span>
+<span class="codeline" id="line-1393"><code>//	}</code></span>
+<span class="codeline" id="line-1394"><code>//</code></span>
+<span class="codeline" id="line-1395"><code>// In C syntax, this struct will be</code></span>
+<span class="codeline" id="line-1396"><code>//</code></span>
+<span class="codeline" id="line-1397"><code>//	struct {</code></span>
+<span class="codeline" id="line-1398"><code>//		uintptr_t  Context;</code></span>
+<span class="codeline" id="line-1399"><code>//		uintptr_t  SigContext;</code></span>
+<span class="codeline" id="line-1400"><code>//		uintptr_t* Buf;</code></span>
+<span class="codeline" id="line-1401"><code>//		uintptr_t  Max;</code></span>
+<span class="codeline" id="line-1402"><code>//	};</code></span>
+<span class="codeline" id="line-1403"><code>//</code></span>
+<span class="codeline" id="line-1404"><code>// The Context field will be zero to gather a traceback from the</code></span>
+<span class="codeline" id="line-1405"><code>// current program execution point. In this case, the traceback</code></span>
+<span class="codeline" id="line-1406"><code>// function will be called from C code.</code></span>
+<span class="codeline" id="line-1407"><code>//</code></span>
+<span class="codeline" id="line-1408"><code>// Otherwise Context will be a value previously returned by a call to</code></span>
+<span class="codeline" id="line-1409"><code>// the context function. The traceback function should gather a stack</code></span>
+<span class="codeline" id="line-1410"><code>// trace from that saved point in the program execution. The traceback</code></span>
+<span class="codeline" id="line-1411"><code>// function may be called from an execution thread other than the one</code></span>
+<span class="codeline" id="line-1412"><code>// that recorded the context, but only when the context is known to be</code></span>
+<span class="codeline" id="line-1413"><code>// valid and unchanging. The traceback function may also be called</code></span>
+<span class="codeline" id="line-1414"><code>// deeper in the call stack on the same thread that recorded the</code></span>
+<span class="codeline" id="line-1415"><code>// context. The traceback function may be called multiple times with</code></span>
+<span class="codeline" id="line-1416"><code>// the same Context value; it will usually be appropriate to cache the</code></span>
+<span class="codeline" id="line-1417"><code>// result, if possible, the first time this is called for a specific</code></span>
+<span class="codeline" id="line-1418"><code>// context value.</code></span>
+<span class="codeline" id="line-1419"><code>//</code></span>
+<span class="codeline" id="line-1420"><code>// If the traceback function is called from a signal handler on a Unix</code></span>
+<span class="codeline" id="line-1421"><code>// system, SigContext will be the signal context argument passed to</code></span>
+<span class="codeline" id="line-1422"><code>// the signal handler (a C ucontext_t* cast to uintptr_t). This may be</code></span>
+<span class="codeline" id="line-1423"><code>// used to start tracing at the point where the signal occurred. If</code></span>
+<span class="codeline" id="line-1424"><code>// the traceback function is not called from a signal handler,</code></span>
+<span class="codeline" id="line-1425"><code>// SigContext will be zero.</code></span>
+<span class="codeline" id="line-1426"><code>//</code></span>
+<span class="codeline" id="line-1427"><code>// Buf is where the traceback information should be stored. It should</code></span>
+<span class="codeline" id="line-1428"><code>// be PC values, such that Buf[0] is the PC of the caller, Buf[1] is</code></span>
+<span class="codeline" id="line-1429"><code>// the PC of that function's caller, and so on.  Max is the maximum</code></span>
+<span class="codeline" id="line-1430"><code>// number of entries to store.  The function should store a zero to</code></span>
+<span class="codeline" id="line-1431"><code>// indicate the top of the stack, or that the caller is on a different</code></span>
+<span class="codeline" id="line-1432"><code>// stack, presumably a Go stack.</code></span>
+<span class="codeline" id="line-1433"><code>//</code></span>
+<span class="codeline" id="line-1434"><code>// Unlike runtime.Callers, the PC values returned should, when passed</code></span>
+<span class="codeline" id="line-1435"><code>// to the symbolizer function, return the file/line of the call</code></span>
+<span class="codeline" id="line-1436"><code>// instruction.  No additional subtraction is required or appropriate.</code></span>
+<span class="codeline" id="line-1437"><code>//</code></span>
+<span class="codeline" id="line-1438"><code>// On all platforms, the traceback function is invoked when a call from</code></span>
+<span class="codeline" id="line-1439"><code>// Go to C to Go requests a stack trace. On linux/amd64, linux/ppc64le,</code></span>
+<span class="codeline" id="line-1440"><code>// linux/arm64, and freebsd/amd64, the traceback function is also invoked</code></span>
+<span class="codeline" id="line-1441"><code>// when a signal is received by a thread that is executing a cgo call.</code></span>
+<span class="codeline" id="line-1442"><code>// The traceback function should not make assumptions about when it is</code></span>
+<span class="codeline" id="line-1443"><code>// called, as future versions of Go may make additional calls.</code></span>
+<span class="codeline" id="line-1444"><code>//</code></span>
+<span class="codeline" id="line-1445"><code>// The symbolizer function will be called with a single argument, a</code></span>
+<span class="codeline" id="line-1446"><code>// pointer to a struct:</code></span>
+<span class="codeline" id="line-1447"><code>//</code></span>
+<span class="codeline" id="line-1448"><code>//	struct {</code></span>
+<span class="codeline" id="line-1449"><code>//		PC      uintptr // program counter to fetch information for</code></span>
+<span class="codeline" id="line-1450"><code>//		File    *byte   // file name (NUL terminated)</code></span>
+<span class="codeline" id="line-1451"><code>//		Lineno  uintptr // line number</code></span>
+<span class="codeline" id="line-1452"><code>//		Func    *byte   // function name (NUL terminated)</code></span>
+<span class="codeline" id="line-1453"><code>//		Entry   uintptr // function entry point</code></span>
+<span class="codeline" id="line-1454"><code>//		More    uintptr // set non-zero if more info for this PC</code></span>
+<span class="codeline" id="line-1455"><code>//		Data    uintptr // unused by runtime, available for function</code></span>
+<span class="codeline" id="line-1456"><code>//	}</code></span>
+<span class="codeline" id="line-1457"><code>//</code></span>
+<span class="codeline" id="line-1458"><code>// In C syntax, this struct will be</code></span>
+<span class="codeline" id="line-1459"><code>//</code></span>
+<span class="codeline" id="line-1460"><code>//	struct {</code></span>
+<span class="codeline" id="line-1461"><code>//		uintptr_t PC;</code></span>
+<span class="codeline" id="line-1462"><code>//		char*     File;</code></span>
+<span class="codeline" id="line-1463"><code>//		uintptr_t Lineno;</code></span>
+<span class="codeline" id="line-1464"><code>//		char*     Func;</code></span>
+<span class="codeline" id="line-1465"><code>//		uintptr_t Entry;</code></span>
+<span class="codeline" id="line-1466"><code>//		uintptr_t More;</code></span>
+<span class="codeline" id="line-1467"><code>//		uintptr_t Data;</code></span>
+<span class="codeline" id="line-1468"><code>//	};</code></span>
+<span class="codeline" id="line-1469"><code>//</code></span>
+<span class="codeline" id="line-1470"><code>// The PC field will be a value returned by a call to the traceback</code></span>
+<span class="codeline" id="line-1471"><code>// function.</code></span>
+<span class="codeline" id="line-1472"><code>//</code></span>
+<span class="codeline" id="line-1473"><code>// The first time the function is called for a particular traceback,</code></span>
+<span class="codeline" id="line-1474"><code>// all the fields except PC will be 0. The function should fill in the</code></span>
+<span class="codeline" id="line-1475"><code>// other fields if possible, setting them to 0/nil if the information</code></span>
+<span class="codeline" id="line-1476"><code>// is not available. The Data field may be used to store any useful</code></span>
+<span class="codeline" id="line-1477"><code>// information across calls. The More field should be set to non-zero</code></span>
+<span class="codeline" id="line-1478"><code>// if there is more information for this PC, zero otherwise. If More</code></span>
+<span class="codeline" id="line-1479"><code>// is set non-zero, the function will be called again with the same</code></span>
+<span class="codeline" id="line-1480"><code>// PC, and may return different information (this is intended for use</code></span>
+<span class="codeline" id="line-1481"><code>// with inlined functions). If More is zero, the function will be</code></span>
+<span class="codeline" id="line-1482"><code>// called with the next PC value in the traceback. When the traceback</code></span>
+<span class="codeline" id="line-1483"><code>// is complete, the function will be called once more with PC set to</code></span>
+<span class="codeline" id="line-1484"><code>// zero; this may be used to free any information. Each call will</code></span>
+<span class="codeline" id="line-1485"><code>// leave the fields of the struct set to the same values they had upon</code></span>
+<span class="codeline" id="line-1486"><code>// return, except for the PC field when the More field is zero. The</code></span>
+<span class="codeline" id="line-1487"><code>// function must not keep a copy of the struct pointer between calls.</code></span>
+<span class="codeline" id="line-1488"><code>//</code></span>
+<span class="codeline" id="line-1489"><code>// When calling SetCgoTraceback, the version argument is the version</code></span>
+<span class="codeline" id="line-1490"><code>// number of the structs that the functions expect to receive.</code></span>
+<span class="codeline" id="line-1491"><code>// Currently this must be zero.</code></span>
+<span class="codeline" id="line-1492"><code>//</code></span>
+<span class="codeline" id="line-1493"><code>// The symbolizer function may be nil, in which case the results of</code></span>
+<span class="codeline" id="line-1494"><code>// the traceback function will be displayed as numbers. If the</code></span>
+<span class="codeline" id="line-1495"><code>// traceback function is nil, the symbolizer function will never be</code></span>
+<span class="codeline" id="line-1496"><code>// called. The context function may be nil, in which case the</code></span>
+<span class="codeline" id="line-1497"><code>// traceback function will only be called with the context field set</code></span>
+<span class="codeline" id="line-1498"><code>// to zero.  If the context function is nil, then calls from Go to C</code></span>
+<span class="codeline" id="line-1499"><code>// to Go will not show a traceback for the C portion of the call stack.</code></span>
+<span class="codeline" id="line-1500"><code>//</code></span>
+<span class="codeline" id="line-1501"><code>// SetCgoTraceback should be called only once, ideally from an init function.</code></span>
+<span class="codeline" id="line-1502"><code>func SetCgoTraceback(version int, traceback, context, symbolizer unsafe.Pointer) {</code></span>
+<span class="codeline" id="line-1503"><code>	if version != 0 {</code></span>
+<span class="codeline" id="line-1504"><code>		panic("unsupported version")</code></span>
+<span class="codeline" id="line-1505"><code>	}</code></span>
+<span class="codeline" id="line-1506"><code></code></span>
+<span class="codeline" id="line-1507"><code>	if cgoTraceback != nil &amp;&amp; cgoTraceback != traceback ||</code></span>
+<span class="codeline" id="line-1508"><code>		cgoContext != nil &amp;&amp; cgoContext != context ||</code></span>
+<span class="codeline" id="line-1509"><code>		cgoSymbolizer != nil &amp;&amp; cgoSymbolizer != symbolizer {</code></span>
+<span class="codeline" id="line-1510"><code>		panic("call SetCgoTraceback only once")</code></span>
+<span class="codeline" id="line-1511"><code>	}</code></span>
+<span class="codeline" id="line-1512"><code></code></span>
+<span class="codeline" id="line-1513"><code>	cgoTraceback = traceback</code></span>
+<span class="codeline" id="line-1514"><code>	cgoContext = context</code></span>
+<span class="codeline" id="line-1515"><code>	cgoSymbolizer = symbolizer</code></span>
+<span class="codeline" id="line-1516"><code></code></span>
+<span class="codeline" id="line-1517"><code>	// The context function is called when a C function calls a Go</code></span>
+<span class="codeline" id="line-1518"><code>	// function. As such it is only called by C code in runtime/cgo.</code></span>
+<span class="codeline" id="line-1519"><code>	if _cgo_set_context_function != nil {</code></span>
+<span class="codeline" id="line-1520"><code>		cgocall(_cgo_set_context_function, context)</code></span>
+<span class="codeline" id="line-1521"><code>	}</code></span>
+<span class="codeline" id="line-1522"><code>}</code></span>
+<span class="codeline" id="line-1523"><code></code></span>
+<span class="codeline" id="line-1524"><code>var cgoTraceback unsafe.Pointer</code></span>
+<span class="codeline" id="line-1525"><code>var cgoContext unsafe.Pointer</code></span>
+<span class="codeline" id="line-1526"><code>var cgoSymbolizer unsafe.Pointer</code></span>
+<span class="codeline" id="line-1527"><code></code></span>
+<span class="codeline" id="line-1528"><code>// cgoTracebackArg is the type passed to cgoTraceback.</code></span>
+<span class="codeline" id="line-1529"><code>type cgoTracebackArg struct {</code></span>
+<span class="codeline" id="line-1530"><code>	context    uintptr</code></span>
+<span class="codeline" id="line-1531"><code>	sigContext uintptr</code></span>
+<span class="codeline" id="line-1532"><code>	buf        *uintptr</code></span>
+<span class="codeline" id="line-1533"><code>	max        uintptr</code></span>
+<span class="codeline" id="line-1534"><code>}</code></span>
+<span class="codeline" id="line-1535"><code></code></span>
+<span class="codeline" id="line-1536"><code>// cgoContextArg is the type passed to the context function.</code></span>
+<span class="codeline" id="line-1537"><code>type cgoContextArg struct {</code></span>
+<span class="codeline" id="line-1538"><code>	context uintptr</code></span>
+<span class="codeline" id="line-1539"><code>}</code></span>
+<span class="codeline" id="line-1540"><code></code></span>
+<span class="codeline" id="line-1541"><code>// cgoSymbolizerArg is the type passed to cgoSymbolizer.</code></span>
+<span class="codeline" id="line-1542"><code>type cgoSymbolizerArg struct {</code></span>
+<span class="codeline" id="line-1543"><code>	pc       uintptr</code></span>
+<span class="codeline" id="line-1544"><code>	file     *byte</code></span>
+<span class="codeline" id="line-1545"><code>	lineno   uintptr</code></span>
+<span class="codeline" id="line-1546"><code>	funcName *byte</code></span>
+<span class="codeline" id="line-1547"><code>	entry    uintptr</code></span>
+<span class="codeline" id="line-1548"><code>	more     uintptr</code></span>
+<span class="codeline" id="line-1549"><code>	data     uintptr</code></span>
+<span class="codeline" id="line-1550"><code>}</code></span>
+<span class="codeline" id="line-1551"><code></code></span>
+<span class="codeline" id="line-1552"><code>// printCgoTraceback prints a traceback of callers.</code></span>
+<span class="codeline" id="line-1553"><code>func printCgoTraceback(callers *cgoCallers) {</code></span>
+<span class="codeline" id="line-1554"><code>	if cgoSymbolizer == nil {</code></span>
+<span class="codeline" id="line-1555"><code>		for _, c := range callers {</code></span>
+<span class="codeline" id="line-1556"><code>			if c == 0 {</code></span>
+<span class="codeline" id="line-1557"><code>				break</code></span>
+<span class="codeline" id="line-1558"><code>			}</code></span>
+<span class="codeline" id="line-1559"><code>			print("non-Go function at pc=", hex(c), "\n")</code></span>
+<span class="codeline" id="line-1560"><code>		}</code></span>
+<span class="codeline" id="line-1561"><code>		return</code></span>
+<span class="codeline" id="line-1562"><code>	}</code></span>
+<span class="codeline" id="line-1563"><code></code></span>
+<span class="codeline" id="line-1564"><code>	commitFrame := func() (pr, stop bool) { return true, false }</code></span>
+<span class="codeline" id="line-1565"><code>	var arg cgoSymbolizerArg</code></span>
+<span class="codeline" id="line-1566"><code>	for _, c := range callers {</code></span>
+<span class="codeline" id="line-1567"><code>		if c == 0 {</code></span>
+<span class="codeline" id="line-1568"><code>			break</code></span>
+<span class="codeline" id="line-1569"><code>		}</code></span>
+<span class="codeline" id="line-1570"><code>		printOneCgoTraceback(c, commitFrame, &amp;arg)</code></span>
+<span class="codeline" id="line-1571"><code>	}</code></span>
+<span class="codeline" id="line-1572"><code>	arg.pc = 0</code></span>
+<span class="codeline" id="line-1573"><code>	callCgoSymbolizer(&amp;arg)</code></span>
+<span class="codeline" id="line-1574"><code>}</code></span>
+<span class="codeline" id="line-1575"><code></code></span>
+<span class="codeline" id="line-1576"><code>// printOneCgoTraceback prints the traceback of a single cgo caller.</code></span>
+<span class="codeline" id="line-1577"><code>// This can print more than one line because of inlining.</code></span>
+<span class="codeline" id="line-1578"><code>// It returns the "stop" result of commitFrame.</code></span>
+<span class="codeline" id="line-1579"><code>func printOneCgoTraceback(pc uintptr, commitFrame func() (pr, stop bool), arg *cgoSymbolizerArg) bool {</code></span>
+<span class="codeline" id="line-1580"><code>	arg.pc = pc</code></span>
+<span class="codeline" id="line-1581"><code>	for {</code></span>
+<span class="codeline" id="line-1582"><code>		if pr, stop := commitFrame(); stop {</code></span>
+<span class="codeline" id="line-1583"><code>			return true</code></span>
+<span class="codeline" id="line-1584"><code>		} else if !pr {</code></span>
+<span class="codeline" id="line-1585"><code>			continue</code></span>
+<span class="codeline" id="line-1586"><code>		}</code></span>
+<span class="codeline" id="line-1587"><code></code></span>
+<span class="codeline" id="line-1588"><code>		callCgoSymbolizer(arg)</code></span>
+<span class="codeline" id="line-1589"><code>		if arg.funcName != nil {</code></span>
+<span class="codeline" id="line-1590"><code>			// Note that we don't print any argument</code></span>
+<span class="codeline" id="line-1591"><code>			// information here, not even parentheses.</code></span>
+<span class="codeline" id="line-1592"><code>			// The symbolizer must add that if appropriate.</code></span>
+<span class="codeline" id="line-1593"><code>			println(gostringnocopy(arg.funcName))</code></span>
+<span class="codeline" id="line-1594"><code>		} else {</code></span>
+<span class="codeline" id="line-1595"><code>			println("non-Go function")</code></span>
+<span class="codeline" id="line-1596"><code>		}</code></span>
+<span class="codeline" id="line-1597"><code>		print("\t")</code></span>
+<span class="codeline" id="line-1598"><code>		if arg.file != nil {</code></span>
+<span class="codeline" id="line-1599"><code>			print(gostringnocopy(arg.file), ":", arg.lineno, " ")</code></span>
+<span class="codeline" id="line-1600"><code>		}</code></span>
+<span class="codeline" id="line-1601"><code>		print("pc=", hex(pc), "\n")</code></span>
+<span class="codeline" id="line-1602"><code>		if arg.more == 0 {</code></span>
+<span class="codeline" id="line-1603"><code>			return false</code></span>
+<span class="codeline" id="line-1604"><code>		}</code></span>
+<span class="codeline" id="line-1605"><code>	}</code></span>
+<span class="codeline" id="line-1606"><code>}</code></span>
+<span class="codeline" id="line-1607"><code></code></span>
+<span class="codeline" id="line-1608"><code>// callCgoSymbolizer calls the cgoSymbolizer function.</code></span>
+<span class="codeline" id="line-1609"><code>func callCgoSymbolizer(arg *cgoSymbolizerArg) {</code></span>
+<span class="codeline" id="line-1610"><code>	call := cgocall</code></span>
+<span class="codeline" id="line-1611"><code>	if panicking.Load() &gt; 0 || getg().m.curg != getg() {</code></span>
+<span class="codeline" id="line-1612"><code>		// We do not want to call into the scheduler when panicking</code></span>
+<span class="codeline" id="line-1613"><code>		// or when on the system stack.</code></span>
+<span class="codeline" id="line-1614"><code>		call = asmcgocall</code></span>
+<span class="codeline" id="line-1615"><code>	}</code></span>
+<span class="codeline" id="line-1616"><code>	if msanenabled {</code></span>
+<span class="codeline" id="line-1617"><code>		msanwrite(unsafe.Pointer(arg), unsafe.Sizeof(cgoSymbolizerArg{}))</code></span>
+<span class="codeline" id="line-1618"><code>	}</code></span>
+<span class="codeline" id="line-1619"><code>	if asanenabled {</code></span>
+<span class="codeline" id="line-1620"><code>		asanwrite(unsafe.Pointer(arg), unsafe.Sizeof(cgoSymbolizerArg{}))</code></span>
+<span class="codeline" id="line-1621"><code>	}</code></span>
+<span class="codeline" id="line-1622"><code>	call(cgoSymbolizer, noescape(unsafe.Pointer(arg)))</code></span>
+<span class="codeline" id="line-1623"><code>}</code></span>
+<span class="codeline" id="line-1624"><code></code></span>
+<span class="codeline" id="line-1625"><code>// cgoContextPCs gets the PC values from a cgo traceback.</code></span>
+<span class="codeline" id="line-1626"><code>func cgoContextPCs(ctxt uintptr, buf []uintptr) {</code></span>
+<span class="codeline" id="line-1627"><code>	if cgoTraceback == nil {</code></span>
+<span class="codeline" id="line-1628"><code>		return</code></span>
+<span class="codeline" id="line-1629"><code>	}</code></span>
+<span class="codeline" id="line-1630"><code>	call := cgocall</code></span>
+<span class="codeline" id="line-1631"><code>	if panicking.Load() &gt; 0 || getg().m.curg != getg() {</code></span>
+<span class="codeline" id="line-1632"><code>		// We do not want to call into the scheduler when panicking</code></span>
+<span class="codeline" id="line-1633"><code>		// or when on the system stack.</code></span>
+<span class="codeline" id="line-1634"><code>		call = asmcgocall</code></span>
+<span class="codeline" id="line-1635"><code>	}</code></span>
+<span class="codeline" id="line-1636"><code>	arg := cgoTracebackArg{</code></span>
+<span class="codeline" id="line-1637"><code>		context: ctxt,</code></span>
+<span class="codeline" id="line-1638"><code>		buf:     (*uintptr)(noescape(unsafe.Pointer(&amp;buf[0]))),</code></span>
+<span class="codeline" id="line-1639"><code>		max:     uintptr(len(buf)),</code></span>
+<span class="codeline" id="line-1640"><code>	}</code></span>
+<span class="codeline" id="line-1641"><code>	if msanenabled {</code></span>
+<span class="codeline" id="line-1642"><code>		msanwrite(unsafe.Pointer(&amp;arg), unsafe.Sizeof(arg))</code></span>
+<span class="codeline" id="line-1643"><code>	}</code></span>
+<span class="codeline" id="line-1644"><code>	if asanenabled {</code></span>
+<span class="codeline" id="line-1645"><code>		asanwrite(unsafe.Pointer(&amp;arg), unsafe.Sizeof(arg))</code></span>
+<span class="codeline" id="line-1646"><code>	}</code></span>
+<span class="codeline" id="line-1647"><code>	call(cgoTraceback, noescape(unsafe.Pointer(&amp;arg)))</code></span>
+<span class="codeline" id="line-1648"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

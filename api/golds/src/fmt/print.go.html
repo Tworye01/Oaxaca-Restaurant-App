@@ -1,0 +1,1249 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: print.go in package fmt</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	print.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/fmt.html">fmt</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package fmt</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/fmtsort"</code></span>
+<span class="codeline" id="line-9"><code>	"io"</code></span>
+<span class="codeline" id="line-10"><code>	"os"</code></span>
+<span class="codeline" id="line-11"><code>	"reflect"</code></span>
+<span class="codeline" id="line-12"><code>	"strconv"</code></span>
+<span class="codeline" id="line-13"><code>	"sync"</code></span>
+<span class="codeline" id="line-14"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-15"><code>)</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>// Strings for use with buffer.WriteString.</code></span>
+<span class="codeline" id="line-18"><code>// This is less overhead than using buffer.Write with byte arrays.</code></span>
+<span class="codeline" id="line-19"><code>const (</code></span>
+<span class="codeline" id="line-20"><code>	commaSpaceString  = ", "</code></span>
+<span class="codeline" id="line-21"><code>	nilAngleString    = "&lt;nil&gt;"</code></span>
+<span class="codeline" id="line-22"><code>	nilParenString    = "(nil)"</code></span>
+<span class="codeline" id="line-23"><code>	nilString         = "nil"</code></span>
+<span class="codeline" id="line-24"><code>	mapString         = "map["</code></span>
+<span class="codeline" id="line-25"><code>	percentBangString = "%!"</code></span>
+<span class="codeline" id="line-26"><code>	missingString     = "(MISSING)"</code></span>
+<span class="codeline" id="line-27"><code>	badIndexString    = "(BADINDEX)"</code></span>
+<span class="codeline" id="line-28"><code>	panicString       = "(PANIC="</code></span>
+<span class="codeline" id="line-29"><code>	extraString       = "%!(EXTRA "</code></span>
+<span class="codeline" id="line-30"><code>	badWidthString    = "%!(BADWIDTH)"</code></span>
+<span class="codeline" id="line-31"><code>	badPrecString     = "%!(BADPREC)"</code></span>
+<span class="codeline" id="line-32"><code>	noVerbString      = "%!(NOVERB)"</code></span>
+<span class="codeline" id="line-33"><code>	invReflectString  = "&lt;invalid reflect.Value&gt;"</code></span>
+<span class="codeline" id="line-34"><code>)</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// State represents the printer state passed to custom formatters.</code></span>
+<span class="codeline" id="line-37"><code>// It provides access to the io.Writer interface plus information about</code></span>
+<span class="codeline" id="line-38"><code>// the flags and options for the operand's format specifier.</code></span>
+<span class="codeline" id="line-39"><code>type State interface {</code></span>
+<span class="codeline" id="line-40"><code>	// Write is the function to call to emit formatted output to be printed.</code></span>
+<span class="codeline" id="line-41"><code>	Write(b []byte) (n int, err error)</code></span>
+<span class="codeline" id="line-42"><code>	// Width returns the value of the width option and whether it has been set.</code></span>
+<span class="codeline" id="line-43"><code>	Width() (wid int, ok bool)</code></span>
+<span class="codeline" id="line-44"><code>	// Precision returns the value of the precision option and whether it has been set.</code></span>
+<span class="codeline" id="line-45"><code>	Precision() (prec int, ok bool)</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>	// Flag reports whether the flag c, a character, has been set.</code></span>
+<span class="codeline" id="line-48"><code>	Flag(c int) bool</code></span>
+<span class="codeline" id="line-49"><code>}</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>// Formatter is implemented by any value that has a Format method.</code></span>
+<span class="codeline" id="line-52"><code>// The implementation controls how State and rune are interpreted,</code></span>
+<span class="codeline" id="line-53"><code>// and may call Sprint() or Fprint(f) etc. to generate its output.</code></span>
+<span class="codeline" id="line-54"><code>type Formatter interface {</code></span>
+<span class="codeline" id="line-55"><code>	Format(f State, verb rune)</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// Stringer is implemented by any value that has a String method,</code></span>
+<span class="codeline" id="line-59"><code>// which defines the “native” format for that value.</code></span>
+<span class="codeline" id="line-60"><code>// The String method is used to print values passed as an operand</code></span>
+<span class="codeline" id="line-61"><code>// to any format that accepts a string or to an unformatted printer</code></span>
+<span class="codeline" id="line-62"><code>// such as Print.</code></span>
+<span class="codeline" id="line-63"><code>type Stringer interface {</code></span>
+<span class="codeline" id="line-64"><code>	String() string</code></span>
+<span class="codeline" id="line-65"><code>}</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// GoStringer is implemented by any value that has a GoString method,</code></span>
+<span class="codeline" id="line-68"><code>// which defines the Go syntax for that value.</code></span>
+<span class="codeline" id="line-69"><code>// The GoString method is used to print values passed as an operand</code></span>
+<span class="codeline" id="line-70"><code>// to a %#v format.</code></span>
+<span class="codeline" id="line-71"><code>type GoStringer interface {</code></span>
+<span class="codeline" id="line-72"><code>	GoString() string</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>// FormatString returns a string representing the fully qualified formatting</code></span>
+<span class="codeline" id="line-76"><code>// directive captured by the State, followed by the argument verb. (State does not</code></span>
+<span class="codeline" id="line-77"><code>// itself contain the verb.) The result has a leading percent sign followed by any</code></span>
+<span class="codeline" id="line-78"><code>// flags, the width, and the precision. Missing flags, width, and precision are</code></span>
+<span class="codeline" id="line-79"><code>// omitted. This function allows a Formatter to reconstruct the original</code></span>
+<span class="codeline" id="line-80"><code>// directive triggering the call to Format.</code></span>
+<span class="codeline" id="line-81"><code>func FormatString(state State, verb rune) string {</code></span>
+<span class="codeline" id="line-82"><code>	var tmp [16]byte // Use a local buffer.</code></span>
+<span class="codeline" id="line-83"><code>	b := append(tmp[:0], '%')</code></span>
+<span class="codeline" id="line-84"><code>	for _, c := range " +-#0" { // All known flags</code></span>
+<span class="codeline" id="line-85"><code>		if state.Flag(int(c)) { // The argument is an int for historical reasons.</code></span>
+<span class="codeline" id="line-86"><code>			b = append(b, byte(c))</code></span>
+<span class="codeline" id="line-87"><code>		}</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code>	if w, ok := state.Width(); ok {</code></span>
+<span class="codeline" id="line-90"><code>		b = strconv.AppendInt(b, int64(w), 10)</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code>	if p, ok := state.Precision(); ok {</code></span>
+<span class="codeline" id="line-93"><code>		b = append(b, '.')</code></span>
+<span class="codeline" id="line-94"><code>		b = strconv.AppendInt(b, int64(p), 10)</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>	b = utf8.AppendRune(b, verb)</code></span>
+<span class="codeline" id="line-97"><code>	return string(b)</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// Use simple []byte instead of bytes.Buffer to avoid large dependency.</code></span>
+<span class="codeline" id="line-101"><code>type buffer []byte</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>func (b *buffer) write(p []byte) {</code></span>
+<span class="codeline" id="line-104"><code>	*b = append(*b, p...)</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>func (b *buffer) writeString(s string) {</code></span>
+<span class="codeline" id="line-108"><code>	*b = append(*b, s...)</code></span>
+<span class="codeline" id="line-109"><code>}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>func (b *buffer) writeByte(c byte) {</code></span>
+<span class="codeline" id="line-112"><code>	*b = append(*b, c)</code></span>
+<span class="codeline" id="line-113"><code>}</code></span>
+<span class="codeline" id="line-114"><code></code></span>
+<span class="codeline" id="line-115"><code>func (b *buffer) writeRune(r rune) {</code></span>
+<span class="codeline" id="line-116"><code>	*b = utf8.AppendRune(*b, r)</code></span>
+<span class="codeline" id="line-117"><code>}</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>// pp is used to store a printer's state and is reused with sync.Pool to avoid allocations.</code></span>
+<span class="codeline" id="line-120"><code>type pp struct {</code></span>
+<span class="codeline" id="line-121"><code>	buf buffer</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>	// arg holds the current item, as an interface{}.</code></span>
+<span class="codeline" id="line-124"><code>	arg any</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	// value is used instead of arg for reflect values.</code></span>
+<span class="codeline" id="line-127"><code>	value reflect.Value</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>	// fmt is used to format basic items such as integers or strings.</code></span>
+<span class="codeline" id="line-130"><code>	fmt fmt</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	// reordered records whether the format string used argument reordering.</code></span>
+<span class="codeline" id="line-133"><code>	reordered bool</code></span>
+<span class="codeline" id="line-134"><code>	// goodArgNum records whether the most recent reordering directive was valid.</code></span>
+<span class="codeline" id="line-135"><code>	goodArgNum bool</code></span>
+<span class="codeline" id="line-136"><code>	// panicking is set by catchPanic to avoid infinite panic, recover, panic, ... recursion.</code></span>
+<span class="codeline" id="line-137"><code>	panicking bool</code></span>
+<span class="codeline" id="line-138"><code>	// erroring is set when printing an error string to guard against calling handleMethods.</code></span>
+<span class="codeline" id="line-139"><code>	erroring bool</code></span>
+<span class="codeline" id="line-140"><code>	// wrapErrs is set when the format string may contain a %w verb.</code></span>
+<span class="codeline" id="line-141"><code>	wrapErrs bool</code></span>
+<span class="codeline" id="line-142"><code>	// wrappedErrs records the targets of the %w verb.</code></span>
+<span class="codeline" id="line-143"><code>	wrappedErrs []int</code></span>
+<span class="codeline" id="line-144"><code>}</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>var ppFree = sync.Pool{</code></span>
+<span class="codeline" id="line-147"><code>	New: func() any { return new(pp) },</code></span>
+<span class="codeline" id="line-148"><code>}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// newPrinter allocates a new pp struct or grabs a cached one.</code></span>
+<span class="codeline" id="line-151"><code>func newPrinter() *pp {</code></span>
+<span class="codeline" id="line-152"><code>	p := ppFree.Get().(*pp)</code></span>
+<span class="codeline" id="line-153"><code>	p.panicking = false</code></span>
+<span class="codeline" id="line-154"><code>	p.erroring = false</code></span>
+<span class="codeline" id="line-155"><code>	p.wrapErrs = false</code></span>
+<span class="codeline" id="line-156"><code>	p.fmt.init(&amp;p.buf)</code></span>
+<span class="codeline" id="line-157"><code>	return p</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>// free saves used pp structs in ppFree; avoids an allocation per invocation.</code></span>
+<span class="codeline" id="line-161"><code>func (p *pp) free() {</code></span>
+<span class="codeline" id="line-162"><code>	// Proper usage of a sync.Pool requires each entry to have approximately</code></span>
+<span class="codeline" id="line-163"><code>	// the same memory cost. To obtain this property when the stored type</code></span>
+<span class="codeline" id="line-164"><code>	// contains a variably-sized buffer, we add a hard limit on the maximum</code></span>
+<span class="codeline" id="line-165"><code>	// buffer to place back in the pool. If the buffer is larger than the</code></span>
+<span class="codeline" id="line-166"><code>	// limit, we drop the buffer and recycle just the printer.</code></span>
+<span class="codeline" id="line-167"><code>	//</code></span>
+<span class="codeline" id="line-168"><code>	// See https://golang.org/issue/23199.</code></span>
+<span class="codeline" id="line-169"><code>	if cap(p.buf) &gt; 64*1024 {</code></span>
+<span class="codeline" id="line-170"><code>		p.buf = nil</code></span>
+<span class="codeline" id="line-171"><code>	} else {</code></span>
+<span class="codeline" id="line-172"><code>		p.buf = p.buf[:0]</code></span>
+<span class="codeline" id="line-173"><code>	}</code></span>
+<span class="codeline" id="line-174"><code>	if cap(p.wrappedErrs) &gt; 8 {</code></span>
+<span class="codeline" id="line-175"><code>		p.wrappedErrs = nil</code></span>
+<span class="codeline" id="line-176"><code>	}</code></span>
+<span class="codeline" id="line-177"><code></code></span>
+<span class="codeline" id="line-178"><code>	p.arg = nil</code></span>
+<span class="codeline" id="line-179"><code>	p.value = reflect.Value{}</code></span>
+<span class="codeline" id="line-180"><code>	p.wrappedErrs = p.wrappedErrs[:0]</code></span>
+<span class="codeline" id="line-181"><code>	ppFree.Put(p)</code></span>
+<span class="codeline" id="line-182"><code>}</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>func (p *pp) Width() (wid int, ok bool) { return p.fmt.wid, p.fmt.widPresent }</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>func (p *pp) Precision() (prec int, ok bool) { return p.fmt.prec, p.fmt.precPresent }</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>func (p *pp) Flag(b int) bool {</code></span>
+<span class="codeline" id="line-189"><code>	switch b {</code></span>
+<span class="codeline" id="line-190"><code>	case '-':</code></span>
+<span class="codeline" id="line-191"><code>		return p.fmt.minus</code></span>
+<span class="codeline" id="line-192"><code>	case '+':</code></span>
+<span class="codeline" id="line-193"><code>		return p.fmt.plus || p.fmt.plusV</code></span>
+<span class="codeline" id="line-194"><code>	case '#':</code></span>
+<span class="codeline" id="line-195"><code>		return p.fmt.sharp || p.fmt.sharpV</code></span>
+<span class="codeline" id="line-196"><code>	case ' ':</code></span>
+<span class="codeline" id="line-197"><code>		return p.fmt.space</code></span>
+<span class="codeline" id="line-198"><code>	case '0':</code></span>
+<span class="codeline" id="line-199"><code>		return p.fmt.zero</code></span>
+<span class="codeline" id="line-200"><code>	}</code></span>
+<span class="codeline" id="line-201"><code>	return false</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>// Implement Write so we can call Fprintf on a pp (through State), for</code></span>
+<span class="codeline" id="line-205"><code>// recursive use in custom verbs.</code></span>
+<span class="codeline" id="line-206"><code>func (p *pp) Write(b []byte) (ret int, err error) {</code></span>
+<span class="codeline" id="line-207"><code>	p.buf.write(b)</code></span>
+<span class="codeline" id="line-208"><code>	return len(b), nil</code></span>
+<span class="codeline" id="line-209"><code>}</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>// Implement WriteString so that we can call io.WriteString</code></span>
+<span class="codeline" id="line-212"><code>// on a pp (through state), for efficiency.</code></span>
+<span class="codeline" id="line-213"><code>func (p *pp) WriteString(s string) (ret int, err error) {</code></span>
+<span class="codeline" id="line-214"><code>	p.buf.writeString(s)</code></span>
+<span class="codeline" id="line-215"><code>	return len(s), nil</code></span>
+<span class="codeline" id="line-216"><code>}</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>// These routines end in 'f' and take a format string.</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>// Fprintf formats according to a format specifier and writes to w.</code></span>
+<span class="codeline" id="line-221"><code>// It returns the number of bytes written and any write error encountered.</code></span>
+<span class="codeline" id="line-222"><code>func Fprintf(w io.Writer, format string, a ...any) (n int, err error) {</code></span>
+<span class="codeline" id="line-223"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-224"><code>	p.doPrintf(format, a)</code></span>
+<span class="codeline" id="line-225"><code>	n, err = w.Write(p.buf)</code></span>
+<span class="codeline" id="line-226"><code>	p.free()</code></span>
+<span class="codeline" id="line-227"><code>	return</code></span>
+<span class="codeline" id="line-228"><code>}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>// Printf formats according to a format specifier and writes to standard output.</code></span>
+<span class="codeline" id="line-231"><code>// It returns the number of bytes written and any write error encountered.</code></span>
+<span class="codeline" id="line-232"><code>func Printf(format string, a ...any) (n int, err error) {</code></span>
+<span class="codeline" id="line-233"><code>	return Fprintf(os.Stdout, format, a...)</code></span>
+<span class="codeline" id="line-234"><code>}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>// Sprintf formats according to a format specifier and returns the resulting string.</code></span>
+<span class="codeline" id="line-237"><code>func Sprintf(format string, a ...any) string {</code></span>
+<span class="codeline" id="line-238"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-239"><code>	p.doPrintf(format, a)</code></span>
+<span class="codeline" id="line-240"><code>	s := string(p.buf)</code></span>
+<span class="codeline" id="line-241"><code>	p.free()</code></span>
+<span class="codeline" id="line-242"><code>	return s</code></span>
+<span class="codeline" id="line-243"><code>}</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>// Appendf formats according to a format specifier, appends the result to the byte</code></span>
+<span class="codeline" id="line-246"><code>// slice, and returns the updated slice.</code></span>
+<span class="codeline" id="line-247"><code>func Appendf(b []byte, format string, a ...any) []byte {</code></span>
+<span class="codeline" id="line-248"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-249"><code>	p.doPrintf(format, a)</code></span>
+<span class="codeline" id="line-250"><code>	b = append(b, p.buf...)</code></span>
+<span class="codeline" id="line-251"><code>	p.free()</code></span>
+<span class="codeline" id="line-252"><code>	return b</code></span>
+<span class="codeline" id="line-253"><code>}</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>// These routines do not take a format string</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>// Fprint formats using the default formats for its operands and writes to w.</code></span>
+<span class="codeline" id="line-258"><code>// Spaces are added between operands when neither is a string.</code></span>
+<span class="codeline" id="line-259"><code>// It returns the number of bytes written and any write error encountered.</code></span>
+<span class="codeline" id="line-260"><code>func Fprint(w io.Writer, a ...any) (n int, err error) {</code></span>
+<span class="codeline" id="line-261"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-262"><code>	p.doPrint(a)</code></span>
+<span class="codeline" id="line-263"><code>	n, err = w.Write(p.buf)</code></span>
+<span class="codeline" id="line-264"><code>	p.free()</code></span>
+<span class="codeline" id="line-265"><code>	return</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// Print formats using the default formats for its operands and writes to standard output.</code></span>
+<span class="codeline" id="line-269"><code>// Spaces are added between operands when neither is a string.</code></span>
+<span class="codeline" id="line-270"><code>// It returns the number of bytes written and any write error encountered.</code></span>
+<span class="codeline" id="line-271"><code>func Print(a ...any) (n int, err error) {</code></span>
+<span class="codeline" id="line-272"><code>	return Fprint(os.Stdout, a...)</code></span>
+<span class="codeline" id="line-273"><code>}</code></span>
+<span class="codeline" id="line-274"><code></code></span>
+<span class="codeline" id="line-275"><code>// Sprint formats using the default formats for its operands and returns the resulting string.</code></span>
+<span class="codeline" id="line-276"><code>// Spaces are added between operands when neither is a string.</code></span>
+<span class="codeline" id="line-277"><code>func Sprint(a ...any) string {</code></span>
+<span class="codeline" id="line-278"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-279"><code>	p.doPrint(a)</code></span>
+<span class="codeline" id="line-280"><code>	s := string(p.buf)</code></span>
+<span class="codeline" id="line-281"><code>	p.free()</code></span>
+<span class="codeline" id="line-282"><code>	return s</code></span>
+<span class="codeline" id="line-283"><code>}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>// Append formats using the default formats for its operands, appends the result to</code></span>
+<span class="codeline" id="line-286"><code>// the byte slice, and returns the updated slice.</code></span>
+<span class="codeline" id="line-287"><code>func Append(b []byte, a ...any) []byte {</code></span>
+<span class="codeline" id="line-288"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-289"><code>	p.doPrint(a)</code></span>
+<span class="codeline" id="line-290"><code>	b = append(b, p.buf...)</code></span>
+<span class="codeline" id="line-291"><code>	p.free()</code></span>
+<span class="codeline" id="line-292"><code>	return b</code></span>
+<span class="codeline" id="line-293"><code>}</code></span>
+<span class="codeline" id="line-294"><code></code></span>
+<span class="codeline" id="line-295"><code>// These routines end in 'ln', do not take a format string,</code></span>
+<span class="codeline" id="line-296"><code>// always add spaces between operands, and add a newline</code></span>
+<span class="codeline" id="line-297"><code>// after the last operand.</code></span>
+<span class="codeline" id="line-298"><code></code></span>
+<span class="codeline" id="line-299"><code>// Fprintln formats using the default formats for its operands and writes to w.</code></span>
+<span class="codeline" id="line-300"><code>// Spaces are always added between operands and a newline is appended.</code></span>
+<span class="codeline" id="line-301"><code>// It returns the number of bytes written and any write error encountered.</code></span>
+<span class="codeline" id="line-302"><code>func Fprintln(w io.Writer, a ...any) (n int, err error) {</code></span>
+<span class="codeline" id="line-303"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-304"><code>	p.doPrintln(a)</code></span>
+<span class="codeline" id="line-305"><code>	n, err = w.Write(p.buf)</code></span>
+<span class="codeline" id="line-306"><code>	p.free()</code></span>
+<span class="codeline" id="line-307"><code>	return</code></span>
+<span class="codeline" id="line-308"><code>}</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>// Println formats using the default formats for its operands and writes to standard output.</code></span>
+<span class="codeline" id="line-311"><code>// Spaces are always added between operands and a newline is appended.</code></span>
+<span class="codeline" id="line-312"><code>// It returns the number of bytes written and any write error encountered.</code></span>
+<span class="codeline" id="line-313"><code>func Println(a ...any) (n int, err error) {</code></span>
+<span class="codeline" id="line-314"><code>	return Fprintln(os.Stdout, a...)</code></span>
+<span class="codeline" id="line-315"><code>}</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>// Sprintln formats using the default formats for its operands and returns the resulting string.</code></span>
+<span class="codeline" id="line-318"><code>// Spaces are always added between operands and a newline is appended.</code></span>
+<span class="codeline" id="line-319"><code>func Sprintln(a ...any) string {</code></span>
+<span class="codeline" id="line-320"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-321"><code>	p.doPrintln(a)</code></span>
+<span class="codeline" id="line-322"><code>	s := string(p.buf)</code></span>
+<span class="codeline" id="line-323"><code>	p.free()</code></span>
+<span class="codeline" id="line-324"><code>	return s</code></span>
+<span class="codeline" id="line-325"><code>}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>// Appendln formats using the default formats for its operands, appends the result</code></span>
+<span class="codeline" id="line-328"><code>// to the byte slice, and returns the updated slice. Spaces are always added</code></span>
+<span class="codeline" id="line-329"><code>// between operands and a newline is appended.</code></span>
+<span class="codeline" id="line-330"><code>func Appendln(b []byte, a ...any) []byte {</code></span>
+<span class="codeline" id="line-331"><code>	p := newPrinter()</code></span>
+<span class="codeline" id="line-332"><code>	p.doPrintln(a)</code></span>
+<span class="codeline" id="line-333"><code>	b = append(b, p.buf...)</code></span>
+<span class="codeline" id="line-334"><code>	p.free()</code></span>
+<span class="codeline" id="line-335"><code>	return b</code></span>
+<span class="codeline" id="line-336"><code>}</code></span>
+<span class="codeline" id="line-337"><code></code></span>
+<span class="codeline" id="line-338"><code>// getField gets the i'th field of the struct value.</code></span>
+<span class="codeline" id="line-339"><code>// If the field itself is a non-nil interface, return a value for</code></span>
+<span class="codeline" id="line-340"><code>// the thing inside the interface, not the interface itself.</code></span>
+<span class="codeline" id="line-341"><code>func getField(v reflect.Value, i int) reflect.Value {</code></span>
+<span class="codeline" id="line-342"><code>	val := v.Field(i)</code></span>
+<span class="codeline" id="line-343"><code>	if val.Kind() == reflect.Interface &amp;&amp; !val.IsNil() {</code></span>
+<span class="codeline" id="line-344"><code>		val = val.Elem()</code></span>
+<span class="codeline" id="line-345"><code>	}</code></span>
+<span class="codeline" id="line-346"><code>	return val</code></span>
+<span class="codeline" id="line-347"><code>}</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>// tooLarge reports whether the magnitude of the integer is</code></span>
+<span class="codeline" id="line-350"><code>// too large to be used as a formatting width or precision.</code></span>
+<span class="codeline" id="line-351"><code>func tooLarge(x int) bool {</code></span>
+<span class="codeline" id="line-352"><code>	const max int = 1e6</code></span>
+<span class="codeline" id="line-353"><code>	return x &gt; max || x &lt; -max</code></span>
+<span class="codeline" id="line-354"><code>}</code></span>
+<span class="codeline" id="line-355"><code></code></span>
+<span class="codeline" id="line-356"><code>// parsenum converts ASCII to integer.  num is 0 (and isnum is false) if no number present.</code></span>
+<span class="codeline" id="line-357"><code>func parsenum(s string, start, end int) (num int, isnum bool, newi int) {</code></span>
+<span class="codeline" id="line-358"><code>	if start &gt;= end {</code></span>
+<span class="codeline" id="line-359"><code>		return 0, false, end</code></span>
+<span class="codeline" id="line-360"><code>	}</code></span>
+<span class="codeline" id="line-361"><code>	for newi = start; newi &lt; end &amp;&amp; '0' &lt;= s[newi] &amp;&amp; s[newi] &lt;= '9'; newi++ {</code></span>
+<span class="codeline" id="line-362"><code>		if tooLarge(num) {</code></span>
+<span class="codeline" id="line-363"><code>			return 0, false, end // Overflow; crazy long number most likely.</code></span>
+<span class="codeline" id="line-364"><code>		}</code></span>
+<span class="codeline" id="line-365"><code>		num = num*10 + int(s[newi]-'0')</code></span>
+<span class="codeline" id="line-366"><code>		isnum = true</code></span>
+<span class="codeline" id="line-367"><code>	}</code></span>
+<span class="codeline" id="line-368"><code>	return</code></span>
+<span class="codeline" id="line-369"><code>}</code></span>
+<span class="codeline" id="line-370"><code></code></span>
+<span class="codeline" id="line-371"><code>func (p *pp) unknownType(v reflect.Value) {</code></span>
+<span class="codeline" id="line-372"><code>	if !v.IsValid() {</code></span>
+<span class="codeline" id="line-373"><code>		p.buf.writeString(nilAngleString)</code></span>
+<span class="codeline" id="line-374"><code>		return</code></span>
+<span class="codeline" id="line-375"><code>	}</code></span>
+<span class="codeline" id="line-376"><code>	p.buf.writeByte('?')</code></span>
+<span class="codeline" id="line-377"><code>	p.buf.writeString(v.Type().String())</code></span>
+<span class="codeline" id="line-378"><code>	p.buf.writeByte('?')</code></span>
+<span class="codeline" id="line-379"><code>}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>func (p *pp) badVerb(verb rune) {</code></span>
+<span class="codeline" id="line-382"><code>	p.erroring = true</code></span>
+<span class="codeline" id="line-383"><code>	p.buf.writeString(percentBangString)</code></span>
+<span class="codeline" id="line-384"><code>	p.buf.writeRune(verb)</code></span>
+<span class="codeline" id="line-385"><code>	p.buf.writeByte('(')</code></span>
+<span class="codeline" id="line-386"><code>	switch {</code></span>
+<span class="codeline" id="line-387"><code>	case p.arg != nil:</code></span>
+<span class="codeline" id="line-388"><code>		p.buf.writeString(reflect.TypeOf(p.arg).String())</code></span>
+<span class="codeline" id="line-389"><code>		p.buf.writeByte('=')</code></span>
+<span class="codeline" id="line-390"><code>		p.printArg(p.arg, 'v')</code></span>
+<span class="codeline" id="line-391"><code>	case p.value.IsValid():</code></span>
+<span class="codeline" id="line-392"><code>		p.buf.writeString(p.value.Type().String())</code></span>
+<span class="codeline" id="line-393"><code>		p.buf.writeByte('=')</code></span>
+<span class="codeline" id="line-394"><code>		p.printValue(p.value, 'v', 0)</code></span>
+<span class="codeline" id="line-395"><code>	default:</code></span>
+<span class="codeline" id="line-396"><code>		p.buf.writeString(nilAngleString)</code></span>
+<span class="codeline" id="line-397"><code>	}</code></span>
+<span class="codeline" id="line-398"><code>	p.buf.writeByte(')')</code></span>
+<span class="codeline" id="line-399"><code>	p.erroring = false</code></span>
+<span class="codeline" id="line-400"><code>}</code></span>
+<span class="codeline" id="line-401"><code></code></span>
+<span class="codeline" id="line-402"><code>func (p *pp) fmtBool(v bool, verb rune) {</code></span>
+<span class="codeline" id="line-403"><code>	switch verb {</code></span>
+<span class="codeline" id="line-404"><code>	case 't', 'v':</code></span>
+<span class="codeline" id="line-405"><code>		p.fmt.fmtBoolean(v)</code></span>
+<span class="codeline" id="line-406"><code>	default:</code></span>
+<span class="codeline" id="line-407"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code>}</code></span>
+<span class="codeline" id="line-410"><code></code></span>
+<span class="codeline" id="line-411"><code>// fmt0x64 formats a uint64 in hexadecimal and prefixes it with 0x or</code></span>
+<span class="codeline" id="line-412"><code>// not, as requested, by temporarily setting the sharp flag.</code></span>
+<span class="codeline" id="line-413"><code>func (p *pp) fmt0x64(v uint64, leading0x bool) {</code></span>
+<span class="codeline" id="line-414"><code>	sharp := p.fmt.sharp</code></span>
+<span class="codeline" id="line-415"><code>	p.fmt.sharp = leading0x</code></span>
+<span class="codeline" id="line-416"><code>	p.fmt.fmtInteger(v, 16, unsigned, 'v', ldigits)</code></span>
+<span class="codeline" id="line-417"><code>	p.fmt.sharp = sharp</code></span>
+<span class="codeline" id="line-418"><code>}</code></span>
+<span class="codeline" id="line-419"><code></code></span>
+<span class="codeline" id="line-420"><code>// fmtInteger formats a signed or unsigned integer.</code></span>
+<span class="codeline" id="line-421"><code>func (p *pp) fmtInteger(v uint64, isSigned bool, verb rune) {</code></span>
+<span class="codeline" id="line-422"><code>	switch verb {</code></span>
+<span class="codeline" id="line-423"><code>	case 'v':</code></span>
+<span class="codeline" id="line-424"><code>		if p.fmt.sharpV &amp;&amp; !isSigned {</code></span>
+<span class="codeline" id="line-425"><code>			p.fmt0x64(v, true)</code></span>
+<span class="codeline" id="line-426"><code>		} else {</code></span>
+<span class="codeline" id="line-427"><code>			p.fmt.fmtInteger(v, 10, isSigned, verb, ldigits)</code></span>
+<span class="codeline" id="line-428"><code>		}</code></span>
+<span class="codeline" id="line-429"><code>	case 'd':</code></span>
+<span class="codeline" id="line-430"><code>		p.fmt.fmtInteger(v, 10, isSigned, verb, ldigits)</code></span>
+<span class="codeline" id="line-431"><code>	case 'b':</code></span>
+<span class="codeline" id="line-432"><code>		p.fmt.fmtInteger(v, 2, isSigned, verb, ldigits)</code></span>
+<span class="codeline" id="line-433"><code>	case 'o', 'O':</code></span>
+<span class="codeline" id="line-434"><code>		p.fmt.fmtInteger(v, 8, isSigned, verb, ldigits)</code></span>
+<span class="codeline" id="line-435"><code>	case 'x':</code></span>
+<span class="codeline" id="line-436"><code>		p.fmt.fmtInteger(v, 16, isSigned, verb, ldigits)</code></span>
+<span class="codeline" id="line-437"><code>	case 'X':</code></span>
+<span class="codeline" id="line-438"><code>		p.fmt.fmtInteger(v, 16, isSigned, verb, udigits)</code></span>
+<span class="codeline" id="line-439"><code>	case 'c':</code></span>
+<span class="codeline" id="line-440"><code>		p.fmt.fmtC(v)</code></span>
+<span class="codeline" id="line-441"><code>	case 'q':</code></span>
+<span class="codeline" id="line-442"><code>		p.fmt.fmtQc(v)</code></span>
+<span class="codeline" id="line-443"><code>	case 'U':</code></span>
+<span class="codeline" id="line-444"><code>		p.fmt.fmtUnicode(v)</code></span>
+<span class="codeline" id="line-445"><code>	default:</code></span>
+<span class="codeline" id="line-446"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-447"><code>	}</code></span>
+<span class="codeline" id="line-448"><code>}</code></span>
+<span class="codeline" id="line-449"><code></code></span>
+<span class="codeline" id="line-450"><code>// fmtFloat formats a float. The default precision for each verb</code></span>
+<span class="codeline" id="line-451"><code>// is specified as last argument in the call to fmt_float.</code></span>
+<span class="codeline" id="line-452"><code>func (p *pp) fmtFloat(v float64, size int, verb rune) {</code></span>
+<span class="codeline" id="line-453"><code>	switch verb {</code></span>
+<span class="codeline" id="line-454"><code>	case 'v':</code></span>
+<span class="codeline" id="line-455"><code>		p.fmt.fmtFloat(v, size, 'g', -1)</code></span>
+<span class="codeline" id="line-456"><code>	case 'b', 'g', 'G', 'x', 'X':</code></span>
+<span class="codeline" id="line-457"><code>		p.fmt.fmtFloat(v, size, verb, -1)</code></span>
+<span class="codeline" id="line-458"><code>	case 'f', 'e', 'E':</code></span>
+<span class="codeline" id="line-459"><code>		p.fmt.fmtFloat(v, size, verb, 6)</code></span>
+<span class="codeline" id="line-460"><code>	case 'F':</code></span>
+<span class="codeline" id="line-461"><code>		p.fmt.fmtFloat(v, size, 'f', 6)</code></span>
+<span class="codeline" id="line-462"><code>	default:</code></span>
+<span class="codeline" id="line-463"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-464"><code>	}</code></span>
+<span class="codeline" id="line-465"><code>}</code></span>
+<span class="codeline" id="line-466"><code></code></span>
+<span class="codeline" id="line-467"><code>// fmtComplex formats a complex number v with</code></span>
+<span class="codeline" id="line-468"><code>// r = real(v) and j = imag(v) as (r+ji) using</code></span>
+<span class="codeline" id="line-469"><code>// fmtFloat for r and j formatting.</code></span>
+<span class="codeline" id="line-470"><code>func (p *pp) fmtComplex(v complex128, size int, verb rune) {</code></span>
+<span class="codeline" id="line-471"><code>	// Make sure any unsupported verbs are found before the</code></span>
+<span class="codeline" id="line-472"><code>	// calls to fmtFloat to not generate an incorrect error string.</code></span>
+<span class="codeline" id="line-473"><code>	switch verb {</code></span>
+<span class="codeline" id="line-474"><code>	case 'v', 'b', 'g', 'G', 'x', 'X', 'f', 'F', 'e', 'E':</code></span>
+<span class="codeline" id="line-475"><code>		oldPlus := p.fmt.plus</code></span>
+<span class="codeline" id="line-476"><code>		p.buf.writeByte('(')</code></span>
+<span class="codeline" id="line-477"><code>		p.fmtFloat(real(v), size/2, verb)</code></span>
+<span class="codeline" id="line-478"><code>		// Imaginary part always has a sign.</code></span>
+<span class="codeline" id="line-479"><code>		p.fmt.plus = true</code></span>
+<span class="codeline" id="line-480"><code>		p.fmtFloat(imag(v), size/2, verb)</code></span>
+<span class="codeline" id="line-481"><code>		p.buf.writeString("i)")</code></span>
+<span class="codeline" id="line-482"><code>		p.fmt.plus = oldPlus</code></span>
+<span class="codeline" id="line-483"><code>	default:</code></span>
+<span class="codeline" id="line-484"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-485"><code>	}</code></span>
+<span class="codeline" id="line-486"><code>}</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>func (p *pp) fmtString(v string, verb rune) {</code></span>
+<span class="codeline" id="line-489"><code>	switch verb {</code></span>
+<span class="codeline" id="line-490"><code>	case 'v':</code></span>
+<span class="codeline" id="line-491"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-492"><code>			p.fmt.fmtQ(v)</code></span>
+<span class="codeline" id="line-493"><code>		} else {</code></span>
+<span class="codeline" id="line-494"><code>			p.fmt.fmtS(v)</code></span>
+<span class="codeline" id="line-495"><code>		}</code></span>
+<span class="codeline" id="line-496"><code>	case 's':</code></span>
+<span class="codeline" id="line-497"><code>		p.fmt.fmtS(v)</code></span>
+<span class="codeline" id="line-498"><code>	case 'x':</code></span>
+<span class="codeline" id="line-499"><code>		p.fmt.fmtSx(v, ldigits)</code></span>
+<span class="codeline" id="line-500"><code>	case 'X':</code></span>
+<span class="codeline" id="line-501"><code>		p.fmt.fmtSx(v, udigits)</code></span>
+<span class="codeline" id="line-502"><code>	case 'q':</code></span>
+<span class="codeline" id="line-503"><code>		p.fmt.fmtQ(v)</code></span>
+<span class="codeline" id="line-504"><code>	default:</code></span>
+<span class="codeline" id="line-505"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-506"><code>	}</code></span>
+<span class="codeline" id="line-507"><code>}</code></span>
+<span class="codeline" id="line-508"><code></code></span>
+<span class="codeline" id="line-509"><code>func (p *pp) fmtBytes(v []byte, verb rune, typeString string) {</code></span>
+<span class="codeline" id="line-510"><code>	switch verb {</code></span>
+<span class="codeline" id="line-511"><code>	case 'v', 'd':</code></span>
+<span class="codeline" id="line-512"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-513"><code>			p.buf.writeString(typeString)</code></span>
+<span class="codeline" id="line-514"><code>			if v == nil {</code></span>
+<span class="codeline" id="line-515"><code>				p.buf.writeString(nilParenString)</code></span>
+<span class="codeline" id="line-516"><code>				return</code></span>
+<span class="codeline" id="line-517"><code>			}</code></span>
+<span class="codeline" id="line-518"><code>			p.buf.writeByte('{')</code></span>
+<span class="codeline" id="line-519"><code>			for i, c := range v {</code></span>
+<span class="codeline" id="line-520"><code>				if i &gt; 0 {</code></span>
+<span class="codeline" id="line-521"><code>					p.buf.writeString(commaSpaceString)</code></span>
+<span class="codeline" id="line-522"><code>				}</code></span>
+<span class="codeline" id="line-523"><code>				p.fmt0x64(uint64(c), true)</code></span>
+<span class="codeline" id="line-524"><code>			}</code></span>
+<span class="codeline" id="line-525"><code>			p.buf.writeByte('}')</code></span>
+<span class="codeline" id="line-526"><code>		} else {</code></span>
+<span class="codeline" id="line-527"><code>			p.buf.writeByte('[')</code></span>
+<span class="codeline" id="line-528"><code>			for i, c := range v {</code></span>
+<span class="codeline" id="line-529"><code>				if i &gt; 0 {</code></span>
+<span class="codeline" id="line-530"><code>					p.buf.writeByte(' ')</code></span>
+<span class="codeline" id="line-531"><code>				}</code></span>
+<span class="codeline" id="line-532"><code>				p.fmt.fmtInteger(uint64(c), 10, unsigned, verb, ldigits)</code></span>
+<span class="codeline" id="line-533"><code>			}</code></span>
+<span class="codeline" id="line-534"><code>			p.buf.writeByte(']')</code></span>
+<span class="codeline" id="line-535"><code>		}</code></span>
+<span class="codeline" id="line-536"><code>	case 's':</code></span>
+<span class="codeline" id="line-537"><code>		p.fmt.fmtBs(v)</code></span>
+<span class="codeline" id="line-538"><code>	case 'x':</code></span>
+<span class="codeline" id="line-539"><code>		p.fmt.fmtBx(v, ldigits)</code></span>
+<span class="codeline" id="line-540"><code>	case 'X':</code></span>
+<span class="codeline" id="line-541"><code>		p.fmt.fmtBx(v, udigits)</code></span>
+<span class="codeline" id="line-542"><code>	case 'q':</code></span>
+<span class="codeline" id="line-543"><code>		p.fmt.fmtQ(string(v))</code></span>
+<span class="codeline" id="line-544"><code>	default:</code></span>
+<span class="codeline" id="line-545"><code>		p.printValue(reflect.ValueOf(v), verb, 0)</code></span>
+<span class="codeline" id="line-546"><code>	}</code></span>
+<span class="codeline" id="line-547"><code>}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>func (p *pp) fmtPointer(value reflect.Value, verb rune) {</code></span>
+<span class="codeline" id="line-550"><code>	var u uintptr</code></span>
+<span class="codeline" id="line-551"><code>	switch value.Kind() {</code></span>
+<span class="codeline" id="line-552"><code>	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:</code></span>
+<span class="codeline" id="line-553"><code>		u = uintptr(value.UnsafePointer())</code></span>
+<span class="codeline" id="line-554"><code>	default:</code></span>
+<span class="codeline" id="line-555"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-556"><code>		return</code></span>
+<span class="codeline" id="line-557"><code>	}</code></span>
+<span class="codeline" id="line-558"><code></code></span>
+<span class="codeline" id="line-559"><code>	switch verb {</code></span>
+<span class="codeline" id="line-560"><code>	case 'v':</code></span>
+<span class="codeline" id="line-561"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-562"><code>			p.buf.writeByte('(')</code></span>
+<span class="codeline" id="line-563"><code>			p.buf.writeString(value.Type().String())</code></span>
+<span class="codeline" id="line-564"><code>			p.buf.writeString(")(")</code></span>
+<span class="codeline" id="line-565"><code>			if u == 0 {</code></span>
+<span class="codeline" id="line-566"><code>				p.buf.writeString(nilString)</code></span>
+<span class="codeline" id="line-567"><code>			} else {</code></span>
+<span class="codeline" id="line-568"><code>				p.fmt0x64(uint64(u), true)</code></span>
+<span class="codeline" id="line-569"><code>			}</code></span>
+<span class="codeline" id="line-570"><code>			p.buf.writeByte(')')</code></span>
+<span class="codeline" id="line-571"><code>		} else {</code></span>
+<span class="codeline" id="line-572"><code>			if u == 0 {</code></span>
+<span class="codeline" id="line-573"><code>				p.fmt.padString(nilAngleString)</code></span>
+<span class="codeline" id="line-574"><code>			} else {</code></span>
+<span class="codeline" id="line-575"><code>				p.fmt0x64(uint64(u), !p.fmt.sharp)</code></span>
+<span class="codeline" id="line-576"><code>			}</code></span>
+<span class="codeline" id="line-577"><code>		}</code></span>
+<span class="codeline" id="line-578"><code>	case 'p':</code></span>
+<span class="codeline" id="line-579"><code>		p.fmt0x64(uint64(u), !p.fmt.sharp)</code></span>
+<span class="codeline" id="line-580"><code>	case 'b', 'o', 'd', 'x', 'X':</code></span>
+<span class="codeline" id="line-581"><code>		p.fmtInteger(uint64(u), unsigned, verb)</code></span>
+<span class="codeline" id="line-582"><code>	default:</code></span>
+<span class="codeline" id="line-583"><code>		p.badVerb(verb)</code></span>
+<span class="codeline" id="line-584"><code>	}</code></span>
+<span class="codeline" id="line-585"><code>}</code></span>
+<span class="codeline" id="line-586"><code></code></span>
+<span class="codeline" id="line-587"><code>func (p *pp) catchPanic(arg any, verb rune, method string) {</code></span>
+<span class="codeline" id="line-588"><code>	if err := recover(); err != nil {</code></span>
+<span class="codeline" id="line-589"><code>		// If it's a nil pointer, just say "&lt;nil&gt;". The likeliest causes are a</code></span>
+<span class="codeline" id="line-590"><code>		// Stringer that fails to guard against nil or a nil pointer for a</code></span>
+<span class="codeline" id="line-591"><code>		// value receiver, and in either case, "&lt;nil&gt;" is a nice result.</code></span>
+<span class="codeline" id="line-592"><code>		if v := reflect.ValueOf(arg); v.Kind() == reflect.Pointer &amp;&amp; v.IsNil() {</code></span>
+<span class="codeline" id="line-593"><code>			p.buf.writeString(nilAngleString)</code></span>
+<span class="codeline" id="line-594"><code>			return</code></span>
+<span class="codeline" id="line-595"><code>		}</code></span>
+<span class="codeline" id="line-596"><code>		// Otherwise print a concise panic message. Most of the time the panic</code></span>
+<span class="codeline" id="line-597"><code>		// value will print itself nicely.</code></span>
+<span class="codeline" id="line-598"><code>		if p.panicking {</code></span>
+<span class="codeline" id="line-599"><code>			// Nested panics; the recursion in printArg cannot succeed.</code></span>
+<span class="codeline" id="line-600"><code>			panic(err)</code></span>
+<span class="codeline" id="line-601"><code>		}</code></span>
+<span class="codeline" id="line-602"><code></code></span>
+<span class="codeline" id="line-603"><code>		oldFlags := p.fmt.fmtFlags</code></span>
+<span class="codeline" id="line-604"><code>		// For this output we want default behavior.</code></span>
+<span class="codeline" id="line-605"><code>		p.fmt.clearflags()</code></span>
+<span class="codeline" id="line-606"><code></code></span>
+<span class="codeline" id="line-607"><code>		p.buf.writeString(percentBangString)</code></span>
+<span class="codeline" id="line-608"><code>		p.buf.writeRune(verb)</code></span>
+<span class="codeline" id="line-609"><code>		p.buf.writeString(panicString)</code></span>
+<span class="codeline" id="line-610"><code>		p.buf.writeString(method)</code></span>
+<span class="codeline" id="line-611"><code>		p.buf.writeString(" method: ")</code></span>
+<span class="codeline" id="line-612"><code>		p.panicking = true</code></span>
+<span class="codeline" id="line-613"><code>		p.printArg(err, 'v')</code></span>
+<span class="codeline" id="line-614"><code>		p.panicking = false</code></span>
+<span class="codeline" id="line-615"><code>		p.buf.writeByte(')')</code></span>
+<span class="codeline" id="line-616"><code></code></span>
+<span class="codeline" id="line-617"><code>		p.fmt.fmtFlags = oldFlags</code></span>
+<span class="codeline" id="line-618"><code>	}</code></span>
+<span class="codeline" id="line-619"><code>}</code></span>
+<span class="codeline" id="line-620"><code></code></span>
+<span class="codeline" id="line-621"><code>func (p *pp) handleMethods(verb rune) (handled bool) {</code></span>
+<span class="codeline" id="line-622"><code>	if p.erroring {</code></span>
+<span class="codeline" id="line-623"><code>		return</code></span>
+<span class="codeline" id="line-624"><code>	}</code></span>
+<span class="codeline" id="line-625"><code>	if verb == 'w' {</code></span>
+<span class="codeline" id="line-626"><code>		// It is invalid to use %w other than with Errorf or with a non-error arg.</code></span>
+<span class="codeline" id="line-627"><code>		_, ok := p.arg.(error)</code></span>
+<span class="codeline" id="line-628"><code>		if !ok || !p.wrapErrs {</code></span>
+<span class="codeline" id="line-629"><code>			p.badVerb(verb)</code></span>
+<span class="codeline" id="line-630"><code>			return true</code></span>
+<span class="codeline" id="line-631"><code>		}</code></span>
+<span class="codeline" id="line-632"><code>		// If the arg is a Formatter, pass 'v' as the verb to it.</code></span>
+<span class="codeline" id="line-633"><code>		verb = 'v'</code></span>
+<span class="codeline" id="line-634"><code>	}</code></span>
+<span class="codeline" id="line-635"><code></code></span>
+<span class="codeline" id="line-636"><code>	// Is it a Formatter?</code></span>
+<span class="codeline" id="line-637"><code>	if formatter, ok := p.arg.(Formatter); ok {</code></span>
+<span class="codeline" id="line-638"><code>		handled = true</code></span>
+<span class="codeline" id="line-639"><code>		defer p.catchPanic(p.arg, verb, "Format")</code></span>
+<span class="codeline" id="line-640"><code>		formatter.Format(p, verb)</code></span>
+<span class="codeline" id="line-641"><code>		return</code></span>
+<span class="codeline" id="line-642"><code>	}</code></span>
+<span class="codeline" id="line-643"><code></code></span>
+<span class="codeline" id="line-644"><code>	// If we're doing Go syntax and the argument knows how to supply it, take care of it now.</code></span>
+<span class="codeline" id="line-645"><code>	if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-646"><code>		if stringer, ok := p.arg.(GoStringer); ok {</code></span>
+<span class="codeline" id="line-647"><code>			handled = true</code></span>
+<span class="codeline" id="line-648"><code>			defer p.catchPanic(p.arg, verb, "GoString")</code></span>
+<span class="codeline" id="line-649"><code>			// Print the result of GoString unadorned.</code></span>
+<span class="codeline" id="line-650"><code>			p.fmt.fmtS(stringer.GoString())</code></span>
+<span class="codeline" id="line-651"><code>			return</code></span>
+<span class="codeline" id="line-652"><code>		}</code></span>
+<span class="codeline" id="line-653"><code>	} else {</code></span>
+<span class="codeline" id="line-654"><code>		// If a string is acceptable according to the format, see if</code></span>
+<span class="codeline" id="line-655"><code>		// the value satisfies one of the string-valued interfaces.</code></span>
+<span class="codeline" id="line-656"><code>		// Println etc. set verb to %v, which is "stringable".</code></span>
+<span class="codeline" id="line-657"><code>		switch verb {</code></span>
+<span class="codeline" id="line-658"><code>		case 'v', 's', 'x', 'X', 'q':</code></span>
+<span class="codeline" id="line-659"><code>			// Is it an error or Stringer?</code></span>
+<span class="codeline" id="line-660"><code>			// The duplication in the bodies is necessary:</code></span>
+<span class="codeline" id="line-661"><code>			// setting handled and deferring catchPanic</code></span>
+<span class="codeline" id="line-662"><code>			// must happen before calling the method.</code></span>
+<span class="codeline" id="line-663"><code>			switch v := p.arg.(type) {</code></span>
+<span class="codeline" id="line-664"><code>			case error:</code></span>
+<span class="codeline" id="line-665"><code>				handled = true</code></span>
+<span class="codeline" id="line-666"><code>				defer p.catchPanic(p.arg, verb, "Error")</code></span>
+<span class="codeline" id="line-667"><code>				p.fmtString(v.Error(), verb)</code></span>
+<span class="codeline" id="line-668"><code>				return</code></span>
+<span class="codeline" id="line-669"><code></code></span>
+<span class="codeline" id="line-670"><code>			case Stringer:</code></span>
+<span class="codeline" id="line-671"><code>				handled = true</code></span>
+<span class="codeline" id="line-672"><code>				defer p.catchPanic(p.arg, verb, "String")</code></span>
+<span class="codeline" id="line-673"><code>				p.fmtString(v.String(), verb)</code></span>
+<span class="codeline" id="line-674"><code>				return</code></span>
+<span class="codeline" id="line-675"><code>			}</code></span>
+<span class="codeline" id="line-676"><code>		}</code></span>
+<span class="codeline" id="line-677"><code>	}</code></span>
+<span class="codeline" id="line-678"><code>	return false</code></span>
+<span class="codeline" id="line-679"><code>}</code></span>
+<span class="codeline" id="line-680"><code></code></span>
+<span class="codeline" id="line-681"><code>func (p *pp) printArg(arg any, verb rune) {</code></span>
+<span class="codeline" id="line-682"><code>	p.arg = arg</code></span>
+<span class="codeline" id="line-683"><code>	p.value = reflect.Value{}</code></span>
+<span class="codeline" id="line-684"><code></code></span>
+<span class="codeline" id="line-685"><code>	if arg == nil {</code></span>
+<span class="codeline" id="line-686"><code>		switch verb {</code></span>
+<span class="codeline" id="line-687"><code>		case 'T', 'v':</code></span>
+<span class="codeline" id="line-688"><code>			p.fmt.padString(nilAngleString)</code></span>
+<span class="codeline" id="line-689"><code>		default:</code></span>
+<span class="codeline" id="line-690"><code>			p.badVerb(verb)</code></span>
+<span class="codeline" id="line-691"><code>		}</code></span>
+<span class="codeline" id="line-692"><code>		return</code></span>
+<span class="codeline" id="line-693"><code>	}</code></span>
+<span class="codeline" id="line-694"><code></code></span>
+<span class="codeline" id="line-695"><code>	// Special processing considerations.</code></span>
+<span class="codeline" id="line-696"><code>	// %T (the value's type) and %p (its address) are special; we always do them first.</code></span>
+<span class="codeline" id="line-697"><code>	switch verb {</code></span>
+<span class="codeline" id="line-698"><code>	case 'T':</code></span>
+<span class="codeline" id="line-699"><code>		p.fmt.fmtS(reflect.TypeOf(arg).String())</code></span>
+<span class="codeline" id="line-700"><code>		return</code></span>
+<span class="codeline" id="line-701"><code>	case 'p':</code></span>
+<span class="codeline" id="line-702"><code>		p.fmtPointer(reflect.ValueOf(arg), 'p')</code></span>
+<span class="codeline" id="line-703"><code>		return</code></span>
+<span class="codeline" id="line-704"><code>	}</code></span>
+<span class="codeline" id="line-705"><code></code></span>
+<span class="codeline" id="line-706"><code>	// Some types can be done without reflection.</code></span>
+<span class="codeline" id="line-707"><code>	switch f := arg.(type) {</code></span>
+<span class="codeline" id="line-708"><code>	case bool:</code></span>
+<span class="codeline" id="line-709"><code>		p.fmtBool(f, verb)</code></span>
+<span class="codeline" id="line-710"><code>	case float32:</code></span>
+<span class="codeline" id="line-711"><code>		p.fmtFloat(float64(f), 32, verb)</code></span>
+<span class="codeline" id="line-712"><code>	case float64:</code></span>
+<span class="codeline" id="line-713"><code>		p.fmtFloat(f, 64, verb)</code></span>
+<span class="codeline" id="line-714"><code>	case complex64:</code></span>
+<span class="codeline" id="line-715"><code>		p.fmtComplex(complex128(f), 64, verb)</code></span>
+<span class="codeline" id="line-716"><code>	case complex128:</code></span>
+<span class="codeline" id="line-717"><code>		p.fmtComplex(f, 128, verb)</code></span>
+<span class="codeline" id="line-718"><code>	case int:</code></span>
+<span class="codeline" id="line-719"><code>		p.fmtInteger(uint64(f), signed, verb)</code></span>
+<span class="codeline" id="line-720"><code>	case int8:</code></span>
+<span class="codeline" id="line-721"><code>		p.fmtInteger(uint64(f), signed, verb)</code></span>
+<span class="codeline" id="line-722"><code>	case int16:</code></span>
+<span class="codeline" id="line-723"><code>		p.fmtInteger(uint64(f), signed, verb)</code></span>
+<span class="codeline" id="line-724"><code>	case int32:</code></span>
+<span class="codeline" id="line-725"><code>		p.fmtInteger(uint64(f), signed, verb)</code></span>
+<span class="codeline" id="line-726"><code>	case int64:</code></span>
+<span class="codeline" id="line-727"><code>		p.fmtInteger(uint64(f), signed, verb)</code></span>
+<span class="codeline" id="line-728"><code>	case uint:</code></span>
+<span class="codeline" id="line-729"><code>		p.fmtInteger(uint64(f), unsigned, verb)</code></span>
+<span class="codeline" id="line-730"><code>	case uint8:</code></span>
+<span class="codeline" id="line-731"><code>		p.fmtInteger(uint64(f), unsigned, verb)</code></span>
+<span class="codeline" id="line-732"><code>	case uint16:</code></span>
+<span class="codeline" id="line-733"><code>		p.fmtInteger(uint64(f), unsigned, verb)</code></span>
+<span class="codeline" id="line-734"><code>	case uint32:</code></span>
+<span class="codeline" id="line-735"><code>		p.fmtInteger(uint64(f), unsigned, verb)</code></span>
+<span class="codeline" id="line-736"><code>	case uint64:</code></span>
+<span class="codeline" id="line-737"><code>		p.fmtInteger(f, unsigned, verb)</code></span>
+<span class="codeline" id="line-738"><code>	case uintptr:</code></span>
+<span class="codeline" id="line-739"><code>		p.fmtInteger(uint64(f), unsigned, verb)</code></span>
+<span class="codeline" id="line-740"><code>	case string:</code></span>
+<span class="codeline" id="line-741"><code>		p.fmtString(f, verb)</code></span>
+<span class="codeline" id="line-742"><code>	case []byte:</code></span>
+<span class="codeline" id="line-743"><code>		p.fmtBytes(f, verb, "[]byte")</code></span>
+<span class="codeline" id="line-744"><code>	case reflect.Value:</code></span>
+<span class="codeline" id="line-745"><code>		// Handle extractable values with special methods</code></span>
+<span class="codeline" id="line-746"><code>		// since printValue does not handle them at depth 0.</code></span>
+<span class="codeline" id="line-747"><code>		if f.IsValid() &amp;&amp; f.CanInterface() {</code></span>
+<span class="codeline" id="line-748"><code>			p.arg = f.Interface()</code></span>
+<span class="codeline" id="line-749"><code>			if p.handleMethods(verb) {</code></span>
+<span class="codeline" id="line-750"><code>				return</code></span>
+<span class="codeline" id="line-751"><code>			}</code></span>
+<span class="codeline" id="line-752"><code>		}</code></span>
+<span class="codeline" id="line-753"><code>		p.printValue(f, verb, 0)</code></span>
+<span class="codeline" id="line-754"><code>	default:</code></span>
+<span class="codeline" id="line-755"><code>		// If the type is not simple, it might have methods.</code></span>
+<span class="codeline" id="line-756"><code>		if !p.handleMethods(verb) {</code></span>
+<span class="codeline" id="line-757"><code>			// Need to use reflection, since the type had no</code></span>
+<span class="codeline" id="line-758"><code>			// interface methods that could be used for formatting.</code></span>
+<span class="codeline" id="line-759"><code>			p.printValue(reflect.ValueOf(f), verb, 0)</code></span>
+<span class="codeline" id="line-760"><code>		}</code></span>
+<span class="codeline" id="line-761"><code>	}</code></span>
+<span class="codeline" id="line-762"><code>}</code></span>
+<span class="codeline" id="line-763"><code></code></span>
+<span class="codeline" id="line-764"><code>// printValue is similar to printArg but starts with a reflect value, not an interface{} value.</code></span>
+<span class="codeline" id="line-765"><code>// It does not handle 'p' and 'T' verbs because these should have been already handled by printArg.</code></span>
+<span class="codeline" id="line-766"><code>func (p *pp) printValue(value reflect.Value, verb rune, depth int) {</code></span>
+<span class="codeline" id="line-767"><code>	// Handle values with special methods if not already handled by printArg (depth == 0).</code></span>
+<span class="codeline" id="line-768"><code>	if depth &gt; 0 &amp;&amp; value.IsValid() &amp;&amp; value.CanInterface() {</code></span>
+<span class="codeline" id="line-769"><code>		p.arg = value.Interface()</code></span>
+<span class="codeline" id="line-770"><code>		if p.handleMethods(verb) {</code></span>
+<span class="codeline" id="line-771"><code>			return</code></span>
+<span class="codeline" id="line-772"><code>		}</code></span>
+<span class="codeline" id="line-773"><code>	}</code></span>
+<span class="codeline" id="line-774"><code>	p.arg = nil</code></span>
+<span class="codeline" id="line-775"><code>	p.value = value</code></span>
+<span class="codeline" id="line-776"><code></code></span>
+<span class="codeline" id="line-777"><code>	switch f := value; value.Kind() {</code></span>
+<span class="codeline" id="line-778"><code>	case reflect.Invalid:</code></span>
+<span class="codeline" id="line-779"><code>		if depth == 0 {</code></span>
+<span class="codeline" id="line-780"><code>			p.buf.writeString(invReflectString)</code></span>
+<span class="codeline" id="line-781"><code>		} else {</code></span>
+<span class="codeline" id="line-782"><code>			switch verb {</code></span>
+<span class="codeline" id="line-783"><code>			case 'v':</code></span>
+<span class="codeline" id="line-784"><code>				p.buf.writeString(nilAngleString)</code></span>
+<span class="codeline" id="line-785"><code>			default:</code></span>
+<span class="codeline" id="line-786"><code>				p.badVerb(verb)</code></span>
+<span class="codeline" id="line-787"><code>			}</code></span>
+<span class="codeline" id="line-788"><code>		}</code></span>
+<span class="codeline" id="line-789"><code>	case reflect.Bool:</code></span>
+<span class="codeline" id="line-790"><code>		p.fmtBool(f.Bool(), verb)</code></span>
+<span class="codeline" id="line-791"><code>	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:</code></span>
+<span class="codeline" id="line-792"><code>		p.fmtInteger(uint64(f.Int()), signed, verb)</code></span>
+<span class="codeline" id="line-793"><code>	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:</code></span>
+<span class="codeline" id="line-794"><code>		p.fmtInteger(f.Uint(), unsigned, verb)</code></span>
+<span class="codeline" id="line-795"><code>	case reflect.Float32:</code></span>
+<span class="codeline" id="line-796"><code>		p.fmtFloat(f.Float(), 32, verb)</code></span>
+<span class="codeline" id="line-797"><code>	case reflect.Float64:</code></span>
+<span class="codeline" id="line-798"><code>		p.fmtFloat(f.Float(), 64, verb)</code></span>
+<span class="codeline" id="line-799"><code>	case reflect.Complex64:</code></span>
+<span class="codeline" id="line-800"><code>		p.fmtComplex(f.Complex(), 64, verb)</code></span>
+<span class="codeline" id="line-801"><code>	case reflect.Complex128:</code></span>
+<span class="codeline" id="line-802"><code>		p.fmtComplex(f.Complex(), 128, verb)</code></span>
+<span class="codeline" id="line-803"><code>	case reflect.String:</code></span>
+<span class="codeline" id="line-804"><code>		p.fmtString(f.String(), verb)</code></span>
+<span class="codeline" id="line-805"><code>	case reflect.Map:</code></span>
+<span class="codeline" id="line-806"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-807"><code>			p.buf.writeString(f.Type().String())</code></span>
+<span class="codeline" id="line-808"><code>			if f.IsNil() {</code></span>
+<span class="codeline" id="line-809"><code>				p.buf.writeString(nilParenString)</code></span>
+<span class="codeline" id="line-810"><code>				return</code></span>
+<span class="codeline" id="line-811"><code>			}</code></span>
+<span class="codeline" id="line-812"><code>			p.buf.writeByte('{')</code></span>
+<span class="codeline" id="line-813"><code>		} else {</code></span>
+<span class="codeline" id="line-814"><code>			p.buf.writeString(mapString)</code></span>
+<span class="codeline" id="line-815"><code>		}</code></span>
+<span class="codeline" id="line-816"><code>		sorted := fmtsort.Sort(f)</code></span>
+<span class="codeline" id="line-817"><code>		for i, key := range sorted.Key {</code></span>
+<span class="codeline" id="line-818"><code>			if i &gt; 0 {</code></span>
+<span class="codeline" id="line-819"><code>				if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-820"><code>					p.buf.writeString(commaSpaceString)</code></span>
+<span class="codeline" id="line-821"><code>				} else {</code></span>
+<span class="codeline" id="line-822"><code>					p.buf.writeByte(' ')</code></span>
+<span class="codeline" id="line-823"><code>				}</code></span>
+<span class="codeline" id="line-824"><code>			}</code></span>
+<span class="codeline" id="line-825"><code>			p.printValue(key, verb, depth+1)</code></span>
+<span class="codeline" id="line-826"><code>			p.buf.writeByte(':')</code></span>
+<span class="codeline" id="line-827"><code>			p.printValue(sorted.Value[i], verb, depth+1)</code></span>
+<span class="codeline" id="line-828"><code>		}</code></span>
+<span class="codeline" id="line-829"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-830"><code>			p.buf.writeByte('}')</code></span>
+<span class="codeline" id="line-831"><code>		} else {</code></span>
+<span class="codeline" id="line-832"><code>			p.buf.writeByte(']')</code></span>
+<span class="codeline" id="line-833"><code>		}</code></span>
+<span class="codeline" id="line-834"><code>	case reflect.Struct:</code></span>
+<span class="codeline" id="line-835"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-836"><code>			p.buf.writeString(f.Type().String())</code></span>
+<span class="codeline" id="line-837"><code>		}</code></span>
+<span class="codeline" id="line-838"><code>		p.buf.writeByte('{')</code></span>
+<span class="codeline" id="line-839"><code>		for i := 0; i &lt; f.NumField(); i++ {</code></span>
+<span class="codeline" id="line-840"><code>			if i &gt; 0 {</code></span>
+<span class="codeline" id="line-841"><code>				if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-842"><code>					p.buf.writeString(commaSpaceString)</code></span>
+<span class="codeline" id="line-843"><code>				} else {</code></span>
+<span class="codeline" id="line-844"><code>					p.buf.writeByte(' ')</code></span>
+<span class="codeline" id="line-845"><code>				}</code></span>
+<span class="codeline" id="line-846"><code>			}</code></span>
+<span class="codeline" id="line-847"><code>			if p.fmt.plusV || p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-848"><code>				if name := f.Type().Field(i).Name; name != "" {</code></span>
+<span class="codeline" id="line-849"><code>					p.buf.writeString(name)</code></span>
+<span class="codeline" id="line-850"><code>					p.buf.writeByte(':')</code></span>
+<span class="codeline" id="line-851"><code>				}</code></span>
+<span class="codeline" id="line-852"><code>			}</code></span>
+<span class="codeline" id="line-853"><code>			p.printValue(getField(f, i), verb, depth+1)</code></span>
+<span class="codeline" id="line-854"><code>		}</code></span>
+<span class="codeline" id="line-855"><code>		p.buf.writeByte('}')</code></span>
+<span class="codeline" id="line-856"><code>	case reflect.Interface:</code></span>
+<span class="codeline" id="line-857"><code>		value := f.Elem()</code></span>
+<span class="codeline" id="line-858"><code>		if !value.IsValid() {</code></span>
+<span class="codeline" id="line-859"><code>			if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-860"><code>				p.buf.writeString(f.Type().String())</code></span>
+<span class="codeline" id="line-861"><code>				p.buf.writeString(nilParenString)</code></span>
+<span class="codeline" id="line-862"><code>			} else {</code></span>
+<span class="codeline" id="line-863"><code>				p.buf.writeString(nilAngleString)</code></span>
+<span class="codeline" id="line-864"><code>			}</code></span>
+<span class="codeline" id="line-865"><code>		} else {</code></span>
+<span class="codeline" id="line-866"><code>			p.printValue(value, verb, depth+1)</code></span>
+<span class="codeline" id="line-867"><code>		}</code></span>
+<span class="codeline" id="line-868"><code>	case reflect.Array, reflect.Slice:</code></span>
+<span class="codeline" id="line-869"><code>		switch verb {</code></span>
+<span class="codeline" id="line-870"><code>		case 's', 'q', 'x', 'X':</code></span>
+<span class="codeline" id="line-871"><code>			// Handle byte and uint8 slices and arrays special for the above verbs.</code></span>
+<span class="codeline" id="line-872"><code>			t := f.Type()</code></span>
+<span class="codeline" id="line-873"><code>			if t.Elem().Kind() == reflect.Uint8 {</code></span>
+<span class="codeline" id="line-874"><code>				var bytes []byte</code></span>
+<span class="codeline" id="line-875"><code>				if f.Kind() == reflect.Slice || f.CanAddr() {</code></span>
+<span class="codeline" id="line-876"><code>					bytes = f.Bytes()</code></span>
+<span class="codeline" id="line-877"><code>				} else {</code></span>
+<span class="codeline" id="line-878"><code>					// We have an array, but we cannot Bytes() a non-addressable array,</code></span>
+<span class="codeline" id="line-879"><code>					// so we build a slice by hand. This is a rare case but it would be nice</code></span>
+<span class="codeline" id="line-880"><code>					// if reflection could help a little more.</code></span>
+<span class="codeline" id="line-881"><code>					bytes = make([]byte, f.Len())</code></span>
+<span class="codeline" id="line-882"><code>					for i := range bytes {</code></span>
+<span class="codeline" id="line-883"><code>						bytes[i] = byte(f.Index(i).Uint())</code></span>
+<span class="codeline" id="line-884"><code>					}</code></span>
+<span class="codeline" id="line-885"><code>				}</code></span>
+<span class="codeline" id="line-886"><code>				p.fmtBytes(bytes, verb, t.String())</code></span>
+<span class="codeline" id="line-887"><code>				return</code></span>
+<span class="codeline" id="line-888"><code>			}</code></span>
+<span class="codeline" id="line-889"><code>		}</code></span>
+<span class="codeline" id="line-890"><code>		if p.fmt.sharpV {</code></span>
+<span class="codeline" id="line-891"><code>			p.buf.writeString(f.Type().String())</code></span>
+<span class="codeline" id="line-892"><code>			if f.Kind() == reflect.Slice &amp;&amp; f.IsNil() {</code></span>
+<span class="codeline" id="line-893"><code>				p.buf.writeString(nilParenString)</code></span>
+<span class="codeline" id="line-894"><code>				return</code></span>
+<span class="codeline" id="line-895"><code>			}</code></span>
+<span class="codeline" id="line-896"><code>			p.buf.writeByte('{')</code></span>
+<span class="codeline" id="line-897"><code>			for i := 0; i &lt; f.Len(); i++ {</code></span>
+<span class="codeline" id="line-898"><code>				if i &gt; 0 {</code></span>
+<span class="codeline" id="line-899"><code>					p.buf.writeString(commaSpaceString)</code></span>
+<span class="codeline" id="line-900"><code>				}</code></span>
+<span class="codeline" id="line-901"><code>				p.printValue(f.Index(i), verb, depth+1)</code></span>
+<span class="codeline" id="line-902"><code>			}</code></span>
+<span class="codeline" id="line-903"><code>			p.buf.writeByte('}')</code></span>
+<span class="codeline" id="line-904"><code>		} else {</code></span>
+<span class="codeline" id="line-905"><code>			p.buf.writeByte('[')</code></span>
+<span class="codeline" id="line-906"><code>			for i := 0; i &lt; f.Len(); i++ {</code></span>
+<span class="codeline" id="line-907"><code>				if i &gt; 0 {</code></span>
+<span class="codeline" id="line-908"><code>					p.buf.writeByte(' ')</code></span>
+<span class="codeline" id="line-909"><code>				}</code></span>
+<span class="codeline" id="line-910"><code>				p.printValue(f.Index(i), verb, depth+1)</code></span>
+<span class="codeline" id="line-911"><code>			}</code></span>
+<span class="codeline" id="line-912"><code>			p.buf.writeByte(']')</code></span>
+<span class="codeline" id="line-913"><code>		}</code></span>
+<span class="codeline" id="line-914"><code>	case reflect.Pointer:</code></span>
+<span class="codeline" id="line-915"><code>		// pointer to array or slice or struct? ok at top level</code></span>
+<span class="codeline" id="line-916"><code>		// but not embedded (avoid loops)</code></span>
+<span class="codeline" id="line-917"><code>		if depth == 0 &amp;&amp; f.UnsafePointer() != nil {</code></span>
+<span class="codeline" id="line-918"><code>			switch a := f.Elem(); a.Kind() {</code></span>
+<span class="codeline" id="line-919"><code>			case reflect.Array, reflect.Slice, reflect.Struct, reflect.Map:</code></span>
+<span class="codeline" id="line-920"><code>				p.buf.writeByte('&amp;')</code></span>
+<span class="codeline" id="line-921"><code>				p.printValue(a, verb, depth+1)</code></span>
+<span class="codeline" id="line-922"><code>				return</code></span>
+<span class="codeline" id="line-923"><code>			}</code></span>
+<span class="codeline" id="line-924"><code>		}</code></span>
+<span class="codeline" id="line-925"><code>		fallthrough</code></span>
+<span class="codeline" id="line-926"><code>	case reflect.Chan, reflect.Func, reflect.UnsafePointer:</code></span>
+<span class="codeline" id="line-927"><code>		p.fmtPointer(f, verb)</code></span>
+<span class="codeline" id="line-928"><code>	default:</code></span>
+<span class="codeline" id="line-929"><code>		p.unknownType(f)</code></span>
+<span class="codeline" id="line-930"><code>	}</code></span>
+<span class="codeline" id="line-931"><code>}</code></span>
+<span class="codeline" id="line-932"><code></code></span>
+<span class="codeline" id="line-933"><code>// intFromArg gets the argNumth element of a. On return, isInt reports whether the argument has integer type.</code></span>
+<span class="codeline" id="line-934"><code>func intFromArg(a []any, argNum int) (num int, isInt bool, newArgNum int) {</code></span>
+<span class="codeline" id="line-935"><code>	newArgNum = argNum</code></span>
+<span class="codeline" id="line-936"><code>	if argNum &lt; len(a) {</code></span>
+<span class="codeline" id="line-937"><code>		num, isInt = a[argNum].(int) // Almost always OK.</code></span>
+<span class="codeline" id="line-938"><code>		if !isInt {</code></span>
+<span class="codeline" id="line-939"><code>			// Work harder.</code></span>
+<span class="codeline" id="line-940"><code>			switch v := reflect.ValueOf(a[argNum]); v.Kind() {</code></span>
+<span class="codeline" id="line-941"><code>			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:</code></span>
+<span class="codeline" id="line-942"><code>				n := v.Int()</code></span>
+<span class="codeline" id="line-943"><code>				if int64(int(n)) == n {</code></span>
+<span class="codeline" id="line-944"><code>					num = int(n)</code></span>
+<span class="codeline" id="line-945"><code>					isInt = true</code></span>
+<span class="codeline" id="line-946"><code>				}</code></span>
+<span class="codeline" id="line-947"><code>			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:</code></span>
+<span class="codeline" id="line-948"><code>				n := v.Uint()</code></span>
+<span class="codeline" id="line-949"><code>				if int64(n) &gt;= 0 &amp;&amp; uint64(int(n)) == n {</code></span>
+<span class="codeline" id="line-950"><code>					num = int(n)</code></span>
+<span class="codeline" id="line-951"><code>					isInt = true</code></span>
+<span class="codeline" id="line-952"><code>				}</code></span>
+<span class="codeline" id="line-953"><code>			default:</code></span>
+<span class="codeline" id="line-954"><code>				// Already 0, false.</code></span>
+<span class="codeline" id="line-955"><code>			}</code></span>
+<span class="codeline" id="line-956"><code>		}</code></span>
+<span class="codeline" id="line-957"><code>		newArgNum = argNum + 1</code></span>
+<span class="codeline" id="line-958"><code>		if tooLarge(num) {</code></span>
+<span class="codeline" id="line-959"><code>			num = 0</code></span>
+<span class="codeline" id="line-960"><code>			isInt = false</code></span>
+<span class="codeline" id="line-961"><code>		}</code></span>
+<span class="codeline" id="line-962"><code>	}</code></span>
+<span class="codeline" id="line-963"><code>	return</code></span>
+<span class="codeline" id="line-964"><code>}</code></span>
+<span class="codeline" id="line-965"><code></code></span>
+<span class="codeline" id="line-966"><code>// parseArgNumber returns the value of the bracketed number, minus 1</code></span>
+<span class="codeline" id="line-967"><code>// (explicit argument numbers are one-indexed but we want zero-indexed).</code></span>
+<span class="codeline" id="line-968"><code>// The opening bracket is known to be present at format[0].</code></span>
+<span class="codeline" id="line-969"><code>// The returned values are the index, the number of bytes to consume</code></span>
+<span class="codeline" id="line-970"><code>// up to the closing paren, if present, and whether the number parsed</code></span>
+<span class="codeline" id="line-971"><code>// ok. The bytes to consume will be 1 if no closing paren is present.</code></span>
+<span class="codeline" id="line-972"><code>func parseArgNumber(format string) (index int, wid int, ok bool) {</code></span>
+<span class="codeline" id="line-973"><code>	// There must be at least 3 bytes: [n].</code></span>
+<span class="codeline" id="line-974"><code>	if len(format) &lt; 3 {</code></span>
+<span class="codeline" id="line-975"><code>		return 0, 1, false</code></span>
+<span class="codeline" id="line-976"><code>	}</code></span>
+<span class="codeline" id="line-977"><code></code></span>
+<span class="codeline" id="line-978"><code>	// Find closing bracket.</code></span>
+<span class="codeline" id="line-979"><code>	for i := 1; i &lt; len(format); i++ {</code></span>
+<span class="codeline" id="line-980"><code>		if format[i] == ']' {</code></span>
+<span class="codeline" id="line-981"><code>			width, ok, newi := parsenum(format, 1, i)</code></span>
+<span class="codeline" id="line-982"><code>			if !ok || newi != i {</code></span>
+<span class="codeline" id="line-983"><code>				return 0, i + 1, false</code></span>
+<span class="codeline" id="line-984"><code>			}</code></span>
+<span class="codeline" id="line-985"><code>			return width - 1, i + 1, true // arg numbers are one-indexed and skip paren.</code></span>
+<span class="codeline" id="line-986"><code>		}</code></span>
+<span class="codeline" id="line-987"><code>	}</code></span>
+<span class="codeline" id="line-988"><code>	return 0, 1, false</code></span>
+<span class="codeline" id="line-989"><code>}</code></span>
+<span class="codeline" id="line-990"><code></code></span>
+<span class="codeline" id="line-991"><code>// argNumber returns the next argument to evaluate, which is either the value of the passed-in</code></span>
+<span class="codeline" id="line-992"><code>// argNum or the value of the bracketed integer that begins format[i:]. It also returns</code></span>
+<span class="codeline" id="line-993"><code>// the new value of i, that is, the index of the next byte of the format to process.</code></span>
+<span class="codeline" id="line-994"><code>func (p *pp) argNumber(argNum int, format string, i int, numArgs int) (newArgNum, newi int, found bool) {</code></span>
+<span class="codeline" id="line-995"><code>	if len(format) &lt;= i || format[i] != '[' {</code></span>
+<span class="codeline" id="line-996"><code>		return argNum, i, false</code></span>
+<span class="codeline" id="line-997"><code>	}</code></span>
+<span class="codeline" id="line-998"><code>	p.reordered = true</code></span>
+<span class="codeline" id="line-999"><code>	index, wid, ok := parseArgNumber(format[i:])</code></span>
+<span class="codeline" id="line-1000"><code>	if ok &amp;&amp; 0 &lt;= index &amp;&amp; index &lt; numArgs {</code></span>
+<span class="codeline" id="line-1001"><code>		return index, i + wid, true</code></span>
+<span class="codeline" id="line-1002"><code>	}</code></span>
+<span class="codeline" id="line-1003"><code>	p.goodArgNum = false</code></span>
+<span class="codeline" id="line-1004"><code>	return argNum, i + wid, ok</code></span>
+<span class="codeline" id="line-1005"><code>}</code></span>
+<span class="codeline" id="line-1006"><code></code></span>
+<span class="codeline" id="line-1007"><code>func (p *pp) badArgNum(verb rune) {</code></span>
+<span class="codeline" id="line-1008"><code>	p.buf.writeString(percentBangString)</code></span>
+<span class="codeline" id="line-1009"><code>	p.buf.writeRune(verb)</code></span>
+<span class="codeline" id="line-1010"><code>	p.buf.writeString(badIndexString)</code></span>
+<span class="codeline" id="line-1011"><code>}</code></span>
+<span class="codeline" id="line-1012"><code></code></span>
+<span class="codeline" id="line-1013"><code>func (p *pp) missingArg(verb rune) {</code></span>
+<span class="codeline" id="line-1014"><code>	p.buf.writeString(percentBangString)</code></span>
+<span class="codeline" id="line-1015"><code>	p.buf.writeRune(verb)</code></span>
+<span class="codeline" id="line-1016"><code>	p.buf.writeString(missingString)</code></span>
+<span class="codeline" id="line-1017"><code>}</code></span>
+<span class="codeline" id="line-1018"><code></code></span>
+<span class="codeline" id="line-1019"><code>func (p *pp) doPrintf(format string, a []any) {</code></span>
+<span class="codeline" id="line-1020"><code>	end := len(format)</code></span>
+<span class="codeline" id="line-1021"><code>	argNum := 0         // we process one argument per non-trivial format</code></span>
+<span class="codeline" id="line-1022"><code>	afterIndex := false // previous item in format was an index like [3].</code></span>
+<span class="codeline" id="line-1023"><code>	p.reordered = false</code></span>
+<span class="codeline" id="line-1024"><code>formatLoop:</code></span>
+<span class="codeline" id="line-1025"><code>	for i := 0; i &lt; end; {</code></span>
+<span class="codeline" id="line-1026"><code>		p.goodArgNum = true</code></span>
+<span class="codeline" id="line-1027"><code>		lasti := i</code></span>
+<span class="codeline" id="line-1028"><code>		for i &lt; end &amp;&amp; format[i] != '%' {</code></span>
+<span class="codeline" id="line-1029"><code>			i++</code></span>
+<span class="codeline" id="line-1030"><code>		}</code></span>
+<span class="codeline" id="line-1031"><code>		if i &gt; lasti {</code></span>
+<span class="codeline" id="line-1032"><code>			p.buf.writeString(format[lasti:i])</code></span>
+<span class="codeline" id="line-1033"><code>		}</code></span>
+<span class="codeline" id="line-1034"><code>		if i &gt;= end {</code></span>
+<span class="codeline" id="line-1035"><code>			// done processing format string</code></span>
+<span class="codeline" id="line-1036"><code>			break</code></span>
+<span class="codeline" id="line-1037"><code>		}</code></span>
+<span class="codeline" id="line-1038"><code></code></span>
+<span class="codeline" id="line-1039"><code>		// Process one verb</code></span>
+<span class="codeline" id="line-1040"><code>		i++</code></span>
+<span class="codeline" id="line-1041"><code></code></span>
+<span class="codeline" id="line-1042"><code>		// Do we have flags?</code></span>
+<span class="codeline" id="line-1043"><code>		p.fmt.clearflags()</code></span>
+<span class="codeline" id="line-1044"><code>	simpleFormat:</code></span>
+<span class="codeline" id="line-1045"><code>		for ; i &lt; end; i++ {</code></span>
+<span class="codeline" id="line-1046"><code>			c := format[i]</code></span>
+<span class="codeline" id="line-1047"><code>			switch c {</code></span>
+<span class="codeline" id="line-1048"><code>			case '#':</code></span>
+<span class="codeline" id="line-1049"><code>				p.fmt.sharp = true</code></span>
+<span class="codeline" id="line-1050"><code>			case '0':</code></span>
+<span class="codeline" id="line-1051"><code>				p.fmt.zero = !p.fmt.minus // Only allow zero padding to the left.</code></span>
+<span class="codeline" id="line-1052"><code>			case '+':</code></span>
+<span class="codeline" id="line-1053"><code>				p.fmt.plus = true</code></span>
+<span class="codeline" id="line-1054"><code>			case '-':</code></span>
+<span class="codeline" id="line-1055"><code>				p.fmt.minus = true</code></span>
+<span class="codeline" id="line-1056"><code>				p.fmt.zero = false // Do not pad with zeros to the right.</code></span>
+<span class="codeline" id="line-1057"><code>			case ' ':</code></span>
+<span class="codeline" id="line-1058"><code>				p.fmt.space = true</code></span>
+<span class="codeline" id="line-1059"><code>			default:</code></span>
+<span class="codeline" id="line-1060"><code>				// Fast path for common case of ascii lower case simple verbs</code></span>
+<span class="codeline" id="line-1061"><code>				// without precision or width or argument indices.</code></span>
+<span class="codeline" id="line-1062"><code>				if 'a' &lt;= c &amp;&amp; c &lt;= 'z' &amp;&amp; argNum &lt; len(a) {</code></span>
+<span class="codeline" id="line-1063"><code>					switch c {</code></span>
+<span class="codeline" id="line-1064"><code>					case 'w':</code></span>
+<span class="codeline" id="line-1065"><code>						p.wrappedErrs = append(p.wrappedErrs, argNum)</code></span>
+<span class="codeline" id="line-1066"><code>						fallthrough</code></span>
+<span class="codeline" id="line-1067"><code>					case 'v':</code></span>
+<span class="codeline" id="line-1068"><code>						// Go syntax</code></span>
+<span class="codeline" id="line-1069"><code>						p.fmt.sharpV = p.fmt.sharp</code></span>
+<span class="codeline" id="line-1070"><code>						p.fmt.sharp = false</code></span>
+<span class="codeline" id="line-1071"><code>						// Struct-field syntax</code></span>
+<span class="codeline" id="line-1072"><code>						p.fmt.plusV = p.fmt.plus</code></span>
+<span class="codeline" id="line-1073"><code>						p.fmt.plus = false</code></span>
+<span class="codeline" id="line-1074"><code>					}</code></span>
+<span class="codeline" id="line-1075"><code>					p.printArg(a[argNum], rune(c))</code></span>
+<span class="codeline" id="line-1076"><code>					argNum++</code></span>
+<span class="codeline" id="line-1077"><code>					i++</code></span>
+<span class="codeline" id="line-1078"><code>					continue formatLoop</code></span>
+<span class="codeline" id="line-1079"><code>				}</code></span>
+<span class="codeline" id="line-1080"><code>				// Format is more complex than simple flags and a verb or is malformed.</code></span>
+<span class="codeline" id="line-1081"><code>				break simpleFormat</code></span>
+<span class="codeline" id="line-1082"><code>			}</code></span>
+<span class="codeline" id="line-1083"><code>		}</code></span>
+<span class="codeline" id="line-1084"><code></code></span>
+<span class="codeline" id="line-1085"><code>		// Do we have an explicit argument index?</code></span>
+<span class="codeline" id="line-1086"><code>		argNum, i, afterIndex = p.argNumber(argNum, format, i, len(a))</code></span>
+<span class="codeline" id="line-1087"><code></code></span>
+<span class="codeline" id="line-1088"><code>		// Do we have width?</code></span>
+<span class="codeline" id="line-1089"><code>		if i &lt; end &amp;&amp; format[i] == '*' {</code></span>
+<span class="codeline" id="line-1090"><code>			i++</code></span>
+<span class="codeline" id="line-1091"><code>			p.fmt.wid, p.fmt.widPresent, argNum = intFromArg(a, argNum)</code></span>
+<span class="codeline" id="line-1092"><code></code></span>
+<span class="codeline" id="line-1093"><code>			if !p.fmt.widPresent {</code></span>
+<span class="codeline" id="line-1094"><code>				p.buf.writeString(badWidthString)</code></span>
+<span class="codeline" id="line-1095"><code>			}</code></span>
+<span class="codeline" id="line-1096"><code></code></span>
+<span class="codeline" id="line-1097"><code>			// We have a negative width, so take its value and ensure</code></span>
+<span class="codeline" id="line-1098"><code>			// that the minus flag is set</code></span>
+<span class="codeline" id="line-1099"><code>			if p.fmt.wid &lt; 0 {</code></span>
+<span class="codeline" id="line-1100"><code>				p.fmt.wid = -p.fmt.wid</code></span>
+<span class="codeline" id="line-1101"><code>				p.fmt.minus = true</code></span>
+<span class="codeline" id="line-1102"><code>				p.fmt.zero = false // Do not pad with zeros to the right.</code></span>
+<span class="codeline" id="line-1103"><code>			}</code></span>
+<span class="codeline" id="line-1104"><code>			afterIndex = false</code></span>
+<span class="codeline" id="line-1105"><code>		} else {</code></span>
+<span class="codeline" id="line-1106"><code>			p.fmt.wid, p.fmt.widPresent, i = parsenum(format, i, end)</code></span>
+<span class="codeline" id="line-1107"><code>			if afterIndex &amp;&amp; p.fmt.widPresent { // "%[3]2d"</code></span>
+<span class="codeline" id="line-1108"><code>				p.goodArgNum = false</code></span>
+<span class="codeline" id="line-1109"><code>			}</code></span>
+<span class="codeline" id="line-1110"><code>		}</code></span>
+<span class="codeline" id="line-1111"><code></code></span>
+<span class="codeline" id="line-1112"><code>		// Do we have precision?</code></span>
+<span class="codeline" id="line-1113"><code>		if i+1 &lt; end &amp;&amp; format[i] == '.' {</code></span>
+<span class="codeline" id="line-1114"><code>			i++</code></span>
+<span class="codeline" id="line-1115"><code>			if afterIndex { // "%[3].2d"</code></span>
+<span class="codeline" id="line-1116"><code>				p.goodArgNum = false</code></span>
+<span class="codeline" id="line-1117"><code>			}</code></span>
+<span class="codeline" id="line-1118"><code>			argNum, i, afterIndex = p.argNumber(argNum, format, i, len(a))</code></span>
+<span class="codeline" id="line-1119"><code>			if i &lt; end &amp;&amp; format[i] == '*' {</code></span>
+<span class="codeline" id="line-1120"><code>				i++</code></span>
+<span class="codeline" id="line-1121"><code>				p.fmt.prec, p.fmt.precPresent, argNum = intFromArg(a, argNum)</code></span>
+<span class="codeline" id="line-1122"><code>				// Negative precision arguments don't make sense</code></span>
+<span class="codeline" id="line-1123"><code>				if p.fmt.prec &lt; 0 {</code></span>
+<span class="codeline" id="line-1124"><code>					p.fmt.prec = 0</code></span>
+<span class="codeline" id="line-1125"><code>					p.fmt.precPresent = false</code></span>
+<span class="codeline" id="line-1126"><code>				}</code></span>
+<span class="codeline" id="line-1127"><code>				if !p.fmt.precPresent {</code></span>
+<span class="codeline" id="line-1128"><code>					p.buf.writeString(badPrecString)</code></span>
+<span class="codeline" id="line-1129"><code>				}</code></span>
+<span class="codeline" id="line-1130"><code>				afterIndex = false</code></span>
+<span class="codeline" id="line-1131"><code>			} else {</code></span>
+<span class="codeline" id="line-1132"><code>				p.fmt.prec, p.fmt.precPresent, i = parsenum(format, i, end)</code></span>
+<span class="codeline" id="line-1133"><code>				if !p.fmt.precPresent {</code></span>
+<span class="codeline" id="line-1134"><code>					p.fmt.prec = 0</code></span>
+<span class="codeline" id="line-1135"><code>					p.fmt.precPresent = true</code></span>
+<span class="codeline" id="line-1136"><code>				}</code></span>
+<span class="codeline" id="line-1137"><code>			}</code></span>
+<span class="codeline" id="line-1138"><code>		}</code></span>
+<span class="codeline" id="line-1139"><code></code></span>
+<span class="codeline" id="line-1140"><code>		if !afterIndex {</code></span>
+<span class="codeline" id="line-1141"><code>			argNum, i, afterIndex = p.argNumber(argNum, format, i, len(a))</code></span>
+<span class="codeline" id="line-1142"><code>		}</code></span>
+<span class="codeline" id="line-1143"><code></code></span>
+<span class="codeline" id="line-1144"><code>		if i &gt;= end {</code></span>
+<span class="codeline" id="line-1145"><code>			p.buf.writeString(noVerbString)</code></span>
+<span class="codeline" id="line-1146"><code>			break</code></span>
+<span class="codeline" id="line-1147"><code>		}</code></span>
+<span class="codeline" id="line-1148"><code></code></span>
+<span class="codeline" id="line-1149"><code>		verb, size := rune(format[i]), 1</code></span>
+<span class="codeline" id="line-1150"><code>		if verb &gt;= utf8.RuneSelf {</code></span>
+<span class="codeline" id="line-1151"><code>			verb, size = utf8.DecodeRuneInString(format[i:])</code></span>
+<span class="codeline" id="line-1152"><code>		}</code></span>
+<span class="codeline" id="line-1153"><code>		i += size</code></span>
+<span class="codeline" id="line-1154"><code></code></span>
+<span class="codeline" id="line-1155"><code>		switch {</code></span>
+<span class="codeline" id="line-1156"><code>		case verb == '%': // Percent does not absorb operands and ignores f.wid and f.prec.</code></span>
+<span class="codeline" id="line-1157"><code>			p.buf.writeByte('%')</code></span>
+<span class="codeline" id="line-1158"><code>		case !p.goodArgNum:</code></span>
+<span class="codeline" id="line-1159"><code>			p.badArgNum(verb)</code></span>
+<span class="codeline" id="line-1160"><code>		case argNum &gt;= len(a): // No argument left over to print for the current verb.</code></span>
+<span class="codeline" id="line-1161"><code>			p.missingArg(verb)</code></span>
+<span class="codeline" id="line-1162"><code>		case verb == 'w':</code></span>
+<span class="codeline" id="line-1163"><code>			p.wrappedErrs = append(p.wrappedErrs, argNum)</code></span>
+<span class="codeline" id="line-1164"><code>			fallthrough</code></span>
+<span class="codeline" id="line-1165"><code>		case verb == 'v':</code></span>
+<span class="codeline" id="line-1166"><code>			// Go syntax</code></span>
+<span class="codeline" id="line-1167"><code>			p.fmt.sharpV = p.fmt.sharp</code></span>
+<span class="codeline" id="line-1168"><code>			p.fmt.sharp = false</code></span>
+<span class="codeline" id="line-1169"><code>			// Struct-field syntax</code></span>
+<span class="codeline" id="line-1170"><code>			p.fmt.plusV = p.fmt.plus</code></span>
+<span class="codeline" id="line-1171"><code>			p.fmt.plus = false</code></span>
+<span class="codeline" id="line-1172"><code>			fallthrough</code></span>
+<span class="codeline" id="line-1173"><code>		default:</code></span>
+<span class="codeline" id="line-1174"><code>			p.printArg(a[argNum], verb)</code></span>
+<span class="codeline" id="line-1175"><code>			argNum++</code></span>
+<span class="codeline" id="line-1176"><code>		}</code></span>
+<span class="codeline" id="line-1177"><code>	}</code></span>
+<span class="codeline" id="line-1178"><code></code></span>
+<span class="codeline" id="line-1179"><code>	// Check for extra arguments unless the call accessed the arguments</code></span>
+<span class="codeline" id="line-1180"><code>	// out of order, in which case it's too expensive to detect if they've all</code></span>
+<span class="codeline" id="line-1181"><code>	// been used and arguably OK if they're not.</code></span>
+<span class="codeline" id="line-1182"><code>	if !p.reordered &amp;&amp; argNum &lt; len(a) {</code></span>
+<span class="codeline" id="line-1183"><code>		p.fmt.clearflags()</code></span>
+<span class="codeline" id="line-1184"><code>		p.buf.writeString(extraString)</code></span>
+<span class="codeline" id="line-1185"><code>		for i, arg := range a[argNum:] {</code></span>
+<span class="codeline" id="line-1186"><code>			if i &gt; 0 {</code></span>
+<span class="codeline" id="line-1187"><code>				p.buf.writeString(commaSpaceString)</code></span>
+<span class="codeline" id="line-1188"><code>			}</code></span>
+<span class="codeline" id="line-1189"><code>			if arg == nil {</code></span>
+<span class="codeline" id="line-1190"><code>				p.buf.writeString(nilAngleString)</code></span>
+<span class="codeline" id="line-1191"><code>			} else {</code></span>
+<span class="codeline" id="line-1192"><code>				p.buf.writeString(reflect.TypeOf(arg).String())</code></span>
+<span class="codeline" id="line-1193"><code>				p.buf.writeByte('=')</code></span>
+<span class="codeline" id="line-1194"><code>				p.printArg(arg, 'v')</code></span>
+<span class="codeline" id="line-1195"><code>			}</code></span>
+<span class="codeline" id="line-1196"><code>		}</code></span>
+<span class="codeline" id="line-1197"><code>		p.buf.writeByte(')')</code></span>
+<span class="codeline" id="line-1198"><code>	}</code></span>
+<span class="codeline" id="line-1199"><code>}</code></span>
+<span class="codeline" id="line-1200"><code></code></span>
+<span class="codeline" id="line-1201"><code>func (p *pp) doPrint(a []any) {</code></span>
+<span class="codeline" id="line-1202"><code>	prevString := false</code></span>
+<span class="codeline" id="line-1203"><code>	for argNum, arg := range a {</code></span>
+<span class="codeline" id="line-1204"><code>		isString := arg != nil &amp;&amp; reflect.TypeOf(arg).Kind() == reflect.String</code></span>
+<span class="codeline" id="line-1205"><code>		// Add a space between two non-string arguments.</code></span>
+<span class="codeline" id="line-1206"><code>		if argNum &gt; 0 &amp;&amp; !isString &amp;&amp; !prevString {</code></span>
+<span class="codeline" id="line-1207"><code>			p.buf.writeByte(' ')</code></span>
+<span class="codeline" id="line-1208"><code>		}</code></span>
+<span class="codeline" id="line-1209"><code>		p.printArg(arg, 'v')</code></span>
+<span class="codeline" id="line-1210"><code>		prevString = isString</code></span>
+<span class="codeline" id="line-1211"><code>	}</code></span>
+<span class="codeline" id="line-1212"><code>}</code></span>
+<span class="codeline" id="line-1213"><code></code></span>
+<span class="codeline" id="line-1214"><code>// doPrintln is like doPrint but always adds a space between arguments</code></span>
+<span class="codeline" id="line-1215"><code>// and a newline after the last argument.</code></span>
+<span class="codeline" id="line-1216"><code>func (p *pp) doPrintln(a []any) {</code></span>
+<span class="codeline" id="line-1217"><code>	for argNum, arg := range a {</code></span>
+<span class="codeline" id="line-1218"><code>		if argNum &gt; 0 {</code></span>
+<span class="codeline" id="line-1219"><code>			p.buf.writeByte(' ')</code></span>
+<span class="codeline" id="line-1220"><code>		}</code></span>
+<span class="codeline" id="line-1221"><code>		p.printArg(arg, 'v')</code></span>
+<span class="codeline" id="line-1222"><code>	}</code></span>
+<span class="codeline" id="line-1223"><code>	p.buf.writeByte('\n')</code></span>
+<span class="codeline" id="line-1224"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

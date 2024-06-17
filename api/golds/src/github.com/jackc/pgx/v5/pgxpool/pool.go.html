@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: pool.go in package github.com/jackc/pgx/v5/pgxpool</title>
+<link href="../../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	pool.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../../pkg/github.com/jackc/pgx/v5/pgxpool.html">github.com/jackc/pgx/v5/pgxpool</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package pgxpool</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"context"</code></span>
+<span class="codeline" id="line-5"><code>	"fmt"</code></span>
+<span class="codeline" id="line-6"><code>	"math/rand"</code></span>
+<span class="codeline" id="line-7"><code>	"runtime"</code></span>
+<span class="codeline" id="line-8"><code>	"strconv"</code></span>
+<span class="codeline" id="line-9"><code>	"sync"</code></span>
+<span class="codeline" id="line-10"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-11"><code>	"time"</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>	"github.com/jackc/pgx/v5"</code></span>
+<span class="codeline" id="line-14"><code>	"github.com/jackc/pgx/v5/pgconn"</code></span>
+<span class="codeline" id="line-15"><code>	"github.com/jackc/puddle/v2"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>var defaultMaxConns = int32(4)</code></span>
+<span class="codeline" id="line-19"><code>var defaultMinConns = int32(0)</code></span>
+<span class="codeline" id="line-20"><code>var defaultMaxConnLifetime = time.Hour</code></span>
+<span class="codeline" id="line-21"><code>var defaultMaxConnIdleTime = time.Minute * 30</code></span>
+<span class="codeline" id="line-22"><code>var defaultHealthCheckPeriod = time.Minute</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>type connResource struct {</code></span>
+<span class="codeline" id="line-25"><code>	conn       *pgx.Conn</code></span>
+<span class="codeline" id="line-26"><code>	conns      []Conn</code></span>
+<span class="codeline" id="line-27"><code>	poolRows   []poolRow</code></span>
+<span class="codeline" id="line-28"><code>	poolRowss  []poolRows</code></span>
+<span class="codeline" id="line-29"><code>	maxAgeTime time.Time</code></span>
+<span class="codeline" id="line-30"><code>}</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>func (cr *connResource) getConn(p *Pool, res *puddle.Resource[*connResource]) *Conn {</code></span>
+<span class="codeline" id="line-33"><code>	if len(cr.conns) == 0 {</code></span>
+<span class="codeline" id="line-34"><code>		cr.conns = make([]Conn, 128)</code></span>
+<span class="codeline" id="line-35"><code>	}</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>	c := &amp;cr.conns[len(cr.conns)-1]</code></span>
+<span class="codeline" id="line-38"><code>	cr.conns = cr.conns[0 : len(cr.conns)-1]</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	c.res = res</code></span>
+<span class="codeline" id="line-41"><code>	c.p = p</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>	return c</code></span>
+<span class="codeline" id="line-44"><code>}</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>func (cr *connResource) getPoolRow(c *Conn, r pgx.Row) *poolRow {</code></span>
+<span class="codeline" id="line-47"><code>	if len(cr.poolRows) == 0 {</code></span>
+<span class="codeline" id="line-48"><code>		cr.poolRows = make([]poolRow, 128)</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>	pr := &amp;cr.poolRows[len(cr.poolRows)-1]</code></span>
+<span class="codeline" id="line-52"><code>	cr.poolRows = cr.poolRows[0 : len(cr.poolRows)-1]</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>	pr.c = c</code></span>
+<span class="codeline" id="line-55"><code>	pr.r = r</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>	return pr</code></span>
+<span class="codeline" id="line-58"><code>}</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>func (cr *connResource) getPoolRows(c *Conn, r pgx.Rows) *poolRows {</code></span>
+<span class="codeline" id="line-61"><code>	if len(cr.poolRowss) == 0 {</code></span>
+<span class="codeline" id="line-62"><code>		cr.poolRowss = make([]poolRows, 128)</code></span>
+<span class="codeline" id="line-63"><code>	}</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>	pr := &amp;cr.poolRowss[len(cr.poolRowss)-1]</code></span>
+<span class="codeline" id="line-66"><code>	cr.poolRowss = cr.poolRowss[0 : len(cr.poolRowss)-1]</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>	pr.c = c</code></span>
+<span class="codeline" id="line-69"><code>	pr.r = r</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>	return pr</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>// Pool allows for connection reuse.</code></span>
+<span class="codeline" id="line-75"><code>type Pool struct {</code></span>
+<span class="codeline" id="line-76"><code>	// 64 bit fields accessed with atomics must be at beginning of struct to guarantee alignment for certain 32-bit</code></span>
+<span class="codeline" id="line-77"><code>	// architectures. See BUGS section of https://pkg.go.dev/sync/atomic and https://github.com/jackc/pgx/issues/1288.</code></span>
+<span class="codeline" id="line-78"><code>	newConnsCount        int64</code></span>
+<span class="codeline" id="line-79"><code>	lifetimeDestroyCount int64</code></span>
+<span class="codeline" id="line-80"><code>	idleDestroyCount     int64</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>	p                     *puddle.Pool[*connResource]</code></span>
+<span class="codeline" id="line-83"><code>	config                *Config</code></span>
+<span class="codeline" id="line-84"><code>	beforeConnect         func(context.Context, *pgx.ConnConfig) error</code></span>
+<span class="codeline" id="line-85"><code>	afterConnect          func(context.Context, *pgx.Conn) error</code></span>
+<span class="codeline" id="line-86"><code>	beforeAcquire         func(context.Context, *pgx.Conn) bool</code></span>
+<span class="codeline" id="line-87"><code>	afterRelease          func(*pgx.Conn) bool</code></span>
+<span class="codeline" id="line-88"><code>	beforeClose           func(*pgx.Conn)</code></span>
+<span class="codeline" id="line-89"><code>	minConns              int32</code></span>
+<span class="codeline" id="line-90"><code>	maxConns              int32</code></span>
+<span class="codeline" id="line-91"><code>	maxConnLifetime       time.Duration</code></span>
+<span class="codeline" id="line-92"><code>	maxConnLifetimeJitter time.Duration</code></span>
+<span class="codeline" id="line-93"><code>	maxConnIdleTime       time.Duration</code></span>
+<span class="codeline" id="line-94"><code>	healthCheckPeriod     time.Duration</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>	healthCheckChan chan struct{}</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>	closeOnce sync.Once</code></span>
+<span class="codeline" id="line-99"><code>	closeChan chan struct{}</code></span>
+<span class="codeline" id="line-100"><code>}</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>// Config is the configuration struct for creating a pool. It must be created by [ParseConfig] and then it can be</code></span>
+<span class="codeline" id="line-103"><code>// modified.</code></span>
+<span class="codeline" id="line-104"><code>type Config struct {</code></span>
+<span class="codeline" id="line-105"><code>	ConnConfig *pgx.ConnConfig</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>	// BeforeConnect is called before a new connection is made. It is passed a copy of the underlying pgx.ConnConfig and</code></span>
+<span class="codeline" id="line-108"><code>	// will not impact any existing open connections.</code></span>
+<span class="codeline" id="line-109"><code>	BeforeConnect func(context.Context, *pgx.ConnConfig) error</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>	// AfterConnect is called after a connection is established, but before it is added to the pool.</code></span>
+<span class="codeline" id="line-112"><code>	AfterConnect func(context.Context, *pgx.Conn) error</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>	// BeforeAcquire is called before a connection is acquired from the pool. It must return true to allow the</code></span>
+<span class="codeline" id="line-115"><code>	// acquisition or false to indicate that the connection should be destroyed and a different connection should be</code></span>
+<span class="codeline" id="line-116"><code>	// acquired.</code></span>
+<span class="codeline" id="line-117"><code>	BeforeAcquire func(context.Context, *pgx.Conn) bool</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>	// AfterRelease is called after a connection is released, but before it is returned to the pool. It must return true to</code></span>
+<span class="codeline" id="line-120"><code>	// return the connection to the pool or false to destroy the connection.</code></span>
+<span class="codeline" id="line-121"><code>	AfterRelease func(*pgx.Conn) bool</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>	// BeforeClose is called right before a connection is closed and removed from the pool.</code></span>
+<span class="codeline" id="line-124"><code>	BeforeClose func(*pgx.Conn)</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	// MaxConnLifetime is the duration since creation after which a connection will be automatically closed.</code></span>
+<span class="codeline" id="line-127"><code>	MaxConnLifetime time.Duration</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>	// MaxConnLifetimeJitter is the duration after MaxConnLifetime to randomly decide to close a connection.</code></span>
+<span class="codeline" id="line-130"><code>	// This helps prevent all connections from being closed at the exact same time, starving the pool.</code></span>
+<span class="codeline" id="line-131"><code>	MaxConnLifetimeJitter time.Duration</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>	// MaxConnIdleTime is the duration after which an idle connection will be automatically closed by the health check.</code></span>
+<span class="codeline" id="line-134"><code>	MaxConnIdleTime time.Duration</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>	// MaxConns is the maximum size of the pool. The default is the greater of 4 or runtime.NumCPU().</code></span>
+<span class="codeline" id="line-137"><code>	MaxConns int32</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	// MinConns is the minimum size of the pool. After connection closes, the pool might dip below MinConns. A low</code></span>
+<span class="codeline" id="line-140"><code>	// number of MinConns might mean the pool is empty after MaxConnLifetime until the health check has a chance</code></span>
+<span class="codeline" id="line-141"><code>	// to create new connections.</code></span>
+<span class="codeline" id="line-142"><code>	MinConns int32</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>	// HealthCheckPeriod is the duration between checks of the health of idle connections.</code></span>
+<span class="codeline" id="line-145"><code>	HealthCheckPeriod time.Duration</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>	createdByParseConfig bool // Used to enforce created by ParseConfig rule.</code></span>
+<span class="codeline" id="line-148"><code>}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// Copy returns a deep copy of the config that is safe to use and modify.</code></span>
+<span class="codeline" id="line-151"><code>// The only exception is the tls.Config:</code></span>
+<span class="codeline" id="line-152"><code>// according to the tls.Config docs it must not be modified after creation.</code></span>
+<span class="codeline" id="line-153"><code>func (c *Config) Copy() *Config {</code></span>
+<span class="codeline" id="line-154"><code>	newConfig := new(Config)</code></span>
+<span class="codeline" id="line-155"><code>	*newConfig = *c</code></span>
+<span class="codeline" id="line-156"><code>	newConfig.ConnConfig = c.ConnConfig.Copy()</code></span>
+<span class="codeline" id="line-157"><code>	return newConfig</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>// ConnString returns the connection string as parsed by pgxpool.ParseConfig into pgxpool.Config.</code></span>
+<span class="codeline" id="line-161"><code>func (c *Config) ConnString() string { return c.ConnConfig.ConnString() }</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>// New creates a new Pool. See [ParseConfig] for information on connString format.</code></span>
+<span class="codeline" id="line-164"><code>func New(ctx context.Context, connString string) (*Pool, error) {</code></span>
+<span class="codeline" id="line-165"><code>	config, err := ParseConfig(connString)</code></span>
+<span class="codeline" id="line-166"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-167"><code>		return nil, err</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>	return NewWithConfig(ctx, config)</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>// NewWithConfig creates a new Pool. config must have been created by [ParseConfig].</code></span>
+<span class="codeline" id="line-174"><code>func NewWithConfig(ctx context.Context, config *Config) (*Pool, error) {</code></span>
+<span class="codeline" id="line-175"><code>	// Default values are set in ParseConfig. Enforce initial creation by ParseConfig rather than setting defaults from</code></span>
+<span class="codeline" id="line-176"><code>	// zero values.</code></span>
+<span class="codeline" id="line-177"><code>	if !config.createdByParseConfig {</code></span>
+<span class="codeline" id="line-178"><code>		panic("config must be created by ParseConfig")</code></span>
+<span class="codeline" id="line-179"><code>	}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>	p := &amp;Pool{</code></span>
+<span class="codeline" id="line-182"><code>		config:                config,</code></span>
+<span class="codeline" id="line-183"><code>		beforeConnect:         config.BeforeConnect,</code></span>
+<span class="codeline" id="line-184"><code>		afterConnect:          config.AfterConnect,</code></span>
+<span class="codeline" id="line-185"><code>		beforeAcquire:         config.BeforeAcquire,</code></span>
+<span class="codeline" id="line-186"><code>		afterRelease:          config.AfterRelease,</code></span>
+<span class="codeline" id="line-187"><code>		beforeClose:           config.BeforeClose,</code></span>
+<span class="codeline" id="line-188"><code>		minConns:              config.MinConns,</code></span>
+<span class="codeline" id="line-189"><code>		maxConns:              config.MaxConns,</code></span>
+<span class="codeline" id="line-190"><code>		maxConnLifetime:       config.MaxConnLifetime,</code></span>
+<span class="codeline" id="line-191"><code>		maxConnLifetimeJitter: config.MaxConnLifetimeJitter,</code></span>
+<span class="codeline" id="line-192"><code>		maxConnIdleTime:       config.MaxConnIdleTime,</code></span>
+<span class="codeline" id="line-193"><code>		healthCheckPeriod:     config.HealthCheckPeriod,</code></span>
+<span class="codeline" id="line-194"><code>		healthCheckChan:       make(chan struct{}, 1),</code></span>
+<span class="codeline" id="line-195"><code>		closeChan:             make(chan struct{}),</code></span>
+<span class="codeline" id="line-196"><code>	}</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>	var err error</code></span>
+<span class="codeline" id="line-199"><code>	p.p, err = puddle.NewPool(</code></span>
+<span class="codeline" id="line-200"><code>		&amp;puddle.Config[*connResource]{</code></span>
+<span class="codeline" id="line-201"><code>			Constructor: func(ctx context.Context) (*connResource, error) {</code></span>
+<span class="codeline" id="line-202"><code>				atomic.AddInt64(&amp;p.newConnsCount, 1)</code></span>
+<span class="codeline" id="line-203"><code>				connConfig := p.config.ConnConfig.Copy()</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>				// Connection will continue in background even if Acquire is canceled. Ensure that a connect won't hang forever.</code></span>
+<span class="codeline" id="line-206"><code>				if connConfig.ConnectTimeout &lt;= 0 {</code></span>
+<span class="codeline" id="line-207"><code>					connConfig.ConnectTimeout = 2 * time.Minute</code></span>
+<span class="codeline" id="line-208"><code>				}</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>				if p.beforeConnect != nil {</code></span>
+<span class="codeline" id="line-211"><code>					if err := p.beforeConnect(ctx, connConfig); err != nil {</code></span>
+<span class="codeline" id="line-212"><code>						return nil, err</code></span>
+<span class="codeline" id="line-213"><code>					}</code></span>
+<span class="codeline" id="line-214"><code>				}</code></span>
+<span class="codeline" id="line-215"><code></code></span>
+<span class="codeline" id="line-216"><code>				conn, err := pgx.ConnectConfig(ctx, connConfig)</code></span>
+<span class="codeline" id="line-217"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-218"><code>					return nil, err</code></span>
+<span class="codeline" id="line-219"><code>				}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>				if p.afterConnect != nil {</code></span>
+<span class="codeline" id="line-222"><code>					err = p.afterConnect(ctx, conn)</code></span>
+<span class="codeline" id="line-223"><code>					if err != nil {</code></span>
+<span class="codeline" id="line-224"><code>						conn.Close(ctx)</code></span>
+<span class="codeline" id="line-225"><code>						return nil, err</code></span>
+<span class="codeline" id="line-226"><code>					}</code></span>
+<span class="codeline" id="line-227"><code>				}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>				jitterSecs := rand.Float64() * config.MaxConnLifetimeJitter.Seconds()</code></span>
+<span class="codeline" id="line-230"><code>				maxAgeTime := time.Now().Add(config.MaxConnLifetime).Add(time.Duration(jitterSecs) * time.Second)</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>				cr := &amp;connResource{</code></span>
+<span class="codeline" id="line-233"><code>					conn:       conn,</code></span>
+<span class="codeline" id="line-234"><code>					conns:      make([]Conn, 64),</code></span>
+<span class="codeline" id="line-235"><code>					poolRows:   make([]poolRow, 64),</code></span>
+<span class="codeline" id="line-236"><code>					poolRowss:  make([]poolRows, 64),</code></span>
+<span class="codeline" id="line-237"><code>					maxAgeTime: maxAgeTime,</code></span>
+<span class="codeline" id="line-238"><code>				}</code></span>
+<span class="codeline" id="line-239"><code></code></span>
+<span class="codeline" id="line-240"><code>				return cr, nil</code></span>
+<span class="codeline" id="line-241"><code>			},</code></span>
+<span class="codeline" id="line-242"><code>			Destructor: func(value *connResource) {</code></span>
+<span class="codeline" id="line-243"><code>				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)</code></span>
+<span class="codeline" id="line-244"><code>				conn := value.conn</code></span>
+<span class="codeline" id="line-245"><code>				if p.beforeClose != nil {</code></span>
+<span class="codeline" id="line-246"><code>					p.beforeClose(conn)</code></span>
+<span class="codeline" id="line-247"><code>				}</code></span>
+<span class="codeline" id="line-248"><code>				conn.Close(ctx)</code></span>
+<span class="codeline" id="line-249"><code>				select {</code></span>
+<span class="codeline" id="line-250"><code>				case &lt;-conn.PgConn().CleanupDone():</code></span>
+<span class="codeline" id="line-251"><code>				case &lt;-ctx.Done():</code></span>
+<span class="codeline" id="line-252"><code>				}</code></span>
+<span class="codeline" id="line-253"><code>				cancel()</code></span>
+<span class="codeline" id="line-254"><code>			},</code></span>
+<span class="codeline" id="line-255"><code>			MaxSize: config.MaxConns,</code></span>
+<span class="codeline" id="line-256"><code>		},</code></span>
+<span class="codeline" id="line-257"><code>	)</code></span>
+<span class="codeline" id="line-258"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-259"><code>		return nil, err</code></span>
+<span class="codeline" id="line-260"><code>	}</code></span>
+<span class="codeline" id="line-261"><code></code></span>
+<span class="codeline" id="line-262"><code>	go func() {</code></span>
+<span class="codeline" id="line-263"><code>		p.createIdleResources(ctx, int(p.minConns))</code></span>
+<span class="codeline" id="line-264"><code>		p.backgroundHealthCheck()</code></span>
+<span class="codeline" id="line-265"><code>	}()</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>	return p, nil</code></span>
+<span class="codeline" id="line-268"><code>}</code></span>
+<span class="codeline" id="line-269"><code></code></span>
+<span class="codeline" id="line-270"><code>// ParseConfig builds a Config from connString. It parses connString with the same behavior as [pgx.ParseConfig] with the</code></span>
+<span class="codeline" id="line-271"><code>// addition of the following variables:</code></span>
+<span class="codeline" id="line-272"><code>//</code></span>
+<span class="codeline" id="line-273"><code>//   - pool_max_conns: integer greater than 0</code></span>
+<span class="codeline" id="line-274"><code>//   - pool_min_conns: integer 0 or greater</code></span>
+<span class="codeline" id="line-275"><code>//   - pool_max_conn_lifetime: duration string</code></span>
+<span class="codeline" id="line-276"><code>//   - pool_max_conn_idle_time: duration string</code></span>
+<span class="codeline" id="line-277"><code>//   - pool_health_check_period: duration string</code></span>
+<span class="codeline" id="line-278"><code>//   - pool_max_conn_lifetime_jitter: duration string</code></span>
+<span class="codeline" id="line-279"><code>//</code></span>
+<span class="codeline" id="line-280"><code>// See Config for definitions of these arguments.</code></span>
+<span class="codeline" id="line-281"><code>//</code></span>
+<span class="codeline" id="line-282"><code>//	# Example DSN</code></span>
+<span class="codeline" id="line-283"><code>//	user=jack password=secret host=pg.example.com port=5432 dbname=mydb sslmode=verify-ca pool_max_conns=10</code></span>
+<span class="codeline" id="line-284"><code>//</code></span>
+<span class="codeline" id="line-285"><code>//	# Example URL</code></span>
+<span class="codeline" id="line-286"><code>//	postgres://jack:secret@pg.example.com:5432/mydb?sslmode=verify-ca&amp;pool_max_conns=10</code></span>
+<span class="codeline" id="line-287"><code>func ParseConfig(connString string) (*Config, error) {</code></span>
+<span class="codeline" id="line-288"><code>	connConfig, err := pgx.ParseConfig(connString)</code></span>
+<span class="codeline" id="line-289"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-290"><code>		return nil, err</code></span>
+<span class="codeline" id="line-291"><code>	}</code></span>
+<span class="codeline" id="line-292"><code></code></span>
+<span class="codeline" id="line-293"><code>	config := &amp;Config{</code></span>
+<span class="codeline" id="line-294"><code>		ConnConfig:           connConfig,</code></span>
+<span class="codeline" id="line-295"><code>		createdByParseConfig: true,</code></span>
+<span class="codeline" id="line-296"><code>	}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	if s, ok := config.ConnConfig.Config.RuntimeParams["pool_max_conns"]; ok {</code></span>
+<span class="codeline" id="line-299"><code>		delete(connConfig.Config.RuntimeParams, "pool_max_conns")</code></span>
+<span class="codeline" id="line-300"><code>		n, err := strconv.ParseInt(s, 10, 32)</code></span>
+<span class="codeline" id="line-301"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-302"><code>			return nil, fmt.Errorf("cannot parse pool_max_conns: %w", err)</code></span>
+<span class="codeline" id="line-303"><code>		}</code></span>
+<span class="codeline" id="line-304"><code>		if n &lt; 1 {</code></span>
+<span class="codeline" id="line-305"><code>			return nil, fmt.Errorf("pool_max_conns too small: %d", n)</code></span>
+<span class="codeline" id="line-306"><code>		}</code></span>
+<span class="codeline" id="line-307"><code>		config.MaxConns = int32(n)</code></span>
+<span class="codeline" id="line-308"><code>	} else {</code></span>
+<span class="codeline" id="line-309"><code>		config.MaxConns = defaultMaxConns</code></span>
+<span class="codeline" id="line-310"><code>		if numCPU := int32(runtime.NumCPU()); numCPU &gt; config.MaxConns {</code></span>
+<span class="codeline" id="line-311"><code>			config.MaxConns = numCPU</code></span>
+<span class="codeline" id="line-312"><code>		}</code></span>
+<span class="codeline" id="line-313"><code>	}</code></span>
+<span class="codeline" id="line-314"><code></code></span>
+<span class="codeline" id="line-315"><code>	if s, ok := config.ConnConfig.Config.RuntimeParams["pool_min_conns"]; ok {</code></span>
+<span class="codeline" id="line-316"><code>		delete(connConfig.Config.RuntimeParams, "pool_min_conns")</code></span>
+<span class="codeline" id="line-317"><code>		n, err := strconv.ParseInt(s, 10, 32)</code></span>
+<span class="codeline" id="line-318"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-319"><code>			return nil, fmt.Errorf("cannot parse pool_min_conns: %w", err)</code></span>
+<span class="codeline" id="line-320"><code>		}</code></span>
+<span class="codeline" id="line-321"><code>		config.MinConns = int32(n)</code></span>
+<span class="codeline" id="line-322"><code>	} else {</code></span>
+<span class="codeline" id="line-323"><code>		config.MinConns = defaultMinConns</code></span>
+<span class="codeline" id="line-324"><code>	}</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>	if s, ok := config.ConnConfig.Config.RuntimeParams["pool_max_conn_lifetime"]; ok {</code></span>
+<span class="codeline" id="line-327"><code>		delete(connConfig.Config.RuntimeParams, "pool_max_conn_lifetime")</code></span>
+<span class="codeline" id="line-328"><code>		d, err := time.ParseDuration(s)</code></span>
+<span class="codeline" id="line-329"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-330"><code>			return nil, fmt.Errorf("invalid pool_max_conn_lifetime: %w", err)</code></span>
+<span class="codeline" id="line-331"><code>		}</code></span>
+<span class="codeline" id="line-332"><code>		config.MaxConnLifetime = d</code></span>
+<span class="codeline" id="line-333"><code>	} else {</code></span>
+<span class="codeline" id="line-334"><code>		config.MaxConnLifetime = defaultMaxConnLifetime</code></span>
+<span class="codeline" id="line-335"><code>	}</code></span>
+<span class="codeline" id="line-336"><code></code></span>
+<span class="codeline" id="line-337"><code>	if s, ok := config.ConnConfig.Config.RuntimeParams["pool_max_conn_idle_time"]; ok {</code></span>
+<span class="codeline" id="line-338"><code>		delete(connConfig.Config.RuntimeParams, "pool_max_conn_idle_time")</code></span>
+<span class="codeline" id="line-339"><code>		d, err := time.ParseDuration(s)</code></span>
+<span class="codeline" id="line-340"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-341"><code>			return nil, fmt.Errorf("invalid pool_max_conn_idle_time: %w", err)</code></span>
+<span class="codeline" id="line-342"><code>		}</code></span>
+<span class="codeline" id="line-343"><code>		config.MaxConnIdleTime = d</code></span>
+<span class="codeline" id="line-344"><code>	} else {</code></span>
+<span class="codeline" id="line-345"><code>		config.MaxConnIdleTime = defaultMaxConnIdleTime</code></span>
+<span class="codeline" id="line-346"><code>	}</code></span>
+<span class="codeline" id="line-347"><code></code></span>
+<span class="codeline" id="line-348"><code>	if s, ok := config.ConnConfig.Config.RuntimeParams["pool_health_check_period"]; ok {</code></span>
+<span class="codeline" id="line-349"><code>		delete(connConfig.Config.RuntimeParams, "pool_health_check_period")</code></span>
+<span class="codeline" id="line-350"><code>		d, err := time.ParseDuration(s)</code></span>
+<span class="codeline" id="line-351"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-352"><code>			return nil, fmt.Errorf("invalid pool_health_check_period: %w", err)</code></span>
+<span class="codeline" id="line-353"><code>		}</code></span>
+<span class="codeline" id="line-354"><code>		config.HealthCheckPeriod = d</code></span>
+<span class="codeline" id="line-355"><code>	} else {</code></span>
+<span class="codeline" id="line-356"><code>		config.HealthCheckPeriod = defaultHealthCheckPeriod</code></span>
+<span class="codeline" id="line-357"><code>	}</code></span>
+<span class="codeline" id="line-358"><code></code></span>
+<span class="codeline" id="line-359"><code>	if s, ok := config.ConnConfig.Config.RuntimeParams["pool_max_conn_lifetime_jitter"]; ok {</code></span>
+<span class="codeline" id="line-360"><code>		delete(connConfig.Config.RuntimeParams, "pool_max_conn_lifetime_jitter")</code></span>
+<span class="codeline" id="line-361"><code>		d, err := time.ParseDuration(s)</code></span>
+<span class="codeline" id="line-362"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-363"><code>			return nil, fmt.Errorf("invalid pool_max_conn_lifetime_jitter: %w", err)</code></span>
+<span class="codeline" id="line-364"><code>		}</code></span>
+<span class="codeline" id="line-365"><code>		config.MaxConnLifetimeJitter = d</code></span>
+<span class="codeline" id="line-366"><code>	}</code></span>
+<span class="codeline" id="line-367"><code></code></span>
+<span class="codeline" id="line-368"><code>	return config, nil</code></span>
+<span class="codeline" id="line-369"><code>}</code></span>
+<span class="codeline" id="line-370"><code></code></span>
+<span class="codeline" id="line-371"><code>// Close closes all connections in the pool and rejects future Acquire calls. Blocks until all connections are returned</code></span>
+<span class="codeline" id="line-372"><code>// to pool and closed.</code></span>
+<span class="codeline" id="line-373"><code>func (p *Pool) Close() {</code></span>
+<span class="codeline" id="line-374"><code>	p.closeOnce.Do(func() {</code></span>
+<span class="codeline" id="line-375"><code>		close(p.closeChan)</code></span>
+<span class="codeline" id="line-376"><code>		p.p.Close()</code></span>
+<span class="codeline" id="line-377"><code>	})</code></span>
+<span class="codeline" id="line-378"><code>}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>func (p *Pool) isExpired(res *puddle.Resource[*connResource]) bool {</code></span>
+<span class="codeline" id="line-381"><code>	return time.Now().After(res.Value().maxAgeTime)</code></span>
+<span class="codeline" id="line-382"><code>}</code></span>
+<span class="codeline" id="line-383"><code></code></span>
+<span class="codeline" id="line-384"><code>func (p *Pool) triggerHealthCheck() {</code></span>
+<span class="codeline" id="line-385"><code>	go func() {</code></span>
+<span class="codeline" id="line-386"><code>		// Destroy is asynchronous so we give it time to actually remove itself from</code></span>
+<span class="codeline" id="line-387"><code>		// the pool otherwise we might try to check the pool size too soon</code></span>
+<span class="codeline" id="line-388"><code>		time.Sleep(500 * time.Millisecond)</code></span>
+<span class="codeline" id="line-389"><code>		select {</code></span>
+<span class="codeline" id="line-390"><code>		case p.healthCheckChan &lt;- struct{}{}:</code></span>
+<span class="codeline" id="line-391"><code>		default:</code></span>
+<span class="codeline" id="line-392"><code>		}</code></span>
+<span class="codeline" id="line-393"><code>	}()</code></span>
+<span class="codeline" id="line-394"><code>}</code></span>
+<span class="codeline" id="line-395"><code></code></span>
+<span class="codeline" id="line-396"><code>func (p *Pool) backgroundHealthCheck() {</code></span>
+<span class="codeline" id="line-397"><code>	ticker := time.NewTicker(p.healthCheckPeriod)</code></span>
+<span class="codeline" id="line-398"><code>	defer ticker.Stop()</code></span>
+<span class="codeline" id="line-399"><code>	for {</code></span>
+<span class="codeline" id="line-400"><code>		select {</code></span>
+<span class="codeline" id="line-401"><code>		case &lt;-p.closeChan:</code></span>
+<span class="codeline" id="line-402"><code>			return</code></span>
+<span class="codeline" id="line-403"><code>		case &lt;-p.healthCheckChan:</code></span>
+<span class="codeline" id="line-404"><code>			p.checkHealth()</code></span>
+<span class="codeline" id="line-405"><code>		case &lt;-ticker.C:</code></span>
+<span class="codeline" id="line-406"><code>			p.checkHealth()</code></span>
+<span class="codeline" id="line-407"><code>		}</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code>}</code></span>
+<span class="codeline" id="line-410"><code></code></span>
+<span class="codeline" id="line-411"><code>func (p *Pool) checkHealth() {</code></span>
+<span class="codeline" id="line-412"><code>	for {</code></span>
+<span class="codeline" id="line-413"><code>		// If checkMinConns failed we don't destroy any connections since we couldn't</code></span>
+<span class="codeline" id="line-414"><code>		// even get to minConns</code></span>
+<span class="codeline" id="line-415"><code>		if err := p.checkMinConns(); err != nil {</code></span>
+<span class="codeline" id="line-416"><code>			// Should we log this error somewhere?</code></span>
+<span class="codeline" id="line-417"><code>			break</code></span>
+<span class="codeline" id="line-418"><code>		}</code></span>
+<span class="codeline" id="line-419"><code>		if !p.checkConnsHealth() {</code></span>
+<span class="codeline" id="line-420"><code>			// Since we didn't destroy any connections we can stop looping</code></span>
+<span class="codeline" id="line-421"><code>			break</code></span>
+<span class="codeline" id="line-422"><code>		}</code></span>
+<span class="codeline" id="line-423"><code>		// Technically Destroy is asynchronous but 500ms should be enough for it to</code></span>
+<span class="codeline" id="line-424"><code>		// remove it from the underlying pool</code></span>
+<span class="codeline" id="line-425"><code>		select {</code></span>
+<span class="codeline" id="line-426"><code>		case &lt;-p.closeChan:</code></span>
+<span class="codeline" id="line-427"><code>			return</code></span>
+<span class="codeline" id="line-428"><code>		case &lt;-time.After(500 * time.Millisecond):</code></span>
+<span class="codeline" id="line-429"><code>		}</code></span>
+<span class="codeline" id="line-430"><code>	}</code></span>
+<span class="codeline" id="line-431"><code>}</code></span>
+<span class="codeline" id="line-432"><code></code></span>
+<span class="codeline" id="line-433"><code>// checkConnsHealth will check all idle connections, destroy a connection if</code></span>
+<span class="codeline" id="line-434"><code>// it's idle or too old, and returns true if any were destroyed</code></span>
+<span class="codeline" id="line-435"><code>func (p *Pool) checkConnsHealth() bool {</code></span>
+<span class="codeline" id="line-436"><code>	var destroyed bool</code></span>
+<span class="codeline" id="line-437"><code>	totalConns := p.Stat().TotalConns()</code></span>
+<span class="codeline" id="line-438"><code>	resources := p.p.AcquireAllIdle()</code></span>
+<span class="codeline" id="line-439"><code>	for _, res := range resources {</code></span>
+<span class="codeline" id="line-440"><code>		// We're okay going under minConns if the lifetime is up</code></span>
+<span class="codeline" id="line-441"><code>		if p.isExpired(res) &amp;&amp; totalConns &gt;= p.minConns {</code></span>
+<span class="codeline" id="line-442"><code>			atomic.AddInt64(&amp;p.lifetimeDestroyCount, 1)</code></span>
+<span class="codeline" id="line-443"><code>			res.Destroy()</code></span>
+<span class="codeline" id="line-444"><code>			destroyed = true</code></span>
+<span class="codeline" id="line-445"><code>			// Since Destroy is async we manually decrement totalConns.</code></span>
+<span class="codeline" id="line-446"><code>			totalConns--</code></span>
+<span class="codeline" id="line-447"><code>		} else if res.IdleDuration() &gt; p.maxConnIdleTime &amp;&amp; totalConns &gt; p.minConns {</code></span>
+<span class="codeline" id="line-448"><code>			atomic.AddInt64(&amp;p.idleDestroyCount, 1)</code></span>
+<span class="codeline" id="line-449"><code>			res.Destroy()</code></span>
+<span class="codeline" id="line-450"><code>			destroyed = true</code></span>
+<span class="codeline" id="line-451"><code>			// Since Destroy is async we manually decrement totalConns.</code></span>
+<span class="codeline" id="line-452"><code>			totalConns--</code></span>
+<span class="codeline" id="line-453"><code>		} else {</code></span>
+<span class="codeline" id="line-454"><code>			res.ReleaseUnused()</code></span>
+<span class="codeline" id="line-455"><code>		}</code></span>
+<span class="codeline" id="line-456"><code>	}</code></span>
+<span class="codeline" id="line-457"><code>	return destroyed</code></span>
+<span class="codeline" id="line-458"><code>}</code></span>
+<span class="codeline" id="line-459"><code></code></span>
+<span class="codeline" id="line-460"><code>func (p *Pool) checkMinConns() error {</code></span>
+<span class="codeline" id="line-461"><code>	// TotalConns can include ones that are being destroyed but we should have</code></span>
+<span class="codeline" id="line-462"><code>	// sleep(500ms) around all of the destroys to help prevent that from throwing</code></span>
+<span class="codeline" id="line-463"><code>	// off this check</code></span>
+<span class="codeline" id="line-464"><code>	toCreate := p.minConns - p.Stat().TotalConns()</code></span>
+<span class="codeline" id="line-465"><code>	if toCreate &gt; 0 {</code></span>
+<span class="codeline" id="line-466"><code>		return p.createIdleResources(context.Background(), int(toCreate))</code></span>
+<span class="codeline" id="line-467"><code>	}</code></span>
+<span class="codeline" id="line-468"><code>	return nil</code></span>
+<span class="codeline" id="line-469"><code>}</code></span>
+<span class="codeline" id="line-470"><code></code></span>
+<span class="codeline" id="line-471"><code>func (p *Pool) createIdleResources(parentCtx context.Context, targetResources int) error {</code></span>
+<span class="codeline" id="line-472"><code>	ctx, cancel := context.WithCancel(parentCtx)</code></span>
+<span class="codeline" id="line-473"><code>	defer cancel()</code></span>
+<span class="codeline" id="line-474"><code></code></span>
+<span class="codeline" id="line-475"><code>	errs := make(chan error, targetResources)</code></span>
+<span class="codeline" id="line-476"><code></code></span>
+<span class="codeline" id="line-477"><code>	for i := 0; i &lt; targetResources; i++ {</code></span>
+<span class="codeline" id="line-478"><code>		go func() {</code></span>
+<span class="codeline" id="line-479"><code>			err := p.p.CreateResource(ctx)</code></span>
+<span class="codeline" id="line-480"><code>			// Ignore ErrNotAvailable since it means that the pool has become full since we started creating resource.</code></span>
+<span class="codeline" id="line-481"><code>			if err == puddle.ErrNotAvailable {</code></span>
+<span class="codeline" id="line-482"><code>				err = nil</code></span>
+<span class="codeline" id="line-483"><code>			}</code></span>
+<span class="codeline" id="line-484"><code>			errs &lt;- err</code></span>
+<span class="codeline" id="line-485"><code>		}()</code></span>
+<span class="codeline" id="line-486"><code>	}</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>	var firstError error</code></span>
+<span class="codeline" id="line-489"><code>	for i := 0; i &lt; targetResources; i++ {</code></span>
+<span class="codeline" id="line-490"><code>		err := &lt;-errs</code></span>
+<span class="codeline" id="line-491"><code>		if err != nil &amp;&amp; firstError == nil {</code></span>
+<span class="codeline" id="line-492"><code>			cancel()</code></span>
+<span class="codeline" id="line-493"><code>			firstError = err</code></span>
+<span class="codeline" id="line-494"><code>		}</code></span>
+<span class="codeline" id="line-495"><code>	}</code></span>
+<span class="codeline" id="line-496"><code></code></span>
+<span class="codeline" id="line-497"><code>	return firstError</code></span>
+<span class="codeline" id="line-498"><code>}</code></span>
+<span class="codeline" id="line-499"><code></code></span>
+<span class="codeline" id="line-500"><code>// Acquire returns a connection (*Conn) from the Pool</code></span>
+<span class="codeline" id="line-501"><code>func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {</code></span>
+<span class="codeline" id="line-502"><code>	for {</code></span>
+<span class="codeline" id="line-503"><code>		res, err := p.p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-504"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-505"><code>			return nil, err</code></span>
+<span class="codeline" id="line-506"><code>		}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>		cr := res.Value()</code></span>
+<span class="codeline" id="line-509"><code></code></span>
+<span class="codeline" id="line-510"><code>		if res.IdleDuration() &gt; time.Second {</code></span>
+<span class="codeline" id="line-511"><code>			err := cr.conn.Ping(ctx)</code></span>
+<span class="codeline" id="line-512"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-513"><code>				res.Destroy()</code></span>
+<span class="codeline" id="line-514"><code>				continue</code></span>
+<span class="codeline" id="line-515"><code>			}</code></span>
+<span class="codeline" id="line-516"><code>		}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>		if p.beforeAcquire == nil || p.beforeAcquire(ctx, cr.conn) {</code></span>
+<span class="codeline" id="line-519"><code>			return cr.getConn(p, res), nil</code></span>
+<span class="codeline" id="line-520"><code>		}</code></span>
+<span class="codeline" id="line-521"><code></code></span>
+<span class="codeline" id="line-522"><code>		res.Destroy()</code></span>
+<span class="codeline" id="line-523"><code>	}</code></span>
+<span class="codeline" id="line-524"><code>}</code></span>
+<span class="codeline" id="line-525"><code></code></span>
+<span class="codeline" id="line-526"><code>// AcquireFunc acquires a *Conn and calls f with that *Conn. ctx will only affect the Acquire. It has no effect on the</code></span>
+<span class="codeline" id="line-527"><code>// call of f. The return value is either an error acquiring the *Conn or the return value of f. The *Conn is</code></span>
+<span class="codeline" id="line-528"><code>// automatically released after the call of f.</code></span>
+<span class="codeline" id="line-529"><code>func (p *Pool) AcquireFunc(ctx context.Context, f func(*Conn) error) error {</code></span>
+<span class="codeline" id="line-530"><code>	conn, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-531"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-532"><code>		return err</code></span>
+<span class="codeline" id="line-533"><code>	}</code></span>
+<span class="codeline" id="line-534"><code>	defer conn.Release()</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>	return f(conn)</code></span>
+<span class="codeline" id="line-537"><code>}</code></span>
+<span class="codeline" id="line-538"><code></code></span>
+<span class="codeline" id="line-539"><code>// AcquireAllIdle atomically acquires all currently idle connections. Its intended use is for health check and</code></span>
+<span class="codeline" id="line-540"><code>// keep-alive functionality. It does not update pool statistics.</code></span>
+<span class="codeline" id="line-541"><code>func (p *Pool) AcquireAllIdle(ctx context.Context) []*Conn {</code></span>
+<span class="codeline" id="line-542"><code>	resources := p.p.AcquireAllIdle()</code></span>
+<span class="codeline" id="line-543"><code>	conns := make([]*Conn, 0, len(resources))</code></span>
+<span class="codeline" id="line-544"><code>	for _, res := range resources {</code></span>
+<span class="codeline" id="line-545"><code>		cr := res.Value()</code></span>
+<span class="codeline" id="line-546"><code>		if p.beforeAcquire == nil || p.beforeAcquire(ctx, cr.conn) {</code></span>
+<span class="codeline" id="line-547"><code>			conns = append(conns, cr.getConn(p, res))</code></span>
+<span class="codeline" id="line-548"><code>		} else {</code></span>
+<span class="codeline" id="line-549"><code>			res.Destroy()</code></span>
+<span class="codeline" id="line-550"><code>		}</code></span>
+<span class="codeline" id="line-551"><code>	}</code></span>
+<span class="codeline" id="line-552"><code></code></span>
+<span class="codeline" id="line-553"><code>	return conns</code></span>
+<span class="codeline" id="line-554"><code>}</code></span>
+<span class="codeline" id="line-555"><code></code></span>
+<span class="codeline" id="line-556"><code>// Reset closes all connections, but leaves the pool open. It is intended for use when an error is detected that would</code></span>
+<span class="codeline" id="line-557"><code>// disrupt all connections (such as a network interruption or a server state change).</code></span>
+<span class="codeline" id="line-558"><code>//</code></span>
+<span class="codeline" id="line-559"><code>// It is safe to reset a pool while connections are checked out. Those connections will be closed when they are returned</code></span>
+<span class="codeline" id="line-560"><code>// to the pool.</code></span>
+<span class="codeline" id="line-561"><code>func (p *Pool) Reset() {</code></span>
+<span class="codeline" id="line-562"><code>	p.p.Reset()</code></span>
+<span class="codeline" id="line-563"><code>}</code></span>
+<span class="codeline" id="line-564"><code></code></span>
+<span class="codeline" id="line-565"><code>// Config returns a copy of config that was used to initialize this pool.</code></span>
+<span class="codeline" id="line-566"><code>func (p *Pool) Config() *Config { return p.config.Copy() }</code></span>
+<span class="codeline" id="line-567"><code></code></span>
+<span class="codeline" id="line-568"><code>// Stat returns a pgxpool.Stat struct with a snapshot of Pool statistics.</code></span>
+<span class="codeline" id="line-569"><code>func (p *Pool) Stat() *Stat {</code></span>
+<span class="codeline" id="line-570"><code>	return &amp;Stat{</code></span>
+<span class="codeline" id="line-571"><code>		s:                    p.p.Stat(),</code></span>
+<span class="codeline" id="line-572"><code>		newConnsCount:        atomic.LoadInt64(&amp;p.newConnsCount),</code></span>
+<span class="codeline" id="line-573"><code>		lifetimeDestroyCount: atomic.LoadInt64(&amp;p.lifetimeDestroyCount),</code></span>
+<span class="codeline" id="line-574"><code>		idleDestroyCount:     atomic.LoadInt64(&amp;p.idleDestroyCount),</code></span>
+<span class="codeline" id="line-575"><code>	}</code></span>
+<span class="codeline" id="line-576"><code>}</code></span>
+<span class="codeline" id="line-577"><code></code></span>
+<span class="codeline" id="line-578"><code>// Exec acquires a connection from the Pool and executes the given SQL.</code></span>
+<span class="codeline" id="line-579"><code>// SQL can be either a prepared statement name or an SQL string.</code></span>
+<span class="codeline" id="line-580"><code>// Arguments should be referenced positionally from the SQL string as $1, $2, etc.</code></span>
+<span class="codeline" id="line-581"><code>// The acquired connection is returned to the pool when the Exec function returns.</code></span>
+<span class="codeline" id="line-582"><code>func (p *Pool) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {</code></span>
+<span class="codeline" id="line-583"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-584"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-585"><code>		return pgconn.CommandTag{}, err</code></span>
+<span class="codeline" id="line-586"><code>	}</code></span>
+<span class="codeline" id="line-587"><code>	defer c.Release()</code></span>
+<span class="codeline" id="line-588"><code></code></span>
+<span class="codeline" id="line-589"><code>	return c.Exec(ctx, sql, arguments...)</code></span>
+<span class="codeline" id="line-590"><code>}</code></span>
+<span class="codeline" id="line-591"><code></code></span>
+<span class="codeline" id="line-592"><code>// Query acquires a connection and executes a query that returns pgx.Rows.</code></span>
+<span class="codeline" id="line-593"><code>// Arguments should be referenced positionally from the SQL string as $1, $2, etc.</code></span>
+<span class="codeline" id="line-594"><code>// See pgx.Rows documentation to close the returned Rows and return the acquired connection to the Pool.</code></span>
+<span class="codeline" id="line-595"><code>//</code></span>
+<span class="codeline" id="line-596"><code>// If there is an error, the returned pgx.Rows will be returned in an error state.</code></span>
+<span class="codeline" id="line-597"><code>// If preferred, ignore the error returned from Query and handle errors using the returned pgx.Rows.</code></span>
+<span class="codeline" id="line-598"><code>//</code></span>
+<span class="codeline" id="line-599"><code>// For extra control over how the query is executed, the types QuerySimpleProtocol, QueryResultFormats, and</code></span>
+<span class="codeline" id="line-600"><code>// QueryResultFormatsByOID may be used as the first args to control exactly how the query is executed. This is rarely</code></span>
+<span class="codeline" id="line-601"><code>// needed. See the documentation for those types for details.</code></span>
+<span class="codeline" id="line-602"><code>func (p *Pool) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {</code></span>
+<span class="codeline" id="line-603"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-604"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-605"><code>		return errRows{err: err}, err</code></span>
+<span class="codeline" id="line-606"><code>	}</code></span>
+<span class="codeline" id="line-607"><code></code></span>
+<span class="codeline" id="line-608"><code>	rows, err := c.Query(ctx, sql, args...)</code></span>
+<span class="codeline" id="line-609"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-610"><code>		c.Release()</code></span>
+<span class="codeline" id="line-611"><code>		return errRows{err: err}, err</code></span>
+<span class="codeline" id="line-612"><code>	}</code></span>
+<span class="codeline" id="line-613"><code></code></span>
+<span class="codeline" id="line-614"><code>	return c.getPoolRows(rows), nil</code></span>
+<span class="codeline" id="line-615"><code>}</code></span>
+<span class="codeline" id="line-616"><code></code></span>
+<span class="codeline" id="line-617"><code>// QueryRow acquires a connection and executes a query that is expected</code></span>
+<span class="codeline" id="line-618"><code>// to return at most one row (pgx.Row). Errors are deferred until pgx.Row's</code></span>
+<span class="codeline" id="line-619"><code>// Scan method is called. If the query selects no rows, pgx.Row's Scan will</code></span>
+<span class="codeline" id="line-620"><code>// return ErrNoRows. Otherwise, pgx.Row's Scan scans the first selected row</code></span>
+<span class="codeline" id="line-621"><code>// and discards the rest. The acquired connection is returned to the Pool when</code></span>
+<span class="codeline" id="line-622"><code>// pgx.Row's Scan method is called.</code></span>
+<span class="codeline" id="line-623"><code>//</code></span>
+<span class="codeline" id="line-624"><code>// Arguments should be referenced positionally from the SQL string as $1, $2, etc.</code></span>
+<span class="codeline" id="line-625"><code>//</code></span>
+<span class="codeline" id="line-626"><code>// For extra control over how the query is executed, the types QuerySimpleProtocol, QueryResultFormats, and</code></span>
+<span class="codeline" id="line-627"><code>// QueryResultFormatsByOID may be used as the first args to control exactly how the query is executed. This is rarely</code></span>
+<span class="codeline" id="line-628"><code>// needed. See the documentation for those types for details.</code></span>
+<span class="codeline" id="line-629"><code>func (p *Pool) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {</code></span>
+<span class="codeline" id="line-630"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-631"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-632"><code>		return errRow{err: err}</code></span>
+<span class="codeline" id="line-633"><code>	}</code></span>
+<span class="codeline" id="line-634"><code></code></span>
+<span class="codeline" id="line-635"><code>	row := c.QueryRow(ctx, sql, args...)</code></span>
+<span class="codeline" id="line-636"><code>	return c.getPoolRow(row)</code></span>
+<span class="codeline" id="line-637"><code>}</code></span>
+<span class="codeline" id="line-638"><code></code></span>
+<span class="codeline" id="line-639"><code>func (p *Pool) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {</code></span>
+<span class="codeline" id="line-640"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-641"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-642"><code>		return errBatchResults{err: err}</code></span>
+<span class="codeline" id="line-643"><code>	}</code></span>
+<span class="codeline" id="line-644"><code></code></span>
+<span class="codeline" id="line-645"><code>	br := c.SendBatch(ctx, b)</code></span>
+<span class="codeline" id="line-646"><code>	return &amp;poolBatchResults{br: br, c: c}</code></span>
+<span class="codeline" id="line-647"><code>}</code></span>
+<span class="codeline" id="line-648"><code></code></span>
+<span class="codeline" id="line-649"><code>// Begin acquires a connection from the Pool and starts a transaction. Unlike database/sql, the context only affects the begin command. i.e. there is no</code></span>
+<span class="codeline" id="line-650"><code>// auto-rollback on context cancellation. Begin initiates a transaction block without explicitly setting a transaction mode for the block (see BeginTx with TxOptions if transaction mode is required).</code></span>
+<span class="codeline" id="line-651"><code>// *pgxpool.Tx is returned, which implements the pgx.Tx interface.</code></span>
+<span class="codeline" id="line-652"><code>// Commit or Rollback must be called on the returned transaction to finalize the transaction block.</code></span>
+<span class="codeline" id="line-653"><code>func (p *Pool) Begin(ctx context.Context) (pgx.Tx, error) {</code></span>
+<span class="codeline" id="line-654"><code>	return p.BeginTx(ctx, pgx.TxOptions{})</code></span>
+<span class="codeline" id="line-655"><code>}</code></span>
+<span class="codeline" id="line-656"><code></code></span>
+<span class="codeline" id="line-657"><code>// BeginTx acquires a connection from the Pool and starts a transaction with pgx.TxOptions determining the transaction mode.</code></span>
+<span class="codeline" id="line-658"><code>// Unlike database/sql, the context only affects the begin command. i.e. there is no auto-rollback on context cancellation.</code></span>
+<span class="codeline" id="line-659"><code>// *pgxpool.Tx is returned, which implements the pgx.Tx interface.</code></span>
+<span class="codeline" id="line-660"><code>// Commit or Rollback must be called on the returned transaction to finalize the transaction block.</code></span>
+<span class="codeline" id="line-661"><code>func (p *Pool) BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error) {</code></span>
+<span class="codeline" id="line-662"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-663"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-664"><code>		return nil, err</code></span>
+<span class="codeline" id="line-665"><code>	}</code></span>
+<span class="codeline" id="line-666"><code></code></span>
+<span class="codeline" id="line-667"><code>	t, err := c.BeginTx(ctx, txOptions)</code></span>
+<span class="codeline" id="line-668"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-669"><code>		c.Release()</code></span>
+<span class="codeline" id="line-670"><code>		return nil, err</code></span>
+<span class="codeline" id="line-671"><code>	}</code></span>
+<span class="codeline" id="line-672"><code></code></span>
+<span class="codeline" id="line-673"><code>	return &amp;Tx{t: t, c: c}, nil</code></span>
+<span class="codeline" id="line-674"><code>}</code></span>
+<span class="codeline" id="line-675"><code></code></span>
+<span class="codeline" id="line-676"><code>func (p *Pool) CopyFrom(ctx context.Context, tableName pgx.Identifier, columnNames []string, rowSrc pgx.CopyFromSource) (int64, error) {</code></span>
+<span class="codeline" id="line-677"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-678"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-679"><code>		return 0, err</code></span>
+<span class="codeline" id="line-680"><code>	}</code></span>
+<span class="codeline" id="line-681"><code>	defer c.Release()</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>	return c.Conn().CopyFrom(ctx, tableName, columnNames, rowSrc)</code></span>
+<span class="codeline" id="line-684"><code>}</code></span>
+<span class="codeline" id="line-685"><code></code></span>
+<span class="codeline" id="line-686"><code>// Ping acquires a connection from the Pool and executes an empty sql statement against it.</code></span>
+<span class="codeline" id="line-687"><code>// If the sql returns without error, the database Ping is considered successful, otherwise, the error is returned.</code></span>
+<span class="codeline" id="line-688"><code>func (p *Pool) Ping(ctx context.Context) error {</code></span>
+<span class="codeline" id="line-689"><code>	c, err := p.Acquire(ctx)</code></span>
+<span class="codeline" id="line-690"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-691"><code>		return err</code></span>
+<span class="codeline" id="line-692"><code>	}</code></span>
+<span class="codeline" id="line-693"><code>	defer c.Release()</code></span>
+<span class="codeline" id="line-694"><code>	return c.Ping(ctx)</code></span>
+<span class="codeline" id="line-695"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: benchmark.go in package testing</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	benchmark.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/testing.html">testing</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package testing</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"flag"</code></span>
+<span class="codeline" id="line-9"><code>	"fmt"</code></span>
+<span class="codeline" id="line-10"><code>	"internal/sysinfo"</code></span>
+<span class="codeline" id="line-11"><code>	"io"</code></span>
+<span class="codeline" id="line-12"><code>	"math"</code></span>
+<span class="codeline" id="line-13"><code>	"os"</code></span>
+<span class="codeline" id="line-14"><code>	"runtime"</code></span>
+<span class="codeline" id="line-15"><code>	"sort"</code></span>
+<span class="codeline" id="line-16"><code>	"strconv"</code></span>
+<span class="codeline" id="line-17"><code>	"strings"</code></span>
+<span class="codeline" id="line-18"><code>	"sync"</code></span>
+<span class="codeline" id="line-19"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-20"><code>	"time"</code></span>
+<span class="codeline" id="line-21"><code>	"unicode"</code></span>
+<span class="codeline" id="line-22"><code>)</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>func initBenchmarkFlags() {</code></span>
+<span class="codeline" id="line-25"><code>	matchBenchmarks = flag.String("test.bench", "", "run only benchmarks matching `regexp`")</code></span>
+<span class="codeline" id="line-26"><code>	benchmarkMemory = flag.Bool("test.benchmem", false, "print memory allocations for benchmarks")</code></span>
+<span class="codeline" id="line-27"><code>	flag.Var(&amp;benchTime, "test.benchtime", "run each benchmark for duration `d` or N times if `d` is of the form Nx")</code></span>
+<span class="codeline" id="line-28"><code>}</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>var (</code></span>
+<span class="codeline" id="line-31"><code>	matchBenchmarks *string</code></span>
+<span class="codeline" id="line-32"><code>	benchmarkMemory *bool</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>	benchTime = durationOrCountFlag{d: 1 * time.Second} // changed during test of testing package</code></span>
+<span class="codeline" id="line-35"><code>)</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>type durationOrCountFlag struct {</code></span>
+<span class="codeline" id="line-38"><code>	d         time.Duration</code></span>
+<span class="codeline" id="line-39"><code>	n         int</code></span>
+<span class="codeline" id="line-40"><code>	allowZero bool</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>func (f *durationOrCountFlag) String() string {</code></span>
+<span class="codeline" id="line-44"><code>	if f.n &gt; 0 {</code></span>
+<span class="codeline" id="line-45"><code>		return fmt.Sprintf("%dx", f.n)</code></span>
+<span class="codeline" id="line-46"><code>	}</code></span>
+<span class="codeline" id="line-47"><code>	return f.d.String()</code></span>
+<span class="codeline" id="line-48"><code>}</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>func (f *durationOrCountFlag) Set(s string) error {</code></span>
+<span class="codeline" id="line-51"><code>	if strings.HasSuffix(s, "x") {</code></span>
+<span class="codeline" id="line-52"><code>		n, err := strconv.ParseInt(s[:len(s)-1], 10, 0)</code></span>
+<span class="codeline" id="line-53"><code>		if err != nil || n &lt; 0 || (!f.allowZero &amp;&amp; n == 0) {</code></span>
+<span class="codeline" id="line-54"><code>			return fmt.Errorf("invalid count")</code></span>
+<span class="codeline" id="line-55"><code>		}</code></span>
+<span class="codeline" id="line-56"><code>		*f = durationOrCountFlag{n: int(n)}</code></span>
+<span class="codeline" id="line-57"><code>		return nil</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code>	d, err := time.ParseDuration(s)</code></span>
+<span class="codeline" id="line-60"><code>	if err != nil || d &lt; 0 || (!f.allowZero &amp;&amp; d == 0) {</code></span>
+<span class="codeline" id="line-61"><code>		return fmt.Errorf("invalid duration")</code></span>
+<span class="codeline" id="line-62"><code>	}</code></span>
+<span class="codeline" id="line-63"><code>	*f = durationOrCountFlag{d: d}</code></span>
+<span class="codeline" id="line-64"><code>	return nil</code></span>
+<span class="codeline" id="line-65"><code>}</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// Global lock to ensure only one benchmark runs at a time.</code></span>
+<span class="codeline" id="line-68"><code>var benchmarkLock sync.Mutex</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>// Used for every benchmark for measuring memory.</code></span>
+<span class="codeline" id="line-71"><code>var memStats runtime.MemStats</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>// InternalBenchmark is an internal type but exported because it is cross-package;</code></span>
+<span class="codeline" id="line-74"><code>// it is part of the implementation of the "go test" command.</code></span>
+<span class="codeline" id="line-75"><code>type InternalBenchmark struct {</code></span>
+<span class="codeline" id="line-76"><code>	Name string</code></span>
+<span class="codeline" id="line-77"><code>	F    func(b *B)</code></span>
+<span class="codeline" id="line-78"><code>}</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>// B is a type passed to [Benchmark] functions to manage benchmark</code></span>
+<span class="codeline" id="line-81"><code>// timing and to specify the number of iterations to run.</code></span>
+<span class="codeline" id="line-82"><code>//</code></span>
+<span class="codeline" id="line-83"><code>// A benchmark ends when its Benchmark function returns or calls any of the methods</code></span>
+<span class="codeline" id="line-84"><code>// FailNow, Fatal, Fatalf, SkipNow, Skip, or Skipf. Those methods must be called</code></span>
+<span class="codeline" id="line-85"><code>// only from the goroutine running the Benchmark function.</code></span>
+<span class="codeline" id="line-86"><code>// The other reporting methods, such as the variations of Log and Error,</code></span>
+<span class="codeline" id="line-87"><code>// may be called simultaneously from multiple goroutines.</code></span>
+<span class="codeline" id="line-88"><code>//</code></span>
+<span class="codeline" id="line-89"><code>// Like in tests, benchmark logs are accumulated during execution</code></span>
+<span class="codeline" id="line-90"><code>// and dumped to standard output when done. Unlike in tests, benchmark logs</code></span>
+<span class="codeline" id="line-91"><code>// are always printed, so as not to hide output whose existence may be</code></span>
+<span class="codeline" id="line-92"><code>// affecting benchmark results.</code></span>
+<span class="codeline" id="line-93"><code>type B struct {</code></span>
+<span class="codeline" id="line-94"><code>	common</code></span>
+<span class="codeline" id="line-95"><code>	importPath       string // import path of the package containing the benchmark</code></span>
+<span class="codeline" id="line-96"><code>	context          *benchContext</code></span>
+<span class="codeline" id="line-97"><code>	N                int</code></span>
+<span class="codeline" id="line-98"><code>	previousN        int           // number of iterations in the previous run</code></span>
+<span class="codeline" id="line-99"><code>	previousDuration time.Duration // total duration of the previous run</code></span>
+<span class="codeline" id="line-100"><code>	benchFunc        func(b *B)</code></span>
+<span class="codeline" id="line-101"><code>	benchTime        durationOrCountFlag</code></span>
+<span class="codeline" id="line-102"><code>	bytes            int64</code></span>
+<span class="codeline" id="line-103"><code>	missingBytes     bool // one of the subbenchmarks does not have bytes set.</code></span>
+<span class="codeline" id="line-104"><code>	timerOn          bool</code></span>
+<span class="codeline" id="line-105"><code>	showAllocResult  bool</code></span>
+<span class="codeline" id="line-106"><code>	result           BenchmarkResult</code></span>
+<span class="codeline" id="line-107"><code>	parallelism      int // RunParallel creates parallelism*GOMAXPROCS goroutines</code></span>
+<span class="codeline" id="line-108"><code>	// The initial states of memStats.Mallocs and memStats.TotalAlloc.</code></span>
+<span class="codeline" id="line-109"><code>	startAllocs uint64</code></span>
+<span class="codeline" id="line-110"><code>	startBytes  uint64</code></span>
+<span class="codeline" id="line-111"><code>	// The net total of this test after being run.</code></span>
+<span class="codeline" id="line-112"><code>	netAllocs uint64</code></span>
+<span class="codeline" id="line-113"><code>	netBytes  uint64</code></span>
+<span class="codeline" id="line-114"><code>	// Extra metrics collected by ReportMetric.</code></span>
+<span class="codeline" id="line-115"><code>	extra map[string]float64</code></span>
+<span class="codeline" id="line-116"><code>}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>// StartTimer starts timing a test. This function is called automatically</code></span>
+<span class="codeline" id="line-119"><code>// before a benchmark starts, but it can also be used to resume timing after</code></span>
+<span class="codeline" id="line-120"><code>// a call to [B.StopTimer].</code></span>
+<span class="codeline" id="line-121"><code>func (b *B) StartTimer() {</code></span>
+<span class="codeline" id="line-122"><code>	if !b.timerOn {</code></span>
+<span class="codeline" id="line-123"><code>		runtime.ReadMemStats(&amp;memStats)</code></span>
+<span class="codeline" id="line-124"><code>		b.startAllocs = memStats.Mallocs</code></span>
+<span class="codeline" id="line-125"><code>		b.startBytes = memStats.TotalAlloc</code></span>
+<span class="codeline" id="line-126"><code>		b.start = time.Now()</code></span>
+<span class="codeline" id="line-127"><code>		b.timerOn = true</code></span>
+<span class="codeline" id="line-128"><code>	}</code></span>
+<span class="codeline" id="line-129"><code>}</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>// StopTimer stops timing a test. This can be used to pause the timer</code></span>
+<span class="codeline" id="line-132"><code>// while performing complex initialization that you don't</code></span>
+<span class="codeline" id="line-133"><code>// want to measure.</code></span>
+<span class="codeline" id="line-134"><code>func (b *B) StopTimer() {</code></span>
+<span class="codeline" id="line-135"><code>	if b.timerOn {</code></span>
+<span class="codeline" id="line-136"><code>		b.duration += time.Since(b.start)</code></span>
+<span class="codeline" id="line-137"><code>		runtime.ReadMemStats(&amp;memStats)</code></span>
+<span class="codeline" id="line-138"><code>		b.netAllocs += memStats.Mallocs - b.startAllocs</code></span>
+<span class="codeline" id="line-139"><code>		b.netBytes += memStats.TotalAlloc - b.startBytes</code></span>
+<span class="codeline" id="line-140"><code>		b.timerOn = false</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>// ResetTimer zeroes the elapsed benchmark time and memory allocation counters</code></span>
+<span class="codeline" id="line-145"><code>// and deletes user-reported metrics.</code></span>
+<span class="codeline" id="line-146"><code>// It does not affect whether the timer is running.</code></span>
+<span class="codeline" id="line-147"><code>func (b *B) ResetTimer() {</code></span>
+<span class="codeline" id="line-148"><code>	if b.extra == nil {</code></span>
+<span class="codeline" id="line-149"><code>		// Allocate the extra map before reading memory stats.</code></span>
+<span class="codeline" id="line-150"><code>		// Pre-size it to make more allocation unlikely.</code></span>
+<span class="codeline" id="line-151"><code>		b.extra = make(map[string]float64, 16)</code></span>
+<span class="codeline" id="line-152"><code>	} else {</code></span>
+<span class="codeline" id="line-153"><code>		clear(b.extra)</code></span>
+<span class="codeline" id="line-154"><code>	}</code></span>
+<span class="codeline" id="line-155"><code>	if b.timerOn {</code></span>
+<span class="codeline" id="line-156"><code>		runtime.ReadMemStats(&amp;memStats)</code></span>
+<span class="codeline" id="line-157"><code>		b.startAllocs = memStats.Mallocs</code></span>
+<span class="codeline" id="line-158"><code>		b.startBytes = memStats.TotalAlloc</code></span>
+<span class="codeline" id="line-159"><code>		b.start = time.Now()</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code>	b.duration = 0</code></span>
+<span class="codeline" id="line-162"><code>	b.netAllocs = 0</code></span>
+<span class="codeline" id="line-163"><code>	b.netBytes = 0</code></span>
+<span class="codeline" id="line-164"><code>}</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>// SetBytes records the number of bytes processed in a single operation.</code></span>
+<span class="codeline" id="line-167"><code>// If this is called, the benchmark will report ns/op and MB/s.</code></span>
+<span class="codeline" id="line-168"><code>func (b *B) SetBytes(n int64) { b.bytes = n }</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>// ReportAllocs enables malloc statistics for this benchmark.</code></span>
+<span class="codeline" id="line-171"><code>// It is equivalent to setting -test.benchmem, but it only affects the</code></span>
+<span class="codeline" id="line-172"><code>// benchmark function that calls ReportAllocs.</code></span>
+<span class="codeline" id="line-173"><code>func (b *B) ReportAllocs() {</code></span>
+<span class="codeline" id="line-174"><code>	b.showAllocResult = true</code></span>
+<span class="codeline" id="line-175"><code>}</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>// runN runs a single benchmark for the specified number of iterations.</code></span>
+<span class="codeline" id="line-178"><code>func (b *B) runN(n int) {</code></span>
+<span class="codeline" id="line-179"><code>	benchmarkLock.Lock()</code></span>
+<span class="codeline" id="line-180"><code>	defer benchmarkLock.Unlock()</code></span>
+<span class="codeline" id="line-181"><code>	defer func() {</code></span>
+<span class="codeline" id="line-182"><code>		b.runCleanup(normalPanic)</code></span>
+<span class="codeline" id="line-183"><code>		b.checkRaces()</code></span>
+<span class="codeline" id="line-184"><code>	}()</code></span>
+<span class="codeline" id="line-185"><code>	// Try to get a comparable environment for each run</code></span>
+<span class="codeline" id="line-186"><code>	// by clearing garbage from previous runs.</code></span>
+<span class="codeline" id="line-187"><code>	runtime.GC()</code></span>
+<span class="codeline" id="line-188"><code>	b.resetRaces()</code></span>
+<span class="codeline" id="line-189"><code>	b.N = n</code></span>
+<span class="codeline" id="line-190"><code>	b.parallelism = 1</code></span>
+<span class="codeline" id="line-191"><code>	b.ResetTimer()</code></span>
+<span class="codeline" id="line-192"><code>	b.StartTimer()</code></span>
+<span class="codeline" id="line-193"><code>	b.benchFunc(b)</code></span>
+<span class="codeline" id="line-194"><code>	b.StopTimer()</code></span>
+<span class="codeline" id="line-195"><code>	b.previousN = n</code></span>
+<span class="codeline" id="line-196"><code>	b.previousDuration = b.duration</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>// run1 runs the first iteration of benchFunc. It reports whether more</code></span>
+<span class="codeline" id="line-200"><code>// iterations of this benchmarks should be run.</code></span>
+<span class="codeline" id="line-201"><code>func (b *B) run1() bool {</code></span>
+<span class="codeline" id="line-202"><code>	if ctx := b.context; ctx != nil {</code></span>
+<span class="codeline" id="line-203"><code>		// Extend maxLen, if needed.</code></span>
+<span class="codeline" id="line-204"><code>		if n := len(b.name) + ctx.extLen + 1; n &gt; ctx.maxLen {</code></span>
+<span class="codeline" id="line-205"><code>			ctx.maxLen = n + 8 // Add additional slack to avoid too many jumps in size.</code></span>
+<span class="codeline" id="line-206"><code>		}</code></span>
+<span class="codeline" id="line-207"><code>	}</code></span>
+<span class="codeline" id="line-208"><code>	go func() {</code></span>
+<span class="codeline" id="line-209"><code>		// Signal that we're done whether we return normally</code></span>
+<span class="codeline" id="line-210"><code>		// or by FailNow's runtime.Goexit.</code></span>
+<span class="codeline" id="line-211"><code>		defer func() {</code></span>
+<span class="codeline" id="line-212"><code>			b.signal &lt;- true</code></span>
+<span class="codeline" id="line-213"><code>		}()</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>		b.runN(1)</code></span>
+<span class="codeline" id="line-216"><code>	}()</code></span>
+<span class="codeline" id="line-217"><code>	&lt;-b.signal</code></span>
+<span class="codeline" id="line-218"><code>	if b.failed {</code></span>
+<span class="codeline" id="line-219"><code>		fmt.Fprintf(b.w, "%s--- FAIL: %s\n%s", b.chatty.prefix(), b.name, b.output)</code></span>
+<span class="codeline" id="line-220"><code>		return false</code></span>
+<span class="codeline" id="line-221"><code>	}</code></span>
+<span class="codeline" id="line-222"><code>	// Only print the output if we know we are not going to proceed.</code></span>
+<span class="codeline" id="line-223"><code>	// Otherwise it is printed in processBench.</code></span>
+<span class="codeline" id="line-224"><code>	b.mu.RLock()</code></span>
+<span class="codeline" id="line-225"><code>	finished := b.finished</code></span>
+<span class="codeline" id="line-226"><code>	b.mu.RUnlock()</code></span>
+<span class="codeline" id="line-227"><code>	if b.hasSub.Load() || finished {</code></span>
+<span class="codeline" id="line-228"><code>		tag := "BENCH"</code></span>
+<span class="codeline" id="line-229"><code>		if b.skipped {</code></span>
+<span class="codeline" id="line-230"><code>			tag = "SKIP"</code></span>
+<span class="codeline" id="line-231"><code>		}</code></span>
+<span class="codeline" id="line-232"><code>		if b.chatty != nil &amp;&amp; (len(b.output) &gt; 0 || finished) {</code></span>
+<span class="codeline" id="line-233"><code>			b.trimOutput()</code></span>
+<span class="codeline" id="line-234"><code>			fmt.Fprintf(b.w, "%s--- %s: %s\n%s", b.chatty.prefix(), tag, b.name, b.output)</code></span>
+<span class="codeline" id="line-235"><code>		}</code></span>
+<span class="codeline" id="line-236"><code>		return false</code></span>
+<span class="codeline" id="line-237"><code>	}</code></span>
+<span class="codeline" id="line-238"><code>	return true</code></span>
+<span class="codeline" id="line-239"><code>}</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>var labelsOnce sync.Once</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>// run executes the benchmark in a separate goroutine, including all of its</code></span>
+<span class="codeline" id="line-244"><code>// subbenchmarks. b must not have subbenchmarks.</code></span>
+<span class="codeline" id="line-245"><code>func (b *B) run() {</code></span>
+<span class="codeline" id="line-246"><code>	labelsOnce.Do(func() {</code></span>
+<span class="codeline" id="line-247"><code>		fmt.Fprintf(b.w, "goos: %s\n", runtime.GOOS)</code></span>
+<span class="codeline" id="line-248"><code>		fmt.Fprintf(b.w, "goarch: %s\n", runtime.GOARCH)</code></span>
+<span class="codeline" id="line-249"><code>		if b.importPath != "" {</code></span>
+<span class="codeline" id="line-250"><code>			fmt.Fprintf(b.w, "pkg: %s\n", b.importPath)</code></span>
+<span class="codeline" id="line-251"><code>		}</code></span>
+<span class="codeline" id="line-252"><code>		if cpu := sysinfo.CPUName(); cpu != "" {</code></span>
+<span class="codeline" id="line-253"><code>			fmt.Fprintf(b.w, "cpu: %s\n", cpu)</code></span>
+<span class="codeline" id="line-254"><code>		}</code></span>
+<span class="codeline" id="line-255"><code>	})</code></span>
+<span class="codeline" id="line-256"><code>	if b.context != nil {</code></span>
+<span class="codeline" id="line-257"><code>		// Running go test --test.bench</code></span>
+<span class="codeline" id="line-258"><code>		b.context.processBench(b) // Must call doBench.</code></span>
+<span class="codeline" id="line-259"><code>	} else {</code></span>
+<span class="codeline" id="line-260"><code>		// Running func Benchmark.</code></span>
+<span class="codeline" id="line-261"><code>		b.doBench()</code></span>
+<span class="codeline" id="line-262"><code>	}</code></span>
+<span class="codeline" id="line-263"><code>}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>func (b *B) doBench() BenchmarkResult {</code></span>
+<span class="codeline" id="line-266"><code>	go b.launch()</code></span>
+<span class="codeline" id="line-267"><code>	&lt;-b.signal</code></span>
+<span class="codeline" id="line-268"><code>	return b.result</code></span>
+<span class="codeline" id="line-269"><code>}</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>// launch launches the benchmark function. It gradually increases the number</code></span>
+<span class="codeline" id="line-272"><code>// of benchmark iterations until the benchmark runs for the requested benchtime.</code></span>
+<span class="codeline" id="line-273"><code>// launch is run by the doBench function as a separate goroutine.</code></span>
+<span class="codeline" id="line-274"><code>// run1 must have been called on b.</code></span>
+<span class="codeline" id="line-275"><code>func (b *B) launch() {</code></span>
+<span class="codeline" id="line-276"><code>	// Signal that we're done whether we return normally</code></span>
+<span class="codeline" id="line-277"><code>	// or by FailNow's runtime.Goexit.</code></span>
+<span class="codeline" id="line-278"><code>	defer func() {</code></span>
+<span class="codeline" id="line-279"><code>		b.signal &lt;- true</code></span>
+<span class="codeline" id="line-280"><code>	}()</code></span>
+<span class="codeline" id="line-281"><code></code></span>
+<span class="codeline" id="line-282"><code>	// Run the benchmark for at least the specified amount of time.</code></span>
+<span class="codeline" id="line-283"><code>	if b.benchTime.n &gt; 0 {</code></span>
+<span class="codeline" id="line-284"><code>		// We already ran a single iteration in run1.</code></span>
+<span class="codeline" id="line-285"><code>		// If -benchtime=1x was requested, use that result.</code></span>
+<span class="codeline" id="line-286"><code>		// See https://golang.org/issue/32051.</code></span>
+<span class="codeline" id="line-287"><code>		if b.benchTime.n &gt; 1 {</code></span>
+<span class="codeline" id="line-288"><code>			b.runN(b.benchTime.n)</code></span>
+<span class="codeline" id="line-289"><code>		}</code></span>
+<span class="codeline" id="line-290"><code>	} else {</code></span>
+<span class="codeline" id="line-291"><code>		d := b.benchTime.d</code></span>
+<span class="codeline" id="line-292"><code>		for n := int64(1); !b.failed &amp;&amp; b.duration &lt; d &amp;&amp; n &lt; 1e9; {</code></span>
+<span class="codeline" id="line-293"><code>			last := n</code></span>
+<span class="codeline" id="line-294"><code>			// Predict required iterations.</code></span>
+<span class="codeline" id="line-295"><code>			goalns := d.Nanoseconds()</code></span>
+<span class="codeline" id="line-296"><code>			prevIters := int64(b.N)</code></span>
+<span class="codeline" id="line-297"><code>			prevns := b.duration.Nanoseconds()</code></span>
+<span class="codeline" id="line-298"><code>			if prevns &lt;= 0 {</code></span>
+<span class="codeline" id="line-299"><code>				// Round up, to avoid div by zero.</code></span>
+<span class="codeline" id="line-300"><code>				prevns = 1</code></span>
+<span class="codeline" id="line-301"><code>			}</code></span>
+<span class="codeline" id="line-302"><code>			// Order of operations matters.</code></span>
+<span class="codeline" id="line-303"><code>			// For very fast benchmarks, prevIters ~= prevns.</code></span>
+<span class="codeline" id="line-304"><code>			// If you divide first, you get 0 or 1,</code></span>
+<span class="codeline" id="line-305"><code>			// which can hide an order of magnitude in execution time.</code></span>
+<span class="codeline" id="line-306"><code>			// So multiply first, then divide.</code></span>
+<span class="codeline" id="line-307"><code>			n = goalns * prevIters / prevns</code></span>
+<span class="codeline" id="line-308"><code>			// Run more iterations than we think we'll need (1.2x).</code></span>
+<span class="codeline" id="line-309"><code>			n += n / 5</code></span>
+<span class="codeline" id="line-310"><code>			// Don't grow too fast in case we had timing errors previously.</code></span>
+<span class="codeline" id="line-311"><code>			n = min(n, 100*last)</code></span>
+<span class="codeline" id="line-312"><code>			// Be sure to run at least one more than last time.</code></span>
+<span class="codeline" id="line-313"><code>			n = max(n, last+1)</code></span>
+<span class="codeline" id="line-314"><code>			// Don't run more than 1e9 times. (This also keeps n in int range on 32 bit platforms.)</code></span>
+<span class="codeline" id="line-315"><code>			n = min(n, 1e9)</code></span>
+<span class="codeline" id="line-316"><code>			b.runN(int(n))</code></span>
+<span class="codeline" id="line-317"><code>		}</code></span>
+<span class="codeline" id="line-318"><code>	}</code></span>
+<span class="codeline" id="line-319"><code>	b.result = BenchmarkResult{b.N, b.duration, b.bytes, b.netAllocs, b.netBytes, b.extra}</code></span>
+<span class="codeline" id="line-320"><code>}</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>// Elapsed returns the measured elapsed time of the benchmark.</code></span>
+<span class="codeline" id="line-323"><code>// The duration reported by Elapsed matches the one measured by</code></span>
+<span class="codeline" id="line-324"><code>// [B.StartTimer], [B.StopTimer], and [B.ResetTimer].</code></span>
+<span class="codeline" id="line-325"><code>func (b *B) Elapsed() time.Duration {</code></span>
+<span class="codeline" id="line-326"><code>	d := b.duration</code></span>
+<span class="codeline" id="line-327"><code>	if b.timerOn {</code></span>
+<span class="codeline" id="line-328"><code>		d += time.Since(b.start)</code></span>
+<span class="codeline" id="line-329"><code>	}</code></span>
+<span class="codeline" id="line-330"><code>	return d</code></span>
+<span class="codeline" id="line-331"><code>}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>// ReportMetric adds "n unit" to the reported benchmark results.</code></span>
+<span class="codeline" id="line-334"><code>// If the metric is per-iteration, the caller should divide by b.N,</code></span>
+<span class="codeline" id="line-335"><code>// and by convention units should end in "/op".</code></span>
+<span class="codeline" id="line-336"><code>// ReportMetric overrides any previously reported value for the same unit.</code></span>
+<span class="codeline" id="line-337"><code>// ReportMetric panics if unit is the empty string or if unit contains</code></span>
+<span class="codeline" id="line-338"><code>// any whitespace.</code></span>
+<span class="codeline" id="line-339"><code>// If unit is a unit normally reported by the benchmark framework itself</code></span>
+<span class="codeline" id="line-340"><code>// (such as "allocs/op"), ReportMetric will override that metric.</code></span>
+<span class="codeline" id="line-341"><code>// Setting "ns/op" to 0 will suppress that built-in metric.</code></span>
+<span class="codeline" id="line-342"><code>func (b *B) ReportMetric(n float64, unit string) {</code></span>
+<span class="codeline" id="line-343"><code>	if unit == "" {</code></span>
+<span class="codeline" id="line-344"><code>		panic("metric unit must not be empty")</code></span>
+<span class="codeline" id="line-345"><code>	}</code></span>
+<span class="codeline" id="line-346"><code>	if strings.IndexFunc(unit, unicode.IsSpace) &gt;= 0 {</code></span>
+<span class="codeline" id="line-347"><code>		panic("metric unit must not contain whitespace")</code></span>
+<span class="codeline" id="line-348"><code>	}</code></span>
+<span class="codeline" id="line-349"><code>	b.extra[unit] = n</code></span>
+<span class="codeline" id="line-350"><code>}</code></span>
+<span class="codeline" id="line-351"><code></code></span>
+<span class="codeline" id="line-352"><code>// BenchmarkResult contains the results of a benchmark run.</code></span>
+<span class="codeline" id="line-353"><code>type BenchmarkResult struct {</code></span>
+<span class="codeline" id="line-354"><code>	N         int           // The number of iterations.</code></span>
+<span class="codeline" id="line-355"><code>	T         time.Duration // The total time taken.</code></span>
+<span class="codeline" id="line-356"><code>	Bytes     int64         // Bytes processed in one iteration.</code></span>
+<span class="codeline" id="line-357"><code>	MemAllocs uint64        // The total number of memory allocations.</code></span>
+<span class="codeline" id="line-358"><code>	MemBytes  uint64        // The total number of bytes allocated.</code></span>
+<span class="codeline" id="line-359"><code></code></span>
+<span class="codeline" id="line-360"><code>	// Extra records additional metrics reported by ReportMetric.</code></span>
+<span class="codeline" id="line-361"><code>	Extra map[string]float64</code></span>
+<span class="codeline" id="line-362"><code>}</code></span>
+<span class="codeline" id="line-363"><code></code></span>
+<span class="codeline" id="line-364"><code>// NsPerOp returns the "ns/op" metric.</code></span>
+<span class="codeline" id="line-365"><code>func (r BenchmarkResult) NsPerOp() int64 {</code></span>
+<span class="codeline" id="line-366"><code>	if v, ok := r.Extra["ns/op"]; ok {</code></span>
+<span class="codeline" id="line-367"><code>		return int64(v)</code></span>
+<span class="codeline" id="line-368"><code>	}</code></span>
+<span class="codeline" id="line-369"><code>	if r.N &lt;= 0 {</code></span>
+<span class="codeline" id="line-370"><code>		return 0</code></span>
+<span class="codeline" id="line-371"><code>	}</code></span>
+<span class="codeline" id="line-372"><code>	return r.T.Nanoseconds() / int64(r.N)</code></span>
+<span class="codeline" id="line-373"><code>}</code></span>
+<span class="codeline" id="line-374"><code></code></span>
+<span class="codeline" id="line-375"><code>// mbPerSec returns the "MB/s" metric.</code></span>
+<span class="codeline" id="line-376"><code>func (r BenchmarkResult) mbPerSec() float64 {</code></span>
+<span class="codeline" id="line-377"><code>	if v, ok := r.Extra["MB/s"]; ok {</code></span>
+<span class="codeline" id="line-378"><code>		return v</code></span>
+<span class="codeline" id="line-379"><code>	}</code></span>
+<span class="codeline" id="line-380"><code>	if r.Bytes &lt;= 0 || r.T &lt;= 0 || r.N &lt;= 0 {</code></span>
+<span class="codeline" id="line-381"><code>		return 0</code></span>
+<span class="codeline" id="line-382"><code>	}</code></span>
+<span class="codeline" id="line-383"><code>	return (float64(r.Bytes) * float64(r.N) / 1e6) / r.T.Seconds()</code></span>
+<span class="codeline" id="line-384"><code>}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>// AllocsPerOp returns the "allocs/op" metric,</code></span>
+<span class="codeline" id="line-387"><code>// which is calculated as r.MemAllocs / r.N.</code></span>
+<span class="codeline" id="line-388"><code>func (r BenchmarkResult) AllocsPerOp() int64 {</code></span>
+<span class="codeline" id="line-389"><code>	if v, ok := r.Extra["allocs/op"]; ok {</code></span>
+<span class="codeline" id="line-390"><code>		return int64(v)</code></span>
+<span class="codeline" id="line-391"><code>	}</code></span>
+<span class="codeline" id="line-392"><code>	if r.N &lt;= 0 {</code></span>
+<span class="codeline" id="line-393"><code>		return 0</code></span>
+<span class="codeline" id="line-394"><code>	}</code></span>
+<span class="codeline" id="line-395"><code>	return int64(r.MemAllocs) / int64(r.N)</code></span>
+<span class="codeline" id="line-396"><code>}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>// AllocedBytesPerOp returns the "B/op" metric,</code></span>
+<span class="codeline" id="line-399"><code>// which is calculated as r.MemBytes / r.N.</code></span>
+<span class="codeline" id="line-400"><code>func (r BenchmarkResult) AllocedBytesPerOp() int64 {</code></span>
+<span class="codeline" id="line-401"><code>	if v, ok := r.Extra["B/op"]; ok {</code></span>
+<span class="codeline" id="line-402"><code>		return int64(v)</code></span>
+<span class="codeline" id="line-403"><code>	}</code></span>
+<span class="codeline" id="line-404"><code>	if r.N &lt;= 0 {</code></span>
+<span class="codeline" id="line-405"><code>		return 0</code></span>
+<span class="codeline" id="line-406"><code>	}</code></span>
+<span class="codeline" id="line-407"><code>	return int64(r.MemBytes) / int64(r.N)</code></span>
+<span class="codeline" id="line-408"><code>}</code></span>
+<span class="codeline" id="line-409"><code></code></span>
+<span class="codeline" id="line-410"><code>// String returns a summary of the benchmark results.</code></span>
+<span class="codeline" id="line-411"><code>// It follows the benchmark result line format from</code></span>
+<span class="codeline" id="line-412"><code>// https://golang.org/design/14313-benchmark-format, not including the</code></span>
+<span class="codeline" id="line-413"><code>// benchmark name.</code></span>
+<span class="codeline" id="line-414"><code>// Extra metrics override built-in metrics of the same name.</code></span>
+<span class="codeline" id="line-415"><code>// String does not include allocs/op or B/op, since those are reported</code></span>
+<span class="codeline" id="line-416"><code>// by [BenchmarkResult.MemString].</code></span>
+<span class="codeline" id="line-417"><code>func (r BenchmarkResult) String() string {</code></span>
+<span class="codeline" id="line-418"><code>	buf := new(strings.Builder)</code></span>
+<span class="codeline" id="line-419"><code>	fmt.Fprintf(buf, "%8d", r.N)</code></span>
+<span class="codeline" id="line-420"><code></code></span>
+<span class="codeline" id="line-421"><code>	// Get ns/op as a float.</code></span>
+<span class="codeline" id="line-422"><code>	ns, ok := r.Extra["ns/op"]</code></span>
+<span class="codeline" id="line-423"><code>	if !ok {</code></span>
+<span class="codeline" id="line-424"><code>		ns = float64(r.T.Nanoseconds()) / float64(r.N)</code></span>
+<span class="codeline" id="line-425"><code>	}</code></span>
+<span class="codeline" id="line-426"><code>	if ns != 0 {</code></span>
+<span class="codeline" id="line-427"><code>		buf.WriteByte('\t')</code></span>
+<span class="codeline" id="line-428"><code>		prettyPrint(buf, ns, "ns/op")</code></span>
+<span class="codeline" id="line-429"><code>	}</code></span>
+<span class="codeline" id="line-430"><code></code></span>
+<span class="codeline" id="line-431"><code>	if mbs := r.mbPerSec(); mbs != 0 {</code></span>
+<span class="codeline" id="line-432"><code>		fmt.Fprintf(buf, "\t%7.2f MB/s", mbs)</code></span>
+<span class="codeline" id="line-433"><code>	}</code></span>
+<span class="codeline" id="line-434"><code></code></span>
+<span class="codeline" id="line-435"><code>	// Print extra metrics that aren't represented in the standard</code></span>
+<span class="codeline" id="line-436"><code>	// metrics.</code></span>
+<span class="codeline" id="line-437"><code>	var extraKeys []string</code></span>
+<span class="codeline" id="line-438"><code>	for k := range r.Extra {</code></span>
+<span class="codeline" id="line-439"><code>		switch k {</code></span>
+<span class="codeline" id="line-440"><code>		case "ns/op", "MB/s", "B/op", "allocs/op":</code></span>
+<span class="codeline" id="line-441"><code>			// Built-in metrics reported elsewhere.</code></span>
+<span class="codeline" id="line-442"><code>			continue</code></span>
+<span class="codeline" id="line-443"><code>		}</code></span>
+<span class="codeline" id="line-444"><code>		extraKeys = append(extraKeys, k)</code></span>
+<span class="codeline" id="line-445"><code>	}</code></span>
+<span class="codeline" id="line-446"><code>	sort.Strings(extraKeys)</code></span>
+<span class="codeline" id="line-447"><code>	for _, k := range extraKeys {</code></span>
+<span class="codeline" id="line-448"><code>		buf.WriteByte('\t')</code></span>
+<span class="codeline" id="line-449"><code>		prettyPrint(buf, r.Extra[k], k)</code></span>
+<span class="codeline" id="line-450"><code>	}</code></span>
+<span class="codeline" id="line-451"><code>	return buf.String()</code></span>
+<span class="codeline" id="line-452"><code>}</code></span>
+<span class="codeline" id="line-453"><code></code></span>
+<span class="codeline" id="line-454"><code>func prettyPrint(w io.Writer, x float64, unit string) {</code></span>
+<span class="codeline" id="line-455"><code>	// Print all numbers with 10 places before the decimal point</code></span>
+<span class="codeline" id="line-456"><code>	// and small numbers with four sig figs. Field widths are</code></span>
+<span class="codeline" id="line-457"><code>	// chosen to fit the whole part in 10 places while aligning</code></span>
+<span class="codeline" id="line-458"><code>	// the decimal point of all fractional formats.</code></span>
+<span class="codeline" id="line-459"><code>	var format string</code></span>
+<span class="codeline" id="line-460"><code>	switch y := math.Abs(x); {</code></span>
+<span class="codeline" id="line-461"><code>	case y == 0 || y &gt;= 999.95:</code></span>
+<span class="codeline" id="line-462"><code>		format = "%10.0f %s"</code></span>
+<span class="codeline" id="line-463"><code>	case y &gt;= 99.995:</code></span>
+<span class="codeline" id="line-464"><code>		format = "%12.1f %s"</code></span>
+<span class="codeline" id="line-465"><code>	case y &gt;= 9.9995:</code></span>
+<span class="codeline" id="line-466"><code>		format = "%13.2f %s"</code></span>
+<span class="codeline" id="line-467"><code>	case y &gt;= 0.99995:</code></span>
+<span class="codeline" id="line-468"><code>		format = "%14.3f %s"</code></span>
+<span class="codeline" id="line-469"><code>	case y &gt;= 0.099995:</code></span>
+<span class="codeline" id="line-470"><code>		format = "%15.4f %s"</code></span>
+<span class="codeline" id="line-471"><code>	case y &gt;= 0.0099995:</code></span>
+<span class="codeline" id="line-472"><code>		format = "%16.5f %s"</code></span>
+<span class="codeline" id="line-473"><code>	case y &gt;= 0.00099995:</code></span>
+<span class="codeline" id="line-474"><code>		format = "%17.6f %s"</code></span>
+<span class="codeline" id="line-475"><code>	default:</code></span>
+<span class="codeline" id="line-476"><code>		format = "%18.7f %s"</code></span>
+<span class="codeline" id="line-477"><code>	}</code></span>
+<span class="codeline" id="line-478"><code>	fmt.Fprintf(w, format, x, unit)</code></span>
+<span class="codeline" id="line-479"><code>}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>// MemString returns r.AllocedBytesPerOp and r.AllocsPerOp in the same format as 'go test'.</code></span>
+<span class="codeline" id="line-482"><code>func (r BenchmarkResult) MemString() string {</code></span>
+<span class="codeline" id="line-483"><code>	return fmt.Sprintf("%8d B/op\t%8d allocs/op",</code></span>
+<span class="codeline" id="line-484"><code>		r.AllocedBytesPerOp(), r.AllocsPerOp())</code></span>
+<span class="codeline" id="line-485"><code>}</code></span>
+<span class="codeline" id="line-486"><code></code></span>
+<span class="codeline" id="line-487"><code>// benchmarkName returns full name of benchmark including procs suffix.</code></span>
+<span class="codeline" id="line-488"><code>func benchmarkName(name string, n int) string {</code></span>
+<span class="codeline" id="line-489"><code>	if n != 1 {</code></span>
+<span class="codeline" id="line-490"><code>		return fmt.Sprintf("%s-%d", name, n)</code></span>
+<span class="codeline" id="line-491"><code>	}</code></span>
+<span class="codeline" id="line-492"><code>	return name</code></span>
+<span class="codeline" id="line-493"><code>}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>type benchContext struct {</code></span>
+<span class="codeline" id="line-496"><code>	match *matcher</code></span>
+<span class="codeline" id="line-497"><code></code></span>
+<span class="codeline" id="line-498"><code>	maxLen int // The largest recorded benchmark name.</code></span>
+<span class="codeline" id="line-499"><code>	extLen int // Maximum extension length.</code></span>
+<span class="codeline" id="line-500"><code>}</code></span>
+<span class="codeline" id="line-501"><code></code></span>
+<span class="codeline" id="line-502"><code>// RunBenchmarks is an internal function but exported because it is cross-package;</code></span>
+<span class="codeline" id="line-503"><code>// it is part of the implementation of the "go test" command.</code></span>
+<span class="codeline" id="line-504"><code>func RunBenchmarks(matchString func(pat, str string) (bool, error), benchmarks []InternalBenchmark) {</code></span>
+<span class="codeline" id="line-505"><code>	runBenchmarks("", matchString, benchmarks)</code></span>
+<span class="codeline" id="line-506"><code>}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>func runBenchmarks(importPath string, matchString func(pat, str string) (bool, error), benchmarks []InternalBenchmark) bool {</code></span>
+<span class="codeline" id="line-509"><code>	// If no flag was specified, don't run benchmarks.</code></span>
+<span class="codeline" id="line-510"><code>	if len(*matchBenchmarks) == 0 {</code></span>
+<span class="codeline" id="line-511"><code>		return true</code></span>
+<span class="codeline" id="line-512"><code>	}</code></span>
+<span class="codeline" id="line-513"><code>	// Collect matching benchmarks and determine longest name.</code></span>
+<span class="codeline" id="line-514"><code>	maxprocs := 1</code></span>
+<span class="codeline" id="line-515"><code>	for _, procs := range cpuList {</code></span>
+<span class="codeline" id="line-516"><code>		if procs &gt; maxprocs {</code></span>
+<span class="codeline" id="line-517"><code>			maxprocs = procs</code></span>
+<span class="codeline" id="line-518"><code>		}</code></span>
+<span class="codeline" id="line-519"><code>	}</code></span>
+<span class="codeline" id="line-520"><code>	ctx := &amp;benchContext{</code></span>
+<span class="codeline" id="line-521"><code>		match:  newMatcher(matchString, *matchBenchmarks, "-test.bench", *skip),</code></span>
+<span class="codeline" id="line-522"><code>		extLen: len(benchmarkName("", maxprocs)),</code></span>
+<span class="codeline" id="line-523"><code>	}</code></span>
+<span class="codeline" id="line-524"><code>	var bs []InternalBenchmark</code></span>
+<span class="codeline" id="line-525"><code>	for _, Benchmark := range benchmarks {</code></span>
+<span class="codeline" id="line-526"><code>		if _, matched, _ := ctx.match.fullName(nil, Benchmark.Name); matched {</code></span>
+<span class="codeline" id="line-527"><code>			bs = append(bs, Benchmark)</code></span>
+<span class="codeline" id="line-528"><code>			benchName := benchmarkName(Benchmark.Name, maxprocs)</code></span>
+<span class="codeline" id="line-529"><code>			if l := len(benchName) + ctx.extLen + 1; l &gt; ctx.maxLen {</code></span>
+<span class="codeline" id="line-530"><code>				ctx.maxLen = l</code></span>
+<span class="codeline" id="line-531"><code>			}</code></span>
+<span class="codeline" id="line-532"><code>		}</code></span>
+<span class="codeline" id="line-533"><code>	}</code></span>
+<span class="codeline" id="line-534"><code>	main := &amp;B{</code></span>
+<span class="codeline" id="line-535"><code>		common: common{</code></span>
+<span class="codeline" id="line-536"><code>			name:  "Main",</code></span>
+<span class="codeline" id="line-537"><code>			w:     os.Stdout,</code></span>
+<span class="codeline" id="line-538"><code>			bench: true,</code></span>
+<span class="codeline" id="line-539"><code>		},</code></span>
+<span class="codeline" id="line-540"><code>		importPath: importPath,</code></span>
+<span class="codeline" id="line-541"><code>		benchFunc: func(b *B) {</code></span>
+<span class="codeline" id="line-542"><code>			for _, Benchmark := range bs {</code></span>
+<span class="codeline" id="line-543"><code>				b.Run(Benchmark.Name, Benchmark.F)</code></span>
+<span class="codeline" id="line-544"><code>			}</code></span>
+<span class="codeline" id="line-545"><code>		},</code></span>
+<span class="codeline" id="line-546"><code>		benchTime: benchTime,</code></span>
+<span class="codeline" id="line-547"><code>		context:   ctx,</code></span>
+<span class="codeline" id="line-548"><code>	}</code></span>
+<span class="codeline" id="line-549"><code>	if Verbose() {</code></span>
+<span class="codeline" id="line-550"><code>		main.chatty = newChattyPrinter(main.w)</code></span>
+<span class="codeline" id="line-551"><code>	}</code></span>
+<span class="codeline" id="line-552"><code>	main.runN(1)</code></span>
+<span class="codeline" id="line-553"><code>	return !main.failed</code></span>
+<span class="codeline" id="line-554"><code>}</code></span>
+<span class="codeline" id="line-555"><code></code></span>
+<span class="codeline" id="line-556"><code>// processBench runs bench b for the configured CPU counts and prints the results.</code></span>
+<span class="codeline" id="line-557"><code>func (ctx *benchContext) processBench(b *B) {</code></span>
+<span class="codeline" id="line-558"><code>	for i, procs := range cpuList {</code></span>
+<span class="codeline" id="line-559"><code>		for j := uint(0); j &lt; *count; j++ {</code></span>
+<span class="codeline" id="line-560"><code>			runtime.GOMAXPROCS(procs)</code></span>
+<span class="codeline" id="line-561"><code>			benchName := benchmarkName(b.name, procs)</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>			// If it's chatty, we've already printed this information.</code></span>
+<span class="codeline" id="line-564"><code>			if b.chatty == nil {</code></span>
+<span class="codeline" id="line-565"><code>				fmt.Fprintf(b.w, "%-*s\t", ctx.maxLen, benchName)</code></span>
+<span class="codeline" id="line-566"><code>			}</code></span>
+<span class="codeline" id="line-567"><code>			// Recompute the running time for all but the first iteration.</code></span>
+<span class="codeline" id="line-568"><code>			if i &gt; 0 || j &gt; 0 {</code></span>
+<span class="codeline" id="line-569"><code>				b = &amp;B{</code></span>
+<span class="codeline" id="line-570"><code>					common: common{</code></span>
+<span class="codeline" id="line-571"><code>						signal: make(chan bool),</code></span>
+<span class="codeline" id="line-572"><code>						name:   b.name,</code></span>
+<span class="codeline" id="line-573"><code>						w:      b.w,</code></span>
+<span class="codeline" id="line-574"><code>						chatty: b.chatty,</code></span>
+<span class="codeline" id="line-575"><code>						bench:  true,</code></span>
+<span class="codeline" id="line-576"><code>					},</code></span>
+<span class="codeline" id="line-577"><code>					benchFunc: b.benchFunc,</code></span>
+<span class="codeline" id="line-578"><code>					benchTime: b.benchTime,</code></span>
+<span class="codeline" id="line-579"><code>				}</code></span>
+<span class="codeline" id="line-580"><code>				b.run1()</code></span>
+<span class="codeline" id="line-581"><code>			}</code></span>
+<span class="codeline" id="line-582"><code>			r := b.doBench()</code></span>
+<span class="codeline" id="line-583"><code>			if b.failed {</code></span>
+<span class="codeline" id="line-584"><code>				// The output could be very long here, but probably isn't.</code></span>
+<span class="codeline" id="line-585"><code>				// We print it all, regardless, because we don't want to trim the reason</code></span>
+<span class="codeline" id="line-586"><code>				// the benchmark failed.</code></span>
+<span class="codeline" id="line-587"><code>				fmt.Fprintf(b.w, "%s--- FAIL: %s\n%s", b.chatty.prefix(), benchName, b.output)</code></span>
+<span class="codeline" id="line-588"><code>				continue</code></span>
+<span class="codeline" id="line-589"><code>			}</code></span>
+<span class="codeline" id="line-590"><code>			results := r.String()</code></span>
+<span class="codeline" id="line-591"><code>			if b.chatty != nil {</code></span>
+<span class="codeline" id="line-592"><code>				fmt.Fprintf(b.w, "%-*s\t", ctx.maxLen, benchName)</code></span>
+<span class="codeline" id="line-593"><code>			}</code></span>
+<span class="codeline" id="line-594"><code>			if *benchmarkMemory || b.showAllocResult {</code></span>
+<span class="codeline" id="line-595"><code>				results += "\t" + r.MemString()</code></span>
+<span class="codeline" id="line-596"><code>			}</code></span>
+<span class="codeline" id="line-597"><code>			fmt.Fprintln(b.w, results)</code></span>
+<span class="codeline" id="line-598"><code>			// Unlike with tests, we ignore the -chatty flag and always print output for</code></span>
+<span class="codeline" id="line-599"><code>			// benchmarks since the output generation time will skew the results.</code></span>
+<span class="codeline" id="line-600"><code>			if len(b.output) &gt; 0 {</code></span>
+<span class="codeline" id="line-601"><code>				b.trimOutput()</code></span>
+<span class="codeline" id="line-602"><code>				fmt.Fprintf(b.w, "%s--- BENCH: %s\n%s", b.chatty.prefix(), benchName, b.output)</code></span>
+<span class="codeline" id="line-603"><code>			}</code></span>
+<span class="codeline" id="line-604"><code>			if p := runtime.GOMAXPROCS(-1); p != procs {</code></span>
+<span class="codeline" id="line-605"><code>				fmt.Fprintf(os.Stderr, "testing: %s left GOMAXPROCS set to %d\n", benchName, p)</code></span>
+<span class="codeline" id="line-606"><code>			}</code></span>
+<span class="codeline" id="line-607"><code>			if b.chatty != nil &amp;&amp; b.chatty.json {</code></span>
+<span class="codeline" id="line-608"><code>				b.chatty.Updatef("", "=== NAME  %s\n", "")</code></span>
+<span class="codeline" id="line-609"><code>			}</code></span>
+<span class="codeline" id="line-610"><code>		}</code></span>
+<span class="codeline" id="line-611"><code>	}</code></span>
+<span class="codeline" id="line-612"><code>}</code></span>
+<span class="codeline" id="line-613"><code></code></span>
+<span class="codeline" id="line-614"><code>// If hideStdoutForTesting is true, Run does not print the benchName.</code></span>
+<span class="codeline" id="line-615"><code>// This avoids a spurious print during 'go test' on package testing itself,</code></span>
+<span class="codeline" id="line-616"><code>// which invokes b.Run in its own tests (see sub_test.go).</code></span>
+<span class="codeline" id="line-617"><code>var hideStdoutForTesting = false</code></span>
+<span class="codeline" id="line-618"><code></code></span>
+<span class="codeline" id="line-619"><code>// Run benchmarks f as a subbenchmark with the given name. It reports</code></span>
+<span class="codeline" id="line-620"><code>// whether there were any failures.</code></span>
+<span class="codeline" id="line-621"><code>//</code></span>
+<span class="codeline" id="line-622"><code>// A subbenchmark is like any other benchmark. A benchmark that calls Run at</code></span>
+<span class="codeline" id="line-623"><code>// least once will not be measured itself and will be called once with N=1.</code></span>
+<span class="codeline" id="line-624"><code>func (b *B) Run(name string, f func(b *B)) bool {</code></span>
+<span class="codeline" id="line-625"><code>	// Since b has subbenchmarks, we will no longer run it as a benchmark itself.</code></span>
+<span class="codeline" id="line-626"><code>	// Release the lock and acquire it on exit to ensure locks stay paired.</code></span>
+<span class="codeline" id="line-627"><code>	b.hasSub.Store(true)</code></span>
+<span class="codeline" id="line-628"><code>	benchmarkLock.Unlock()</code></span>
+<span class="codeline" id="line-629"><code>	defer benchmarkLock.Lock()</code></span>
+<span class="codeline" id="line-630"><code></code></span>
+<span class="codeline" id="line-631"><code>	benchName, ok, partial := b.name, true, false</code></span>
+<span class="codeline" id="line-632"><code>	if b.context != nil {</code></span>
+<span class="codeline" id="line-633"><code>		benchName, ok, partial = b.context.match.fullName(&amp;b.common, name)</code></span>
+<span class="codeline" id="line-634"><code>	}</code></span>
+<span class="codeline" id="line-635"><code>	if !ok {</code></span>
+<span class="codeline" id="line-636"><code>		return true</code></span>
+<span class="codeline" id="line-637"><code>	}</code></span>
+<span class="codeline" id="line-638"><code>	var pc [maxStackLen]uintptr</code></span>
+<span class="codeline" id="line-639"><code>	n := runtime.Callers(2, pc[:])</code></span>
+<span class="codeline" id="line-640"><code>	sub := &amp;B{</code></span>
+<span class="codeline" id="line-641"><code>		common: common{</code></span>
+<span class="codeline" id="line-642"><code>			signal:  make(chan bool),</code></span>
+<span class="codeline" id="line-643"><code>			name:    benchName,</code></span>
+<span class="codeline" id="line-644"><code>			parent:  &amp;b.common,</code></span>
+<span class="codeline" id="line-645"><code>			level:   b.level + 1,</code></span>
+<span class="codeline" id="line-646"><code>			creator: pc[:n],</code></span>
+<span class="codeline" id="line-647"><code>			w:       b.w,</code></span>
+<span class="codeline" id="line-648"><code>			chatty:  b.chatty,</code></span>
+<span class="codeline" id="line-649"><code>			bench:   true,</code></span>
+<span class="codeline" id="line-650"><code>		},</code></span>
+<span class="codeline" id="line-651"><code>		importPath: b.importPath,</code></span>
+<span class="codeline" id="line-652"><code>		benchFunc:  f,</code></span>
+<span class="codeline" id="line-653"><code>		benchTime:  b.benchTime,</code></span>
+<span class="codeline" id="line-654"><code>		context:    b.context,</code></span>
+<span class="codeline" id="line-655"><code>	}</code></span>
+<span class="codeline" id="line-656"><code>	if partial {</code></span>
+<span class="codeline" id="line-657"><code>		// Partial name match, like -bench=X/Y matching BenchmarkX.</code></span>
+<span class="codeline" id="line-658"><code>		// Only process sub-benchmarks, if any.</code></span>
+<span class="codeline" id="line-659"><code>		sub.hasSub.Store(true)</code></span>
+<span class="codeline" id="line-660"><code>	}</code></span>
+<span class="codeline" id="line-661"><code></code></span>
+<span class="codeline" id="line-662"><code>	if b.chatty != nil {</code></span>
+<span class="codeline" id="line-663"><code>		labelsOnce.Do(func() {</code></span>
+<span class="codeline" id="line-664"><code>			fmt.Printf("goos: %s\n", runtime.GOOS)</code></span>
+<span class="codeline" id="line-665"><code>			fmt.Printf("goarch: %s\n", runtime.GOARCH)</code></span>
+<span class="codeline" id="line-666"><code>			if b.importPath != "" {</code></span>
+<span class="codeline" id="line-667"><code>				fmt.Printf("pkg: %s\n", b.importPath)</code></span>
+<span class="codeline" id="line-668"><code>			}</code></span>
+<span class="codeline" id="line-669"><code>			if cpu := sysinfo.CPUName(); cpu != "" {</code></span>
+<span class="codeline" id="line-670"><code>				fmt.Printf("cpu: %s\n", cpu)</code></span>
+<span class="codeline" id="line-671"><code>			}</code></span>
+<span class="codeline" id="line-672"><code>		})</code></span>
+<span class="codeline" id="line-673"><code></code></span>
+<span class="codeline" id="line-674"><code>		if !hideStdoutForTesting {</code></span>
+<span class="codeline" id="line-675"><code>			if b.chatty.json {</code></span>
+<span class="codeline" id="line-676"><code>				b.chatty.Updatef(benchName, "=== RUN   %s\n", benchName)</code></span>
+<span class="codeline" id="line-677"><code>			}</code></span>
+<span class="codeline" id="line-678"><code>			fmt.Println(benchName)</code></span>
+<span class="codeline" id="line-679"><code>		}</code></span>
+<span class="codeline" id="line-680"><code>	}</code></span>
+<span class="codeline" id="line-681"><code></code></span>
+<span class="codeline" id="line-682"><code>	if sub.run1() {</code></span>
+<span class="codeline" id="line-683"><code>		sub.run()</code></span>
+<span class="codeline" id="line-684"><code>	}</code></span>
+<span class="codeline" id="line-685"><code>	b.add(sub.result)</code></span>
+<span class="codeline" id="line-686"><code>	return !sub.failed</code></span>
+<span class="codeline" id="line-687"><code>}</code></span>
+<span class="codeline" id="line-688"><code></code></span>
+<span class="codeline" id="line-689"><code>// add simulates running benchmarks in sequence in a single iteration. It is</code></span>
+<span class="codeline" id="line-690"><code>// used to give some meaningful results in case func Benchmark is used in</code></span>
+<span class="codeline" id="line-691"><code>// combination with Run.</code></span>
+<span class="codeline" id="line-692"><code>func (b *B) add(other BenchmarkResult) {</code></span>
+<span class="codeline" id="line-693"><code>	r := &amp;b.result</code></span>
+<span class="codeline" id="line-694"><code>	// The aggregated BenchmarkResults resemble running all subbenchmarks as</code></span>
+<span class="codeline" id="line-695"><code>	// in sequence in a single benchmark.</code></span>
+<span class="codeline" id="line-696"><code>	r.N = 1</code></span>
+<span class="codeline" id="line-697"><code>	r.T += time.Duration(other.NsPerOp())</code></span>
+<span class="codeline" id="line-698"><code>	if other.Bytes == 0 {</code></span>
+<span class="codeline" id="line-699"><code>		// Summing Bytes is meaningless in aggregate if not all subbenchmarks</code></span>
+<span class="codeline" id="line-700"><code>		// set it.</code></span>
+<span class="codeline" id="line-701"><code>		b.missingBytes = true</code></span>
+<span class="codeline" id="line-702"><code>		r.Bytes = 0</code></span>
+<span class="codeline" id="line-703"><code>	}</code></span>
+<span class="codeline" id="line-704"><code>	if !b.missingBytes {</code></span>
+<span class="codeline" id="line-705"><code>		r.Bytes += other.Bytes</code></span>
+<span class="codeline" id="line-706"><code>	}</code></span>
+<span class="codeline" id="line-707"><code>	r.MemAllocs += uint64(other.AllocsPerOp())</code></span>
+<span class="codeline" id="line-708"><code>	r.MemBytes += uint64(other.AllocedBytesPerOp())</code></span>
+<span class="codeline" id="line-709"><code>}</code></span>
+<span class="codeline" id="line-710"><code></code></span>
+<span class="codeline" id="line-711"><code>// trimOutput shortens the output from a benchmark, which can be very long.</code></span>
+<span class="codeline" id="line-712"><code>func (b *B) trimOutput() {</code></span>
+<span class="codeline" id="line-713"><code>	// The output is likely to appear multiple times because the benchmark</code></span>
+<span class="codeline" id="line-714"><code>	// is run multiple times, but at least it will be seen. This is not a big deal</code></span>
+<span class="codeline" id="line-715"><code>	// because benchmarks rarely print, but just in case, we trim it if it's too long.</code></span>
+<span class="codeline" id="line-716"><code>	const maxNewlines = 10</code></span>
+<span class="codeline" id="line-717"><code>	for nlCount, j := 0, 0; j &lt; len(b.output); j++ {</code></span>
+<span class="codeline" id="line-718"><code>		if b.output[j] == '\n' {</code></span>
+<span class="codeline" id="line-719"><code>			nlCount++</code></span>
+<span class="codeline" id="line-720"><code>			if nlCount &gt;= maxNewlines {</code></span>
+<span class="codeline" id="line-721"><code>				b.output = append(b.output[:j], "\n\t... [output truncated]\n"...)</code></span>
+<span class="codeline" id="line-722"><code>				break</code></span>
+<span class="codeline" id="line-723"><code>			}</code></span>
+<span class="codeline" id="line-724"><code>		}</code></span>
+<span class="codeline" id="line-725"><code>	}</code></span>
+<span class="codeline" id="line-726"><code>}</code></span>
+<span class="codeline" id="line-727"><code></code></span>
+<span class="codeline" id="line-728"><code>// A PB is used by RunParallel for running parallel benchmarks.</code></span>
+<span class="codeline" id="line-729"><code>type PB struct {</code></span>
+<span class="codeline" id="line-730"><code>	globalN *atomic.Uint64 // shared between all worker goroutines iteration counter</code></span>
+<span class="codeline" id="line-731"><code>	grain   uint64         // acquire that many iterations from globalN at once</code></span>
+<span class="codeline" id="line-732"><code>	cache   uint64         // local cache of acquired iterations</code></span>
+<span class="codeline" id="line-733"><code>	bN      uint64         // total number of iterations to execute (b.N)</code></span>
+<span class="codeline" id="line-734"><code>}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>// Next reports whether there are more iterations to execute.</code></span>
+<span class="codeline" id="line-737"><code>func (pb *PB) Next() bool {</code></span>
+<span class="codeline" id="line-738"><code>	if pb.cache == 0 {</code></span>
+<span class="codeline" id="line-739"><code>		n := pb.globalN.Add(pb.grain)</code></span>
+<span class="codeline" id="line-740"><code>		if n &lt;= pb.bN {</code></span>
+<span class="codeline" id="line-741"><code>			pb.cache = pb.grain</code></span>
+<span class="codeline" id="line-742"><code>		} else if n &lt; pb.bN+pb.grain {</code></span>
+<span class="codeline" id="line-743"><code>			pb.cache = pb.bN + pb.grain - n</code></span>
+<span class="codeline" id="line-744"><code>		} else {</code></span>
+<span class="codeline" id="line-745"><code>			return false</code></span>
+<span class="codeline" id="line-746"><code>		}</code></span>
+<span class="codeline" id="line-747"><code>	}</code></span>
+<span class="codeline" id="line-748"><code>	pb.cache--</code></span>
+<span class="codeline" id="line-749"><code>	return true</code></span>
+<span class="codeline" id="line-750"><code>}</code></span>
+<span class="codeline" id="line-751"><code></code></span>
+<span class="codeline" id="line-752"><code>// RunParallel runs a benchmark in parallel.</code></span>
+<span class="codeline" id="line-753"><code>// It creates multiple goroutines and distributes b.N iterations among them.</code></span>
+<span class="codeline" id="line-754"><code>// The number of goroutines defaults to GOMAXPROCS. To increase parallelism for</code></span>
+<span class="codeline" id="line-755"><code>// non-CPU-bound benchmarks, call [B.SetParallelism] before RunParallel.</code></span>
+<span class="codeline" id="line-756"><code>// RunParallel is usually used with the go test -cpu flag.</code></span>
+<span class="codeline" id="line-757"><code>//</code></span>
+<span class="codeline" id="line-758"><code>// The body function will be run in each goroutine. It should set up any</code></span>
+<span class="codeline" id="line-759"><code>// goroutine-local state and then iterate until pb.Next returns false.</code></span>
+<span class="codeline" id="line-760"><code>// It should not use the [B.StartTimer], [B.StopTimer], or [B.ResetTimer] functions,</code></span>
+<span class="codeline" id="line-761"><code>// because they have global effect. It should also not call [B.Run].</code></span>
+<span class="codeline" id="line-762"><code>//</code></span>
+<span class="codeline" id="line-763"><code>// RunParallel reports ns/op values as wall time for the benchmark as a whole,</code></span>
+<span class="codeline" id="line-764"><code>// not the sum of wall time or CPU time over each parallel goroutine.</code></span>
+<span class="codeline" id="line-765"><code>func (b *B) RunParallel(body func(*PB)) {</code></span>
+<span class="codeline" id="line-766"><code>	if b.N == 0 {</code></span>
+<span class="codeline" id="line-767"><code>		return // Nothing to do when probing.</code></span>
+<span class="codeline" id="line-768"><code>	}</code></span>
+<span class="codeline" id="line-769"><code>	// Calculate grain size as number of iterations that take ~100µs.</code></span>
+<span class="codeline" id="line-770"><code>	// 100µs is enough to amortize the overhead and provide sufficient</code></span>
+<span class="codeline" id="line-771"><code>	// dynamic load balancing.</code></span>
+<span class="codeline" id="line-772"><code>	grain := uint64(0)</code></span>
+<span class="codeline" id="line-773"><code>	if b.previousN &gt; 0 &amp;&amp; b.previousDuration &gt; 0 {</code></span>
+<span class="codeline" id="line-774"><code>		grain = 1e5 * uint64(b.previousN) / uint64(b.previousDuration)</code></span>
+<span class="codeline" id="line-775"><code>	}</code></span>
+<span class="codeline" id="line-776"><code>	if grain &lt; 1 {</code></span>
+<span class="codeline" id="line-777"><code>		grain = 1</code></span>
+<span class="codeline" id="line-778"><code>	}</code></span>
+<span class="codeline" id="line-779"><code>	// We expect the inner loop and function call to take at least 10ns,</code></span>
+<span class="codeline" id="line-780"><code>	// so do not do more than 100µs/10ns=1e4 iterations.</code></span>
+<span class="codeline" id="line-781"><code>	if grain &gt; 1e4 {</code></span>
+<span class="codeline" id="line-782"><code>		grain = 1e4</code></span>
+<span class="codeline" id="line-783"><code>	}</code></span>
+<span class="codeline" id="line-784"><code></code></span>
+<span class="codeline" id="line-785"><code>	var n atomic.Uint64</code></span>
+<span class="codeline" id="line-786"><code>	numProcs := b.parallelism * runtime.GOMAXPROCS(0)</code></span>
+<span class="codeline" id="line-787"><code>	var wg sync.WaitGroup</code></span>
+<span class="codeline" id="line-788"><code>	wg.Add(numProcs)</code></span>
+<span class="codeline" id="line-789"><code>	for p := 0; p &lt; numProcs; p++ {</code></span>
+<span class="codeline" id="line-790"><code>		go func() {</code></span>
+<span class="codeline" id="line-791"><code>			defer wg.Done()</code></span>
+<span class="codeline" id="line-792"><code>			pb := &amp;PB{</code></span>
+<span class="codeline" id="line-793"><code>				globalN: &amp;n,</code></span>
+<span class="codeline" id="line-794"><code>				grain:   grain,</code></span>
+<span class="codeline" id="line-795"><code>				bN:      uint64(b.N),</code></span>
+<span class="codeline" id="line-796"><code>			}</code></span>
+<span class="codeline" id="line-797"><code>			body(pb)</code></span>
+<span class="codeline" id="line-798"><code>		}()</code></span>
+<span class="codeline" id="line-799"><code>	}</code></span>
+<span class="codeline" id="line-800"><code>	wg.Wait()</code></span>
+<span class="codeline" id="line-801"><code>	if n.Load() &lt;= uint64(b.N) &amp;&amp; !b.Failed() {</code></span>
+<span class="codeline" id="line-802"><code>		b.Fatal("RunParallel: body exited without pb.Next() == false")</code></span>
+<span class="codeline" id="line-803"><code>	}</code></span>
+<span class="codeline" id="line-804"><code>}</code></span>
+<span class="codeline" id="line-805"><code></code></span>
+<span class="codeline" id="line-806"><code>// SetParallelism sets the number of goroutines used by [B.RunParallel] to p*GOMAXPROCS.</code></span>
+<span class="codeline" id="line-807"><code>// There is usually no need to call SetParallelism for CPU-bound benchmarks.</code></span>
+<span class="codeline" id="line-808"><code>// If p is less than 1, this call will have no effect.</code></span>
+<span class="codeline" id="line-809"><code>func (b *B) SetParallelism(p int) {</code></span>
+<span class="codeline" id="line-810"><code>	if p &gt;= 1 {</code></span>
+<span class="codeline" id="line-811"><code>		b.parallelism = p</code></span>
+<span class="codeline" id="line-812"><code>	}</code></span>
+<span class="codeline" id="line-813"><code>}</code></span>
+<span class="codeline" id="line-814"><code></code></span>
+<span class="codeline" id="line-815"><code>// Benchmark benchmarks a single function. It is useful for creating</code></span>
+<span class="codeline" id="line-816"><code>// custom benchmarks that do not use the "go test" command.</code></span>
+<span class="codeline" id="line-817"><code>//</code></span>
+<span class="codeline" id="line-818"><code>// If f depends on testing flags, then [Init] must be used to register</code></span>
+<span class="codeline" id="line-819"><code>// those flags before calling Benchmark and before calling [flag.Parse].</code></span>
+<span class="codeline" id="line-820"><code>//</code></span>
+<span class="codeline" id="line-821"><code>// If f calls Run, the result will be an estimate of running all its</code></span>
+<span class="codeline" id="line-822"><code>// subbenchmarks that don't call Run in sequence in a single benchmark.</code></span>
+<span class="codeline" id="line-823"><code>func Benchmark(f func(b *B)) BenchmarkResult {</code></span>
+<span class="codeline" id="line-824"><code>	b := &amp;B{</code></span>
+<span class="codeline" id="line-825"><code>		common: common{</code></span>
+<span class="codeline" id="line-826"><code>			signal: make(chan bool),</code></span>
+<span class="codeline" id="line-827"><code>			w:      discard{},</code></span>
+<span class="codeline" id="line-828"><code>		},</code></span>
+<span class="codeline" id="line-829"><code>		benchFunc: f,</code></span>
+<span class="codeline" id="line-830"><code>		benchTime: benchTime,</code></span>
+<span class="codeline" id="line-831"><code>	}</code></span>
+<span class="codeline" id="line-832"><code>	if b.run1() {</code></span>
+<span class="codeline" id="line-833"><code>		b.run()</code></span>
+<span class="codeline" id="line-834"><code>	}</code></span>
+<span class="codeline" id="line-835"><code>	return b.result</code></span>
+<span class="codeline" id="line-836"><code>}</code></span>
+<span class="codeline" id="line-837"><code></code></span>
+<span class="codeline" id="line-838"><code>type discard struct{}</code></span>
+<span class="codeline" id="line-839"><code></code></span>
+<span class="codeline" id="line-840"><code>func (discard) Write(b []byte) (n int, err error) { return len(b), nil }</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

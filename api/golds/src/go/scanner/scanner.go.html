@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: scanner.go in package go/scanner</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	scanner.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/scanner.html">go/scanner</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package scanner implements a scanner for Go source text.</code></span>
+<span class="codeline" id="line-6"><code>// It takes a []byte as source which can then be tokenized</code></span>
+<span class="codeline" id="line-7"><code>// through repeated calls to the Scan method.</code></span></div><span class="codeline" id="line-8"><code>package scanner</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>import (</code></span>
+<span class="codeline" id="line-11"><code>	"bytes"</code></span>
+<span class="codeline" id="line-12"><code>	"fmt"</code></span>
+<span class="codeline" id="line-13"><code>	"go/token"</code></span>
+<span class="codeline" id="line-14"><code>	"path/filepath"</code></span>
+<span class="codeline" id="line-15"><code>	"strconv"</code></span>
+<span class="codeline" id="line-16"><code>	"unicode"</code></span>
+<span class="codeline" id="line-17"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-18"><code>)</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>// An ErrorHandler may be provided to [Scanner.Init]. If a syntax error is</code></span>
+<span class="codeline" id="line-21"><code>// encountered and a handler was installed, the handler is called with a</code></span>
+<span class="codeline" id="line-22"><code>// position and an error message. The position points to the beginning of</code></span>
+<span class="codeline" id="line-23"><code>// the offending token.</code></span>
+<span class="codeline" id="line-24"><code>type ErrorHandler func(pos token.Position, msg string)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>// A Scanner holds the scanner's internal state while processing</code></span>
+<span class="codeline" id="line-27"><code>// a given text. It can be allocated as part of another data</code></span>
+<span class="codeline" id="line-28"><code>// structure but must be initialized via [Scanner.Init] before use.</code></span>
+<span class="codeline" id="line-29"><code>type Scanner struct {</code></span>
+<span class="codeline" id="line-30"><code>	// immutable state</code></span>
+<span class="codeline" id="line-31"><code>	file *token.File  // source file handle</code></span>
+<span class="codeline" id="line-32"><code>	dir  string       // directory portion of file.Name()</code></span>
+<span class="codeline" id="line-33"><code>	src  []byte       // source</code></span>
+<span class="codeline" id="line-34"><code>	err  ErrorHandler // error reporting; or nil</code></span>
+<span class="codeline" id="line-35"><code>	mode Mode         // scanning mode</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>	// scanning state</code></span>
+<span class="codeline" id="line-38"><code>	ch         rune      // current character</code></span>
+<span class="codeline" id="line-39"><code>	offset     int       // character offset</code></span>
+<span class="codeline" id="line-40"><code>	rdOffset   int       // reading offset (position after current character)</code></span>
+<span class="codeline" id="line-41"><code>	lineOffset int       // current line offset</code></span>
+<span class="codeline" id="line-42"><code>	insertSemi bool      // insert a semicolon before next newline</code></span>
+<span class="codeline" id="line-43"><code>	nlPos      token.Pos // position of newline in preceding comment</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>	// public state - ok to modify</code></span>
+<span class="codeline" id="line-46"><code>	ErrorCount int // number of errors encountered</code></span>
+<span class="codeline" id="line-47"><code>}</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>const (</code></span>
+<span class="codeline" id="line-50"><code>	bom = 0xFEFF // byte order mark, only permitted as very first character</code></span>
+<span class="codeline" id="line-51"><code>	eof = -1     // end of file</code></span>
+<span class="codeline" id="line-52"><code>)</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>// Read the next Unicode char into s.ch.</code></span>
+<span class="codeline" id="line-55"><code>// s.ch &lt; 0 means end-of-file.</code></span>
+<span class="codeline" id="line-56"><code>//</code></span>
+<span class="codeline" id="line-57"><code>// For optimization, there is some overlap between this method and</code></span>
+<span class="codeline" id="line-58"><code>// s.scanIdentifier.</code></span>
+<span class="codeline" id="line-59"><code>func (s *Scanner) next() {</code></span>
+<span class="codeline" id="line-60"><code>	if s.rdOffset &lt; len(s.src) {</code></span>
+<span class="codeline" id="line-61"><code>		s.offset = s.rdOffset</code></span>
+<span class="codeline" id="line-62"><code>		if s.ch == '\n' {</code></span>
+<span class="codeline" id="line-63"><code>			s.lineOffset = s.offset</code></span>
+<span class="codeline" id="line-64"><code>			s.file.AddLine(s.offset)</code></span>
+<span class="codeline" id="line-65"><code>		}</code></span>
+<span class="codeline" id="line-66"><code>		r, w := rune(s.src[s.rdOffset]), 1</code></span>
+<span class="codeline" id="line-67"><code>		switch {</code></span>
+<span class="codeline" id="line-68"><code>		case r == 0:</code></span>
+<span class="codeline" id="line-69"><code>			s.error(s.offset, "illegal character NUL")</code></span>
+<span class="codeline" id="line-70"><code>		case r &gt;= utf8.RuneSelf:</code></span>
+<span class="codeline" id="line-71"><code>			// not ASCII</code></span>
+<span class="codeline" id="line-72"><code>			r, w = utf8.DecodeRune(s.src[s.rdOffset:])</code></span>
+<span class="codeline" id="line-73"><code>			if r == utf8.RuneError &amp;&amp; w == 1 {</code></span>
+<span class="codeline" id="line-74"><code>				s.error(s.offset, "illegal UTF-8 encoding")</code></span>
+<span class="codeline" id="line-75"><code>			} else if r == bom &amp;&amp; s.offset &gt; 0 {</code></span>
+<span class="codeline" id="line-76"><code>				s.error(s.offset, "illegal byte order mark")</code></span>
+<span class="codeline" id="line-77"><code>			}</code></span>
+<span class="codeline" id="line-78"><code>		}</code></span>
+<span class="codeline" id="line-79"><code>		s.rdOffset += w</code></span>
+<span class="codeline" id="line-80"><code>		s.ch = r</code></span>
+<span class="codeline" id="line-81"><code>	} else {</code></span>
+<span class="codeline" id="line-82"><code>		s.offset = len(s.src)</code></span>
+<span class="codeline" id="line-83"><code>		if s.ch == '\n' {</code></span>
+<span class="codeline" id="line-84"><code>			s.lineOffset = s.offset</code></span>
+<span class="codeline" id="line-85"><code>			s.file.AddLine(s.offset)</code></span>
+<span class="codeline" id="line-86"><code>		}</code></span>
+<span class="codeline" id="line-87"><code>		s.ch = eof</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>// peek returns the byte following the most recently read character without</code></span>
+<span class="codeline" id="line-92"><code>// advancing the scanner. If the scanner is at EOF, peek returns 0.</code></span>
+<span class="codeline" id="line-93"><code>func (s *Scanner) peek() byte {</code></span>
+<span class="codeline" id="line-94"><code>	if s.rdOffset &lt; len(s.src) {</code></span>
+<span class="codeline" id="line-95"><code>		return s.src[s.rdOffset]</code></span>
+<span class="codeline" id="line-96"><code>	}</code></span>
+<span class="codeline" id="line-97"><code>	return 0</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// A mode value is a set of flags (or 0).</code></span>
+<span class="codeline" id="line-101"><code>// They control scanner behavior.</code></span>
+<span class="codeline" id="line-102"><code>type Mode uint</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>const (</code></span>
+<span class="codeline" id="line-105"><code>	ScanComments    Mode = 1 &lt;&lt; iota // return comments as COMMENT tokens</code></span>
+<span class="codeline" id="line-106"><code>	dontInsertSemis                  // do not automatically insert semicolons - for testing only</code></span>
+<span class="codeline" id="line-107"><code>)</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>// Init prepares the scanner s to tokenize the text src by setting the</code></span>
+<span class="codeline" id="line-110"><code>// scanner at the beginning of src. The scanner uses the file set file</code></span>
+<span class="codeline" id="line-111"><code>// for position information and it adds line information for each line.</code></span>
+<span class="codeline" id="line-112"><code>// It is ok to re-use the same file when re-scanning the same file as</code></span>
+<span class="codeline" id="line-113"><code>// line information which is already present is ignored. Init causes a</code></span>
+<span class="codeline" id="line-114"><code>// panic if the file size does not match the src size.</code></span>
+<span class="codeline" id="line-115"><code>//</code></span>
+<span class="codeline" id="line-116"><code>// Calls to [Scanner.Scan] will invoke the error handler err if they encounter a</code></span>
+<span class="codeline" id="line-117"><code>// syntax error and err is not nil. Also, for each error encountered,</code></span>
+<span class="codeline" id="line-118"><code>// the [Scanner] field ErrorCount is incremented by one. The mode parameter</code></span>
+<span class="codeline" id="line-119"><code>// determines how comments are handled.</code></span>
+<span class="codeline" id="line-120"><code>//</code></span>
+<span class="codeline" id="line-121"><code>// Note that Init may call err if there is an error in the first character</code></span>
+<span class="codeline" id="line-122"><code>// of the file.</code></span>
+<span class="codeline" id="line-123"><code>func (s *Scanner) Init(file *token.File, src []byte, err ErrorHandler, mode Mode) {</code></span>
+<span class="codeline" id="line-124"><code>	// Explicitly initialize all fields since a scanner may be reused.</code></span>
+<span class="codeline" id="line-125"><code>	if file.Size() != len(src) {</code></span>
+<span class="codeline" id="line-126"><code>		panic(fmt.Sprintf("file size (%d) does not match src len (%d)", file.Size(), len(src)))</code></span>
+<span class="codeline" id="line-127"><code>	}</code></span>
+<span class="codeline" id="line-128"><code>	s.file = file</code></span>
+<span class="codeline" id="line-129"><code>	s.dir, _ = filepath.Split(file.Name())</code></span>
+<span class="codeline" id="line-130"><code>	s.src = src</code></span>
+<span class="codeline" id="line-131"><code>	s.err = err</code></span>
+<span class="codeline" id="line-132"><code>	s.mode = mode</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>	s.ch = ' '</code></span>
+<span class="codeline" id="line-135"><code>	s.offset = 0</code></span>
+<span class="codeline" id="line-136"><code>	s.rdOffset = 0</code></span>
+<span class="codeline" id="line-137"><code>	s.lineOffset = 0</code></span>
+<span class="codeline" id="line-138"><code>	s.insertSemi = false</code></span>
+<span class="codeline" id="line-139"><code>	s.ErrorCount = 0</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>	s.next()</code></span>
+<span class="codeline" id="line-142"><code>	if s.ch == bom {</code></span>
+<span class="codeline" id="line-143"><code>		s.next() // ignore BOM at file beginning</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>func (s *Scanner) error(offs int, msg string) {</code></span>
+<span class="codeline" id="line-148"><code>	if s.err != nil {</code></span>
+<span class="codeline" id="line-149"><code>		s.err(s.file.Position(s.file.Pos(offs)), msg)</code></span>
+<span class="codeline" id="line-150"><code>	}</code></span>
+<span class="codeline" id="line-151"><code>	s.ErrorCount++</code></span>
+<span class="codeline" id="line-152"><code>}</code></span>
+<span class="codeline" id="line-153"><code></code></span>
+<span class="codeline" id="line-154"><code>func (s *Scanner) errorf(offs int, format string, args ...any) {</code></span>
+<span class="codeline" id="line-155"><code>	s.error(offs, fmt.Sprintf(format, args...))</code></span>
+<span class="codeline" id="line-156"><code>}</code></span>
+<span class="codeline" id="line-157"><code></code></span>
+<span class="codeline" id="line-158"><code>// scanComment returns the text of the comment and (if nonzero)</code></span>
+<span class="codeline" id="line-159"><code>// the offset of the first newline within it, which implies a</code></span>
+<span class="codeline" id="line-160"><code>// /*...*/ comment.</code></span>
+<span class="codeline" id="line-161"><code>func (s *Scanner) scanComment() (string, int) {</code></span>
+<span class="codeline" id="line-162"><code>	// initial '/' already consumed; s.ch == '/' || s.ch == '*'</code></span>
+<span class="codeline" id="line-163"><code>	offs := s.offset - 1 // position of initial '/'</code></span>
+<span class="codeline" id="line-164"><code>	next := -1           // position immediately following the comment; &lt; 0 means invalid comment</code></span>
+<span class="codeline" id="line-165"><code>	numCR := 0</code></span>
+<span class="codeline" id="line-166"><code>	nlOffset := 0 // offset of first newline within /*...*/ comment</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>	if s.ch == '/' {</code></span>
+<span class="codeline" id="line-169"><code>		//-style comment</code></span>
+<span class="codeline" id="line-170"><code>		// (the final '\n' is not considered part of the comment)</code></span>
+<span class="codeline" id="line-171"><code>		s.next()</code></span>
+<span class="codeline" id="line-172"><code>		for s.ch != '\n' &amp;&amp; s.ch &gt;= 0 {</code></span>
+<span class="codeline" id="line-173"><code>			if s.ch == '\r' {</code></span>
+<span class="codeline" id="line-174"><code>				numCR++</code></span>
+<span class="codeline" id="line-175"><code>			}</code></span>
+<span class="codeline" id="line-176"><code>			s.next()</code></span>
+<span class="codeline" id="line-177"><code>		}</code></span>
+<span class="codeline" id="line-178"><code>		// if we are at '\n', the position following the comment is afterwards</code></span>
+<span class="codeline" id="line-179"><code>		next = s.offset</code></span>
+<span class="codeline" id="line-180"><code>		if s.ch == '\n' {</code></span>
+<span class="codeline" id="line-181"><code>			next++</code></span>
+<span class="codeline" id="line-182"><code>		}</code></span>
+<span class="codeline" id="line-183"><code>		goto exit</code></span>
+<span class="codeline" id="line-184"><code>	}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>	/*-style comment */</code></span>
+<span class="codeline" id="line-187"><code>	s.next()</code></span>
+<span class="codeline" id="line-188"><code>	for s.ch &gt;= 0 {</code></span>
+<span class="codeline" id="line-189"><code>		ch := s.ch</code></span>
+<span class="codeline" id="line-190"><code>		if ch == '\r' {</code></span>
+<span class="codeline" id="line-191"><code>			numCR++</code></span>
+<span class="codeline" id="line-192"><code>		} else if ch == '\n' &amp;&amp; nlOffset == 0 {</code></span>
+<span class="codeline" id="line-193"><code>			nlOffset = s.offset</code></span>
+<span class="codeline" id="line-194"><code>		}</code></span>
+<span class="codeline" id="line-195"><code>		s.next()</code></span>
+<span class="codeline" id="line-196"><code>		if ch == '*' &amp;&amp; s.ch == '/' {</code></span>
+<span class="codeline" id="line-197"><code>			s.next()</code></span>
+<span class="codeline" id="line-198"><code>			next = s.offset</code></span>
+<span class="codeline" id="line-199"><code>			goto exit</code></span>
+<span class="codeline" id="line-200"><code>		}</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>	s.error(offs, "comment not terminated")</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>exit:</code></span>
+<span class="codeline" id="line-206"><code>	lit := s.src[offs:s.offset]</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>	// On Windows, a (//-comment) line may end in "\r\n".</code></span>
+<span class="codeline" id="line-209"><code>	// Remove the final '\r' before analyzing the text for</code></span>
+<span class="codeline" id="line-210"><code>	// line directives (matching the compiler). Remove any</code></span>
+<span class="codeline" id="line-211"><code>	// other '\r' afterwards (matching the pre-existing be-</code></span>
+<span class="codeline" id="line-212"><code>	// havior of the scanner).</code></span>
+<span class="codeline" id="line-213"><code>	if numCR &gt; 0 &amp;&amp; len(lit) &gt;= 2 &amp;&amp; lit[1] == '/' &amp;&amp; lit[len(lit)-1] == '\r' {</code></span>
+<span class="codeline" id="line-214"><code>		lit = lit[:len(lit)-1]</code></span>
+<span class="codeline" id="line-215"><code>		numCR--</code></span>
+<span class="codeline" id="line-216"><code>	}</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>	// interpret line directives</code></span>
+<span class="codeline" id="line-219"><code>	// (//line directives must start at the beginning of the current line)</code></span>
+<span class="codeline" id="line-220"><code>	if next &gt;= 0 /* implies valid comment */ &amp;&amp; (lit[1] == '*' || offs == s.lineOffset) &amp;&amp; bytes.HasPrefix(lit[2:], prefix) {</code></span>
+<span class="codeline" id="line-221"><code>		s.updateLineInfo(next, offs, lit)</code></span>
+<span class="codeline" id="line-222"><code>	}</code></span>
+<span class="codeline" id="line-223"><code></code></span>
+<span class="codeline" id="line-224"><code>	if numCR &gt; 0 {</code></span>
+<span class="codeline" id="line-225"><code>		lit = stripCR(lit, lit[1] == '*')</code></span>
+<span class="codeline" id="line-226"><code>	}</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>	return string(lit), nlOffset</code></span>
+<span class="codeline" id="line-229"><code>}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>var prefix = []byte("line ")</code></span>
+<span class="codeline" id="line-232"><code></code></span>
+<span class="codeline" id="line-233"><code>// updateLineInfo parses the incoming comment text at offset offs</code></span>
+<span class="codeline" id="line-234"><code>// as a line directive. If successful, it updates the line info table</code></span>
+<span class="codeline" id="line-235"><code>// for the position next per the line directive.</code></span>
+<span class="codeline" id="line-236"><code>func (s *Scanner) updateLineInfo(next, offs int, text []byte) {</code></span>
+<span class="codeline" id="line-237"><code>	// extract comment text</code></span>
+<span class="codeline" id="line-238"><code>	if text[1] == '*' {</code></span>
+<span class="codeline" id="line-239"><code>		text = text[:len(text)-2] // lop off trailing "*/"</code></span>
+<span class="codeline" id="line-240"><code>	}</code></span>
+<span class="codeline" id="line-241"><code>	text = text[7:] // lop off leading "//line " or "/*line "</code></span>
+<span class="codeline" id="line-242"><code>	offs += 7</code></span>
+<span class="codeline" id="line-243"><code></code></span>
+<span class="codeline" id="line-244"><code>	i, n, ok := trailingDigits(text)</code></span>
+<span class="codeline" id="line-245"><code>	if i == 0 {</code></span>
+<span class="codeline" id="line-246"><code>		return // ignore (not a line directive)</code></span>
+<span class="codeline" id="line-247"><code>	}</code></span>
+<span class="codeline" id="line-248"><code>	// i &gt; 0</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>	if !ok {</code></span>
+<span class="codeline" id="line-251"><code>		// text has a suffix :xxx but xxx is not a number</code></span>
+<span class="codeline" id="line-252"><code>		s.error(offs+i, "invalid line number: "+string(text[i:]))</code></span>
+<span class="codeline" id="line-253"><code>		return</code></span>
+<span class="codeline" id="line-254"><code>	}</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>	// Put a cap on the maximum size of line and column numbers.</code></span>
+<span class="codeline" id="line-257"><code>	// 30 bits allows for some additional space before wrapping an int32.</code></span>
+<span class="codeline" id="line-258"><code>	// Keep this consistent with cmd/compile/internal/syntax.PosMax.</code></span>
+<span class="codeline" id="line-259"><code>	const maxLineCol = 1 &lt;&lt; 30</code></span>
+<span class="codeline" id="line-260"><code>	var line, col int</code></span>
+<span class="codeline" id="line-261"><code>	i2, n2, ok2 := trailingDigits(text[:i-1])</code></span>
+<span class="codeline" id="line-262"><code>	if ok2 {</code></span>
+<span class="codeline" id="line-263"><code>		//line filename:line:col</code></span>
+<span class="codeline" id="line-264"><code>		i, i2 = i2, i</code></span>
+<span class="codeline" id="line-265"><code>		line, col = n2, n</code></span>
+<span class="codeline" id="line-266"><code>		if col == 0 || col &gt; maxLineCol {</code></span>
+<span class="codeline" id="line-267"><code>			s.error(offs+i2, "invalid column number: "+string(text[i2:]))</code></span>
+<span class="codeline" id="line-268"><code>			return</code></span>
+<span class="codeline" id="line-269"><code>		}</code></span>
+<span class="codeline" id="line-270"><code>		text = text[:i2-1] // lop off ":col"</code></span>
+<span class="codeline" id="line-271"><code>	} else {</code></span>
+<span class="codeline" id="line-272"><code>		//line filename:line</code></span>
+<span class="codeline" id="line-273"><code>		line = n</code></span>
+<span class="codeline" id="line-274"><code>	}</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>	if line == 0 || line &gt; maxLineCol {</code></span>
+<span class="codeline" id="line-277"><code>		s.error(offs+i, "invalid line number: "+string(text[i:]))</code></span>
+<span class="codeline" id="line-278"><code>		return</code></span>
+<span class="codeline" id="line-279"><code>	}</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	// If we have a column (//line filename:line:col form),</code></span>
+<span class="codeline" id="line-282"><code>	// an empty filename means to use the previous filename.</code></span>
+<span class="codeline" id="line-283"><code>	filename := string(text[:i-1]) // lop off ":line", and trim white space</code></span>
+<span class="codeline" id="line-284"><code>	if filename == "" &amp;&amp; ok2 {</code></span>
+<span class="codeline" id="line-285"><code>		filename = s.file.Position(s.file.Pos(offs)).Filename</code></span>
+<span class="codeline" id="line-286"><code>	} else if filename != "" {</code></span>
+<span class="codeline" id="line-287"><code>		// Put a relative filename in the current directory.</code></span>
+<span class="codeline" id="line-288"><code>		// This is for compatibility with earlier releases.</code></span>
+<span class="codeline" id="line-289"><code>		// See issue 26671.</code></span>
+<span class="codeline" id="line-290"><code>		filename = filepath.Clean(filename)</code></span>
+<span class="codeline" id="line-291"><code>		if !filepath.IsAbs(filename) {</code></span>
+<span class="codeline" id="line-292"><code>			filename = filepath.Join(s.dir, filename)</code></span>
+<span class="codeline" id="line-293"><code>		}</code></span>
+<span class="codeline" id="line-294"><code>	}</code></span>
+<span class="codeline" id="line-295"><code></code></span>
+<span class="codeline" id="line-296"><code>	s.file.AddLineColumnInfo(next, filename, line, col)</code></span>
+<span class="codeline" id="line-297"><code>}</code></span>
+<span class="codeline" id="line-298"><code></code></span>
+<span class="codeline" id="line-299"><code>func trailingDigits(text []byte) (int, int, bool) {</code></span>
+<span class="codeline" id="line-300"><code>	i := bytes.LastIndexByte(text, ':') // look from right (Windows filenames may contain ':')</code></span>
+<span class="codeline" id="line-301"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-302"><code>		return 0, 0, false // no ":"</code></span>
+<span class="codeline" id="line-303"><code>	}</code></span>
+<span class="codeline" id="line-304"><code>	// i &gt;= 0</code></span>
+<span class="codeline" id="line-305"><code>	n, err := strconv.ParseUint(string(text[i+1:]), 10, 0)</code></span>
+<span class="codeline" id="line-306"><code>	return i + 1, int(n), err == nil</code></span>
+<span class="codeline" id="line-307"><code>}</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>func isLetter(ch rune) bool {</code></span>
+<span class="codeline" id="line-310"><code>	return 'a' &lt;= lower(ch) &amp;&amp; lower(ch) &lt;= 'z' || ch == '_' || ch &gt;= utf8.RuneSelf &amp;&amp; unicode.IsLetter(ch)</code></span>
+<span class="codeline" id="line-311"><code>}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>func isDigit(ch rune) bool {</code></span>
+<span class="codeline" id="line-314"><code>	return isDecimal(ch) || ch &gt;= utf8.RuneSelf &amp;&amp; unicode.IsDigit(ch)</code></span>
+<span class="codeline" id="line-315"><code>}</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>// scanIdentifier reads the string of valid identifier characters at s.offset.</code></span>
+<span class="codeline" id="line-318"><code>// It must only be called when s.ch is known to be a valid letter.</code></span>
+<span class="codeline" id="line-319"><code>//</code></span>
+<span class="codeline" id="line-320"><code>// Be careful when making changes to this function: it is optimized and affects</code></span>
+<span class="codeline" id="line-321"><code>// scanning performance significantly.</code></span>
+<span class="codeline" id="line-322"><code>func (s *Scanner) scanIdentifier() string {</code></span>
+<span class="codeline" id="line-323"><code>	offs := s.offset</code></span>
+<span class="codeline" id="line-324"><code></code></span>
+<span class="codeline" id="line-325"><code>	// Optimize for the common case of an ASCII identifier.</code></span>
+<span class="codeline" id="line-326"><code>	//</code></span>
+<span class="codeline" id="line-327"><code>	// Ranging over s.src[s.rdOffset:] lets us avoid some bounds checks, and</code></span>
+<span class="codeline" id="line-328"><code>	// avoids conversions to runes.</code></span>
+<span class="codeline" id="line-329"><code>	//</code></span>
+<span class="codeline" id="line-330"><code>	// In case we encounter a non-ASCII character, fall back on the slower path</code></span>
+<span class="codeline" id="line-331"><code>	// of calling into s.next().</code></span>
+<span class="codeline" id="line-332"><code>	for rdOffset, b := range s.src[s.rdOffset:] {</code></span>
+<span class="codeline" id="line-333"><code>		if 'a' &lt;= b &amp;&amp; b &lt;= 'z' || 'A' &lt;= b &amp;&amp; b &lt;= 'Z' || b == '_' || '0' &lt;= b &amp;&amp; b &lt;= '9' {</code></span>
+<span class="codeline" id="line-334"><code>			// Avoid assigning a rune for the common case of an ascii character.</code></span>
+<span class="codeline" id="line-335"><code>			continue</code></span>
+<span class="codeline" id="line-336"><code>		}</code></span>
+<span class="codeline" id="line-337"><code>		s.rdOffset += rdOffset</code></span>
+<span class="codeline" id="line-338"><code>		if 0 &lt; b &amp;&amp; b &lt; utf8.RuneSelf {</code></span>
+<span class="codeline" id="line-339"><code>			// Optimization: we've encountered an ASCII character that's not a letter</code></span>
+<span class="codeline" id="line-340"><code>			// or number. Avoid the call into s.next() and corresponding set up.</code></span>
+<span class="codeline" id="line-341"><code>			//</code></span>
+<span class="codeline" id="line-342"><code>			// Note that s.next() does some line accounting if s.ch is '\n', so this</code></span>
+<span class="codeline" id="line-343"><code>			// shortcut is only possible because we know that the preceding character</code></span>
+<span class="codeline" id="line-344"><code>			// is not '\n'.</code></span>
+<span class="codeline" id="line-345"><code>			s.ch = rune(b)</code></span>
+<span class="codeline" id="line-346"><code>			s.offset = s.rdOffset</code></span>
+<span class="codeline" id="line-347"><code>			s.rdOffset++</code></span>
+<span class="codeline" id="line-348"><code>			goto exit</code></span>
+<span class="codeline" id="line-349"><code>		}</code></span>
+<span class="codeline" id="line-350"><code>		// We know that the preceding character is valid for an identifier because</code></span>
+<span class="codeline" id="line-351"><code>		// scanIdentifier is only called when s.ch is a letter, so calling s.next()</code></span>
+<span class="codeline" id="line-352"><code>		// at s.rdOffset resets the scanner state.</code></span>
+<span class="codeline" id="line-353"><code>		s.next()</code></span>
+<span class="codeline" id="line-354"><code>		for isLetter(s.ch) || isDigit(s.ch) {</code></span>
+<span class="codeline" id="line-355"><code>			s.next()</code></span>
+<span class="codeline" id="line-356"><code>		}</code></span>
+<span class="codeline" id="line-357"><code>		goto exit</code></span>
+<span class="codeline" id="line-358"><code>	}</code></span>
+<span class="codeline" id="line-359"><code>	s.offset = len(s.src)</code></span>
+<span class="codeline" id="line-360"><code>	s.rdOffset = len(s.src)</code></span>
+<span class="codeline" id="line-361"><code>	s.ch = eof</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>exit:</code></span>
+<span class="codeline" id="line-364"><code>	return string(s.src[offs:s.offset])</code></span>
+<span class="codeline" id="line-365"><code>}</code></span>
+<span class="codeline" id="line-366"><code></code></span>
+<span class="codeline" id="line-367"><code>func digitVal(ch rune) int {</code></span>
+<span class="codeline" id="line-368"><code>	switch {</code></span>
+<span class="codeline" id="line-369"><code>	case '0' &lt;= ch &amp;&amp; ch &lt;= '9':</code></span>
+<span class="codeline" id="line-370"><code>		return int(ch - '0')</code></span>
+<span class="codeline" id="line-371"><code>	case 'a' &lt;= lower(ch) &amp;&amp; lower(ch) &lt;= 'f':</code></span>
+<span class="codeline" id="line-372"><code>		return int(lower(ch) - 'a' + 10)</code></span>
+<span class="codeline" id="line-373"><code>	}</code></span>
+<span class="codeline" id="line-374"><code>	return 16 // larger than any legal digit val</code></span>
+<span class="codeline" id="line-375"><code>}</code></span>
+<span class="codeline" id="line-376"><code></code></span>
+<span class="codeline" id="line-377"><code>func lower(ch rune) rune     { return ('a' - 'A') | ch } // returns lower-case ch iff ch is ASCII letter</code></span>
+<span class="codeline" id="line-378"><code>func isDecimal(ch rune) bool { return '0' &lt;= ch &amp;&amp; ch &lt;= '9' }</code></span>
+<span class="codeline" id="line-379"><code>func isHex(ch rune) bool     { return '0' &lt;= ch &amp;&amp; ch &lt;= '9' || 'a' &lt;= lower(ch) &amp;&amp; lower(ch) &lt;= 'f' }</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>// digits accepts the sequence { digit | '_' }.</code></span>
+<span class="codeline" id="line-382"><code>// If base &lt;= 10, digits accepts any decimal digit but records</code></span>
+<span class="codeline" id="line-383"><code>// the offset (relative to the source start) of a digit &gt;= base</code></span>
+<span class="codeline" id="line-384"><code>// in *invalid, if *invalid &lt; 0.</code></span>
+<span class="codeline" id="line-385"><code>// digits returns a bitset describing whether the sequence contained</code></span>
+<span class="codeline" id="line-386"><code>// digits (bit 0 is set), or separators '_' (bit 1 is set).</code></span>
+<span class="codeline" id="line-387"><code>func (s *Scanner) digits(base int, invalid *int) (digsep int) {</code></span>
+<span class="codeline" id="line-388"><code>	if base &lt;= 10 {</code></span>
+<span class="codeline" id="line-389"><code>		max := rune('0' + base)</code></span>
+<span class="codeline" id="line-390"><code>		for isDecimal(s.ch) || s.ch == '_' {</code></span>
+<span class="codeline" id="line-391"><code>			ds := 1</code></span>
+<span class="codeline" id="line-392"><code>			if s.ch == '_' {</code></span>
+<span class="codeline" id="line-393"><code>				ds = 2</code></span>
+<span class="codeline" id="line-394"><code>			} else if s.ch &gt;= max &amp;&amp; *invalid &lt; 0 {</code></span>
+<span class="codeline" id="line-395"><code>				*invalid = s.offset // record invalid rune offset</code></span>
+<span class="codeline" id="line-396"><code>			}</code></span>
+<span class="codeline" id="line-397"><code>			digsep |= ds</code></span>
+<span class="codeline" id="line-398"><code>			s.next()</code></span>
+<span class="codeline" id="line-399"><code>		}</code></span>
+<span class="codeline" id="line-400"><code>	} else {</code></span>
+<span class="codeline" id="line-401"><code>		for isHex(s.ch) || s.ch == '_' {</code></span>
+<span class="codeline" id="line-402"><code>			ds := 1</code></span>
+<span class="codeline" id="line-403"><code>			if s.ch == '_' {</code></span>
+<span class="codeline" id="line-404"><code>				ds = 2</code></span>
+<span class="codeline" id="line-405"><code>			}</code></span>
+<span class="codeline" id="line-406"><code>			digsep |= ds</code></span>
+<span class="codeline" id="line-407"><code>			s.next()</code></span>
+<span class="codeline" id="line-408"><code>		}</code></span>
+<span class="codeline" id="line-409"><code>	}</code></span>
+<span class="codeline" id="line-410"><code>	return</code></span>
+<span class="codeline" id="line-411"><code>}</code></span>
+<span class="codeline" id="line-412"><code></code></span>
+<span class="codeline" id="line-413"><code>func (s *Scanner) scanNumber() (token.Token, string) {</code></span>
+<span class="codeline" id="line-414"><code>	offs := s.offset</code></span>
+<span class="codeline" id="line-415"><code>	tok := token.ILLEGAL</code></span>
+<span class="codeline" id="line-416"><code></code></span>
+<span class="codeline" id="line-417"><code>	base := 10        // number base</code></span>
+<span class="codeline" id="line-418"><code>	prefix := rune(0) // one of 0 (decimal), '0' (0-octal), 'x', 'o', or 'b'</code></span>
+<span class="codeline" id="line-419"><code>	digsep := 0       // bit 0: digit present, bit 1: '_' present</code></span>
+<span class="codeline" id="line-420"><code>	invalid := -1     // index of invalid digit in literal, or &lt; 0</code></span>
+<span class="codeline" id="line-421"><code></code></span>
+<span class="codeline" id="line-422"><code>	// integer part</code></span>
+<span class="codeline" id="line-423"><code>	if s.ch != '.' {</code></span>
+<span class="codeline" id="line-424"><code>		tok = token.INT</code></span>
+<span class="codeline" id="line-425"><code>		if s.ch == '0' {</code></span>
+<span class="codeline" id="line-426"><code>			s.next()</code></span>
+<span class="codeline" id="line-427"><code>			switch lower(s.ch) {</code></span>
+<span class="codeline" id="line-428"><code>			case 'x':</code></span>
+<span class="codeline" id="line-429"><code>				s.next()</code></span>
+<span class="codeline" id="line-430"><code>				base, prefix = 16, 'x'</code></span>
+<span class="codeline" id="line-431"><code>			case 'o':</code></span>
+<span class="codeline" id="line-432"><code>				s.next()</code></span>
+<span class="codeline" id="line-433"><code>				base, prefix = 8, 'o'</code></span>
+<span class="codeline" id="line-434"><code>			case 'b':</code></span>
+<span class="codeline" id="line-435"><code>				s.next()</code></span>
+<span class="codeline" id="line-436"><code>				base, prefix = 2, 'b'</code></span>
+<span class="codeline" id="line-437"><code>			default:</code></span>
+<span class="codeline" id="line-438"><code>				base, prefix = 8, '0'</code></span>
+<span class="codeline" id="line-439"><code>				digsep = 1 // leading 0</code></span>
+<span class="codeline" id="line-440"><code>			}</code></span>
+<span class="codeline" id="line-441"><code>		}</code></span>
+<span class="codeline" id="line-442"><code>		digsep |= s.digits(base, &amp;invalid)</code></span>
+<span class="codeline" id="line-443"><code>	}</code></span>
+<span class="codeline" id="line-444"><code></code></span>
+<span class="codeline" id="line-445"><code>	// fractional part</code></span>
+<span class="codeline" id="line-446"><code>	if s.ch == '.' {</code></span>
+<span class="codeline" id="line-447"><code>		tok = token.FLOAT</code></span>
+<span class="codeline" id="line-448"><code>		if prefix == 'o' || prefix == 'b' {</code></span>
+<span class="codeline" id="line-449"><code>			s.error(s.offset, "invalid radix point in "+litname(prefix))</code></span>
+<span class="codeline" id="line-450"><code>		}</code></span>
+<span class="codeline" id="line-451"><code>		s.next()</code></span>
+<span class="codeline" id="line-452"><code>		digsep |= s.digits(base, &amp;invalid)</code></span>
+<span class="codeline" id="line-453"><code>	}</code></span>
+<span class="codeline" id="line-454"><code></code></span>
+<span class="codeline" id="line-455"><code>	if digsep&amp;1 == 0 {</code></span>
+<span class="codeline" id="line-456"><code>		s.error(s.offset, litname(prefix)+" has no digits")</code></span>
+<span class="codeline" id="line-457"><code>	}</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>	// exponent</code></span>
+<span class="codeline" id="line-460"><code>	if e := lower(s.ch); e == 'e' || e == 'p' {</code></span>
+<span class="codeline" id="line-461"><code>		switch {</code></span>
+<span class="codeline" id="line-462"><code>		case e == 'e' &amp;&amp; prefix != 0 &amp;&amp; prefix != '0':</code></span>
+<span class="codeline" id="line-463"><code>			s.errorf(s.offset, "%q exponent requires decimal mantissa", s.ch)</code></span>
+<span class="codeline" id="line-464"><code>		case e == 'p' &amp;&amp; prefix != 'x':</code></span>
+<span class="codeline" id="line-465"><code>			s.errorf(s.offset, "%q exponent requires hexadecimal mantissa", s.ch)</code></span>
+<span class="codeline" id="line-466"><code>		}</code></span>
+<span class="codeline" id="line-467"><code>		s.next()</code></span>
+<span class="codeline" id="line-468"><code>		tok = token.FLOAT</code></span>
+<span class="codeline" id="line-469"><code>		if s.ch == '+' || s.ch == '-' {</code></span>
+<span class="codeline" id="line-470"><code>			s.next()</code></span>
+<span class="codeline" id="line-471"><code>		}</code></span>
+<span class="codeline" id="line-472"><code>		ds := s.digits(10, nil)</code></span>
+<span class="codeline" id="line-473"><code>		digsep |= ds</code></span>
+<span class="codeline" id="line-474"><code>		if ds&amp;1 == 0 {</code></span>
+<span class="codeline" id="line-475"><code>			s.error(s.offset, "exponent has no digits")</code></span>
+<span class="codeline" id="line-476"><code>		}</code></span>
+<span class="codeline" id="line-477"><code>	} else if prefix == 'x' &amp;&amp; tok == token.FLOAT {</code></span>
+<span class="codeline" id="line-478"><code>		s.error(s.offset, "hexadecimal mantissa requires a 'p' exponent")</code></span>
+<span class="codeline" id="line-479"><code>	}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>	// suffix 'i'</code></span>
+<span class="codeline" id="line-482"><code>	if s.ch == 'i' {</code></span>
+<span class="codeline" id="line-483"><code>		tok = token.IMAG</code></span>
+<span class="codeline" id="line-484"><code>		s.next()</code></span>
+<span class="codeline" id="line-485"><code>	}</code></span>
+<span class="codeline" id="line-486"><code></code></span>
+<span class="codeline" id="line-487"><code>	lit := string(s.src[offs:s.offset])</code></span>
+<span class="codeline" id="line-488"><code>	if tok == token.INT &amp;&amp; invalid &gt;= 0 {</code></span>
+<span class="codeline" id="line-489"><code>		s.errorf(invalid, "invalid digit %q in %s", lit[invalid-offs], litname(prefix))</code></span>
+<span class="codeline" id="line-490"><code>	}</code></span>
+<span class="codeline" id="line-491"><code>	if digsep&amp;2 != 0 {</code></span>
+<span class="codeline" id="line-492"><code>		if i := invalidSep(lit); i &gt;= 0 {</code></span>
+<span class="codeline" id="line-493"><code>			s.error(offs+i, "'_' must separate successive digits")</code></span>
+<span class="codeline" id="line-494"><code>		}</code></span>
+<span class="codeline" id="line-495"><code>	}</code></span>
+<span class="codeline" id="line-496"><code></code></span>
+<span class="codeline" id="line-497"><code>	return tok, lit</code></span>
+<span class="codeline" id="line-498"><code>}</code></span>
+<span class="codeline" id="line-499"><code></code></span>
+<span class="codeline" id="line-500"><code>func litname(prefix rune) string {</code></span>
+<span class="codeline" id="line-501"><code>	switch prefix {</code></span>
+<span class="codeline" id="line-502"><code>	case 'x':</code></span>
+<span class="codeline" id="line-503"><code>		return "hexadecimal literal"</code></span>
+<span class="codeline" id="line-504"><code>	case 'o', '0':</code></span>
+<span class="codeline" id="line-505"><code>		return "octal literal"</code></span>
+<span class="codeline" id="line-506"><code>	case 'b':</code></span>
+<span class="codeline" id="line-507"><code>		return "binary literal"</code></span>
+<span class="codeline" id="line-508"><code>	}</code></span>
+<span class="codeline" id="line-509"><code>	return "decimal literal"</code></span>
+<span class="codeline" id="line-510"><code>}</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>// invalidSep returns the index of the first invalid separator in x, or -1.</code></span>
+<span class="codeline" id="line-513"><code>func invalidSep(x string) int {</code></span>
+<span class="codeline" id="line-514"><code>	x1 := ' ' // prefix char, we only care if it's 'x'</code></span>
+<span class="codeline" id="line-515"><code>	d := '.'  // digit, one of '_', '0' (a digit), or '.' (anything else)</code></span>
+<span class="codeline" id="line-516"><code>	i := 0</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>	// a prefix counts as a digit</code></span>
+<span class="codeline" id="line-519"><code>	if len(x) &gt;= 2 &amp;&amp; x[0] == '0' {</code></span>
+<span class="codeline" id="line-520"><code>		x1 = lower(rune(x[1]))</code></span>
+<span class="codeline" id="line-521"><code>		if x1 == 'x' || x1 == 'o' || x1 == 'b' {</code></span>
+<span class="codeline" id="line-522"><code>			d = '0'</code></span>
+<span class="codeline" id="line-523"><code>			i = 2</code></span>
+<span class="codeline" id="line-524"><code>		}</code></span>
+<span class="codeline" id="line-525"><code>	}</code></span>
+<span class="codeline" id="line-526"><code></code></span>
+<span class="codeline" id="line-527"><code>	// mantissa and exponent</code></span>
+<span class="codeline" id="line-528"><code>	for ; i &lt; len(x); i++ {</code></span>
+<span class="codeline" id="line-529"><code>		p := d // previous digit</code></span>
+<span class="codeline" id="line-530"><code>		d = rune(x[i])</code></span>
+<span class="codeline" id="line-531"><code>		switch {</code></span>
+<span class="codeline" id="line-532"><code>		case d == '_':</code></span>
+<span class="codeline" id="line-533"><code>			if p != '0' {</code></span>
+<span class="codeline" id="line-534"><code>				return i</code></span>
+<span class="codeline" id="line-535"><code>			}</code></span>
+<span class="codeline" id="line-536"><code>		case isDecimal(d) || x1 == 'x' &amp;&amp; isHex(d):</code></span>
+<span class="codeline" id="line-537"><code>			d = '0'</code></span>
+<span class="codeline" id="line-538"><code>		default:</code></span>
+<span class="codeline" id="line-539"><code>			if p == '_' {</code></span>
+<span class="codeline" id="line-540"><code>				return i - 1</code></span>
+<span class="codeline" id="line-541"><code>			}</code></span>
+<span class="codeline" id="line-542"><code>			d = '.'</code></span>
+<span class="codeline" id="line-543"><code>		}</code></span>
+<span class="codeline" id="line-544"><code>	}</code></span>
+<span class="codeline" id="line-545"><code>	if d == '_' {</code></span>
+<span class="codeline" id="line-546"><code>		return len(x) - 1</code></span>
+<span class="codeline" id="line-547"><code>	}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>	return -1</code></span>
+<span class="codeline" id="line-550"><code>}</code></span>
+<span class="codeline" id="line-551"><code></code></span>
+<span class="codeline" id="line-552"><code>// scanEscape parses an escape sequence where rune is the accepted</code></span>
+<span class="codeline" id="line-553"><code>// escaped quote. In case of a syntax error, it stops at the offending</code></span>
+<span class="codeline" id="line-554"><code>// character (without consuming it) and returns false. Otherwise</code></span>
+<span class="codeline" id="line-555"><code>// it returns true.</code></span>
+<span class="codeline" id="line-556"><code>func (s *Scanner) scanEscape(quote rune) bool {</code></span>
+<span class="codeline" id="line-557"><code>	offs := s.offset</code></span>
+<span class="codeline" id="line-558"><code></code></span>
+<span class="codeline" id="line-559"><code>	var n int</code></span>
+<span class="codeline" id="line-560"><code>	var base, max uint32</code></span>
+<span class="codeline" id="line-561"><code>	switch s.ch {</code></span>
+<span class="codeline" id="line-562"><code>	case 'a', 'b', 'f', 'n', 'r', 't', 'v', '\\', quote:</code></span>
+<span class="codeline" id="line-563"><code>		s.next()</code></span>
+<span class="codeline" id="line-564"><code>		return true</code></span>
+<span class="codeline" id="line-565"><code>	case '0', '1', '2', '3', '4', '5', '6', '7':</code></span>
+<span class="codeline" id="line-566"><code>		n, base, max = 3, 8, 255</code></span>
+<span class="codeline" id="line-567"><code>	case 'x':</code></span>
+<span class="codeline" id="line-568"><code>		s.next()</code></span>
+<span class="codeline" id="line-569"><code>		n, base, max = 2, 16, 255</code></span>
+<span class="codeline" id="line-570"><code>	case 'u':</code></span>
+<span class="codeline" id="line-571"><code>		s.next()</code></span>
+<span class="codeline" id="line-572"><code>		n, base, max = 4, 16, unicode.MaxRune</code></span>
+<span class="codeline" id="line-573"><code>	case 'U':</code></span>
+<span class="codeline" id="line-574"><code>		s.next()</code></span>
+<span class="codeline" id="line-575"><code>		n, base, max = 8, 16, unicode.MaxRune</code></span>
+<span class="codeline" id="line-576"><code>	default:</code></span>
+<span class="codeline" id="line-577"><code>		msg := "unknown escape sequence"</code></span>
+<span class="codeline" id="line-578"><code>		if s.ch &lt; 0 {</code></span>
+<span class="codeline" id="line-579"><code>			msg = "escape sequence not terminated"</code></span>
+<span class="codeline" id="line-580"><code>		}</code></span>
+<span class="codeline" id="line-581"><code>		s.error(offs, msg)</code></span>
+<span class="codeline" id="line-582"><code>		return false</code></span>
+<span class="codeline" id="line-583"><code>	}</code></span>
+<span class="codeline" id="line-584"><code></code></span>
+<span class="codeline" id="line-585"><code>	var x uint32</code></span>
+<span class="codeline" id="line-586"><code>	for n &gt; 0 {</code></span>
+<span class="codeline" id="line-587"><code>		d := uint32(digitVal(s.ch))</code></span>
+<span class="codeline" id="line-588"><code>		if d &gt;= base {</code></span>
+<span class="codeline" id="line-589"><code>			msg := fmt.Sprintf("illegal character %#U in escape sequence", s.ch)</code></span>
+<span class="codeline" id="line-590"><code>			if s.ch &lt; 0 {</code></span>
+<span class="codeline" id="line-591"><code>				msg = "escape sequence not terminated"</code></span>
+<span class="codeline" id="line-592"><code>			}</code></span>
+<span class="codeline" id="line-593"><code>			s.error(s.offset, msg)</code></span>
+<span class="codeline" id="line-594"><code>			return false</code></span>
+<span class="codeline" id="line-595"><code>		}</code></span>
+<span class="codeline" id="line-596"><code>		x = x*base + d</code></span>
+<span class="codeline" id="line-597"><code>		s.next()</code></span>
+<span class="codeline" id="line-598"><code>		n--</code></span>
+<span class="codeline" id="line-599"><code>	}</code></span>
+<span class="codeline" id="line-600"><code></code></span>
+<span class="codeline" id="line-601"><code>	if x &gt; max || 0xD800 &lt;= x &amp;&amp; x &lt; 0xE000 {</code></span>
+<span class="codeline" id="line-602"><code>		s.error(offs, "escape sequence is invalid Unicode code point")</code></span>
+<span class="codeline" id="line-603"><code>		return false</code></span>
+<span class="codeline" id="line-604"><code>	}</code></span>
+<span class="codeline" id="line-605"><code></code></span>
+<span class="codeline" id="line-606"><code>	return true</code></span>
+<span class="codeline" id="line-607"><code>}</code></span>
+<span class="codeline" id="line-608"><code></code></span>
+<span class="codeline" id="line-609"><code>func (s *Scanner) scanRune() string {</code></span>
+<span class="codeline" id="line-610"><code>	// '\'' opening already consumed</code></span>
+<span class="codeline" id="line-611"><code>	offs := s.offset - 1</code></span>
+<span class="codeline" id="line-612"><code></code></span>
+<span class="codeline" id="line-613"><code>	valid := true</code></span>
+<span class="codeline" id="line-614"><code>	n := 0</code></span>
+<span class="codeline" id="line-615"><code>	for {</code></span>
+<span class="codeline" id="line-616"><code>		ch := s.ch</code></span>
+<span class="codeline" id="line-617"><code>		if ch == '\n' || ch &lt; 0 {</code></span>
+<span class="codeline" id="line-618"><code>			// only report error if we don't have one already</code></span>
+<span class="codeline" id="line-619"><code>			if valid {</code></span>
+<span class="codeline" id="line-620"><code>				s.error(offs, "rune literal not terminated")</code></span>
+<span class="codeline" id="line-621"><code>				valid = false</code></span>
+<span class="codeline" id="line-622"><code>			}</code></span>
+<span class="codeline" id="line-623"><code>			break</code></span>
+<span class="codeline" id="line-624"><code>		}</code></span>
+<span class="codeline" id="line-625"><code>		s.next()</code></span>
+<span class="codeline" id="line-626"><code>		if ch == '\'' {</code></span>
+<span class="codeline" id="line-627"><code>			break</code></span>
+<span class="codeline" id="line-628"><code>		}</code></span>
+<span class="codeline" id="line-629"><code>		n++</code></span>
+<span class="codeline" id="line-630"><code>		if ch == '\\' {</code></span>
+<span class="codeline" id="line-631"><code>			if !s.scanEscape('\'') {</code></span>
+<span class="codeline" id="line-632"><code>				valid = false</code></span>
+<span class="codeline" id="line-633"><code>			}</code></span>
+<span class="codeline" id="line-634"><code>			// continue to read to closing quote</code></span>
+<span class="codeline" id="line-635"><code>		}</code></span>
+<span class="codeline" id="line-636"><code>	}</code></span>
+<span class="codeline" id="line-637"><code></code></span>
+<span class="codeline" id="line-638"><code>	if valid &amp;&amp; n != 1 {</code></span>
+<span class="codeline" id="line-639"><code>		s.error(offs, "illegal rune literal")</code></span>
+<span class="codeline" id="line-640"><code>	}</code></span>
+<span class="codeline" id="line-641"><code></code></span>
+<span class="codeline" id="line-642"><code>	return string(s.src[offs:s.offset])</code></span>
+<span class="codeline" id="line-643"><code>}</code></span>
+<span class="codeline" id="line-644"><code></code></span>
+<span class="codeline" id="line-645"><code>func (s *Scanner) scanString() string {</code></span>
+<span class="codeline" id="line-646"><code>	// '"' opening already consumed</code></span>
+<span class="codeline" id="line-647"><code>	offs := s.offset - 1</code></span>
+<span class="codeline" id="line-648"><code></code></span>
+<span class="codeline" id="line-649"><code>	for {</code></span>
+<span class="codeline" id="line-650"><code>		ch := s.ch</code></span>
+<span class="codeline" id="line-651"><code>		if ch == '\n' || ch &lt; 0 {</code></span>
+<span class="codeline" id="line-652"><code>			s.error(offs, "string literal not terminated")</code></span>
+<span class="codeline" id="line-653"><code>			break</code></span>
+<span class="codeline" id="line-654"><code>		}</code></span>
+<span class="codeline" id="line-655"><code>		s.next()</code></span>
+<span class="codeline" id="line-656"><code>		if ch == '"' {</code></span>
+<span class="codeline" id="line-657"><code>			break</code></span>
+<span class="codeline" id="line-658"><code>		}</code></span>
+<span class="codeline" id="line-659"><code>		if ch == '\\' {</code></span>
+<span class="codeline" id="line-660"><code>			s.scanEscape('"')</code></span>
+<span class="codeline" id="line-661"><code>		}</code></span>
+<span class="codeline" id="line-662"><code>	}</code></span>
+<span class="codeline" id="line-663"><code></code></span>
+<span class="codeline" id="line-664"><code>	return string(s.src[offs:s.offset])</code></span>
+<span class="codeline" id="line-665"><code>}</code></span>
+<span class="codeline" id="line-666"><code></code></span>
+<span class="codeline" id="line-667"><code>func stripCR(b []byte, comment bool) []byte {</code></span>
+<span class="codeline" id="line-668"><code>	c := make([]byte, len(b))</code></span>
+<span class="codeline" id="line-669"><code>	i := 0</code></span>
+<span class="codeline" id="line-670"><code>	for j, ch := range b {</code></span>
+<span class="codeline" id="line-671"><code>		// In a /*-style comment, don't strip \r from *\r/ (incl.</code></span>
+<span class="codeline" id="line-672"><code>		// sequences of \r from *\r\r...\r/) since the resulting</code></span>
+<span class="codeline" id="line-673"><code>		// */ would terminate the comment too early unless the \r</code></span>
+<span class="codeline" id="line-674"><code>		// is immediately following the opening /* in which case</code></span>
+<span class="codeline" id="line-675"><code>		// it's ok because /*/ is not closed yet (issue #11151).</code></span>
+<span class="codeline" id="line-676"><code>		if ch != '\r' || comment &amp;&amp; i &gt; len("/*") &amp;&amp; c[i-1] == '*' &amp;&amp; j+1 &lt; len(b) &amp;&amp; b[j+1] == '/' {</code></span>
+<span class="codeline" id="line-677"><code>			c[i] = ch</code></span>
+<span class="codeline" id="line-678"><code>			i++</code></span>
+<span class="codeline" id="line-679"><code>		}</code></span>
+<span class="codeline" id="line-680"><code>	}</code></span>
+<span class="codeline" id="line-681"><code>	return c[:i]</code></span>
+<span class="codeline" id="line-682"><code>}</code></span>
+<span class="codeline" id="line-683"><code></code></span>
+<span class="codeline" id="line-684"><code>func (s *Scanner) scanRawString() string {</code></span>
+<span class="codeline" id="line-685"><code>	// '`' opening already consumed</code></span>
+<span class="codeline" id="line-686"><code>	offs := s.offset - 1</code></span>
+<span class="codeline" id="line-687"><code></code></span>
+<span class="codeline" id="line-688"><code>	hasCR := false</code></span>
+<span class="codeline" id="line-689"><code>	for {</code></span>
+<span class="codeline" id="line-690"><code>		ch := s.ch</code></span>
+<span class="codeline" id="line-691"><code>		if ch &lt; 0 {</code></span>
+<span class="codeline" id="line-692"><code>			s.error(offs, "raw string literal not terminated")</code></span>
+<span class="codeline" id="line-693"><code>			break</code></span>
+<span class="codeline" id="line-694"><code>		}</code></span>
+<span class="codeline" id="line-695"><code>		s.next()</code></span>
+<span class="codeline" id="line-696"><code>		if ch == '`' {</code></span>
+<span class="codeline" id="line-697"><code>			break</code></span>
+<span class="codeline" id="line-698"><code>		}</code></span>
+<span class="codeline" id="line-699"><code>		if ch == '\r' {</code></span>
+<span class="codeline" id="line-700"><code>			hasCR = true</code></span>
+<span class="codeline" id="line-701"><code>		}</code></span>
+<span class="codeline" id="line-702"><code>	}</code></span>
+<span class="codeline" id="line-703"><code></code></span>
+<span class="codeline" id="line-704"><code>	lit := s.src[offs:s.offset]</code></span>
+<span class="codeline" id="line-705"><code>	if hasCR {</code></span>
+<span class="codeline" id="line-706"><code>		lit = stripCR(lit, false)</code></span>
+<span class="codeline" id="line-707"><code>	}</code></span>
+<span class="codeline" id="line-708"><code></code></span>
+<span class="codeline" id="line-709"><code>	return string(lit)</code></span>
+<span class="codeline" id="line-710"><code>}</code></span>
+<span class="codeline" id="line-711"><code></code></span>
+<span class="codeline" id="line-712"><code>func (s *Scanner) skipWhitespace() {</code></span>
+<span class="codeline" id="line-713"><code>	for s.ch == ' ' || s.ch == '\t' || s.ch == '\n' &amp;&amp; !s.insertSemi || s.ch == '\r' {</code></span>
+<span class="codeline" id="line-714"><code>		s.next()</code></span>
+<span class="codeline" id="line-715"><code>	}</code></span>
+<span class="codeline" id="line-716"><code>}</code></span>
+<span class="codeline" id="line-717"><code></code></span>
+<span class="codeline" id="line-718"><code>// Helper functions for scanning multi-byte tokens such as &gt;&gt; += &gt;&gt;= .</code></span>
+<span class="codeline" id="line-719"><code>// Different routines recognize different length tok_i based on matches</code></span>
+<span class="codeline" id="line-720"><code>// of ch_i. If a token ends in '=', the result is tok1 or tok3</code></span>
+<span class="codeline" id="line-721"><code>// respectively. Otherwise, the result is tok0 if there was no other</code></span>
+<span class="codeline" id="line-722"><code>// matching character, or tok2 if the matching character was ch2.</code></span>
+<span class="codeline" id="line-723"><code></code></span>
+<span class="codeline" id="line-724"><code>func (s *Scanner) switch2(tok0, tok1 token.Token) token.Token {</code></span>
+<span class="codeline" id="line-725"><code>	if s.ch == '=' {</code></span>
+<span class="codeline" id="line-726"><code>		s.next()</code></span>
+<span class="codeline" id="line-727"><code>		return tok1</code></span>
+<span class="codeline" id="line-728"><code>	}</code></span>
+<span class="codeline" id="line-729"><code>	return tok0</code></span>
+<span class="codeline" id="line-730"><code>}</code></span>
+<span class="codeline" id="line-731"><code></code></span>
+<span class="codeline" id="line-732"><code>func (s *Scanner) switch3(tok0, tok1 token.Token, ch2 rune, tok2 token.Token) token.Token {</code></span>
+<span class="codeline" id="line-733"><code>	if s.ch == '=' {</code></span>
+<span class="codeline" id="line-734"><code>		s.next()</code></span>
+<span class="codeline" id="line-735"><code>		return tok1</code></span>
+<span class="codeline" id="line-736"><code>	}</code></span>
+<span class="codeline" id="line-737"><code>	if s.ch == ch2 {</code></span>
+<span class="codeline" id="line-738"><code>		s.next()</code></span>
+<span class="codeline" id="line-739"><code>		return tok2</code></span>
+<span class="codeline" id="line-740"><code>	}</code></span>
+<span class="codeline" id="line-741"><code>	return tok0</code></span>
+<span class="codeline" id="line-742"><code>}</code></span>
+<span class="codeline" id="line-743"><code></code></span>
+<span class="codeline" id="line-744"><code>func (s *Scanner) switch4(tok0, tok1 token.Token, ch2 rune, tok2, tok3 token.Token) token.Token {</code></span>
+<span class="codeline" id="line-745"><code>	if s.ch == '=' {</code></span>
+<span class="codeline" id="line-746"><code>		s.next()</code></span>
+<span class="codeline" id="line-747"><code>		return tok1</code></span>
+<span class="codeline" id="line-748"><code>	}</code></span>
+<span class="codeline" id="line-749"><code>	if s.ch == ch2 {</code></span>
+<span class="codeline" id="line-750"><code>		s.next()</code></span>
+<span class="codeline" id="line-751"><code>		if s.ch == '=' {</code></span>
+<span class="codeline" id="line-752"><code>			s.next()</code></span>
+<span class="codeline" id="line-753"><code>			return tok3</code></span>
+<span class="codeline" id="line-754"><code>		}</code></span>
+<span class="codeline" id="line-755"><code>		return tok2</code></span>
+<span class="codeline" id="line-756"><code>	}</code></span>
+<span class="codeline" id="line-757"><code>	return tok0</code></span>
+<span class="codeline" id="line-758"><code>}</code></span>
+<span class="codeline" id="line-759"><code></code></span>
+<span class="codeline" id="line-760"><code>// Scan scans the next token and returns the token position, the token,</code></span>
+<span class="codeline" id="line-761"><code>// and its literal string if applicable. The source end is indicated by</code></span>
+<span class="codeline" id="line-762"><code>// [token.EOF].</code></span>
+<span class="codeline" id="line-763"><code>//</code></span>
+<span class="codeline" id="line-764"><code>// If the returned token is a literal ([token.IDENT], [token.INT], [token.FLOAT],</code></span>
+<span class="codeline" id="line-765"><code>// [token.IMAG], [token.CHAR], [token.STRING]) or [token.COMMENT], the literal string</code></span>
+<span class="codeline" id="line-766"><code>// has the corresponding value.</code></span>
+<span class="codeline" id="line-767"><code>//</code></span>
+<span class="codeline" id="line-768"><code>// If the returned token is a keyword, the literal string is the keyword.</code></span>
+<span class="codeline" id="line-769"><code>//</code></span>
+<span class="codeline" id="line-770"><code>// If the returned token is [token.SEMICOLON], the corresponding</code></span>
+<span class="codeline" id="line-771"><code>// literal string is ";" if the semicolon was present in the source,</code></span>
+<span class="codeline" id="line-772"><code>// and "\n" if the semicolon was inserted because of a newline or</code></span>
+<span class="codeline" id="line-773"><code>// at EOF.</code></span>
+<span class="codeline" id="line-774"><code>//</code></span>
+<span class="codeline" id="line-775"><code>// If the returned token is [token.ILLEGAL], the literal string is the</code></span>
+<span class="codeline" id="line-776"><code>// offending character.</code></span>
+<span class="codeline" id="line-777"><code>//</code></span>
+<span class="codeline" id="line-778"><code>// In all other cases, Scan returns an empty literal string.</code></span>
+<span class="codeline" id="line-779"><code>//</code></span>
+<span class="codeline" id="line-780"><code>// For more tolerant parsing, Scan will return a valid token if</code></span>
+<span class="codeline" id="line-781"><code>// possible even if a syntax error was encountered. Thus, even</code></span>
+<span class="codeline" id="line-782"><code>// if the resulting token sequence contains no illegal tokens,</code></span>
+<span class="codeline" id="line-783"><code>// a client may not assume that no error occurred. Instead it</code></span>
+<span class="codeline" id="line-784"><code>// must check the scanner's ErrorCount or the number of calls</code></span>
+<span class="codeline" id="line-785"><code>// of the error handler, if there was one installed.</code></span>
+<span class="codeline" id="line-786"><code>//</code></span>
+<span class="codeline" id="line-787"><code>// Scan adds line information to the file added to the file</code></span>
+<span class="codeline" id="line-788"><code>// set with Init. Token positions are relative to that file</code></span>
+<span class="codeline" id="line-789"><code>// and thus relative to the file set.</code></span>
+<span class="codeline" id="line-790"><code>func (s *Scanner) Scan() (pos token.Pos, tok token.Token, lit string) {</code></span>
+<span class="codeline" id="line-791"><code>scanAgain:</code></span>
+<span class="codeline" id="line-792"><code>	if s.nlPos.IsValid() {</code></span>
+<span class="codeline" id="line-793"><code>		// Return artificial ';' token after /*...*/ comment</code></span>
+<span class="codeline" id="line-794"><code>		// containing newline, at position of first newline.</code></span>
+<span class="codeline" id="line-795"><code>		pos, tok, lit = s.nlPos, token.SEMICOLON, "\n"</code></span>
+<span class="codeline" id="line-796"><code>		s.nlPos = token.NoPos</code></span>
+<span class="codeline" id="line-797"><code>		return</code></span>
+<span class="codeline" id="line-798"><code>	}</code></span>
+<span class="codeline" id="line-799"><code></code></span>
+<span class="codeline" id="line-800"><code>	s.skipWhitespace()</code></span>
+<span class="codeline" id="line-801"><code></code></span>
+<span class="codeline" id="line-802"><code>	// current token start</code></span>
+<span class="codeline" id="line-803"><code>	pos = s.file.Pos(s.offset)</code></span>
+<span class="codeline" id="line-804"><code></code></span>
+<span class="codeline" id="line-805"><code>	// determine token value</code></span>
+<span class="codeline" id="line-806"><code>	insertSemi := false</code></span>
+<span class="codeline" id="line-807"><code>	switch ch := s.ch; {</code></span>
+<span class="codeline" id="line-808"><code>	case isLetter(ch):</code></span>
+<span class="codeline" id="line-809"><code>		lit = s.scanIdentifier()</code></span>
+<span class="codeline" id="line-810"><code>		if len(lit) &gt; 1 {</code></span>
+<span class="codeline" id="line-811"><code>			// keywords are longer than one letter - avoid lookup otherwise</code></span>
+<span class="codeline" id="line-812"><code>			tok = token.Lookup(lit)</code></span>
+<span class="codeline" id="line-813"><code>			switch tok {</code></span>
+<span class="codeline" id="line-814"><code>			case token.IDENT, token.BREAK, token.CONTINUE, token.FALLTHROUGH, token.RETURN:</code></span>
+<span class="codeline" id="line-815"><code>				insertSemi = true</code></span>
+<span class="codeline" id="line-816"><code>			}</code></span>
+<span class="codeline" id="line-817"><code>		} else {</code></span>
+<span class="codeline" id="line-818"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-819"><code>			tok = token.IDENT</code></span>
+<span class="codeline" id="line-820"><code>		}</code></span>
+<span class="codeline" id="line-821"><code>	case isDecimal(ch) || ch == '.' &amp;&amp; isDecimal(rune(s.peek())):</code></span>
+<span class="codeline" id="line-822"><code>		insertSemi = true</code></span>
+<span class="codeline" id="line-823"><code>		tok, lit = s.scanNumber()</code></span>
+<span class="codeline" id="line-824"><code>	default:</code></span>
+<span class="codeline" id="line-825"><code>		s.next() // always make progress</code></span>
+<span class="codeline" id="line-826"><code>		switch ch {</code></span>
+<span class="codeline" id="line-827"><code>		case eof:</code></span>
+<span class="codeline" id="line-828"><code>			if s.insertSemi {</code></span>
+<span class="codeline" id="line-829"><code>				s.insertSemi = false // EOF consumed</code></span>
+<span class="codeline" id="line-830"><code>				return pos, token.SEMICOLON, "\n"</code></span>
+<span class="codeline" id="line-831"><code>			}</code></span>
+<span class="codeline" id="line-832"><code>			tok = token.EOF</code></span>
+<span class="codeline" id="line-833"><code>		case '\n':</code></span>
+<span class="codeline" id="line-834"><code>			// we only reach here if s.insertSemi was</code></span>
+<span class="codeline" id="line-835"><code>			// set in the first place and exited early</code></span>
+<span class="codeline" id="line-836"><code>			// from s.skipWhitespace()</code></span>
+<span class="codeline" id="line-837"><code>			s.insertSemi = false // newline consumed</code></span>
+<span class="codeline" id="line-838"><code>			return pos, token.SEMICOLON, "\n"</code></span>
+<span class="codeline" id="line-839"><code>		case '"':</code></span>
+<span class="codeline" id="line-840"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-841"><code>			tok = token.STRING</code></span>
+<span class="codeline" id="line-842"><code>			lit = s.scanString()</code></span>
+<span class="codeline" id="line-843"><code>		case '\'':</code></span>
+<span class="codeline" id="line-844"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-845"><code>			tok = token.CHAR</code></span>
+<span class="codeline" id="line-846"><code>			lit = s.scanRune()</code></span>
+<span class="codeline" id="line-847"><code>		case '`':</code></span>
+<span class="codeline" id="line-848"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-849"><code>			tok = token.STRING</code></span>
+<span class="codeline" id="line-850"><code>			lit = s.scanRawString()</code></span>
+<span class="codeline" id="line-851"><code>		case ':':</code></span>
+<span class="codeline" id="line-852"><code>			tok = s.switch2(token.COLON, token.DEFINE)</code></span>
+<span class="codeline" id="line-853"><code>		case '.':</code></span>
+<span class="codeline" id="line-854"><code>			// fractions starting with a '.' are handled by outer switch</code></span>
+<span class="codeline" id="line-855"><code>			tok = token.PERIOD</code></span>
+<span class="codeline" id="line-856"><code>			if s.ch == '.' &amp;&amp; s.peek() == '.' {</code></span>
+<span class="codeline" id="line-857"><code>				s.next()</code></span>
+<span class="codeline" id="line-858"><code>				s.next() // consume last '.'</code></span>
+<span class="codeline" id="line-859"><code>				tok = token.ELLIPSIS</code></span>
+<span class="codeline" id="line-860"><code>			}</code></span>
+<span class="codeline" id="line-861"><code>		case ',':</code></span>
+<span class="codeline" id="line-862"><code>			tok = token.COMMA</code></span>
+<span class="codeline" id="line-863"><code>		case ';':</code></span>
+<span class="codeline" id="line-864"><code>			tok = token.SEMICOLON</code></span>
+<span class="codeline" id="line-865"><code>			lit = ";"</code></span>
+<span class="codeline" id="line-866"><code>		case '(':</code></span>
+<span class="codeline" id="line-867"><code>			tok = token.LPAREN</code></span>
+<span class="codeline" id="line-868"><code>		case ')':</code></span>
+<span class="codeline" id="line-869"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-870"><code>			tok = token.RPAREN</code></span>
+<span class="codeline" id="line-871"><code>		case '[':</code></span>
+<span class="codeline" id="line-872"><code>			tok = token.LBRACK</code></span>
+<span class="codeline" id="line-873"><code>		case ']':</code></span>
+<span class="codeline" id="line-874"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-875"><code>			tok = token.RBRACK</code></span>
+<span class="codeline" id="line-876"><code>		case '{':</code></span>
+<span class="codeline" id="line-877"><code>			tok = token.LBRACE</code></span>
+<span class="codeline" id="line-878"><code>		case '}':</code></span>
+<span class="codeline" id="line-879"><code>			insertSemi = true</code></span>
+<span class="codeline" id="line-880"><code>			tok = token.RBRACE</code></span>
+<span class="codeline" id="line-881"><code>		case '+':</code></span>
+<span class="codeline" id="line-882"><code>			tok = s.switch3(token.ADD, token.ADD_ASSIGN, '+', token.INC)</code></span>
+<span class="codeline" id="line-883"><code>			if tok == token.INC {</code></span>
+<span class="codeline" id="line-884"><code>				insertSemi = true</code></span>
+<span class="codeline" id="line-885"><code>			}</code></span>
+<span class="codeline" id="line-886"><code>		case '-':</code></span>
+<span class="codeline" id="line-887"><code>			tok = s.switch3(token.SUB, token.SUB_ASSIGN, '-', token.DEC)</code></span>
+<span class="codeline" id="line-888"><code>			if tok == token.DEC {</code></span>
+<span class="codeline" id="line-889"><code>				insertSemi = true</code></span>
+<span class="codeline" id="line-890"><code>			}</code></span>
+<span class="codeline" id="line-891"><code>		case '*':</code></span>
+<span class="codeline" id="line-892"><code>			tok = s.switch2(token.MUL, token.MUL_ASSIGN)</code></span>
+<span class="codeline" id="line-893"><code>		case '/':</code></span>
+<span class="codeline" id="line-894"><code>			if s.ch == '/' || s.ch == '*' {</code></span>
+<span class="codeline" id="line-895"><code>				// comment</code></span>
+<span class="codeline" id="line-896"><code>				comment, nlOffset := s.scanComment()</code></span>
+<span class="codeline" id="line-897"><code>				if s.insertSemi &amp;&amp; nlOffset != 0 {</code></span>
+<span class="codeline" id="line-898"><code>					// For /*...*/ containing \n, return</code></span>
+<span class="codeline" id="line-899"><code>					// COMMENT then artificial SEMICOLON.</code></span>
+<span class="codeline" id="line-900"><code>					s.nlPos = s.file.Pos(nlOffset)</code></span>
+<span class="codeline" id="line-901"><code>					s.insertSemi = false</code></span>
+<span class="codeline" id="line-902"><code>				} else {</code></span>
+<span class="codeline" id="line-903"><code>					insertSemi = s.insertSemi // preserve insertSemi info</code></span>
+<span class="codeline" id="line-904"><code>				}</code></span>
+<span class="codeline" id="line-905"><code>				if s.mode&amp;ScanComments == 0 {</code></span>
+<span class="codeline" id="line-906"><code>					// skip comment</code></span>
+<span class="codeline" id="line-907"><code>					goto scanAgain</code></span>
+<span class="codeline" id="line-908"><code>				}</code></span>
+<span class="codeline" id="line-909"><code>				tok = token.COMMENT</code></span>
+<span class="codeline" id="line-910"><code>				lit = comment</code></span>
+<span class="codeline" id="line-911"><code>			} else {</code></span>
+<span class="codeline" id="line-912"><code>				// division</code></span>
+<span class="codeline" id="line-913"><code>				tok = s.switch2(token.QUO, token.QUO_ASSIGN)</code></span>
+<span class="codeline" id="line-914"><code>			}</code></span>
+<span class="codeline" id="line-915"><code>		case '%':</code></span>
+<span class="codeline" id="line-916"><code>			tok = s.switch2(token.REM, token.REM_ASSIGN)</code></span>
+<span class="codeline" id="line-917"><code>		case '^':</code></span>
+<span class="codeline" id="line-918"><code>			tok = s.switch2(token.XOR, token.XOR_ASSIGN)</code></span>
+<span class="codeline" id="line-919"><code>		case '&lt;':</code></span>
+<span class="codeline" id="line-920"><code>			if s.ch == '-' {</code></span>
+<span class="codeline" id="line-921"><code>				s.next()</code></span>
+<span class="codeline" id="line-922"><code>				tok = token.ARROW</code></span>
+<span class="codeline" id="line-923"><code>			} else {</code></span>
+<span class="codeline" id="line-924"><code>				tok = s.switch4(token.LSS, token.LEQ, '&lt;', token.SHL, token.SHL_ASSIGN)</code></span>
+<span class="codeline" id="line-925"><code>			}</code></span>
+<span class="codeline" id="line-926"><code>		case '&gt;':</code></span>
+<span class="codeline" id="line-927"><code>			tok = s.switch4(token.GTR, token.GEQ, '&gt;', token.SHR, token.SHR_ASSIGN)</code></span>
+<span class="codeline" id="line-928"><code>		case '=':</code></span>
+<span class="codeline" id="line-929"><code>			tok = s.switch2(token.ASSIGN, token.EQL)</code></span>
+<span class="codeline" id="line-930"><code>		case '!':</code></span>
+<span class="codeline" id="line-931"><code>			tok = s.switch2(token.NOT, token.NEQ)</code></span>
+<span class="codeline" id="line-932"><code>		case '&amp;':</code></span>
+<span class="codeline" id="line-933"><code>			if s.ch == '^' {</code></span>
+<span class="codeline" id="line-934"><code>				s.next()</code></span>
+<span class="codeline" id="line-935"><code>				tok = s.switch2(token.AND_NOT, token.AND_NOT_ASSIGN)</code></span>
+<span class="codeline" id="line-936"><code>			} else {</code></span>
+<span class="codeline" id="line-937"><code>				tok = s.switch3(token.AND, token.AND_ASSIGN, '&amp;', token.LAND)</code></span>
+<span class="codeline" id="line-938"><code>			}</code></span>
+<span class="codeline" id="line-939"><code>		case '|':</code></span>
+<span class="codeline" id="line-940"><code>			tok = s.switch3(token.OR, token.OR_ASSIGN, '|', token.LOR)</code></span>
+<span class="codeline" id="line-941"><code>		case '~':</code></span>
+<span class="codeline" id="line-942"><code>			tok = token.TILDE</code></span>
+<span class="codeline" id="line-943"><code>		default:</code></span>
+<span class="codeline" id="line-944"><code>			// next reports unexpected BOMs - don't repeat</code></span>
+<span class="codeline" id="line-945"><code>			if ch != bom {</code></span>
+<span class="codeline" id="line-946"><code>				// Report an informative error for U+201[CD] quotation</code></span>
+<span class="codeline" id="line-947"><code>				// marks, which are easily introduced via copy and paste.</code></span>
+<span class="codeline" id="line-948"><code>				if ch == '“' || ch == '”' {</code></span>
+<span class="codeline" id="line-949"><code>					s.errorf(s.file.Offset(pos), "curly quotation mark %q (use neutral %q)", ch, '"')</code></span>
+<span class="codeline" id="line-950"><code>				} else {</code></span>
+<span class="codeline" id="line-951"><code>					s.errorf(s.file.Offset(pos), "illegal character %#U", ch)</code></span>
+<span class="codeline" id="line-952"><code>				}</code></span>
+<span class="codeline" id="line-953"><code>			}</code></span>
+<span class="codeline" id="line-954"><code>			insertSemi = s.insertSemi // preserve insertSemi info</code></span>
+<span class="codeline" id="line-955"><code>			tok = token.ILLEGAL</code></span>
+<span class="codeline" id="line-956"><code>			lit = string(ch)</code></span>
+<span class="codeline" id="line-957"><code>		}</code></span>
+<span class="codeline" id="line-958"><code>	}</code></span>
+<span class="codeline" id="line-959"><code>	if s.mode&amp;dontInsertSemis == 0 {</code></span>
+<span class="codeline" id="line-960"><code>		s.insertSemi = insertSemi</code></span>
+<span class="codeline" id="line-961"><code>	}</code></span>
+<span class="codeline" id="line-962"><code></code></span>
+<span class="codeline" id="line-963"><code>	return</code></span>
+<span class="codeline" id="line-964"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

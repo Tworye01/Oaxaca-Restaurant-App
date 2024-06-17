@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: union.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	union.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package types</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-9"><code>	"go/token"</code></span>
+<span class="codeline" id="line-10"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// ----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-14"><code>// API</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// A Union represents a union of terms embedded in an interface.</code></span>
+<span class="codeline" id="line-17"><code>type Union struct {</code></span>
+<span class="codeline" id="line-18"><code>	terms []*Term // list of syntactical terms (not a canonicalized termlist)</code></span>
+<span class="codeline" id="line-19"><code>}</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>// NewUnion returns a new [Union] type with the given terms.</code></span>
+<span class="codeline" id="line-22"><code>// It is an error to create an empty union; they are syntactically not possible.</code></span>
+<span class="codeline" id="line-23"><code>func NewUnion(terms []*Term) *Union {</code></span>
+<span class="codeline" id="line-24"><code>	if len(terms) == 0 {</code></span>
+<span class="codeline" id="line-25"><code>		panic("empty union")</code></span>
+<span class="codeline" id="line-26"><code>	}</code></span>
+<span class="codeline" id="line-27"><code>	return &amp;Union{terms}</code></span>
+<span class="codeline" id="line-28"><code>}</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>func (u *Union) Len() int         { return len(u.terms) }</code></span>
+<span class="codeline" id="line-31"><code>func (u *Union) Term(i int) *Term { return u.terms[i] }</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>func (u *Union) Underlying() Type { return u }</code></span>
+<span class="codeline" id="line-34"><code>func (u *Union) String() string   { return TypeString(u, nil) }</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// A Term represents a term in a [Union].</code></span>
+<span class="codeline" id="line-37"><code>type Term term</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>// NewTerm returns a new union term.</code></span>
+<span class="codeline" id="line-40"><code>func NewTerm(tilde bool, typ Type) *Term { return &amp;Term{tilde, typ} }</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>func (t *Term) Tilde() bool    { return t.tilde }</code></span>
+<span class="codeline" id="line-43"><code>func (t *Term) Type() Type     { return t.typ }</code></span>
+<span class="codeline" id="line-44"><code>func (t *Term) String() string { return (*term)(t).String() }</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>// ----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-47"><code>// Implementation</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>// Avoid excessive type-checking times due to quadratic termlist operations.</code></span>
+<span class="codeline" id="line-50"><code>const maxTermCount = 100</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>// parseUnion parses uexpr as a union of expressions.</code></span>
+<span class="codeline" id="line-53"><code>// The result is a Union type, or Typ[Invalid] for some errors.</code></span>
+<span class="codeline" id="line-54"><code>func parseUnion(check *Checker, uexpr ast.Expr) Type {</code></span>
+<span class="codeline" id="line-55"><code>	blist, tlist := flattenUnion(nil, uexpr)</code></span>
+<span class="codeline" id="line-56"><code>	assert(len(blist) == len(tlist)-1)</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>	var terms []*Term</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	var u Type</code></span>
+<span class="codeline" id="line-61"><code>	for i, x := range tlist {</code></span>
+<span class="codeline" id="line-62"><code>		term := parseTilde(check, x)</code></span>
+<span class="codeline" id="line-63"><code>		if len(tlist) == 1 &amp;&amp; !term.tilde {</code></span>
+<span class="codeline" id="line-64"><code>			// Single type. Ok to return early because all relevant</code></span>
+<span class="codeline" id="line-65"><code>			// checks have been performed in parseTilde (no need to</code></span>
+<span class="codeline" id="line-66"><code>			// run through term validity check below).</code></span>
+<span class="codeline" id="line-67"><code>			return term.typ // typ already recorded through check.typ in parseTilde</code></span>
+<span class="codeline" id="line-68"><code>		}</code></span>
+<span class="codeline" id="line-69"><code>		if len(terms) &gt;= maxTermCount {</code></span>
+<span class="codeline" id="line-70"><code>			if isValid(u) {</code></span>
+<span class="codeline" id="line-71"><code>				check.errorf(x, InvalidUnion, "cannot handle more than %d union terms (implementation limitation)", maxTermCount)</code></span>
+<span class="codeline" id="line-72"><code>				u = Typ[Invalid]</code></span>
+<span class="codeline" id="line-73"><code>			}</code></span>
+<span class="codeline" id="line-74"><code>		} else {</code></span>
+<span class="codeline" id="line-75"><code>			terms = append(terms, term)</code></span>
+<span class="codeline" id="line-76"><code>			u = &amp;Union{terms}</code></span>
+<span class="codeline" id="line-77"><code>		}</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-80"><code>			check.recordTypeAndValue(blist[i-1], typexpr, u, nil)</code></span>
+<span class="codeline" id="line-81"><code>		}</code></span>
+<span class="codeline" id="line-82"><code>	}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>	if !isValid(u) {</code></span>
+<span class="codeline" id="line-85"><code>		return u</code></span>
+<span class="codeline" id="line-86"><code>	}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>	// Check validity of terms.</code></span>
+<span class="codeline" id="line-89"><code>	// Do this check later because it requires types to be set up.</code></span>
+<span class="codeline" id="line-90"><code>	// Note: This is a quadratic algorithm, but unions tend to be short.</code></span>
+<span class="codeline" id="line-91"><code>	check.later(func() {</code></span>
+<span class="codeline" id="line-92"><code>		for i, t := range terms {</code></span>
+<span class="codeline" id="line-93"><code>			if !isValid(t.typ) {</code></span>
+<span class="codeline" id="line-94"><code>				continue</code></span>
+<span class="codeline" id="line-95"><code>			}</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>			u := under(t.typ)</code></span>
+<span class="codeline" id="line-98"><code>			f, _ := u.(*Interface)</code></span>
+<span class="codeline" id="line-99"><code>			if t.tilde {</code></span>
+<span class="codeline" id="line-100"><code>				if f != nil {</code></span>
+<span class="codeline" id="line-101"><code>					check.errorf(tlist[i], InvalidUnion, "invalid use of ~ (%s is an interface)", t.typ)</code></span>
+<span class="codeline" id="line-102"><code>					continue // don't report another error for t</code></span>
+<span class="codeline" id="line-103"><code>				}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>				if !Identical(u, t.typ) {</code></span>
+<span class="codeline" id="line-106"><code>					check.errorf(tlist[i], InvalidUnion, "invalid use of ~ (underlying type of %s is %s)", t.typ, u)</code></span>
+<span class="codeline" id="line-107"><code>					continue</code></span>
+<span class="codeline" id="line-108"><code>				}</code></span>
+<span class="codeline" id="line-109"><code>			}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>			// Stand-alone embedded interfaces are ok and are handled by the single-type case</code></span>
+<span class="codeline" id="line-112"><code>			// in the beginning. Embedded interfaces with tilde are excluded above. If we reach</code></span>
+<span class="codeline" id="line-113"><code>			// here, we must have at least two terms in the syntactic term list (but not necessarily</code></span>
+<span class="codeline" id="line-114"><code>			// in the term list of the union's type set).</code></span>
+<span class="codeline" id="line-115"><code>			if f != nil {</code></span>
+<span class="codeline" id="line-116"><code>				tset := f.typeSet()</code></span>
+<span class="codeline" id="line-117"><code>				switch {</code></span>
+<span class="codeline" id="line-118"><code>				case tset.NumMethods() != 0:</code></span>
+<span class="codeline" id="line-119"><code>					check.errorf(tlist[i], InvalidUnion, "cannot use %s in union (%s contains methods)", t, t)</code></span>
+<span class="codeline" id="line-120"><code>				case t.typ == universeComparable.Type():</code></span>
+<span class="codeline" id="line-121"><code>					check.error(tlist[i], InvalidUnion, "cannot use comparable in union")</code></span>
+<span class="codeline" id="line-122"><code>				case tset.comparable:</code></span>
+<span class="codeline" id="line-123"><code>					check.errorf(tlist[i], InvalidUnion, "cannot use %s in union (%s embeds comparable)", t, t)</code></span>
+<span class="codeline" id="line-124"><code>				}</code></span>
+<span class="codeline" id="line-125"><code>				continue // terms with interface types are not subject to the no-overlap rule</code></span>
+<span class="codeline" id="line-126"><code>			}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>			// Report overlapping (non-disjoint) terms such as</code></span>
+<span class="codeline" id="line-129"><code>			// a|a, a|~a, ~a|~a, and ~a|A (where under(A) == a).</code></span>
+<span class="codeline" id="line-130"><code>			if j := overlappingTerm(terms[:i], t); j &gt;= 0 {</code></span>
+<span class="codeline" id="line-131"><code>				check.softErrorf(tlist[i], InvalidUnion, "overlapping terms %s and %s", t, terms[j])</code></span>
+<span class="codeline" id="line-132"><code>			}</code></span>
+<span class="codeline" id="line-133"><code>		}</code></span>
+<span class="codeline" id="line-134"><code>	}).describef(uexpr, "check term validity %s", uexpr)</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>	return u</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>func parseTilde(check *Checker, tx ast.Expr) *Term {</code></span>
+<span class="codeline" id="line-140"><code>	x := tx</code></span>
+<span class="codeline" id="line-141"><code>	var tilde bool</code></span>
+<span class="codeline" id="line-142"><code>	if op, _ := x.(*ast.UnaryExpr); op != nil &amp;&amp; op.Op == token.TILDE {</code></span>
+<span class="codeline" id="line-143"><code>		x = op.X</code></span>
+<span class="codeline" id="line-144"><code>		tilde = true</code></span>
+<span class="codeline" id="line-145"><code>	}</code></span>
+<span class="codeline" id="line-146"><code>	typ := check.typ(x)</code></span>
+<span class="codeline" id="line-147"><code>	// Embedding stand-alone type parameters is not permitted (go.dev/issue/47127).</code></span>
+<span class="codeline" id="line-148"><code>	// We don't need this restriction anymore if we make the underlying type of a type</code></span>
+<span class="codeline" id="line-149"><code>	// parameter its constraint interface: if we embed a lone type parameter, we will</code></span>
+<span class="codeline" id="line-150"><code>	// simply use its underlying type (like we do for other named, embedded interfaces),</code></span>
+<span class="codeline" id="line-151"><code>	// and since the underlying type is an interface the embedding is well defined.</code></span>
+<span class="codeline" id="line-152"><code>	if isTypeParam(typ) {</code></span>
+<span class="codeline" id="line-153"><code>		if tilde {</code></span>
+<span class="codeline" id="line-154"><code>			check.errorf(x, MisplacedTypeParam, "type in term %s cannot be a type parameter", tx)</code></span>
+<span class="codeline" id="line-155"><code>		} else {</code></span>
+<span class="codeline" id="line-156"><code>			check.error(x, MisplacedTypeParam, "term cannot be a type parameter")</code></span>
+<span class="codeline" id="line-157"><code>		}</code></span>
+<span class="codeline" id="line-158"><code>		typ = Typ[Invalid]</code></span>
+<span class="codeline" id="line-159"><code>	}</code></span>
+<span class="codeline" id="line-160"><code>	term := NewTerm(tilde, typ)</code></span>
+<span class="codeline" id="line-161"><code>	if tilde {</code></span>
+<span class="codeline" id="line-162"><code>		check.recordTypeAndValue(tx, typexpr, &amp;Union{[]*Term{term}}, nil)</code></span>
+<span class="codeline" id="line-163"><code>	}</code></span>
+<span class="codeline" id="line-164"><code>	return term</code></span>
+<span class="codeline" id="line-165"><code>}</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>// overlappingTerm reports the index of the term x in terms which is</code></span>
+<span class="codeline" id="line-168"><code>// overlapping (not disjoint) from y. The result is &lt; 0 if there is no</code></span>
+<span class="codeline" id="line-169"><code>// such term. The type of term y must not be an interface, and terms</code></span>
+<span class="codeline" id="line-170"><code>// with an interface type are ignored in the terms list.</code></span>
+<span class="codeline" id="line-171"><code>func overlappingTerm(terms []*Term, y *Term) int {</code></span>
+<span class="codeline" id="line-172"><code>	assert(!IsInterface(y.typ))</code></span>
+<span class="codeline" id="line-173"><code>	for i, x := range terms {</code></span>
+<span class="codeline" id="line-174"><code>		if IsInterface(x.typ) {</code></span>
+<span class="codeline" id="line-175"><code>			continue</code></span>
+<span class="codeline" id="line-176"><code>		}</code></span>
+<span class="codeline" id="line-177"><code>		// disjoint requires non-nil, non-top arguments,</code></span>
+<span class="codeline" id="line-178"><code>		// and non-interface types as term types.</code></span>
+<span class="codeline" id="line-179"><code>		if debug {</code></span>
+<span class="codeline" id="line-180"><code>			if x == nil || x.typ == nil || y == nil || y.typ == nil {</code></span>
+<span class="codeline" id="line-181"><code>				panic("empty or top union term")</code></span>
+<span class="codeline" id="line-182"><code>			}</code></span>
+<span class="codeline" id="line-183"><code>		}</code></span>
+<span class="codeline" id="line-184"><code>		if !(*term)(x).disjoint((*term)(y)) {</code></span>
+<span class="codeline" id="line-185"><code>			return i</code></span>
+<span class="codeline" id="line-186"><code>		}</code></span>
+<span class="codeline" id="line-187"><code>	}</code></span>
+<span class="codeline" id="line-188"><code>	return -1</code></span>
+<span class="codeline" id="line-189"><code>}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>// flattenUnion walks a union type expression of the form A | B | C | ...,</code></span>
+<span class="codeline" id="line-192"><code>// extracting both the binary exprs (blist) and leaf types (tlist).</code></span>
+<span class="codeline" id="line-193"><code>func flattenUnion(list []ast.Expr, x ast.Expr) (blist, tlist []ast.Expr) {</code></span>
+<span class="codeline" id="line-194"><code>	if o, _ := x.(*ast.BinaryExpr); o != nil &amp;&amp; o.Op == token.OR {</code></span>
+<span class="codeline" id="line-195"><code>		blist, tlist = flattenUnion(list, o.X)</code></span>
+<span class="codeline" id="line-196"><code>		blist = append(blist, o)</code></span>
+<span class="codeline" id="line-197"><code>		x = o.Y</code></span>
+<span class="codeline" id="line-198"><code>	}</code></span>
+<span class="codeline" id="line-199"><code>	return blist, append(tlist, x)</code></span>
+<span class="codeline" id="line-200"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

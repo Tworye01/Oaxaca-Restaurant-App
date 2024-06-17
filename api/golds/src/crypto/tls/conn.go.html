@@ -1,0 +1,1691 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: conn.go in package crypto/tls</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	conn.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/tls.html">crypto/tls</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2010 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// TLS low level connection and record layer</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package tls</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"bytes"</code></span>
+<span class="codeline" id="line-11"><code>	"context"</code></span>
+<span class="codeline" id="line-12"><code>	"crypto/cipher"</code></span>
+<span class="codeline" id="line-13"><code>	"crypto/subtle"</code></span>
+<span class="codeline" id="line-14"><code>	"crypto/x509"</code></span>
+<span class="codeline" id="line-15"><code>	"errors"</code></span>
+<span class="codeline" id="line-16"><code>	"fmt"</code></span>
+<span class="codeline" id="line-17"><code>	"hash"</code></span>
+<span class="codeline" id="line-18"><code>	"internal/godebug"</code></span>
+<span class="codeline" id="line-19"><code>	"io"</code></span>
+<span class="codeline" id="line-20"><code>	"net"</code></span>
+<span class="codeline" id="line-21"><code>	"sync"</code></span>
+<span class="codeline" id="line-22"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-23"><code>	"time"</code></span>
+<span class="codeline" id="line-24"><code>)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>// A Conn represents a secured connection.</code></span>
+<span class="codeline" id="line-27"><code>// It implements the net.Conn interface.</code></span>
+<span class="codeline" id="line-28"><code>type Conn struct {</code></span>
+<span class="codeline" id="line-29"><code>	// constant</code></span>
+<span class="codeline" id="line-30"><code>	conn        net.Conn</code></span>
+<span class="codeline" id="line-31"><code>	isClient    bool</code></span>
+<span class="codeline" id="line-32"><code>	handshakeFn func(context.Context) error // (*Conn).clientHandshake or serverHandshake</code></span>
+<span class="codeline" id="line-33"><code>	quic        *quicState                  // nil for non-QUIC connections</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>	// isHandshakeComplete is true if the connection is currently transferring</code></span>
+<span class="codeline" id="line-36"><code>	// application data (i.e. is not currently processing a handshake).</code></span>
+<span class="codeline" id="line-37"><code>	// isHandshakeComplete is true implies handshakeErr == nil.</code></span>
+<span class="codeline" id="line-38"><code>	isHandshakeComplete atomic.Bool</code></span>
+<span class="codeline" id="line-39"><code>	// constant after handshake; protected by handshakeMutex</code></span>
+<span class="codeline" id="line-40"><code>	handshakeMutex sync.Mutex</code></span>
+<span class="codeline" id="line-41"><code>	handshakeErr   error   // error resulting from handshake</code></span>
+<span class="codeline" id="line-42"><code>	vers           uint16  // TLS version</code></span>
+<span class="codeline" id="line-43"><code>	haveVers       bool    // version has been negotiated</code></span>
+<span class="codeline" id="line-44"><code>	config         *Config // configuration passed to constructor</code></span>
+<span class="codeline" id="line-45"><code>	// handshakes counts the number of handshakes performed on the</code></span>
+<span class="codeline" id="line-46"><code>	// connection so far. If renegotiation is disabled then this is either</code></span>
+<span class="codeline" id="line-47"><code>	// zero or one.</code></span>
+<span class="codeline" id="line-48"><code>	handshakes       int</code></span>
+<span class="codeline" id="line-49"><code>	extMasterSecret  bool</code></span>
+<span class="codeline" id="line-50"><code>	didResume        bool // whether this connection was a session resumption</code></span>
+<span class="codeline" id="line-51"><code>	cipherSuite      uint16</code></span>
+<span class="codeline" id="line-52"><code>	ocspResponse     []byte   // stapled OCSP response</code></span>
+<span class="codeline" id="line-53"><code>	scts             [][]byte // signed certificate timestamps from server</code></span>
+<span class="codeline" id="line-54"><code>	peerCertificates []*x509.Certificate</code></span>
+<span class="codeline" id="line-55"><code>	// activeCertHandles contains the cache handles to certificates in</code></span>
+<span class="codeline" id="line-56"><code>	// peerCertificates that are used to track active references.</code></span>
+<span class="codeline" id="line-57"><code>	activeCertHandles []*activeCert</code></span>
+<span class="codeline" id="line-58"><code>	// verifiedChains contains the certificate chains that we built, as</code></span>
+<span class="codeline" id="line-59"><code>	// opposed to the ones presented by the server.</code></span>
+<span class="codeline" id="line-60"><code>	verifiedChains [][]*x509.Certificate</code></span>
+<span class="codeline" id="line-61"><code>	// serverName contains the server name indicated by the client, if any.</code></span>
+<span class="codeline" id="line-62"><code>	serverName string</code></span>
+<span class="codeline" id="line-63"><code>	// secureRenegotiation is true if the server echoed the secure</code></span>
+<span class="codeline" id="line-64"><code>	// renegotiation extension. (This is meaningless as a server because</code></span>
+<span class="codeline" id="line-65"><code>	// renegotiation is not supported in that case.)</code></span>
+<span class="codeline" id="line-66"><code>	secureRenegotiation bool</code></span>
+<span class="codeline" id="line-67"><code>	// ekm is a closure for exporting keying material.</code></span>
+<span class="codeline" id="line-68"><code>	ekm func(label string, context []byte, length int) ([]byte, error)</code></span>
+<span class="codeline" id="line-69"><code>	// resumptionSecret is the resumption_master_secret for handling</code></span>
+<span class="codeline" id="line-70"><code>	// or sending NewSessionTicket messages.</code></span>
+<span class="codeline" id="line-71"><code>	resumptionSecret []byte</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>	// ticketKeys is the set of active session ticket keys for this</code></span>
+<span class="codeline" id="line-74"><code>	// connection. The first one is used to encrypt new tickets and</code></span>
+<span class="codeline" id="line-75"><code>	// all are tried to decrypt tickets.</code></span>
+<span class="codeline" id="line-76"><code>	ticketKeys []ticketKey</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>	// clientFinishedIsFirst is true if the client sent the first Finished</code></span>
+<span class="codeline" id="line-79"><code>	// message during the most recent handshake. This is recorded because</code></span>
+<span class="codeline" id="line-80"><code>	// the first transmitted Finished message is the tls-unique</code></span>
+<span class="codeline" id="line-81"><code>	// channel-binding value.</code></span>
+<span class="codeline" id="line-82"><code>	clientFinishedIsFirst bool</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>	// closeNotifyErr is any error from sending the alertCloseNotify record.</code></span>
+<span class="codeline" id="line-85"><code>	closeNotifyErr error</code></span>
+<span class="codeline" id="line-86"><code>	// closeNotifySent is true if the Conn attempted to send an</code></span>
+<span class="codeline" id="line-87"><code>	// alertCloseNotify record.</code></span>
+<span class="codeline" id="line-88"><code>	closeNotifySent bool</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	// clientFinished and serverFinished contain the Finished message sent</code></span>
+<span class="codeline" id="line-91"><code>	// by the client or server in the most recent handshake. This is</code></span>
+<span class="codeline" id="line-92"><code>	// retained to support the renegotiation extension and tls-unique</code></span>
+<span class="codeline" id="line-93"><code>	// channel-binding.</code></span>
+<span class="codeline" id="line-94"><code>	clientFinished [12]byte</code></span>
+<span class="codeline" id="line-95"><code>	serverFinished [12]byte</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>	// clientProtocol is the negotiated ALPN protocol.</code></span>
+<span class="codeline" id="line-98"><code>	clientProtocol string</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>	// input/output</code></span>
+<span class="codeline" id="line-101"><code>	in, out   halfConn</code></span>
+<span class="codeline" id="line-102"><code>	rawInput  bytes.Buffer // raw input, starting with a record header</code></span>
+<span class="codeline" id="line-103"><code>	input     bytes.Reader // application data waiting to be read, from rawInput.Next</code></span>
+<span class="codeline" id="line-104"><code>	hand      bytes.Buffer // handshake data waiting to be read</code></span>
+<span class="codeline" id="line-105"><code>	buffering bool         // whether records are buffered in sendBuf</code></span>
+<span class="codeline" id="line-106"><code>	sendBuf   []byte       // a buffer of records waiting to be sent</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	// bytesSent counts the bytes of application data sent.</code></span>
+<span class="codeline" id="line-109"><code>	// packetsSent counts packets.</code></span>
+<span class="codeline" id="line-110"><code>	bytesSent   int64</code></span>
+<span class="codeline" id="line-111"><code>	packetsSent int64</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>	// retryCount counts the number of consecutive non-advancing records</code></span>
+<span class="codeline" id="line-114"><code>	// received by Conn.readRecord. That is, records that neither advance the</code></span>
+<span class="codeline" id="line-115"><code>	// handshake, nor deliver application data. Protected by in.Mutex.</code></span>
+<span class="codeline" id="line-116"><code>	retryCount int</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	// activeCall indicates whether Close has been call in the low bit.</code></span>
+<span class="codeline" id="line-119"><code>	// the rest of the bits are the number of goroutines in Conn.Write.</code></span>
+<span class="codeline" id="line-120"><code>	activeCall atomic.Int32</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	tmp [16]byte</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// Access to net.Conn methods.</code></span>
+<span class="codeline" id="line-126"><code>// Cannot just embed net.Conn because that would</code></span>
+<span class="codeline" id="line-127"><code>// export the struct field too.</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>// LocalAddr returns the local network address.</code></span>
+<span class="codeline" id="line-130"><code>func (c *Conn) LocalAddr() net.Addr {</code></span>
+<span class="codeline" id="line-131"><code>	return c.conn.LocalAddr()</code></span>
+<span class="codeline" id="line-132"><code>}</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>// RemoteAddr returns the remote network address.</code></span>
+<span class="codeline" id="line-135"><code>func (c *Conn) RemoteAddr() net.Addr {</code></span>
+<span class="codeline" id="line-136"><code>	return c.conn.RemoteAddr()</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>// SetDeadline sets the read and write deadlines associated with the connection.</code></span>
+<span class="codeline" id="line-140"><code>// A zero value for t means [Conn.Read] and [Conn.Write] will not time out.</code></span>
+<span class="codeline" id="line-141"><code>// After a Write has timed out, the TLS state is corrupt and all future writes will return the same error.</code></span>
+<span class="codeline" id="line-142"><code>func (c *Conn) SetDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-143"><code>	return c.conn.SetDeadline(t)</code></span>
+<span class="codeline" id="line-144"><code>}</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>// SetReadDeadline sets the read deadline on the underlying connection.</code></span>
+<span class="codeline" id="line-147"><code>// A zero value for t means [Conn.Read] will not time out.</code></span>
+<span class="codeline" id="line-148"><code>func (c *Conn) SetReadDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-149"><code>	return c.conn.SetReadDeadline(t)</code></span>
+<span class="codeline" id="line-150"><code>}</code></span>
+<span class="codeline" id="line-151"><code></code></span>
+<span class="codeline" id="line-152"><code>// SetWriteDeadline sets the write deadline on the underlying connection.</code></span>
+<span class="codeline" id="line-153"><code>// A zero value for t means [Conn.Write] will not time out.</code></span>
+<span class="codeline" id="line-154"><code>// After a [Conn.Write] has timed out, the TLS state is corrupt and all future writes will return the same error.</code></span>
+<span class="codeline" id="line-155"><code>func (c *Conn) SetWriteDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-156"><code>	return c.conn.SetWriteDeadline(t)</code></span>
+<span class="codeline" id="line-157"><code>}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>// NetConn returns the underlying connection that is wrapped by c.</code></span>
+<span class="codeline" id="line-160"><code>// Note that writing to or reading from this connection directly will corrupt the</code></span>
+<span class="codeline" id="line-161"><code>// TLS session.</code></span>
+<span class="codeline" id="line-162"><code>func (c *Conn) NetConn() net.Conn {</code></span>
+<span class="codeline" id="line-163"><code>	return c.conn</code></span>
+<span class="codeline" id="line-164"><code>}</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>// A halfConn represents one direction of the record layer</code></span>
+<span class="codeline" id="line-167"><code>// connection, either sending or receiving.</code></span>
+<span class="codeline" id="line-168"><code>type halfConn struct {</code></span>
+<span class="codeline" id="line-169"><code>	sync.Mutex</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>	err     error  // first permanent error</code></span>
+<span class="codeline" id="line-172"><code>	version uint16 // protocol version</code></span>
+<span class="codeline" id="line-173"><code>	cipher  any    // cipher algorithm</code></span>
+<span class="codeline" id="line-174"><code>	mac     hash.Hash</code></span>
+<span class="codeline" id="line-175"><code>	seq     [8]byte // 64-bit sequence number</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>	scratchBuf [13]byte // to avoid allocs; interface method args escape</code></span>
+<span class="codeline" id="line-178"><code></code></span>
+<span class="codeline" id="line-179"><code>	nextCipher any       // next encryption state</code></span>
+<span class="codeline" id="line-180"><code>	nextMac    hash.Hash // next MAC algorithm</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>	level         QUICEncryptionLevel // current QUIC encryption level</code></span>
+<span class="codeline" id="line-183"><code>	trafficSecret []byte              // current TLS 1.3 traffic secret</code></span>
+<span class="codeline" id="line-184"><code>}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>type permanentError struct {</code></span>
+<span class="codeline" id="line-187"><code>	err net.Error</code></span>
+<span class="codeline" id="line-188"><code>}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>func (e *permanentError) Error() string   { return e.err.Error() }</code></span>
+<span class="codeline" id="line-191"><code>func (e *permanentError) Unwrap() error   { return e.err }</code></span>
+<span class="codeline" id="line-192"><code>func (e *permanentError) Timeout() bool   { return e.err.Timeout() }</code></span>
+<span class="codeline" id="line-193"><code>func (e *permanentError) Temporary() bool { return false }</code></span>
+<span class="codeline" id="line-194"><code></code></span>
+<span class="codeline" id="line-195"><code>func (hc *halfConn) setErrorLocked(err error) error {</code></span>
+<span class="codeline" id="line-196"><code>	if e, ok := err.(net.Error); ok {</code></span>
+<span class="codeline" id="line-197"><code>		hc.err = &amp;permanentError{err: e}</code></span>
+<span class="codeline" id="line-198"><code>	} else {</code></span>
+<span class="codeline" id="line-199"><code>		hc.err = err</code></span>
+<span class="codeline" id="line-200"><code>	}</code></span>
+<span class="codeline" id="line-201"><code>	return hc.err</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>// prepareCipherSpec sets the encryption and MAC states</code></span>
+<span class="codeline" id="line-205"><code>// that a subsequent changeCipherSpec will use.</code></span>
+<span class="codeline" id="line-206"><code>func (hc *halfConn) prepareCipherSpec(version uint16, cipher any, mac hash.Hash) {</code></span>
+<span class="codeline" id="line-207"><code>	hc.version = version</code></span>
+<span class="codeline" id="line-208"><code>	hc.nextCipher = cipher</code></span>
+<span class="codeline" id="line-209"><code>	hc.nextMac = mac</code></span>
+<span class="codeline" id="line-210"><code>}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>// changeCipherSpec changes the encryption and MAC states</code></span>
+<span class="codeline" id="line-213"><code>// to the ones previously passed to prepareCipherSpec.</code></span>
+<span class="codeline" id="line-214"><code>func (hc *halfConn) changeCipherSpec() error {</code></span>
+<span class="codeline" id="line-215"><code>	if hc.nextCipher == nil || hc.version == VersionTLS13 {</code></span>
+<span class="codeline" id="line-216"><code>		return alertInternalError</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code>	hc.cipher = hc.nextCipher</code></span>
+<span class="codeline" id="line-219"><code>	hc.mac = hc.nextMac</code></span>
+<span class="codeline" id="line-220"><code>	hc.nextCipher = nil</code></span>
+<span class="codeline" id="line-221"><code>	hc.nextMac = nil</code></span>
+<span class="codeline" id="line-222"><code>	for i := range hc.seq {</code></span>
+<span class="codeline" id="line-223"><code>		hc.seq[i] = 0</code></span>
+<span class="codeline" id="line-224"><code>	}</code></span>
+<span class="codeline" id="line-225"><code>	return nil</code></span>
+<span class="codeline" id="line-226"><code>}</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) {</code></span>
+<span class="codeline" id="line-229"><code>	hc.trafficSecret = secret</code></span>
+<span class="codeline" id="line-230"><code>	hc.level = level</code></span>
+<span class="codeline" id="line-231"><code>	key, iv := suite.trafficKey(secret)</code></span>
+<span class="codeline" id="line-232"><code>	hc.cipher = suite.aead(key, iv)</code></span>
+<span class="codeline" id="line-233"><code>	for i := range hc.seq {</code></span>
+<span class="codeline" id="line-234"><code>		hc.seq[i] = 0</code></span>
+<span class="codeline" id="line-235"><code>	}</code></span>
+<span class="codeline" id="line-236"><code>}</code></span>
+<span class="codeline" id="line-237"><code></code></span>
+<span class="codeline" id="line-238"><code>// incSeq increments the sequence number.</code></span>
+<span class="codeline" id="line-239"><code>func (hc *halfConn) incSeq() {</code></span>
+<span class="codeline" id="line-240"><code>	for i := 7; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-241"><code>		hc.seq[i]++</code></span>
+<span class="codeline" id="line-242"><code>		if hc.seq[i] != 0 {</code></span>
+<span class="codeline" id="line-243"><code>			return</code></span>
+<span class="codeline" id="line-244"><code>		}</code></span>
+<span class="codeline" id="line-245"><code>	}</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>	// Not allowed to let sequence number wrap.</code></span>
+<span class="codeline" id="line-248"><code>	// Instead, must renegotiate before it does.</code></span>
+<span class="codeline" id="line-249"><code>	// Not likely enough to bother.</code></span>
+<span class="codeline" id="line-250"><code>	panic("TLS: sequence number wraparound")</code></span>
+<span class="codeline" id="line-251"><code>}</code></span>
+<span class="codeline" id="line-252"><code></code></span>
+<span class="codeline" id="line-253"><code>// explicitNonceLen returns the number of bytes of explicit nonce or IV included</code></span>
+<span class="codeline" id="line-254"><code>// in each record. Explicit nonces are present only in CBC modes after TLS 1.0</code></span>
+<span class="codeline" id="line-255"><code>// and in certain AEAD modes in TLS 1.2.</code></span>
+<span class="codeline" id="line-256"><code>func (hc *halfConn) explicitNonceLen() int {</code></span>
+<span class="codeline" id="line-257"><code>	if hc.cipher == nil {</code></span>
+<span class="codeline" id="line-258"><code>		return 0</code></span>
+<span class="codeline" id="line-259"><code>	}</code></span>
+<span class="codeline" id="line-260"><code></code></span>
+<span class="codeline" id="line-261"><code>	switch c := hc.cipher.(type) {</code></span>
+<span class="codeline" id="line-262"><code>	case cipher.Stream:</code></span>
+<span class="codeline" id="line-263"><code>		return 0</code></span>
+<span class="codeline" id="line-264"><code>	case aead:</code></span>
+<span class="codeline" id="line-265"><code>		return c.explicitNonceLen()</code></span>
+<span class="codeline" id="line-266"><code>	case cbcMode:</code></span>
+<span class="codeline" id="line-267"><code>		// TLS 1.1 introduced a per-record explicit IV to fix the BEAST attack.</code></span>
+<span class="codeline" id="line-268"><code>		if hc.version &gt;= VersionTLS11 {</code></span>
+<span class="codeline" id="line-269"><code>			return c.BlockSize()</code></span>
+<span class="codeline" id="line-270"><code>		}</code></span>
+<span class="codeline" id="line-271"><code>		return 0</code></span>
+<span class="codeline" id="line-272"><code>	default:</code></span>
+<span class="codeline" id="line-273"><code>		panic("unknown cipher type")</code></span>
+<span class="codeline" id="line-274"><code>	}</code></span>
+<span class="codeline" id="line-275"><code>}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>// extractPadding returns, in constant time, the length of the padding to remove</code></span>
+<span class="codeline" id="line-278"><code>// from the end of payload. It also returns a byte which is equal to 255 if the</code></span>
+<span class="codeline" id="line-279"><code>// padding was valid and 0 otherwise. See RFC 2246, Section 6.2.3.2.</code></span>
+<span class="codeline" id="line-280"><code>func extractPadding(payload []byte) (toRemove int, good byte) {</code></span>
+<span class="codeline" id="line-281"><code>	if len(payload) &lt; 1 {</code></span>
+<span class="codeline" id="line-282"><code>		return 0, 0</code></span>
+<span class="codeline" id="line-283"><code>	}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	paddingLen := payload[len(payload)-1]</code></span>
+<span class="codeline" id="line-286"><code>	t := uint(len(payload)-1) - uint(paddingLen)</code></span>
+<span class="codeline" id="line-287"><code>	// if len(payload) &gt;= (paddingLen - 1) then the MSB of t is zero</code></span>
+<span class="codeline" id="line-288"><code>	good = byte(int32(^t) &gt;&gt; 31)</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	// The maximum possible padding length plus the actual length field</code></span>
+<span class="codeline" id="line-291"><code>	toCheck := 256</code></span>
+<span class="codeline" id="line-292"><code>	// The length of the padded data is public, so we can use an if here</code></span>
+<span class="codeline" id="line-293"><code>	if toCheck &gt; len(payload) {</code></span>
+<span class="codeline" id="line-294"><code>		toCheck = len(payload)</code></span>
+<span class="codeline" id="line-295"><code>	}</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>	for i := 0; i &lt; toCheck; i++ {</code></span>
+<span class="codeline" id="line-298"><code>		t := uint(paddingLen) - uint(i)</code></span>
+<span class="codeline" id="line-299"><code>		// if i &lt;= paddingLen then the MSB of t is zero</code></span>
+<span class="codeline" id="line-300"><code>		mask := byte(int32(^t) &gt;&gt; 31)</code></span>
+<span class="codeline" id="line-301"><code>		b := payload[len(payload)-1-i]</code></span>
+<span class="codeline" id="line-302"><code>		good &amp;^= mask&amp;paddingLen ^ mask&amp;b</code></span>
+<span class="codeline" id="line-303"><code>	}</code></span>
+<span class="codeline" id="line-304"><code></code></span>
+<span class="codeline" id="line-305"><code>	// We AND together the bits of good and replicate the result across</code></span>
+<span class="codeline" id="line-306"><code>	// all the bits.</code></span>
+<span class="codeline" id="line-307"><code>	good &amp;= good &lt;&lt; 4</code></span>
+<span class="codeline" id="line-308"><code>	good &amp;= good &lt;&lt; 2</code></span>
+<span class="codeline" id="line-309"><code>	good &amp;= good &lt;&lt; 1</code></span>
+<span class="codeline" id="line-310"><code>	good = uint8(int8(good) &gt;&gt; 7)</code></span>
+<span class="codeline" id="line-311"><code></code></span>
+<span class="codeline" id="line-312"><code>	// Zero the padding length on error. This ensures any unchecked bytes</code></span>
+<span class="codeline" id="line-313"><code>	// are included in the MAC. Otherwise, an attacker that could</code></span>
+<span class="codeline" id="line-314"><code>	// distinguish MAC failures from padding failures could mount an attack</code></span>
+<span class="codeline" id="line-315"><code>	// similar to POODLE in SSL 3.0: given a good ciphertext that uses a</code></span>
+<span class="codeline" id="line-316"><code>	// full block's worth of padding, replace the final block with another</code></span>
+<span class="codeline" id="line-317"><code>	// block. If the MAC check passed but the padding check failed, the</code></span>
+<span class="codeline" id="line-318"><code>	// last byte of that block decrypted to the block size.</code></span>
+<span class="codeline" id="line-319"><code>	//</code></span>
+<span class="codeline" id="line-320"><code>	// See also macAndPaddingGood logic below.</code></span>
+<span class="codeline" id="line-321"><code>	paddingLen &amp;= good</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>	toRemove = int(paddingLen) + 1</code></span>
+<span class="codeline" id="line-324"><code>	return</code></span>
+<span class="codeline" id="line-325"><code>}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>func roundUp(a, b int) int {</code></span>
+<span class="codeline" id="line-328"><code>	return a + (b-a%b)%b</code></span>
+<span class="codeline" id="line-329"><code>}</code></span>
+<span class="codeline" id="line-330"><code></code></span>
+<span class="codeline" id="line-331"><code>// cbcMode is an interface for block ciphers using cipher block chaining.</code></span>
+<span class="codeline" id="line-332"><code>type cbcMode interface {</code></span>
+<span class="codeline" id="line-333"><code>	cipher.BlockMode</code></span>
+<span class="codeline" id="line-334"><code>	SetIV([]byte)</code></span>
+<span class="codeline" id="line-335"><code>}</code></span>
+<span class="codeline" id="line-336"><code></code></span>
+<span class="codeline" id="line-337"><code>// decrypt authenticates and decrypts the record if protection is active at</code></span>
+<span class="codeline" id="line-338"><code>// this stage. The returned plaintext might overlap with the input.</code></span>
+<span class="codeline" id="line-339"><code>func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {</code></span>
+<span class="codeline" id="line-340"><code>	var plaintext []byte</code></span>
+<span class="codeline" id="line-341"><code>	typ := recordType(record[0])</code></span>
+<span class="codeline" id="line-342"><code>	payload := record[recordHeaderLen:]</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>	// In TLS 1.3, change_cipher_spec messages are to be ignored without being</code></span>
+<span class="codeline" id="line-345"><code>	// decrypted. See RFC 8446, Appendix D.4.</code></span>
+<span class="codeline" id="line-346"><code>	if hc.version == VersionTLS13 &amp;&amp; typ == recordTypeChangeCipherSpec {</code></span>
+<span class="codeline" id="line-347"><code>		return payload, typ, nil</code></span>
+<span class="codeline" id="line-348"><code>	}</code></span>
+<span class="codeline" id="line-349"><code></code></span>
+<span class="codeline" id="line-350"><code>	paddingGood := byte(255)</code></span>
+<span class="codeline" id="line-351"><code>	paddingLen := 0</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>	explicitNonceLen := hc.explicitNonceLen()</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>	if hc.cipher != nil {</code></span>
+<span class="codeline" id="line-356"><code>		switch c := hc.cipher.(type) {</code></span>
+<span class="codeline" id="line-357"><code>		case cipher.Stream:</code></span>
+<span class="codeline" id="line-358"><code>			c.XORKeyStream(payload, payload)</code></span>
+<span class="codeline" id="line-359"><code>		case aead:</code></span>
+<span class="codeline" id="line-360"><code>			if len(payload) &lt; explicitNonceLen {</code></span>
+<span class="codeline" id="line-361"><code>				return nil, 0, alertBadRecordMAC</code></span>
+<span class="codeline" id="line-362"><code>			}</code></span>
+<span class="codeline" id="line-363"><code>			nonce := payload[:explicitNonceLen]</code></span>
+<span class="codeline" id="line-364"><code>			if len(nonce) == 0 {</code></span>
+<span class="codeline" id="line-365"><code>				nonce = hc.seq[:]</code></span>
+<span class="codeline" id="line-366"><code>			}</code></span>
+<span class="codeline" id="line-367"><code>			payload = payload[explicitNonceLen:]</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>			var additionalData []byte</code></span>
+<span class="codeline" id="line-370"><code>			if hc.version == VersionTLS13 {</code></span>
+<span class="codeline" id="line-371"><code>				additionalData = record[:recordHeaderLen]</code></span>
+<span class="codeline" id="line-372"><code>			} else {</code></span>
+<span class="codeline" id="line-373"><code>				additionalData = append(hc.scratchBuf[:0], hc.seq[:]...)</code></span>
+<span class="codeline" id="line-374"><code>				additionalData = append(additionalData, record[:3]...)</code></span>
+<span class="codeline" id="line-375"><code>				n := len(payload) - c.Overhead()</code></span>
+<span class="codeline" id="line-376"><code>				additionalData = append(additionalData, byte(n&gt;&gt;8), byte(n))</code></span>
+<span class="codeline" id="line-377"><code>			}</code></span>
+<span class="codeline" id="line-378"><code></code></span>
+<span class="codeline" id="line-379"><code>			var err error</code></span>
+<span class="codeline" id="line-380"><code>			plaintext, err = c.Open(payload[:0], nonce, payload, additionalData)</code></span>
+<span class="codeline" id="line-381"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-382"><code>				return nil, 0, alertBadRecordMAC</code></span>
+<span class="codeline" id="line-383"><code>			}</code></span>
+<span class="codeline" id="line-384"><code>		case cbcMode:</code></span>
+<span class="codeline" id="line-385"><code>			blockSize := c.BlockSize()</code></span>
+<span class="codeline" id="line-386"><code>			minPayload := explicitNonceLen + roundUp(hc.mac.Size()+1, blockSize)</code></span>
+<span class="codeline" id="line-387"><code>			if len(payload)%blockSize != 0 || len(payload) &lt; minPayload {</code></span>
+<span class="codeline" id="line-388"><code>				return nil, 0, alertBadRecordMAC</code></span>
+<span class="codeline" id="line-389"><code>			}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>			if explicitNonceLen &gt; 0 {</code></span>
+<span class="codeline" id="line-392"><code>				c.SetIV(payload[:explicitNonceLen])</code></span>
+<span class="codeline" id="line-393"><code>				payload = payload[explicitNonceLen:]</code></span>
+<span class="codeline" id="line-394"><code>			}</code></span>
+<span class="codeline" id="line-395"><code>			c.CryptBlocks(payload, payload)</code></span>
+<span class="codeline" id="line-396"><code></code></span>
+<span class="codeline" id="line-397"><code>			// In a limited attempt to protect against CBC padding oracles like</code></span>
+<span class="codeline" id="line-398"><code>			// Lucky13, the data past paddingLen (which is secret) is passed to</code></span>
+<span class="codeline" id="line-399"><code>			// the MAC function as extra data, to be fed into the HMAC after</code></span>
+<span class="codeline" id="line-400"><code>			// computing the digest. This makes the MAC roughly constant time as</code></span>
+<span class="codeline" id="line-401"><code>			// long as the digest computation is constant time and does not</code></span>
+<span class="codeline" id="line-402"><code>			// affect the subsequent write, modulo cache effects.</code></span>
+<span class="codeline" id="line-403"><code>			paddingLen, paddingGood = extractPadding(payload)</code></span>
+<span class="codeline" id="line-404"><code>		default:</code></span>
+<span class="codeline" id="line-405"><code>			panic("unknown cipher type")</code></span>
+<span class="codeline" id="line-406"><code>		}</code></span>
+<span class="codeline" id="line-407"><code></code></span>
+<span class="codeline" id="line-408"><code>		if hc.version == VersionTLS13 {</code></span>
+<span class="codeline" id="line-409"><code>			if typ != recordTypeApplicationData {</code></span>
+<span class="codeline" id="line-410"><code>				return nil, 0, alertUnexpectedMessage</code></span>
+<span class="codeline" id="line-411"><code>			}</code></span>
+<span class="codeline" id="line-412"><code>			if len(plaintext) &gt; maxPlaintext+1 {</code></span>
+<span class="codeline" id="line-413"><code>				return nil, 0, alertRecordOverflow</code></span>
+<span class="codeline" id="line-414"><code>			}</code></span>
+<span class="codeline" id="line-415"><code>			// Remove padding and find the ContentType scanning from the end.</code></span>
+<span class="codeline" id="line-416"><code>			for i := len(plaintext) - 1; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-417"><code>				if plaintext[i] != 0 {</code></span>
+<span class="codeline" id="line-418"><code>					typ = recordType(plaintext[i])</code></span>
+<span class="codeline" id="line-419"><code>					plaintext = plaintext[:i]</code></span>
+<span class="codeline" id="line-420"><code>					break</code></span>
+<span class="codeline" id="line-421"><code>				}</code></span>
+<span class="codeline" id="line-422"><code>				if i == 0 {</code></span>
+<span class="codeline" id="line-423"><code>					return nil, 0, alertUnexpectedMessage</code></span>
+<span class="codeline" id="line-424"><code>				}</code></span>
+<span class="codeline" id="line-425"><code>			}</code></span>
+<span class="codeline" id="line-426"><code>		}</code></span>
+<span class="codeline" id="line-427"><code>	} else {</code></span>
+<span class="codeline" id="line-428"><code>		plaintext = payload</code></span>
+<span class="codeline" id="line-429"><code>	}</code></span>
+<span class="codeline" id="line-430"><code></code></span>
+<span class="codeline" id="line-431"><code>	if hc.mac != nil {</code></span>
+<span class="codeline" id="line-432"><code>		macSize := hc.mac.Size()</code></span>
+<span class="codeline" id="line-433"><code>		if len(payload) &lt; macSize {</code></span>
+<span class="codeline" id="line-434"><code>			return nil, 0, alertBadRecordMAC</code></span>
+<span class="codeline" id="line-435"><code>		}</code></span>
+<span class="codeline" id="line-436"><code></code></span>
+<span class="codeline" id="line-437"><code>		n := len(payload) - macSize - paddingLen</code></span>
+<span class="codeline" id="line-438"><code>		n = subtle.ConstantTimeSelect(int(uint32(n)&gt;&gt;31), 0, n) // if n &lt; 0 { n = 0 }</code></span>
+<span class="codeline" id="line-439"><code>		record[3] = byte(n &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-440"><code>		record[4] = byte(n)</code></span>
+<span class="codeline" id="line-441"><code>		remoteMAC := payload[n : n+macSize]</code></span>
+<span class="codeline" id="line-442"><code>		localMAC := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], record[:recordHeaderLen], payload[:n], payload[n+macSize:])</code></span>
+<span class="codeline" id="line-443"><code></code></span>
+<span class="codeline" id="line-444"><code>		// This is equivalent to checking the MACs and paddingGood</code></span>
+<span class="codeline" id="line-445"><code>		// separately, but in constant-time to prevent distinguishing</code></span>
+<span class="codeline" id="line-446"><code>		// padding failures from MAC failures. Depending on what value</code></span>
+<span class="codeline" id="line-447"><code>		// of paddingLen was returned on bad padding, distinguishing</code></span>
+<span class="codeline" id="line-448"><code>		// bad MAC from bad padding can lead to an attack.</code></span>
+<span class="codeline" id="line-449"><code>		//</code></span>
+<span class="codeline" id="line-450"><code>		// See also the logic at the end of extractPadding.</code></span>
+<span class="codeline" id="line-451"><code>		macAndPaddingGood := subtle.ConstantTimeCompare(localMAC, remoteMAC) &amp; int(paddingGood)</code></span>
+<span class="codeline" id="line-452"><code>		if macAndPaddingGood != 1 {</code></span>
+<span class="codeline" id="line-453"><code>			return nil, 0, alertBadRecordMAC</code></span>
+<span class="codeline" id="line-454"><code>		}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>		plaintext = payload[:n]</code></span>
+<span class="codeline" id="line-457"><code>	}</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>	hc.incSeq()</code></span>
+<span class="codeline" id="line-460"><code>	return plaintext, typ, nil</code></span>
+<span class="codeline" id="line-461"><code>}</code></span>
+<span class="codeline" id="line-462"><code></code></span>
+<span class="codeline" id="line-463"><code>// sliceForAppend extends the input slice by n bytes. head is the full extended</code></span>
+<span class="codeline" id="line-464"><code>// slice, while tail is the appended part. If the original slice has sufficient</code></span>
+<span class="codeline" id="line-465"><code>// capacity no allocation is performed.</code></span>
+<span class="codeline" id="line-466"><code>func sliceForAppend(in []byte, n int) (head, tail []byte) {</code></span>
+<span class="codeline" id="line-467"><code>	if total := len(in) + n; cap(in) &gt;= total {</code></span>
+<span class="codeline" id="line-468"><code>		head = in[:total]</code></span>
+<span class="codeline" id="line-469"><code>	} else {</code></span>
+<span class="codeline" id="line-470"><code>		head = make([]byte, total)</code></span>
+<span class="codeline" id="line-471"><code>		copy(head, in)</code></span>
+<span class="codeline" id="line-472"><code>	}</code></span>
+<span class="codeline" id="line-473"><code>	tail = head[len(in):]</code></span>
+<span class="codeline" id="line-474"><code>	return</code></span>
+<span class="codeline" id="line-475"><code>}</code></span>
+<span class="codeline" id="line-476"><code></code></span>
+<span class="codeline" id="line-477"><code>// encrypt encrypts payload, adding the appropriate nonce and/or MAC, and</code></span>
+<span class="codeline" id="line-478"><code>// appends it to record, which must already contain the record header.</code></span>
+<span class="codeline" id="line-479"><code>func (hc *halfConn) encrypt(record, payload []byte, rand io.Reader) ([]byte, error) {</code></span>
+<span class="codeline" id="line-480"><code>	if hc.cipher == nil {</code></span>
+<span class="codeline" id="line-481"><code>		return append(record, payload...), nil</code></span>
+<span class="codeline" id="line-482"><code>	}</code></span>
+<span class="codeline" id="line-483"><code></code></span>
+<span class="codeline" id="line-484"><code>	var explicitNonce []byte</code></span>
+<span class="codeline" id="line-485"><code>	if explicitNonceLen := hc.explicitNonceLen(); explicitNonceLen &gt; 0 {</code></span>
+<span class="codeline" id="line-486"><code>		record, explicitNonce = sliceForAppend(record, explicitNonceLen)</code></span>
+<span class="codeline" id="line-487"><code>		if _, isCBC := hc.cipher.(cbcMode); !isCBC &amp;&amp; explicitNonceLen &lt; 16 {</code></span>
+<span class="codeline" id="line-488"><code>			// The AES-GCM construction in TLS has an explicit nonce so that the</code></span>
+<span class="codeline" id="line-489"><code>			// nonce can be random. However, the nonce is only 8 bytes which is</code></span>
+<span class="codeline" id="line-490"><code>			// too small for a secure, random nonce. Therefore we use the</code></span>
+<span class="codeline" id="line-491"><code>			// sequence number as the nonce. The 3DES-CBC construction also has</code></span>
+<span class="codeline" id="line-492"><code>			// an 8 bytes nonce but its nonces must be unpredictable (see RFC</code></span>
+<span class="codeline" id="line-493"><code>			// 5246, Appendix F.3), forcing us to use randomness. That's not</code></span>
+<span class="codeline" id="line-494"><code>			// 3DES' biggest problem anyway because the birthday bound on block</code></span>
+<span class="codeline" id="line-495"><code>			// collision is reached first due to its similarly small block size</code></span>
+<span class="codeline" id="line-496"><code>			// (see the Sweet32 attack).</code></span>
+<span class="codeline" id="line-497"><code>			copy(explicitNonce, hc.seq[:])</code></span>
+<span class="codeline" id="line-498"><code>		} else {</code></span>
+<span class="codeline" id="line-499"><code>			if _, err := io.ReadFull(rand, explicitNonce); err != nil {</code></span>
+<span class="codeline" id="line-500"><code>				return nil, err</code></span>
+<span class="codeline" id="line-501"><code>			}</code></span>
+<span class="codeline" id="line-502"><code>		}</code></span>
+<span class="codeline" id="line-503"><code>	}</code></span>
+<span class="codeline" id="line-504"><code></code></span>
+<span class="codeline" id="line-505"><code>	var dst []byte</code></span>
+<span class="codeline" id="line-506"><code>	switch c := hc.cipher.(type) {</code></span>
+<span class="codeline" id="line-507"><code>	case cipher.Stream:</code></span>
+<span class="codeline" id="line-508"><code>		mac := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], record[:recordHeaderLen], payload, nil)</code></span>
+<span class="codeline" id="line-509"><code>		record, dst = sliceForAppend(record, len(payload)+len(mac))</code></span>
+<span class="codeline" id="line-510"><code>		c.XORKeyStream(dst[:len(payload)], payload)</code></span>
+<span class="codeline" id="line-511"><code>		c.XORKeyStream(dst[len(payload):], mac)</code></span>
+<span class="codeline" id="line-512"><code>	case aead:</code></span>
+<span class="codeline" id="line-513"><code>		nonce := explicitNonce</code></span>
+<span class="codeline" id="line-514"><code>		if len(nonce) == 0 {</code></span>
+<span class="codeline" id="line-515"><code>			nonce = hc.seq[:]</code></span>
+<span class="codeline" id="line-516"><code>		}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>		if hc.version == VersionTLS13 {</code></span>
+<span class="codeline" id="line-519"><code>			record = append(record, payload...)</code></span>
+<span class="codeline" id="line-520"><code></code></span>
+<span class="codeline" id="line-521"><code>			// Encrypt the actual ContentType and replace the plaintext one.</code></span>
+<span class="codeline" id="line-522"><code>			record = append(record, record[0])</code></span>
+<span class="codeline" id="line-523"><code>			record[0] = byte(recordTypeApplicationData)</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>			n := len(payload) + 1 + c.Overhead()</code></span>
+<span class="codeline" id="line-526"><code>			record[3] = byte(n &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-527"><code>			record[4] = byte(n)</code></span>
+<span class="codeline" id="line-528"><code></code></span>
+<span class="codeline" id="line-529"><code>			record = c.Seal(record[:recordHeaderLen],</code></span>
+<span class="codeline" id="line-530"><code>				nonce, record[recordHeaderLen:], record[:recordHeaderLen])</code></span>
+<span class="codeline" id="line-531"><code>		} else {</code></span>
+<span class="codeline" id="line-532"><code>			additionalData := append(hc.scratchBuf[:0], hc.seq[:]...)</code></span>
+<span class="codeline" id="line-533"><code>			additionalData = append(additionalData, record[:recordHeaderLen]...)</code></span>
+<span class="codeline" id="line-534"><code>			record = c.Seal(record, nonce, payload, additionalData)</code></span>
+<span class="codeline" id="line-535"><code>		}</code></span>
+<span class="codeline" id="line-536"><code>	case cbcMode:</code></span>
+<span class="codeline" id="line-537"><code>		mac := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], record[:recordHeaderLen], payload, nil)</code></span>
+<span class="codeline" id="line-538"><code>		blockSize := c.BlockSize()</code></span>
+<span class="codeline" id="line-539"><code>		plaintextLen := len(payload) + len(mac)</code></span>
+<span class="codeline" id="line-540"><code>		paddingLen := blockSize - plaintextLen%blockSize</code></span>
+<span class="codeline" id="line-541"><code>		record, dst = sliceForAppend(record, plaintextLen+paddingLen)</code></span>
+<span class="codeline" id="line-542"><code>		copy(dst, payload)</code></span>
+<span class="codeline" id="line-543"><code>		copy(dst[len(payload):], mac)</code></span>
+<span class="codeline" id="line-544"><code>		for i := plaintextLen; i &lt; len(dst); i++ {</code></span>
+<span class="codeline" id="line-545"><code>			dst[i] = byte(paddingLen - 1)</code></span>
+<span class="codeline" id="line-546"><code>		}</code></span>
+<span class="codeline" id="line-547"><code>		if len(explicitNonce) &gt; 0 {</code></span>
+<span class="codeline" id="line-548"><code>			c.SetIV(explicitNonce)</code></span>
+<span class="codeline" id="line-549"><code>		}</code></span>
+<span class="codeline" id="line-550"><code>		c.CryptBlocks(dst, dst)</code></span>
+<span class="codeline" id="line-551"><code>	default:</code></span>
+<span class="codeline" id="line-552"><code>		panic("unknown cipher type")</code></span>
+<span class="codeline" id="line-553"><code>	}</code></span>
+<span class="codeline" id="line-554"><code></code></span>
+<span class="codeline" id="line-555"><code>	// Update length to include nonce, MAC and any block padding needed.</code></span>
+<span class="codeline" id="line-556"><code>	n := len(record) - recordHeaderLen</code></span>
+<span class="codeline" id="line-557"><code>	record[3] = byte(n &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-558"><code>	record[4] = byte(n)</code></span>
+<span class="codeline" id="line-559"><code>	hc.incSeq()</code></span>
+<span class="codeline" id="line-560"><code></code></span>
+<span class="codeline" id="line-561"><code>	return record, nil</code></span>
+<span class="codeline" id="line-562"><code>}</code></span>
+<span class="codeline" id="line-563"><code></code></span>
+<span class="codeline" id="line-564"><code>// RecordHeaderError is returned when a TLS record header is invalid.</code></span>
+<span class="codeline" id="line-565"><code>type RecordHeaderError struct {</code></span>
+<span class="codeline" id="line-566"><code>	// Msg contains a human readable string that describes the error.</code></span>
+<span class="codeline" id="line-567"><code>	Msg string</code></span>
+<span class="codeline" id="line-568"><code>	// RecordHeader contains the five bytes of TLS record header that</code></span>
+<span class="codeline" id="line-569"><code>	// triggered the error.</code></span>
+<span class="codeline" id="line-570"><code>	RecordHeader [5]byte</code></span>
+<span class="codeline" id="line-571"><code>	// Conn provides the underlying net.Conn in the case that a client</code></span>
+<span class="codeline" id="line-572"><code>	// sent an initial handshake that didn't look like TLS.</code></span>
+<span class="codeline" id="line-573"><code>	// It is nil if there's already been a handshake or a TLS alert has</code></span>
+<span class="codeline" id="line-574"><code>	// been written to the connection.</code></span>
+<span class="codeline" id="line-575"><code>	Conn net.Conn</code></span>
+<span class="codeline" id="line-576"><code>}</code></span>
+<span class="codeline" id="line-577"><code></code></span>
+<span class="codeline" id="line-578"><code>func (e RecordHeaderError) Error() string { return "tls: " + e.Msg }</code></span>
+<span class="codeline" id="line-579"><code></code></span>
+<span class="codeline" id="line-580"><code>func (c *Conn) newRecordHeaderError(conn net.Conn, msg string) (err RecordHeaderError) {</code></span>
+<span class="codeline" id="line-581"><code>	err.Msg = msg</code></span>
+<span class="codeline" id="line-582"><code>	err.Conn = conn</code></span>
+<span class="codeline" id="line-583"><code>	copy(err.RecordHeader[:], c.rawInput.Bytes())</code></span>
+<span class="codeline" id="line-584"><code>	return err</code></span>
+<span class="codeline" id="line-585"><code>}</code></span>
+<span class="codeline" id="line-586"><code></code></span>
+<span class="codeline" id="line-587"><code>func (c *Conn) readRecord() error {</code></span>
+<span class="codeline" id="line-588"><code>	return c.readRecordOrCCS(false)</code></span>
+<span class="codeline" id="line-589"><code>}</code></span>
+<span class="codeline" id="line-590"><code></code></span>
+<span class="codeline" id="line-591"><code>func (c *Conn) readChangeCipherSpec() error {</code></span>
+<span class="codeline" id="line-592"><code>	return c.readRecordOrCCS(true)</code></span>
+<span class="codeline" id="line-593"><code>}</code></span>
+<span class="codeline" id="line-594"><code></code></span>
+<span class="codeline" id="line-595"><code>// readRecordOrCCS reads one or more TLS records from the connection and</code></span>
+<span class="codeline" id="line-596"><code>// updates the record layer state. Some invariants:</code></span>
+<span class="codeline" id="line-597"><code>//   - c.in must be locked</code></span>
+<span class="codeline" id="line-598"><code>//   - c.input must be empty</code></span>
+<span class="codeline" id="line-599"><code>//</code></span>
+<span class="codeline" id="line-600"><code>// During the handshake one and only one of the following will happen:</code></span>
+<span class="codeline" id="line-601"><code>//   - c.hand grows</code></span>
+<span class="codeline" id="line-602"><code>//   - c.in.changeCipherSpec is called</code></span>
+<span class="codeline" id="line-603"><code>//   - an error is returned</code></span>
+<span class="codeline" id="line-604"><code>//</code></span>
+<span class="codeline" id="line-605"><code>// After the handshake one and only one of the following will happen:</code></span>
+<span class="codeline" id="line-606"><code>//   - c.hand grows</code></span>
+<span class="codeline" id="line-607"><code>//   - c.input is set</code></span>
+<span class="codeline" id="line-608"><code>//   - an error is returned</code></span>
+<span class="codeline" id="line-609"><code>func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {</code></span>
+<span class="codeline" id="line-610"><code>	if c.in.err != nil {</code></span>
+<span class="codeline" id="line-611"><code>		return c.in.err</code></span>
+<span class="codeline" id="line-612"><code>	}</code></span>
+<span class="codeline" id="line-613"><code>	handshakeComplete := c.isHandshakeComplete.Load()</code></span>
+<span class="codeline" id="line-614"><code></code></span>
+<span class="codeline" id="line-615"><code>	// This function modifies c.rawInput, which owns the c.input memory.</code></span>
+<span class="codeline" id="line-616"><code>	if c.input.Len() != 0 {</code></span>
+<span class="codeline" id="line-617"><code>		return c.in.setErrorLocked(errors.New("tls: internal error: attempted to read record with pending application data"))</code></span>
+<span class="codeline" id="line-618"><code>	}</code></span>
+<span class="codeline" id="line-619"><code>	c.input.Reset(nil)</code></span>
+<span class="codeline" id="line-620"><code></code></span>
+<span class="codeline" id="line-621"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-622"><code>		return c.in.setErrorLocked(errors.New("tls: internal error: attempted to read record with QUIC transport"))</code></span>
+<span class="codeline" id="line-623"><code>	}</code></span>
+<span class="codeline" id="line-624"><code></code></span>
+<span class="codeline" id="line-625"><code>	// Read header, payload.</code></span>
+<span class="codeline" id="line-626"><code>	if err := c.readFromUntil(c.conn, recordHeaderLen); err != nil {</code></span>
+<span class="codeline" id="line-627"><code>		// RFC 8446, Section 6.1 suggests that EOF without an alertCloseNotify</code></span>
+<span class="codeline" id="line-628"><code>		// is an error, but popular web sites seem to do this, so we accept it</code></span>
+<span class="codeline" id="line-629"><code>		// if and only if at the record boundary.</code></span>
+<span class="codeline" id="line-630"><code>		if err == io.ErrUnexpectedEOF &amp;&amp; c.rawInput.Len() == 0 {</code></span>
+<span class="codeline" id="line-631"><code>			err = io.EOF</code></span>
+<span class="codeline" id="line-632"><code>		}</code></span>
+<span class="codeline" id="line-633"><code>		if e, ok := err.(net.Error); !ok || !e.Temporary() {</code></span>
+<span class="codeline" id="line-634"><code>			c.in.setErrorLocked(err)</code></span>
+<span class="codeline" id="line-635"><code>		}</code></span>
+<span class="codeline" id="line-636"><code>		return err</code></span>
+<span class="codeline" id="line-637"><code>	}</code></span>
+<span class="codeline" id="line-638"><code>	hdr := c.rawInput.Bytes()[:recordHeaderLen]</code></span>
+<span class="codeline" id="line-639"><code>	typ := recordType(hdr[0])</code></span>
+<span class="codeline" id="line-640"><code></code></span>
+<span class="codeline" id="line-641"><code>	// No valid TLS record has a type of 0x80, however SSLv2 handshakes</code></span>
+<span class="codeline" id="line-642"><code>	// start with a uint16 length where the MSB is set and the first record</code></span>
+<span class="codeline" id="line-643"><code>	// is always &lt; 256 bytes long. Therefore typ == 0x80 strongly suggests</code></span>
+<span class="codeline" id="line-644"><code>	// an SSLv2 client.</code></span>
+<span class="codeline" id="line-645"><code>	if !handshakeComplete &amp;&amp; typ == 0x80 {</code></span>
+<span class="codeline" id="line-646"><code>		c.sendAlert(alertProtocolVersion)</code></span>
+<span class="codeline" id="line-647"><code>		return c.in.setErrorLocked(c.newRecordHeaderError(nil, "unsupported SSLv2 handshake received"))</code></span>
+<span class="codeline" id="line-648"><code>	}</code></span>
+<span class="codeline" id="line-649"><code></code></span>
+<span class="codeline" id="line-650"><code>	vers := uint16(hdr[1])&lt;&lt;8 | uint16(hdr[2])</code></span>
+<span class="codeline" id="line-651"><code>	expectedVers := c.vers</code></span>
+<span class="codeline" id="line-652"><code>	if expectedVers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-653"><code>		// All TLS 1.3 records are expected to have 0x0303 (1.2) after</code></span>
+<span class="codeline" id="line-654"><code>		// the initial hello (RFC 8446 Section 5.1).</code></span>
+<span class="codeline" id="line-655"><code>		expectedVers = VersionTLS12</code></span>
+<span class="codeline" id="line-656"><code>	}</code></span>
+<span class="codeline" id="line-657"><code>	n := int(hdr[3])&lt;&lt;8 | int(hdr[4])</code></span>
+<span class="codeline" id="line-658"><code>	if c.haveVers &amp;&amp; vers != expectedVers {</code></span>
+<span class="codeline" id="line-659"><code>		c.sendAlert(alertProtocolVersion)</code></span>
+<span class="codeline" id="line-660"><code>		msg := fmt.Sprintf("received record with version %x when expecting version %x", vers, expectedVers)</code></span>
+<span class="codeline" id="line-661"><code>		return c.in.setErrorLocked(c.newRecordHeaderError(nil, msg))</code></span>
+<span class="codeline" id="line-662"><code>	}</code></span>
+<span class="codeline" id="line-663"><code>	if !c.haveVers {</code></span>
+<span class="codeline" id="line-664"><code>		// First message, be extra suspicious: this might not be a TLS</code></span>
+<span class="codeline" id="line-665"><code>		// client. Bail out before reading a full 'body', if possible.</code></span>
+<span class="codeline" id="line-666"><code>		// The current max version is 3.3 so if the version is &gt;= 16.0,</code></span>
+<span class="codeline" id="line-667"><code>		// it's probably not real.</code></span>
+<span class="codeline" id="line-668"><code>		if (typ != recordTypeAlert &amp;&amp; typ != recordTypeHandshake) || vers &gt;= 0x1000 {</code></span>
+<span class="codeline" id="line-669"><code>			return c.in.setErrorLocked(c.newRecordHeaderError(c.conn, "first record does not look like a TLS handshake"))</code></span>
+<span class="codeline" id="line-670"><code>		}</code></span>
+<span class="codeline" id="line-671"><code>	}</code></span>
+<span class="codeline" id="line-672"><code>	if c.vers == VersionTLS13 &amp;&amp; n &gt; maxCiphertextTLS13 || n &gt; maxCiphertext {</code></span>
+<span class="codeline" id="line-673"><code>		c.sendAlert(alertRecordOverflow)</code></span>
+<span class="codeline" id="line-674"><code>		msg := fmt.Sprintf("oversized record received with length %d", n)</code></span>
+<span class="codeline" id="line-675"><code>		return c.in.setErrorLocked(c.newRecordHeaderError(nil, msg))</code></span>
+<span class="codeline" id="line-676"><code>	}</code></span>
+<span class="codeline" id="line-677"><code>	if err := c.readFromUntil(c.conn, recordHeaderLen+n); err != nil {</code></span>
+<span class="codeline" id="line-678"><code>		if e, ok := err.(net.Error); !ok || !e.Temporary() {</code></span>
+<span class="codeline" id="line-679"><code>			c.in.setErrorLocked(err)</code></span>
+<span class="codeline" id="line-680"><code>		}</code></span>
+<span class="codeline" id="line-681"><code>		return err</code></span>
+<span class="codeline" id="line-682"><code>	}</code></span>
+<span class="codeline" id="line-683"><code></code></span>
+<span class="codeline" id="line-684"><code>	// Process message.</code></span>
+<span class="codeline" id="line-685"><code>	record := c.rawInput.Next(recordHeaderLen + n)</code></span>
+<span class="codeline" id="line-686"><code>	data, typ, err := c.in.decrypt(record)</code></span>
+<span class="codeline" id="line-687"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-688"><code>		return c.in.setErrorLocked(c.sendAlert(err.(alert)))</code></span>
+<span class="codeline" id="line-689"><code>	}</code></span>
+<span class="codeline" id="line-690"><code>	if len(data) &gt; maxPlaintext {</code></span>
+<span class="codeline" id="line-691"><code>		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))</code></span>
+<span class="codeline" id="line-692"><code>	}</code></span>
+<span class="codeline" id="line-693"><code></code></span>
+<span class="codeline" id="line-694"><code>	// Application Data messages are always protected.</code></span>
+<span class="codeline" id="line-695"><code>	if c.in.cipher == nil &amp;&amp; typ == recordTypeApplicationData {</code></span>
+<span class="codeline" id="line-696"><code>		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-697"><code>	}</code></span>
+<span class="codeline" id="line-698"><code></code></span>
+<span class="codeline" id="line-699"><code>	if typ != recordTypeAlert &amp;&amp; typ != recordTypeChangeCipherSpec &amp;&amp; len(data) &gt; 0 {</code></span>
+<span class="codeline" id="line-700"><code>		// This is a state-advancing message: reset the retry count.</code></span>
+<span class="codeline" id="line-701"><code>		c.retryCount = 0</code></span>
+<span class="codeline" id="line-702"><code>	}</code></span>
+<span class="codeline" id="line-703"><code></code></span>
+<span class="codeline" id="line-704"><code>	// Handshake messages MUST NOT be interleaved with other record types in TLS 1.3.</code></span>
+<span class="codeline" id="line-705"><code>	if c.vers == VersionTLS13 &amp;&amp; typ != recordTypeHandshake &amp;&amp; c.hand.Len() &gt; 0 {</code></span>
+<span class="codeline" id="line-706"><code>		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-707"><code>	}</code></span>
+<span class="codeline" id="line-708"><code></code></span>
+<span class="codeline" id="line-709"><code>	switch typ {</code></span>
+<span class="codeline" id="line-710"><code>	default:</code></span>
+<span class="codeline" id="line-711"><code>		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-712"><code></code></span>
+<span class="codeline" id="line-713"><code>	case recordTypeAlert:</code></span>
+<span class="codeline" id="line-714"><code>		if c.quic != nil {</code></span>
+<span class="codeline" id="line-715"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-716"><code>		}</code></span>
+<span class="codeline" id="line-717"><code>		if len(data) != 2 {</code></span>
+<span class="codeline" id="line-718"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-719"><code>		}</code></span>
+<span class="codeline" id="line-720"><code>		if alert(data[1]) == alertCloseNotify {</code></span>
+<span class="codeline" id="line-721"><code>			return c.in.setErrorLocked(io.EOF)</code></span>
+<span class="codeline" id="line-722"><code>		}</code></span>
+<span class="codeline" id="line-723"><code>		if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-724"><code>			return c.in.setErrorLocked(&amp;net.OpError{Op: "remote error", Err: alert(data[1])})</code></span>
+<span class="codeline" id="line-725"><code>		}</code></span>
+<span class="codeline" id="line-726"><code>		switch data[0] {</code></span>
+<span class="codeline" id="line-727"><code>		case alertLevelWarning:</code></span>
+<span class="codeline" id="line-728"><code>			// Drop the record on the floor and retry.</code></span>
+<span class="codeline" id="line-729"><code>			return c.retryReadRecord(expectChangeCipherSpec)</code></span>
+<span class="codeline" id="line-730"><code>		case alertLevelError:</code></span>
+<span class="codeline" id="line-731"><code>			return c.in.setErrorLocked(&amp;net.OpError{Op: "remote error", Err: alert(data[1])})</code></span>
+<span class="codeline" id="line-732"><code>		default:</code></span>
+<span class="codeline" id="line-733"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-734"><code>		}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>	case recordTypeChangeCipherSpec:</code></span>
+<span class="codeline" id="line-737"><code>		if len(data) != 1 || data[0] != 1 {</code></span>
+<span class="codeline" id="line-738"><code>			return c.in.setErrorLocked(c.sendAlert(alertDecodeError))</code></span>
+<span class="codeline" id="line-739"><code>		}</code></span>
+<span class="codeline" id="line-740"><code>		// Handshake messages are not allowed to fragment across the CCS.</code></span>
+<span class="codeline" id="line-741"><code>		if c.hand.Len() &gt; 0 {</code></span>
+<span class="codeline" id="line-742"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-743"><code>		}</code></span>
+<span class="codeline" id="line-744"><code>		// In TLS 1.3, change_cipher_spec records are ignored until the</code></span>
+<span class="codeline" id="line-745"><code>		// Finished. See RFC 8446, Appendix D.4. Note that according to Section</code></span>
+<span class="codeline" id="line-746"><code>		// 5, a server can send a ChangeCipherSpec before its ServerHello, when</code></span>
+<span class="codeline" id="line-747"><code>		// c.vers is still unset. That's not useful though and suspicious if the</code></span>
+<span class="codeline" id="line-748"><code>		// server then selects a lower protocol version, so don't allow that.</code></span>
+<span class="codeline" id="line-749"><code>		if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-750"><code>			return c.retryReadRecord(expectChangeCipherSpec)</code></span>
+<span class="codeline" id="line-751"><code>		}</code></span>
+<span class="codeline" id="line-752"><code>		if !expectChangeCipherSpec {</code></span>
+<span class="codeline" id="line-753"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-754"><code>		}</code></span>
+<span class="codeline" id="line-755"><code>		if err := c.in.changeCipherSpec(); err != nil {</code></span>
+<span class="codeline" id="line-756"><code>			return c.in.setErrorLocked(c.sendAlert(err.(alert)))</code></span>
+<span class="codeline" id="line-757"><code>		}</code></span>
+<span class="codeline" id="line-758"><code></code></span>
+<span class="codeline" id="line-759"><code>	case recordTypeApplicationData:</code></span>
+<span class="codeline" id="line-760"><code>		if !handshakeComplete || expectChangeCipherSpec {</code></span>
+<span class="codeline" id="line-761"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-762"><code>		}</code></span>
+<span class="codeline" id="line-763"><code>		// Some OpenSSL servers send empty records in order to randomize the</code></span>
+<span class="codeline" id="line-764"><code>		// CBC IV. Ignore a limited number of empty records.</code></span>
+<span class="codeline" id="line-765"><code>		if len(data) == 0 {</code></span>
+<span class="codeline" id="line-766"><code>			return c.retryReadRecord(expectChangeCipherSpec)</code></span>
+<span class="codeline" id="line-767"><code>		}</code></span>
+<span class="codeline" id="line-768"><code>		// Note that data is owned by c.rawInput, following the Next call above,</code></span>
+<span class="codeline" id="line-769"><code>		// to avoid copying the plaintext. This is safe because c.rawInput is</code></span>
+<span class="codeline" id="line-770"><code>		// not read from or written to until c.input is drained.</code></span>
+<span class="codeline" id="line-771"><code>		c.input.Reset(data)</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>	case recordTypeHandshake:</code></span>
+<span class="codeline" id="line-774"><code>		if len(data) == 0 || expectChangeCipherSpec {</code></span>
+<span class="codeline" id="line-775"><code>			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-776"><code>		}</code></span>
+<span class="codeline" id="line-777"><code>		c.hand.Write(data)</code></span>
+<span class="codeline" id="line-778"><code>	}</code></span>
+<span class="codeline" id="line-779"><code></code></span>
+<span class="codeline" id="line-780"><code>	return nil</code></span>
+<span class="codeline" id="line-781"><code>}</code></span>
+<span class="codeline" id="line-782"><code></code></span>
+<span class="codeline" id="line-783"><code>// retryReadRecord recurs into readRecordOrCCS to drop a non-advancing record, like</code></span>
+<span class="codeline" id="line-784"><code>// a warning alert, empty application_data, or a change_cipher_spec in TLS 1.3.</code></span>
+<span class="codeline" id="line-785"><code>func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {</code></span>
+<span class="codeline" id="line-786"><code>	c.retryCount++</code></span>
+<span class="codeline" id="line-787"><code>	if c.retryCount &gt; maxUselessRecords {</code></span>
+<span class="codeline" id="line-788"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-789"><code>		return c.in.setErrorLocked(errors.New("tls: too many ignored records"))</code></span>
+<span class="codeline" id="line-790"><code>	}</code></span>
+<span class="codeline" id="line-791"><code>	return c.readRecordOrCCS(expectChangeCipherSpec)</code></span>
+<span class="codeline" id="line-792"><code>}</code></span>
+<span class="codeline" id="line-793"><code></code></span>
+<span class="codeline" id="line-794"><code>// atLeastReader reads from R, stopping with EOF once at least N bytes have been</code></span>
+<span class="codeline" id="line-795"><code>// read. It is different from an io.LimitedReader in that it doesn't cut short</code></span>
+<span class="codeline" id="line-796"><code>// the last Read call, and in that it considers an early EOF an error.</code></span>
+<span class="codeline" id="line-797"><code>type atLeastReader struct {</code></span>
+<span class="codeline" id="line-798"><code>	R io.Reader</code></span>
+<span class="codeline" id="line-799"><code>	N int64</code></span>
+<span class="codeline" id="line-800"><code>}</code></span>
+<span class="codeline" id="line-801"><code></code></span>
+<span class="codeline" id="line-802"><code>func (r *atLeastReader) Read(p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-803"><code>	if r.N &lt;= 0 {</code></span>
+<span class="codeline" id="line-804"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-805"><code>	}</code></span>
+<span class="codeline" id="line-806"><code>	n, err := r.R.Read(p)</code></span>
+<span class="codeline" id="line-807"><code>	r.N -= int64(n) // won't underflow unless len(p) &gt;= n &gt; 9223372036854775809</code></span>
+<span class="codeline" id="line-808"><code>	if r.N &gt; 0 &amp;&amp; err == io.EOF {</code></span>
+<span class="codeline" id="line-809"><code>		return n, io.ErrUnexpectedEOF</code></span>
+<span class="codeline" id="line-810"><code>	}</code></span>
+<span class="codeline" id="line-811"><code>	if r.N &lt;= 0 &amp;&amp; err == nil {</code></span>
+<span class="codeline" id="line-812"><code>		return n, io.EOF</code></span>
+<span class="codeline" id="line-813"><code>	}</code></span>
+<span class="codeline" id="line-814"><code>	return n, err</code></span>
+<span class="codeline" id="line-815"><code>}</code></span>
+<span class="codeline" id="line-816"><code></code></span>
+<span class="codeline" id="line-817"><code>// readFromUntil reads from r into c.rawInput until c.rawInput contains</code></span>
+<span class="codeline" id="line-818"><code>// at least n bytes or else returns an error.</code></span>
+<span class="codeline" id="line-819"><code>func (c *Conn) readFromUntil(r io.Reader, n int) error {</code></span>
+<span class="codeline" id="line-820"><code>	if c.rawInput.Len() &gt;= n {</code></span>
+<span class="codeline" id="line-821"><code>		return nil</code></span>
+<span class="codeline" id="line-822"><code>	}</code></span>
+<span class="codeline" id="line-823"><code>	needs := n - c.rawInput.Len()</code></span>
+<span class="codeline" id="line-824"><code>	// There might be extra input waiting on the wire. Make a best effort</code></span>
+<span class="codeline" id="line-825"><code>	// attempt to fetch it so that it can be used in (*Conn).Read to</code></span>
+<span class="codeline" id="line-826"><code>	// "predict" closeNotify alerts.</code></span>
+<span class="codeline" id="line-827"><code>	c.rawInput.Grow(needs + bytes.MinRead)</code></span>
+<span class="codeline" id="line-828"><code>	_, err := c.rawInput.ReadFrom(&amp;atLeastReader{r, int64(needs)})</code></span>
+<span class="codeline" id="line-829"><code>	return err</code></span>
+<span class="codeline" id="line-830"><code>}</code></span>
+<span class="codeline" id="line-831"><code></code></span>
+<span class="codeline" id="line-832"><code>// sendAlertLocked sends a TLS alert message.</code></span>
+<span class="codeline" id="line-833"><code>func (c *Conn) sendAlertLocked(err alert) error {</code></span>
+<span class="codeline" id="line-834"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-835"><code>		return c.out.setErrorLocked(&amp;net.OpError{Op: "local error", Err: err})</code></span>
+<span class="codeline" id="line-836"><code>	}</code></span>
+<span class="codeline" id="line-837"><code></code></span>
+<span class="codeline" id="line-838"><code>	switch err {</code></span>
+<span class="codeline" id="line-839"><code>	case alertNoRenegotiation, alertCloseNotify:</code></span>
+<span class="codeline" id="line-840"><code>		c.tmp[0] = alertLevelWarning</code></span>
+<span class="codeline" id="line-841"><code>	default:</code></span>
+<span class="codeline" id="line-842"><code>		c.tmp[0] = alertLevelError</code></span>
+<span class="codeline" id="line-843"><code>	}</code></span>
+<span class="codeline" id="line-844"><code>	c.tmp[1] = byte(err)</code></span>
+<span class="codeline" id="line-845"><code></code></span>
+<span class="codeline" id="line-846"><code>	_, writeErr := c.writeRecordLocked(recordTypeAlert, c.tmp[0:2])</code></span>
+<span class="codeline" id="line-847"><code>	if err == alertCloseNotify {</code></span>
+<span class="codeline" id="line-848"><code>		// closeNotify is a special case in that it isn't an error.</code></span>
+<span class="codeline" id="line-849"><code>		return writeErr</code></span>
+<span class="codeline" id="line-850"><code>	}</code></span>
+<span class="codeline" id="line-851"><code></code></span>
+<span class="codeline" id="line-852"><code>	return c.out.setErrorLocked(&amp;net.OpError{Op: "local error", Err: err})</code></span>
+<span class="codeline" id="line-853"><code>}</code></span>
+<span class="codeline" id="line-854"><code></code></span>
+<span class="codeline" id="line-855"><code>// sendAlert sends a TLS alert message.</code></span>
+<span class="codeline" id="line-856"><code>func (c *Conn) sendAlert(err alert) error {</code></span>
+<span class="codeline" id="line-857"><code>	c.out.Lock()</code></span>
+<span class="codeline" id="line-858"><code>	defer c.out.Unlock()</code></span>
+<span class="codeline" id="line-859"><code>	return c.sendAlertLocked(err)</code></span>
+<span class="codeline" id="line-860"><code>}</code></span>
+<span class="codeline" id="line-861"><code></code></span>
+<span class="codeline" id="line-862"><code>const (</code></span>
+<span class="codeline" id="line-863"><code>	// tcpMSSEstimate is a conservative estimate of the TCP maximum segment</code></span>
+<span class="codeline" id="line-864"><code>	// size (MSS). A constant is used, rather than querying the kernel for</code></span>
+<span class="codeline" id="line-865"><code>	// the actual MSS, to avoid complexity. The value here is the IPv6</code></span>
+<span class="codeline" id="line-866"><code>	// minimum MTU (1280 bytes) minus the overhead of an IPv6 header (40</code></span>
+<span class="codeline" id="line-867"><code>	// bytes) and a TCP header with timestamps (32 bytes).</code></span>
+<span class="codeline" id="line-868"><code>	tcpMSSEstimate = 1208</code></span>
+<span class="codeline" id="line-869"><code></code></span>
+<span class="codeline" id="line-870"><code>	// recordSizeBoostThreshold is the number of bytes of application data</code></span>
+<span class="codeline" id="line-871"><code>	// sent after which the TLS record size will be increased to the</code></span>
+<span class="codeline" id="line-872"><code>	// maximum.</code></span>
+<span class="codeline" id="line-873"><code>	recordSizeBoostThreshold = 128 * 1024</code></span>
+<span class="codeline" id="line-874"><code>)</code></span>
+<span class="codeline" id="line-875"><code></code></span>
+<span class="codeline" id="line-876"><code>// maxPayloadSizeForWrite returns the maximum TLS payload size to use for the</code></span>
+<span class="codeline" id="line-877"><code>// next application data record. There is the following trade-off:</code></span>
+<span class="codeline" id="line-878"><code>//</code></span>
+<span class="codeline" id="line-879"><code>//   - For latency-sensitive applications, such as web browsing, each TLS</code></span>
+<span class="codeline" id="line-880"><code>//     record should fit in one TCP segment.</code></span>
+<span class="codeline" id="line-881"><code>//   - For throughput-sensitive applications, such as large file transfers,</code></span>
+<span class="codeline" id="line-882"><code>//     larger TLS records better amortize framing and encryption overheads.</code></span>
+<span class="codeline" id="line-883"><code>//</code></span>
+<span class="codeline" id="line-884"><code>// A simple heuristic that works well in practice is to use small records for</code></span>
+<span class="codeline" id="line-885"><code>// the first 1MB of data, then use larger records for subsequent data, and</code></span>
+<span class="codeline" id="line-886"><code>// reset back to smaller records after the connection becomes idle. See "High</code></span>
+<span class="codeline" id="line-887"><code>// Performance Web Networking", Chapter 4, or:</code></span>
+<span class="codeline" id="line-888"><code>// https://www.igvita.com/2013/10/24/optimizing-tls-record-size-and-buffering-latency/</code></span>
+<span class="codeline" id="line-889"><code>//</code></span>
+<span class="codeline" id="line-890"><code>// In the interests of simplicity and determinism, this code does not attempt</code></span>
+<span class="codeline" id="line-891"><code>// to reset the record size once the connection is idle, however.</code></span>
+<span class="codeline" id="line-892"><code>func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {</code></span>
+<span class="codeline" id="line-893"><code>	if c.config.DynamicRecordSizingDisabled || typ != recordTypeApplicationData {</code></span>
+<span class="codeline" id="line-894"><code>		return maxPlaintext</code></span>
+<span class="codeline" id="line-895"><code>	}</code></span>
+<span class="codeline" id="line-896"><code></code></span>
+<span class="codeline" id="line-897"><code>	if c.bytesSent &gt;= recordSizeBoostThreshold {</code></span>
+<span class="codeline" id="line-898"><code>		return maxPlaintext</code></span>
+<span class="codeline" id="line-899"><code>	}</code></span>
+<span class="codeline" id="line-900"><code></code></span>
+<span class="codeline" id="line-901"><code>	// Subtract TLS overheads to get the maximum payload size.</code></span>
+<span class="codeline" id="line-902"><code>	payloadBytes := tcpMSSEstimate - recordHeaderLen - c.out.explicitNonceLen()</code></span>
+<span class="codeline" id="line-903"><code>	if c.out.cipher != nil {</code></span>
+<span class="codeline" id="line-904"><code>		switch ciph := c.out.cipher.(type) {</code></span>
+<span class="codeline" id="line-905"><code>		case cipher.Stream:</code></span>
+<span class="codeline" id="line-906"><code>			payloadBytes -= c.out.mac.Size()</code></span>
+<span class="codeline" id="line-907"><code>		case cipher.AEAD:</code></span>
+<span class="codeline" id="line-908"><code>			payloadBytes -= ciph.Overhead()</code></span>
+<span class="codeline" id="line-909"><code>		case cbcMode:</code></span>
+<span class="codeline" id="line-910"><code>			blockSize := ciph.BlockSize()</code></span>
+<span class="codeline" id="line-911"><code>			// The payload must fit in a multiple of blockSize, with</code></span>
+<span class="codeline" id="line-912"><code>			// room for at least one padding byte.</code></span>
+<span class="codeline" id="line-913"><code>			payloadBytes = (payloadBytes &amp; ^(blockSize - 1)) - 1</code></span>
+<span class="codeline" id="line-914"><code>			// The MAC is appended before padding so affects the</code></span>
+<span class="codeline" id="line-915"><code>			// payload size directly.</code></span>
+<span class="codeline" id="line-916"><code>			payloadBytes -= c.out.mac.Size()</code></span>
+<span class="codeline" id="line-917"><code>		default:</code></span>
+<span class="codeline" id="line-918"><code>			panic("unknown cipher type")</code></span>
+<span class="codeline" id="line-919"><code>		}</code></span>
+<span class="codeline" id="line-920"><code>	}</code></span>
+<span class="codeline" id="line-921"><code>	if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-922"><code>		payloadBytes-- // encrypted ContentType</code></span>
+<span class="codeline" id="line-923"><code>	}</code></span>
+<span class="codeline" id="line-924"><code></code></span>
+<span class="codeline" id="line-925"><code>	// Allow packet growth in arithmetic progression up to max.</code></span>
+<span class="codeline" id="line-926"><code>	pkt := c.packetsSent</code></span>
+<span class="codeline" id="line-927"><code>	c.packetsSent++</code></span>
+<span class="codeline" id="line-928"><code>	if pkt &gt; 1000 {</code></span>
+<span class="codeline" id="line-929"><code>		return maxPlaintext // avoid overflow in multiply below</code></span>
+<span class="codeline" id="line-930"><code>	}</code></span>
+<span class="codeline" id="line-931"><code></code></span>
+<span class="codeline" id="line-932"><code>	n := payloadBytes * int(pkt+1)</code></span>
+<span class="codeline" id="line-933"><code>	if n &gt; maxPlaintext {</code></span>
+<span class="codeline" id="line-934"><code>		n = maxPlaintext</code></span>
+<span class="codeline" id="line-935"><code>	}</code></span>
+<span class="codeline" id="line-936"><code>	return n</code></span>
+<span class="codeline" id="line-937"><code>}</code></span>
+<span class="codeline" id="line-938"><code></code></span>
+<span class="codeline" id="line-939"><code>func (c *Conn) write(data []byte) (int, error) {</code></span>
+<span class="codeline" id="line-940"><code>	if c.buffering {</code></span>
+<span class="codeline" id="line-941"><code>		c.sendBuf = append(c.sendBuf, data...)</code></span>
+<span class="codeline" id="line-942"><code>		return len(data), nil</code></span>
+<span class="codeline" id="line-943"><code>	}</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>	n, err := c.conn.Write(data)</code></span>
+<span class="codeline" id="line-946"><code>	c.bytesSent += int64(n)</code></span>
+<span class="codeline" id="line-947"><code>	return n, err</code></span>
+<span class="codeline" id="line-948"><code>}</code></span>
+<span class="codeline" id="line-949"><code></code></span>
+<span class="codeline" id="line-950"><code>func (c *Conn) flush() (int, error) {</code></span>
+<span class="codeline" id="line-951"><code>	if len(c.sendBuf) == 0 {</code></span>
+<span class="codeline" id="line-952"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-953"><code>	}</code></span>
+<span class="codeline" id="line-954"><code></code></span>
+<span class="codeline" id="line-955"><code>	n, err := c.conn.Write(c.sendBuf)</code></span>
+<span class="codeline" id="line-956"><code>	c.bytesSent += int64(n)</code></span>
+<span class="codeline" id="line-957"><code>	c.sendBuf = nil</code></span>
+<span class="codeline" id="line-958"><code>	c.buffering = false</code></span>
+<span class="codeline" id="line-959"><code>	return n, err</code></span>
+<span class="codeline" id="line-960"><code>}</code></span>
+<span class="codeline" id="line-961"><code></code></span>
+<span class="codeline" id="line-962"><code>// outBufPool pools the record-sized scratch buffers used by writeRecordLocked.</code></span>
+<span class="codeline" id="line-963"><code>var outBufPool = sync.Pool{</code></span>
+<span class="codeline" id="line-964"><code>	New: func() any {</code></span>
+<span class="codeline" id="line-965"><code>		return new([]byte)</code></span>
+<span class="codeline" id="line-966"><code>	},</code></span>
+<span class="codeline" id="line-967"><code>}</code></span>
+<span class="codeline" id="line-968"><code></code></span>
+<span class="codeline" id="line-969"><code>// writeRecordLocked writes a TLS record with the given type and payload to the</code></span>
+<span class="codeline" id="line-970"><code>// connection and updates the record layer state.</code></span>
+<span class="codeline" id="line-971"><code>func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {</code></span>
+<span class="codeline" id="line-972"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-973"><code>		if typ != recordTypeHandshake {</code></span>
+<span class="codeline" id="line-974"><code>			return 0, errors.New("tls: internal error: sending non-handshake message to QUIC transport")</code></span>
+<span class="codeline" id="line-975"><code>		}</code></span>
+<span class="codeline" id="line-976"><code>		c.quicWriteCryptoData(c.out.level, data)</code></span>
+<span class="codeline" id="line-977"><code>		if !c.buffering {</code></span>
+<span class="codeline" id="line-978"><code>			if _, err := c.flush(); err != nil {</code></span>
+<span class="codeline" id="line-979"><code>				return 0, err</code></span>
+<span class="codeline" id="line-980"><code>			}</code></span>
+<span class="codeline" id="line-981"><code>		}</code></span>
+<span class="codeline" id="line-982"><code>		return len(data), nil</code></span>
+<span class="codeline" id="line-983"><code>	}</code></span>
+<span class="codeline" id="line-984"><code></code></span>
+<span class="codeline" id="line-985"><code>	outBufPtr := outBufPool.Get().(*[]byte)</code></span>
+<span class="codeline" id="line-986"><code>	outBuf := *outBufPtr</code></span>
+<span class="codeline" id="line-987"><code>	defer func() {</code></span>
+<span class="codeline" id="line-988"><code>		// You might be tempted to simplify this by just passing &amp;outBuf to Put,</code></span>
+<span class="codeline" id="line-989"><code>		// but that would make the local copy of the outBuf slice header escape</code></span>
+<span class="codeline" id="line-990"><code>		// to the heap, causing an allocation. Instead, we keep around the</code></span>
+<span class="codeline" id="line-991"><code>		// pointer to the slice header returned by Get, which is already on the</code></span>
+<span class="codeline" id="line-992"><code>		// heap, and overwrite and return that.</code></span>
+<span class="codeline" id="line-993"><code>		*outBufPtr = outBuf</code></span>
+<span class="codeline" id="line-994"><code>		outBufPool.Put(outBufPtr)</code></span>
+<span class="codeline" id="line-995"><code>	}()</code></span>
+<span class="codeline" id="line-996"><code></code></span>
+<span class="codeline" id="line-997"><code>	var n int</code></span>
+<span class="codeline" id="line-998"><code>	for len(data) &gt; 0 {</code></span>
+<span class="codeline" id="line-999"><code>		m := len(data)</code></span>
+<span class="codeline" id="line-1000"><code>		if maxPayload := c.maxPayloadSizeForWrite(typ); m &gt; maxPayload {</code></span>
+<span class="codeline" id="line-1001"><code>			m = maxPayload</code></span>
+<span class="codeline" id="line-1002"><code>		}</code></span>
+<span class="codeline" id="line-1003"><code></code></span>
+<span class="codeline" id="line-1004"><code>		_, outBuf = sliceForAppend(outBuf[:0], recordHeaderLen)</code></span>
+<span class="codeline" id="line-1005"><code>		outBuf[0] = byte(typ)</code></span>
+<span class="codeline" id="line-1006"><code>		vers := c.vers</code></span>
+<span class="codeline" id="line-1007"><code>		if vers == 0 {</code></span>
+<span class="codeline" id="line-1008"><code>			// Some TLS servers fail if the record version is</code></span>
+<span class="codeline" id="line-1009"><code>			// greater than TLS 1.0 for the initial ClientHello.</code></span>
+<span class="codeline" id="line-1010"><code>			vers = VersionTLS10</code></span>
+<span class="codeline" id="line-1011"><code>		} else if vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-1012"><code>			// TLS 1.3 froze the record layer version to 1.2.</code></span>
+<span class="codeline" id="line-1013"><code>			// See RFC 8446, Section 5.1.</code></span>
+<span class="codeline" id="line-1014"><code>			vers = VersionTLS12</code></span>
+<span class="codeline" id="line-1015"><code>		}</code></span>
+<span class="codeline" id="line-1016"><code>		outBuf[1] = byte(vers &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-1017"><code>		outBuf[2] = byte(vers)</code></span>
+<span class="codeline" id="line-1018"><code>		outBuf[3] = byte(m &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-1019"><code>		outBuf[4] = byte(m)</code></span>
+<span class="codeline" id="line-1020"><code></code></span>
+<span class="codeline" id="line-1021"><code>		var err error</code></span>
+<span class="codeline" id="line-1022"><code>		outBuf, err = c.out.encrypt(outBuf, data[:m], c.config.rand())</code></span>
+<span class="codeline" id="line-1023"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1024"><code>			return n, err</code></span>
+<span class="codeline" id="line-1025"><code>		}</code></span>
+<span class="codeline" id="line-1026"><code>		if _, err := c.write(outBuf); err != nil {</code></span>
+<span class="codeline" id="line-1027"><code>			return n, err</code></span>
+<span class="codeline" id="line-1028"><code>		}</code></span>
+<span class="codeline" id="line-1029"><code>		n += m</code></span>
+<span class="codeline" id="line-1030"><code>		data = data[m:]</code></span>
+<span class="codeline" id="line-1031"><code>	}</code></span>
+<span class="codeline" id="line-1032"><code></code></span>
+<span class="codeline" id="line-1033"><code>	if typ == recordTypeChangeCipherSpec &amp;&amp; c.vers != VersionTLS13 {</code></span>
+<span class="codeline" id="line-1034"><code>		if err := c.out.changeCipherSpec(); err != nil {</code></span>
+<span class="codeline" id="line-1035"><code>			return n, c.sendAlertLocked(err.(alert))</code></span>
+<span class="codeline" id="line-1036"><code>		}</code></span>
+<span class="codeline" id="line-1037"><code>	}</code></span>
+<span class="codeline" id="line-1038"><code></code></span>
+<span class="codeline" id="line-1039"><code>	return n, nil</code></span>
+<span class="codeline" id="line-1040"><code>}</code></span>
+<span class="codeline" id="line-1041"><code></code></span>
+<span class="codeline" id="line-1042"><code>// writeHandshakeRecord writes a handshake message to the connection and updates</code></span>
+<span class="codeline" id="line-1043"><code>// the record layer state. If transcript is non-nil the marshalled message is</code></span>
+<span class="codeline" id="line-1044"><code>// written to it.</code></span>
+<span class="codeline" id="line-1045"><code>func (c *Conn) writeHandshakeRecord(msg handshakeMessage, transcript transcriptHash) (int, error) {</code></span>
+<span class="codeline" id="line-1046"><code>	c.out.Lock()</code></span>
+<span class="codeline" id="line-1047"><code>	defer c.out.Unlock()</code></span>
+<span class="codeline" id="line-1048"><code></code></span>
+<span class="codeline" id="line-1049"><code>	data, err := msg.marshal()</code></span>
+<span class="codeline" id="line-1050"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1051"><code>		return 0, err</code></span>
+<span class="codeline" id="line-1052"><code>	}</code></span>
+<span class="codeline" id="line-1053"><code>	if transcript != nil {</code></span>
+<span class="codeline" id="line-1054"><code>		transcript.Write(data)</code></span>
+<span class="codeline" id="line-1055"><code>	}</code></span>
+<span class="codeline" id="line-1056"><code></code></span>
+<span class="codeline" id="line-1057"><code>	return c.writeRecordLocked(recordTypeHandshake, data)</code></span>
+<span class="codeline" id="line-1058"><code>}</code></span>
+<span class="codeline" id="line-1059"><code></code></span>
+<span class="codeline" id="line-1060"><code>// writeChangeCipherRecord writes a ChangeCipherSpec message to the connection and</code></span>
+<span class="codeline" id="line-1061"><code>// updates the record layer state.</code></span>
+<span class="codeline" id="line-1062"><code>func (c *Conn) writeChangeCipherRecord() error {</code></span>
+<span class="codeline" id="line-1063"><code>	c.out.Lock()</code></span>
+<span class="codeline" id="line-1064"><code>	defer c.out.Unlock()</code></span>
+<span class="codeline" id="line-1065"><code>	_, err := c.writeRecordLocked(recordTypeChangeCipherSpec, []byte{1})</code></span>
+<span class="codeline" id="line-1066"><code>	return err</code></span>
+<span class="codeline" id="line-1067"><code>}</code></span>
+<span class="codeline" id="line-1068"><code></code></span>
+<span class="codeline" id="line-1069"><code>// readHandshakeBytes reads handshake data until c.hand contains at least n bytes.</code></span>
+<span class="codeline" id="line-1070"><code>func (c *Conn) readHandshakeBytes(n int) error {</code></span>
+<span class="codeline" id="line-1071"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-1072"><code>		return c.quicReadHandshakeBytes(n)</code></span>
+<span class="codeline" id="line-1073"><code>	}</code></span>
+<span class="codeline" id="line-1074"><code>	for c.hand.Len() &lt; n {</code></span>
+<span class="codeline" id="line-1075"><code>		if err := c.readRecord(); err != nil {</code></span>
+<span class="codeline" id="line-1076"><code>			return err</code></span>
+<span class="codeline" id="line-1077"><code>		}</code></span>
+<span class="codeline" id="line-1078"><code>	}</code></span>
+<span class="codeline" id="line-1079"><code>	return nil</code></span>
+<span class="codeline" id="line-1080"><code>}</code></span>
+<span class="codeline" id="line-1081"><code></code></span>
+<span class="codeline" id="line-1082"><code>// readHandshake reads the next handshake message from</code></span>
+<span class="codeline" id="line-1083"><code>// the record layer. If transcript is non-nil, the message</code></span>
+<span class="codeline" id="line-1084"><code>// is written to the passed transcriptHash.</code></span>
+<span class="codeline" id="line-1085"><code>func (c *Conn) readHandshake(transcript transcriptHash) (any, error) {</code></span>
+<span class="codeline" id="line-1086"><code>	if err := c.readHandshakeBytes(4); err != nil {</code></span>
+<span class="codeline" id="line-1087"><code>		return nil, err</code></span>
+<span class="codeline" id="line-1088"><code>	}</code></span>
+<span class="codeline" id="line-1089"><code>	data := c.hand.Bytes()</code></span>
+<span class="codeline" id="line-1090"><code>	n := int(data[1])&lt;&lt;16 | int(data[2])&lt;&lt;8 | int(data[3])</code></span>
+<span class="codeline" id="line-1091"><code>	if n &gt; maxHandshake {</code></span>
+<span class="codeline" id="line-1092"><code>		c.sendAlertLocked(alertInternalError)</code></span>
+<span class="codeline" id="line-1093"><code>		return nil, c.in.setErrorLocked(fmt.Errorf("tls: handshake message of length %d bytes exceeds maximum of %d bytes", n, maxHandshake))</code></span>
+<span class="codeline" id="line-1094"><code>	}</code></span>
+<span class="codeline" id="line-1095"><code>	if err := c.readHandshakeBytes(4 + n); err != nil {</code></span>
+<span class="codeline" id="line-1096"><code>		return nil, err</code></span>
+<span class="codeline" id="line-1097"><code>	}</code></span>
+<span class="codeline" id="line-1098"><code>	data = c.hand.Next(4 + n)</code></span>
+<span class="codeline" id="line-1099"><code>	return c.unmarshalHandshakeMessage(data, transcript)</code></span>
+<span class="codeline" id="line-1100"><code>}</code></span>
+<span class="codeline" id="line-1101"><code></code></span>
+<span class="codeline" id="line-1102"><code>func (c *Conn) unmarshalHandshakeMessage(data []byte, transcript transcriptHash) (handshakeMessage, error) {</code></span>
+<span class="codeline" id="line-1103"><code>	var m handshakeMessage</code></span>
+<span class="codeline" id="line-1104"><code>	switch data[0] {</code></span>
+<span class="codeline" id="line-1105"><code>	case typeHelloRequest:</code></span>
+<span class="codeline" id="line-1106"><code>		m = new(helloRequestMsg)</code></span>
+<span class="codeline" id="line-1107"><code>	case typeClientHello:</code></span>
+<span class="codeline" id="line-1108"><code>		m = new(clientHelloMsg)</code></span>
+<span class="codeline" id="line-1109"><code>	case typeServerHello:</code></span>
+<span class="codeline" id="line-1110"><code>		m = new(serverHelloMsg)</code></span>
+<span class="codeline" id="line-1111"><code>	case typeNewSessionTicket:</code></span>
+<span class="codeline" id="line-1112"><code>		if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-1113"><code>			m = new(newSessionTicketMsgTLS13)</code></span>
+<span class="codeline" id="line-1114"><code>		} else {</code></span>
+<span class="codeline" id="line-1115"><code>			m = new(newSessionTicketMsg)</code></span>
+<span class="codeline" id="line-1116"><code>		}</code></span>
+<span class="codeline" id="line-1117"><code>	case typeCertificate:</code></span>
+<span class="codeline" id="line-1118"><code>		if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-1119"><code>			m = new(certificateMsgTLS13)</code></span>
+<span class="codeline" id="line-1120"><code>		} else {</code></span>
+<span class="codeline" id="line-1121"><code>			m = new(certificateMsg)</code></span>
+<span class="codeline" id="line-1122"><code>		}</code></span>
+<span class="codeline" id="line-1123"><code>	case typeCertificateRequest:</code></span>
+<span class="codeline" id="line-1124"><code>		if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-1125"><code>			m = new(certificateRequestMsgTLS13)</code></span>
+<span class="codeline" id="line-1126"><code>		} else {</code></span>
+<span class="codeline" id="line-1127"><code>			m = &amp;certificateRequestMsg{</code></span>
+<span class="codeline" id="line-1128"><code>				hasSignatureAlgorithm: c.vers &gt;= VersionTLS12,</code></span>
+<span class="codeline" id="line-1129"><code>			}</code></span>
+<span class="codeline" id="line-1130"><code>		}</code></span>
+<span class="codeline" id="line-1131"><code>	case typeCertificateStatus:</code></span>
+<span class="codeline" id="line-1132"><code>		m = new(certificateStatusMsg)</code></span>
+<span class="codeline" id="line-1133"><code>	case typeServerKeyExchange:</code></span>
+<span class="codeline" id="line-1134"><code>		m = new(serverKeyExchangeMsg)</code></span>
+<span class="codeline" id="line-1135"><code>	case typeServerHelloDone:</code></span>
+<span class="codeline" id="line-1136"><code>		m = new(serverHelloDoneMsg)</code></span>
+<span class="codeline" id="line-1137"><code>	case typeClientKeyExchange:</code></span>
+<span class="codeline" id="line-1138"><code>		m = new(clientKeyExchangeMsg)</code></span>
+<span class="codeline" id="line-1139"><code>	case typeCertificateVerify:</code></span>
+<span class="codeline" id="line-1140"><code>		m = &amp;certificateVerifyMsg{</code></span>
+<span class="codeline" id="line-1141"><code>			hasSignatureAlgorithm: c.vers &gt;= VersionTLS12,</code></span>
+<span class="codeline" id="line-1142"><code>		}</code></span>
+<span class="codeline" id="line-1143"><code>	case typeFinished:</code></span>
+<span class="codeline" id="line-1144"><code>		m = new(finishedMsg)</code></span>
+<span class="codeline" id="line-1145"><code>	case typeEncryptedExtensions:</code></span>
+<span class="codeline" id="line-1146"><code>		m = new(encryptedExtensionsMsg)</code></span>
+<span class="codeline" id="line-1147"><code>	case typeEndOfEarlyData:</code></span>
+<span class="codeline" id="line-1148"><code>		m = new(endOfEarlyDataMsg)</code></span>
+<span class="codeline" id="line-1149"><code>	case typeKeyUpdate:</code></span>
+<span class="codeline" id="line-1150"><code>		m = new(keyUpdateMsg)</code></span>
+<span class="codeline" id="line-1151"><code>	default:</code></span>
+<span class="codeline" id="line-1152"><code>		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-1153"><code>	}</code></span>
+<span class="codeline" id="line-1154"><code></code></span>
+<span class="codeline" id="line-1155"><code>	// The handshake message unmarshalers</code></span>
+<span class="codeline" id="line-1156"><code>	// expect to be able to keep references to data,</code></span>
+<span class="codeline" id="line-1157"><code>	// so pass in a fresh copy that won't be overwritten.</code></span>
+<span class="codeline" id="line-1158"><code>	data = append([]byte(nil), data...)</code></span>
+<span class="codeline" id="line-1159"><code></code></span>
+<span class="codeline" id="line-1160"><code>	if !m.unmarshal(data) {</code></span>
+<span class="codeline" id="line-1161"><code>		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))</code></span>
+<span class="codeline" id="line-1162"><code>	}</code></span>
+<span class="codeline" id="line-1163"><code></code></span>
+<span class="codeline" id="line-1164"><code>	if transcript != nil {</code></span>
+<span class="codeline" id="line-1165"><code>		transcript.Write(data)</code></span>
+<span class="codeline" id="line-1166"><code>	}</code></span>
+<span class="codeline" id="line-1167"><code></code></span>
+<span class="codeline" id="line-1168"><code>	return m, nil</code></span>
+<span class="codeline" id="line-1169"><code>}</code></span>
+<span class="codeline" id="line-1170"><code></code></span>
+<span class="codeline" id="line-1171"><code>var (</code></span>
+<span class="codeline" id="line-1172"><code>	errShutdown = errors.New("tls: protocol is shutdown")</code></span>
+<span class="codeline" id="line-1173"><code>)</code></span>
+<span class="codeline" id="line-1174"><code></code></span>
+<span class="codeline" id="line-1175"><code>// Write writes data to the connection.</code></span>
+<span class="codeline" id="line-1176"><code>//</code></span>
+<span class="codeline" id="line-1177"><code>// As Write calls [Conn.Handshake], in order to prevent indefinite blocking a deadline</code></span>
+<span class="codeline" id="line-1178"><code>// must be set for both [Conn.Read] and Write before Write is called when the handshake</code></span>
+<span class="codeline" id="line-1179"><code>// has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and</code></span>
+<span class="codeline" id="line-1180"><code>// [Conn.SetWriteDeadline].</code></span>
+<span class="codeline" id="line-1181"><code>func (c *Conn) Write(b []byte) (int, error) {</code></span>
+<span class="codeline" id="line-1182"><code>	// interlock with Close below</code></span>
+<span class="codeline" id="line-1183"><code>	for {</code></span>
+<span class="codeline" id="line-1184"><code>		x := c.activeCall.Load()</code></span>
+<span class="codeline" id="line-1185"><code>		if x&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-1186"><code>			return 0, net.ErrClosed</code></span>
+<span class="codeline" id="line-1187"><code>		}</code></span>
+<span class="codeline" id="line-1188"><code>		if c.activeCall.CompareAndSwap(x, x+2) {</code></span>
+<span class="codeline" id="line-1189"><code>			break</code></span>
+<span class="codeline" id="line-1190"><code>		}</code></span>
+<span class="codeline" id="line-1191"><code>	}</code></span>
+<span class="codeline" id="line-1192"><code>	defer c.activeCall.Add(-2)</code></span>
+<span class="codeline" id="line-1193"><code></code></span>
+<span class="codeline" id="line-1194"><code>	if err := c.Handshake(); err != nil {</code></span>
+<span class="codeline" id="line-1195"><code>		return 0, err</code></span>
+<span class="codeline" id="line-1196"><code>	}</code></span>
+<span class="codeline" id="line-1197"><code></code></span>
+<span class="codeline" id="line-1198"><code>	c.out.Lock()</code></span>
+<span class="codeline" id="line-1199"><code>	defer c.out.Unlock()</code></span>
+<span class="codeline" id="line-1200"><code></code></span>
+<span class="codeline" id="line-1201"><code>	if err := c.out.err; err != nil {</code></span>
+<span class="codeline" id="line-1202"><code>		return 0, err</code></span>
+<span class="codeline" id="line-1203"><code>	}</code></span>
+<span class="codeline" id="line-1204"><code></code></span>
+<span class="codeline" id="line-1205"><code>	if !c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1206"><code>		return 0, alertInternalError</code></span>
+<span class="codeline" id="line-1207"><code>	}</code></span>
+<span class="codeline" id="line-1208"><code></code></span>
+<span class="codeline" id="line-1209"><code>	if c.closeNotifySent {</code></span>
+<span class="codeline" id="line-1210"><code>		return 0, errShutdown</code></span>
+<span class="codeline" id="line-1211"><code>	}</code></span>
+<span class="codeline" id="line-1212"><code></code></span>
+<span class="codeline" id="line-1213"><code>	// TLS 1.0 is susceptible to a chosen-plaintext</code></span>
+<span class="codeline" id="line-1214"><code>	// attack when using block mode ciphers due to predictable IVs.</code></span>
+<span class="codeline" id="line-1215"><code>	// This can be prevented by splitting each Application Data</code></span>
+<span class="codeline" id="line-1216"><code>	// record into two records, effectively randomizing the IV.</code></span>
+<span class="codeline" id="line-1217"><code>	//</code></span>
+<span class="codeline" id="line-1218"><code>	// https://www.openssl.org/~bodo/tls-cbc.txt</code></span>
+<span class="codeline" id="line-1219"><code>	// https://bugzilla.mozilla.org/show_bug.cgi?id=665814</code></span>
+<span class="codeline" id="line-1220"><code>	// https://www.imperialviolet.org/2012/01/15/beastfollowup.html</code></span>
+<span class="codeline" id="line-1221"><code></code></span>
+<span class="codeline" id="line-1222"><code>	var m int</code></span>
+<span class="codeline" id="line-1223"><code>	if len(b) &gt; 1 &amp;&amp; c.vers == VersionTLS10 {</code></span>
+<span class="codeline" id="line-1224"><code>		if _, ok := c.out.cipher.(cipher.BlockMode); ok {</code></span>
+<span class="codeline" id="line-1225"><code>			n, err := c.writeRecordLocked(recordTypeApplicationData, b[:1])</code></span>
+<span class="codeline" id="line-1226"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-1227"><code>				return n, c.out.setErrorLocked(err)</code></span>
+<span class="codeline" id="line-1228"><code>			}</code></span>
+<span class="codeline" id="line-1229"><code>			m, b = 1, b[1:]</code></span>
+<span class="codeline" id="line-1230"><code>		}</code></span>
+<span class="codeline" id="line-1231"><code>	}</code></span>
+<span class="codeline" id="line-1232"><code></code></span>
+<span class="codeline" id="line-1233"><code>	n, err := c.writeRecordLocked(recordTypeApplicationData, b)</code></span>
+<span class="codeline" id="line-1234"><code>	return n + m, c.out.setErrorLocked(err)</code></span>
+<span class="codeline" id="line-1235"><code>}</code></span>
+<span class="codeline" id="line-1236"><code></code></span>
+<span class="codeline" id="line-1237"><code>// handleRenegotiation processes a HelloRequest handshake message.</code></span>
+<span class="codeline" id="line-1238"><code>func (c *Conn) handleRenegotiation() error {</code></span>
+<span class="codeline" id="line-1239"><code>	if c.vers == VersionTLS13 {</code></span>
+<span class="codeline" id="line-1240"><code>		return errors.New("tls: internal error: unexpected renegotiation")</code></span>
+<span class="codeline" id="line-1241"><code>	}</code></span>
+<span class="codeline" id="line-1242"><code></code></span>
+<span class="codeline" id="line-1243"><code>	msg, err := c.readHandshake(nil)</code></span>
+<span class="codeline" id="line-1244"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1245"><code>		return err</code></span>
+<span class="codeline" id="line-1246"><code>	}</code></span>
+<span class="codeline" id="line-1247"><code></code></span>
+<span class="codeline" id="line-1248"><code>	helloReq, ok := msg.(*helloRequestMsg)</code></span>
+<span class="codeline" id="line-1249"><code>	if !ok {</code></span>
+<span class="codeline" id="line-1250"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-1251"><code>		return unexpectedMessageError(helloReq, msg)</code></span>
+<span class="codeline" id="line-1252"><code>	}</code></span>
+<span class="codeline" id="line-1253"><code></code></span>
+<span class="codeline" id="line-1254"><code>	if !c.isClient {</code></span>
+<span class="codeline" id="line-1255"><code>		return c.sendAlert(alertNoRenegotiation)</code></span>
+<span class="codeline" id="line-1256"><code>	}</code></span>
+<span class="codeline" id="line-1257"><code></code></span>
+<span class="codeline" id="line-1258"><code>	switch c.config.Renegotiation {</code></span>
+<span class="codeline" id="line-1259"><code>	case RenegotiateNever:</code></span>
+<span class="codeline" id="line-1260"><code>		return c.sendAlert(alertNoRenegotiation)</code></span>
+<span class="codeline" id="line-1261"><code>	case RenegotiateOnceAsClient:</code></span>
+<span class="codeline" id="line-1262"><code>		if c.handshakes &gt; 1 {</code></span>
+<span class="codeline" id="line-1263"><code>			return c.sendAlert(alertNoRenegotiation)</code></span>
+<span class="codeline" id="line-1264"><code>		}</code></span>
+<span class="codeline" id="line-1265"><code>	case RenegotiateFreelyAsClient:</code></span>
+<span class="codeline" id="line-1266"><code>		// Ok.</code></span>
+<span class="codeline" id="line-1267"><code>	default:</code></span>
+<span class="codeline" id="line-1268"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-1269"><code>		return errors.New("tls: unknown Renegotiation value")</code></span>
+<span class="codeline" id="line-1270"><code>	}</code></span>
+<span class="codeline" id="line-1271"><code></code></span>
+<span class="codeline" id="line-1272"><code>	c.handshakeMutex.Lock()</code></span>
+<span class="codeline" id="line-1273"><code>	defer c.handshakeMutex.Unlock()</code></span>
+<span class="codeline" id="line-1274"><code></code></span>
+<span class="codeline" id="line-1275"><code>	c.isHandshakeComplete.Store(false)</code></span>
+<span class="codeline" id="line-1276"><code>	if c.handshakeErr = c.clientHandshake(context.Background()); c.handshakeErr == nil {</code></span>
+<span class="codeline" id="line-1277"><code>		c.handshakes++</code></span>
+<span class="codeline" id="line-1278"><code>	}</code></span>
+<span class="codeline" id="line-1279"><code>	return c.handshakeErr</code></span>
+<span class="codeline" id="line-1280"><code>}</code></span>
+<span class="codeline" id="line-1281"><code></code></span>
+<span class="codeline" id="line-1282"><code>// handlePostHandshakeMessage processes a handshake message arrived after the</code></span>
+<span class="codeline" id="line-1283"><code>// handshake is complete. Up to TLS 1.2, it indicates the start of a renegotiation.</code></span>
+<span class="codeline" id="line-1284"><code>func (c *Conn) handlePostHandshakeMessage() error {</code></span>
+<span class="codeline" id="line-1285"><code>	if c.vers != VersionTLS13 {</code></span>
+<span class="codeline" id="line-1286"><code>		return c.handleRenegotiation()</code></span>
+<span class="codeline" id="line-1287"><code>	}</code></span>
+<span class="codeline" id="line-1288"><code></code></span>
+<span class="codeline" id="line-1289"><code>	msg, err := c.readHandshake(nil)</code></span>
+<span class="codeline" id="line-1290"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1291"><code>		return err</code></span>
+<span class="codeline" id="line-1292"><code>	}</code></span>
+<span class="codeline" id="line-1293"><code>	c.retryCount++</code></span>
+<span class="codeline" id="line-1294"><code>	if c.retryCount &gt; maxUselessRecords {</code></span>
+<span class="codeline" id="line-1295"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-1296"><code>		return c.in.setErrorLocked(errors.New("tls: too many non-advancing records"))</code></span>
+<span class="codeline" id="line-1297"><code>	}</code></span>
+<span class="codeline" id="line-1298"><code></code></span>
+<span class="codeline" id="line-1299"><code>	switch msg := msg.(type) {</code></span>
+<span class="codeline" id="line-1300"><code>	case *newSessionTicketMsgTLS13:</code></span>
+<span class="codeline" id="line-1301"><code>		return c.handleNewSessionTicket(msg)</code></span>
+<span class="codeline" id="line-1302"><code>	case *keyUpdateMsg:</code></span>
+<span class="codeline" id="line-1303"><code>		return c.handleKeyUpdate(msg)</code></span>
+<span class="codeline" id="line-1304"><code>	}</code></span>
+<span class="codeline" id="line-1305"><code>	// The QUIC layer is supposed to treat an unexpected post-handshake CertificateRequest</code></span>
+<span class="codeline" id="line-1306"><code>	// as a QUIC-level PROTOCOL_VIOLATION error (RFC 9001, Section 4.4). Returning an</code></span>
+<span class="codeline" id="line-1307"><code>	// unexpected_message alert here doesn't provide it with enough information to distinguish</code></span>
+<span class="codeline" id="line-1308"><code>	// this condition from other unexpected messages. This is probably fine.</code></span>
+<span class="codeline" id="line-1309"><code>	c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-1310"><code>	return fmt.Errorf("tls: received unexpected handshake message of type %T", msg)</code></span>
+<span class="codeline" id="line-1311"><code>}</code></span>
+<span class="codeline" id="line-1312"><code></code></span>
+<span class="codeline" id="line-1313"><code>func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {</code></span>
+<span class="codeline" id="line-1314"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-1315"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-1316"><code>		return c.in.setErrorLocked(errors.New("tls: received unexpected key update message"))</code></span>
+<span class="codeline" id="line-1317"><code>	}</code></span>
+<span class="codeline" id="line-1318"><code></code></span>
+<span class="codeline" id="line-1319"><code>	cipherSuite := cipherSuiteTLS13ByID(c.cipherSuite)</code></span>
+<span class="codeline" id="line-1320"><code>	if cipherSuite == nil {</code></span>
+<span class="codeline" id="line-1321"><code>		return c.in.setErrorLocked(c.sendAlert(alertInternalError))</code></span>
+<span class="codeline" id="line-1322"><code>	}</code></span>
+<span class="codeline" id="line-1323"><code></code></span>
+<span class="codeline" id="line-1324"><code>	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)</code></span>
+<span class="codeline" id="line-1325"><code>	c.in.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)</code></span>
+<span class="codeline" id="line-1326"><code></code></span>
+<span class="codeline" id="line-1327"><code>	if keyUpdate.updateRequested {</code></span>
+<span class="codeline" id="line-1328"><code>		c.out.Lock()</code></span>
+<span class="codeline" id="line-1329"><code>		defer c.out.Unlock()</code></span>
+<span class="codeline" id="line-1330"><code></code></span>
+<span class="codeline" id="line-1331"><code>		msg := &amp;keyUpdateMsg{}</code></span>
+<span class="codeline" id="line-1332"><code>		msgBytes, err := msg.marshal()</code></span>
+<span class="codeline" id="line-1333"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1334"><code>			return err</code></span>
+<span class="codeline" id="line-1335"><code>		}</code></span>
+<span class="codeline" id="line-1336"><code>		_, err = c.writeRecordLocked(recordTypeHandshake, msgBytes)</code></span>
+<span class="codeline" id="line-1337"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1338"><code>			// Surface the error at the next write.</code></span>
+<span class="codeline" id="line-1339"><code>			c.out.setErrorLocked(err)</code></span>
+<span class="codeline" id="line-1340"><code>			return nil</code></span>
+<span class="codeline" id="line-1341"><code>		}</code></span>
+<span class="codeline" id="line-1342"><code></code></span>
+<span class="codeline" id="line-1343"><code>		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)</code></span>
+<span class="codeline" id="line-1344"><code>		c.out.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)</code></span>
+<span class="codeline" id="line-1345"><code>	}</code></span>
+<span class="codeline" id="line-1346"><code></code></span>
+<span class="codeline" id="line-1347"><code>	return nil</code></span>
+<span class="codeline" id="line-1348"><code>}</code></span>
+<span class="codeline" id="line-1349"><code></code></span>
+<span class="codeline" id="line-1350"><code>// Read reads data from the connection.</code></span>
+<span class="codeline" id="line-1351"><code>//</code></span>
+<span class="codeline" id="line-1352"><code>// As Read calls [Conn.Handshake], in order to prevent indefinite blocking a deadline</code></span>
+<span class="codeline" id="line-1353"><code>// must be set for both Read and [Conn.Write] before Read is called when the handshake</code></span>
+<span class="codeline" id="line-1354"><code>// has not yet completed. See [Conn.SetDeadline], [Conn.SetReadDeadline], and</code></span>
+<span class="codeline" id="line-1355"><code>// [Conn.SetWriteDeadline].</code></span>
+<span class="codeline" id="line-1356"><code>func (c *Conn) Read(b []byte) (int, error) {</code></span>
+<span class="codeline" id="line-1357"><code>	if err := c.Handshake(); err != nil {</code></span>
+<span class="codeline" id="line-1358"><code>		return 0, err</code></span>
+<span class="codeline" id="line-1359"><code>	}</code></span>
+<span class="codeline" id="line-1360"><code>	if len(b) == 0 {</code></span>
+<span class="codeline" id="line-1361"><code>		// Put this after Handshake, in case people were calling</code></span>
+<span class="codeline" id="line-1362"><code>		// Read(nil) for the side effect of the Handshake.</code></span>
+<span class="codeline" id="line-1363"><code>		return 0, nil</code></span>
+<span class="codeline" id="line-1364"><code>	}</code></span>
+<span class="codeline" id="line-1365"><code></code></span>
+<span class="codeline" id="line-1366"><code>	c.in.Lock()</code></span>
+<span class="codeline" id="line-1367"><code>	defer c.in.Unlock()</code></span>
+<span class="codeline" id="line-1368"><code></code></span>
+<span class="codeline" id="line-1369"><code>	for c.input.Len() == 0 {</code></span>
+<span class="codeline" id="line-1370"><code>		if err := c.readRecord(); err != nil {</code></span>
+<span class="codeline" id="line-1371"><code>			return 0, err</code></span>
+<span class="codeline" id="line-1372"><code>		}</code></span>
+<span class="codeline" id="line-1373"><code>		for c.hand.Len() &gt; 0 {</code></span>
+<span class="codeline" id="line-1374"><code>			if err := c.handlePostHandshakeMessage(); err != nil {</code></span>
+<span class="codeline" id="line-1375"><code>				return 0, err</code></span>
+<span class="codeline" id="line-1376"><code>			}</code></span>
+<span class="codeline" id="line-1377"><code>		}</code></span>
+<span class="codeline" id="line-1378"><code>	}</code></span>
+<span class="codeline" id="line-1379"><code></code></span>
+<span class="codeline" id="line-1380"><code>	n, _ := c.input.Read(b)</code></span>
+<span class="codeline" id="line-1381"><code></code></span>
+<span class="codeline" id="line-1382"><code>	// If a close-notify alert is waiting, read it so that we can return (n,</code></span>
+<span class="codeline" id="line-1383"><code>	// EOF) instead of (n, nil), to signal to the HTTP response reading</code></span>
+<span class="codeline" id="line-1384"><code>	// goroutine that the connection is now closed. This eliminates a race</code></span>
+<span class="codeline" id="line-1385"><code>	// where the HTTP response reading goroutine would otherwise not observe</code></span>
+<span class="codeline" id="line-1386"><code>	// the EOF until its next read, by which time a client goroutine might</code></span>
+<span class="codeline" id="line-1387"><code>	// have already tried to reuse the HTTP connection for a new request.</code></span>
+<span class="codeline" id="line-1388"><code>	// See https://golang.org/cl/76400046 and https://golang.org/issue/3514</code></span>
+<span class="codeline" id="line-1389"><code>	if n != 0 &amp;&amp; c.input.Len() == 0 &amp;&amp; c.rawInput.Len() &gt; 0 &amp;&amp;</code></span>
+<span class="codeline" id="line-1390"><code>		recordType(c.rawInput.Bytes()[0]) == recordTypeAlert {</code></span>
+<span class="codeline" id="line-1391"><code>		if err := c.readRecord(); err != nil {</code></span>
+<span class="codeline" id="line-1392"><code>			return n, err // will be io.EOF on closeNotify</code></span>
+<span class="codeline" id="line-1393"><code>		}</code></span>
+<span class="codeline" id="line-1394"><code>	}</code></span>
+<span class="codeline" id="line-1395"><code></code></span>
+<span class="codeline" id="line-1396"><code>	return n, nil</code></span>
+<span class="codeline" id="line-1397"><code>}</code></span>
+<span class="codeline" id="line-1398"><code></code></span>
+<span class="codeline" id="line-1399"><code>// Close closes the connection.</code></span>
+<span class="codeline" id="line-1400"><code>func (c *Conn) Close() error {</code></span>
+<span class="codeline" id="line-1401"><code>	// Interlock with Conn.Write above.</code></span>
+<span class="codeline" id="line-1402"><code>	var x int32</code></span>
+<span class="codeline" id="line-1403"><code>	for {</code></span>
+<span class="codeline" id="line-1404"><code>		x = c.activeCall.Load()</code></span>
+<span class="codeline" id="line-1405"><code>		if x&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-1406"><code>			return net.ErrClosed</code></span>
+<span class="codeline" id="line-1407"><code>		}</code></span>
+<span class="codeline" id="line-1408"><code>		if c.activeCall.CompareAndSwap(x, x|1) {</code></span>
+<span class="codeline" id="line-1409"><code>			break</code></span>
+<span class="codeline" id="line-1410"><code>		}</code></span>
+<span class="codeline" id="line-1411"><code>	}</code></span>
+<span class="codeline" id="line-1412"><code>	if x != 0 {</code></span>
+<span class="codeline" id="line-1413"><code>		// io.Writer and io.Closer should not be used concurrently.</code></span>
+<span class="codeline" id="line-1414"><code>		// If Close is called while a Write is currently in-flight,</code></span>
+<span class="codeline" id="line-1415"><code>		// interpret that as a sign that this Close is really just</code></span>
+<span class="codeline" id="line-1416"><code>		// being used to break the Write and/or clean up resources and</code></span>
+<span class="codeline" id="line-1417"><code>		// avoid sending the alertCloseNotify, which may block</code></span>
+<span class="codeline" id="line-1418"><code>		// waiting on handshakeMutex or the c.out mutex.</code></span>
+<span class="codeline" id="line-1419"><code>		return c.conn.Close()</code></span>
+<span class="codeline" id="line-1420"><code>	}</code></span>
+<span class="codeline" id="line-1421"><code></code></span>
+<span class="codeline" id="line-1422"><code>	var alertErr error</code></span>
+<span class="codeline" id="line-1423"><code>	if c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1424"><code>		if err := c.closeNotify(); err != nil {</code></span>
+<span class="codeline" id="line-1425"><code>			alertErr = fmt.Errorf("tls: failed to send closeNotify alert (but connection was closed anyway): %w", err)</code></span>
+<span class="codeline" id="line-1426"><code>		}</code></span>
+<span class="codeline" id="line-1427"><code>	}</code></span>
+<span class="codeline" id="line-1428"><code></code></span>
+<span class="codeline" id="line-1429"><code>	if err := c.conn.Close(); err != nil {</code></span>
+<span class="codeline" id="line-1430"><code>		return err</code></span>
+<span class="codeline" id="line-1431"><code>	}</code></span>
+<span class="codeline" id="line-1432"><code>	return alertErr</code></span>
+<span class="codeline" id="line-1433"><code>}</code></span>
+<span class="codeline" id="line-1434"><code></code></span>
+<span class="codeline" id="line-1435"><code>var errEarlyCloseWrite = errors.New("tls: CloseWrite called before handshake complete")</code></span>
+<span class="codeline" id="line-1436"><code></code></span>
+<span class="codeline" id="line-1437"><code>// CloseWrite shuts down the writing side of the connection. It should only be</code></span>
+<span class="codeline" id="line-1438"><code>// called once the handshake has completed and does not call CloseWrite on the</code></span>
+<span class="codeline" id="line-1439"><code>// underlying connection. Most callers should just use [Conn.Close].</code></span>
+<span class="codeline" id="line-1440"><code>func (c *Conn) CloseWrite() error {</code></span>
+<span class="codeline" id="line-1441"><code>	if !c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1442"><code>		return errEarlyCloseWrite</code></span>
+<span class="codeline" id="line-1443"><code>	}</code></span>
+<span class="codeline" id="line-1444"><code></code></span>
+<span class="codeline" id="line-1445"><code>	return c.closeNotify()</code></span>
+<span class="codeline" id="line-1446"><code>}</code></span>
+<span class="codeline" id="line-1447"><code></code></span>
+<span class="codeline" id="line-1448"><code>func (c *Conn) closeNotify() error {</code></span>
+<span class="codeline" id="line-1449"><code>	c.out.Lock()</code></span>
+<span class="codeline" id="line-1450"><code>	defer c.out.Unlock()</code></span>
+<span class="codeline" id="line-1451"><code></code></span>
+<span class="codeline" id="line-1452"><code>	if !c.closeNotifySent {</code></span>
+<span class="codeline" id="line-1453"><code>		// Set a Write Deadline to prevent possibly blocking forever.</code></span>
+<span class="codeline" id="line-1454"><code>		c.SetWriteDeadline(time.Now().Add(time.Second * 5))</code></span>
+<span class="codeline" id="line-1455"><code>		c.closeNotifyErr = c.sendAlertLocked(alertCloseNotify)</code></span>
+<span class="codeline" id="line-1456"><code>		c.closeNotifySent = true</code></span>
+<span class="codeline" id="line-1457"><code>		// Any subsequent writes will fail.</code></span>
+<span class="codeline" id="line-1458"><code>		c.SetWriteDeadline(time.Now())</code></span>
+<span class="codeline" id="line-1459"><code>	}</code></span>
+<span class="codeline" id="line-1460"><code>	return c.closeNotifyErr</code></span>
+<span class="codeline" id="line-1461"><code>}</code></span>
+<span class="codeline" id="line-1462"><code></code></span>
+<span class="codeline" id="line-1463"><code>// Handshake runs the client or server handshake</code></span>
+<span class="codeline" id="line-1464"><code>// protocol if it has not yet been run.</code></span>
+<span class="codeline" id="line-1465"><code>//</code></span>
+<span class="codeline" id="line-1466"><code>// Most uses of this package need not call Handshake explicitly: the</code></span>
+<span class="codeline" id="line-1467"><code>// first [Conn.Read] or [Conn.Write] will call it automatically.</code></span>
+<span class="codeline" id="line-1468"><code>//</code></span>
+<span class="codeline" id="line-1469"><code>// For control over canceling or setting a timeout on a handshake, use</code></span>
+<span class="codeline" id="line-1470"><code>// [Conn.HandshakeContext] or the [Dialer]'s DialContext method instead.</code></span>
+<span class="codeline" id="line-1471"><code>//</code></span>
+<span class="codeline" id="line-1472"><code>// In order to avoid denial of service attacks, the maximum RSA key size allowed</code></span>
+<span class="codeline" id="line-1473"><code>// in certificates sent by either the TLS server or client is limited to 8192</code></span>
+<span class="codeline" id="line-1474"><code>// bits. This limit can be overridden by setting tlsmaxrsasize in the GODEBUG</code></span>
+<span class="codeline" id="line-1475"><code>// environment variable (e.g. GODEBUG=tlsmaxrsasize=4096).</code></span>
+<span class="codeline" id="line-1476"><code>func (c *Conn) Handshake() error {</code></span>
+<span class="codeline" id="line-1477"><code>	return c.HandshakeContext(context.Background())</code></span>
+<span class="codeline" id="line-1478"><code>}</code></span>
+<span class="codeline" id="line-1479"><code></code></span>
+<span class="codeline" id="line-1480"><code>// HandshakeContext runs the client or server handshake</code></span>
+<span class="codeline" id="line-1481"><code>// protocol if it has not yet been run.</code></span>
+<span class="codeline" id="line-1482"><code>//</code></span>
+<span class="codeline" id="line-1483"><code>// The provided Context must be non-nil. If the context is canceled before</code></span>
+<span class="codeline" id="line-1484"><code>// the handshake is complete, the handshake is interrupted and an error is returned.</code></span>
+<span class="codeline" id="line-1485"><code>// Once the handshake has completed, cancellation of the context will not affect the</code></span>
+<span class="codeline" id="line-1486"><code>// connection.</code></span>
+<span class="codeline" id="line-1487"><code>//</code></span>
+<span class="codeline" id="line-1488"><code>// Most uses of this package need not call HandshakeContext explicitly: the</code></span>
+<span class="codeline" id="line-1489"><code>// first [Conn.Read] or [Conn.Write] will call it automatically.</code></span>
+<span class="codeline" id="line-1490"><code>func (c *Conn) HandshakeContext(ctx context.Context) error {</code></span>
+<span class="codeline" id="line-1491"><code>	// Delegate to unexported method for named return</code></span>
+<span class="codeline" id="line-1492"><code>	// without confusing documented signature.</code></span>
+<span class="codeline" id="line-1493"><code>	return c.handshakeContext(ctx)</code></span>
+<span class="codeline" id="line-1494"><code>}</code></span>
+<span class="codeline" id="line-1495"><code></code></span>
+<span class="codeline" id="line-1496"><code>func (c *Conn) handshakeContext(ctx context.Context) (ret error) {</code></span>
+<span class="codeline" id="line-1497"><code>	// Fast sync/atomic-based exit if there is no handshake in flight and the</code></span>
+<span class="codeline" id="line-1498"><code>	// last one succeeded without an error. Avoids the expensive context setup</code></span>
+<span class="codeline" id="line-1499"><code>	// and mutex for most Read and Write calls.</code></span>
+<span class="codeline" id="line-1500"><code>	if c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1501"><code>		return nil</code></span>
+<span class="codeline" id="line-1502"><code>	}</code></span>
+<span class="codeline" id="line-1503"><code></code></span>
+<span class="codeline" id="line-1504"><code>	handshakeCtx, cancel := context.WithCancel(ctx)</code></span>
+<span class="codeline" id="line-1505"><code>	// Note: defer this before starting the "interrupter" goroutine</code></span>
+<span class="codeline" id="line-1506"><code>	// so that we can tell the difference between the input being canceled and</code></span>
+<span class="codeline" id="line-1507"><code>	// this cancellation. In the former case, we need to close the connection.</code></span>
+<span class="codeline" id="line-1508"><code>	defer cancel()</code></span>
+<span class="codeline" id="line-1509"><code></code></span>
+<span class="codeline" id="line-1510"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-1511"><code>		c.quic.cancelc = handshakeCtx.Done()</code></span>
+<span class="codeline" id="line-1512"><code>		c.quic.cancel = cancel</code></span>
+<span class="codeline" id="line-1513"><code>	} else if ctx.Done() != nil {</code></span>
+<span class="codeline" id="line-1514"><code>		// Start the "interrupter" goroutine, if this context might be canceled.</code></span>
+<span class="codeline" id="line-1515"><code>		// (The background context cannot).</code></span>
+<span class="codeline" id="line-1516"><code>		//</code></span>
+<span class="codeline" id="line-1517"><code>		// The interrupter goroutine waits for the input context to be done and</code></span>
+<span class="codeline" id="line-1518"><code>		// closes the connection if this happens before the function returns.</code></span>
+<span class="codeline" id="line-1519"><code>		done := make(chan struct{})</code></span>
+<span class="codeline" id="line-1520"><code>		interruptRes := make(chan error, 1)</code></span>
+<span class="codeline" id="line-1521"><code>		defer func() {</code></span>
+<span class="codeline" id="line-1522"><code>			close(done)</code></span>
+<span class="codeline" id="line-1523"><code>			if ctxErr := &lt;-interruptRes; ctxErr != nil {</code></span>
+<span class="codeline" id="line-1524"><code>				// Return context error to user.</code></span>
+<span class="codeline" id="line-1525"><code>				ret = ctxErr</code></span>
+<span class="codeline" id="line-1526"><code>			}</code></span>
+<span class="codeline" id="line-1527"><code>		}()</code></span>
+<span class="codeline" id="line-1528"><code>		go func() {</code></span>
+<span class="codeline" id="line-1529"><code>			select {</code></span>
+<span class="codeline" id="line-1530"><code>			case &lt;-handshakeCtx.Done():</code></span>
+<span class="codeline" id="line-1531"><code>				// Close the connection, discarding the error</code></span>
+<span class="codeline" id="line-1532"><code>				_ = c.conn.Close()</code></span>
+<span class="codeline" id="line-1533"><code>				interruptRes &lt;- handshakeCtx.Err()</code></span>
+<span class="codeline" id="line-1534"><code>			case &lt;-done:</code></span>
+<span class="codeline" id="line-1535"><code>				interruptRes &lt;- nil</code></span>
+<span class="codeline" id="line-1536"><code>			}</code></span>
+<span class="codeline" id="line-1537"><code>		}()</code></span>
+<span class="codeline" id="line-1538"><code>	}</code></span>
+<span class="codeline" id="line-1539"><code></code></span>
+<span class="codeline" id="line-1540"><code>	c.handshakeMutex.Lock()</code></span>
+<span class="codeline" id="line-1541"><code>	defer c.handshakeMutex.Unlock()</code></span>
+<span class="codeline" id="line-1542"><code></code></span>
+<span class="codeline" id="line-1543"><code>	if err := c.handshakeErr; err != nil {</code></span>
+<span class="codeline" id="line-1544"><code>		return err</code></span>
+<span class="codeline" id="line-1545"><code>	}</code></span>
+<span class="codeline" id="line-1546"><code>	if c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1547"><code>		return nil</code></span>
+<span class="codeline" id="line-1548"><code>	}</code></span>
+<span class="codeline" id="line-1549"><code></code></span>
+<span class="codeline" id="line-1550"><code>	c.in.Lock()</code></span>
+<span class="codeline" id="line-1551"><code>	defer c.in.Unlock()</code></span>
+<span class="codeline" id="line-1552"><code></code></span>
+<span class="codeline" id="line-1553"><code>	c.handshakeErr = c.handshakeFn(handshakeCtx)</code></span>
+<span class="codeline" id="line-1554"><code>	if c.handshakeErr == nil {</code></span>
+<span class="codeline" id="line-1555"><code>		c.handshakes++</code></span>
+<span class="codeline" id="line-1556"><code>	} else {</code></span>
+<span class="codeline" id="line-1557"><code>		// If an error occurred during the handshake try to flush the</code></span>
+<span class="codeline" id="line-1558"><code>		// alert that might be left in the buffer.</code></span>
+<span class="codeline" id="line-1559"><code>		c.flush()</code></span>
+<span class="codeline" id="line-1560"><code>	}</code></span>
+<span class="codeline" id="line-1561"><code></code></span>
+<span class="codeline" id="line-1562"><code>	if c.handshakeErr == nil &amp;&amp; !c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1563"><code>		c.handshakeErr = errors.New("tls: internal error: handshake should have had a result")</code></span>
+<span class="codeline" id="line-1564"><code>	}</code></span>
+<span class="codeline" id="line-1565"><code>	if c.handshakeErr != nil &amp;&amp; c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1566"><code>		panic("tls: internal error: handshake returned an error but is marked successful")</code></span>
+<span class="codeline" id="line-1567"><code>	}</code></span>
+<span class="codeline" id="line-1568"><code></code></span>
+<span class="codeline" id="line-1569"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-1570"><code>		if c.handshakeErr == nil {</code></span>
+<span class="codeline" id="line-1571"><code>			c.quicHandshakeComplete()</code></span>
+<span class="codeline" id="line-1572"><code>			// Provide the 1-RTT read secret now that the handshake is complete.</code></span>
+<span class="codeline" id="line-1573"><code>			// The QUIC layer MUST NOT decrypt 1-RTT packets prior to completing</code></span>
+<span class="codeline" id="line-1574"><code>			// the handshake (RFC 9001, Section 5.7).</code></span>
+<span class="codeline" id="line-1575"><code>			c.quicSetReadSecret(QUICEncryptionLevelApplication, c.cipherSuite, c.in.trafficSecret)</code></span>
+<span class="codeline" id="line-1576"><code>		} else {</code></span>
+<span class="codeline" id="line-1577"><code>			var a alert</code></span>
+<span class="codeline" id="line-1578"><code>			c.out.Lock()</code></span>
+<span class="codeline" id="line-1579"><code>			if !errors.As(c.out.err, &amp;a) {</code></span>
+<span class="codeline" id="line-1580"><code>				a = alertInternalError</code></span>
+<span class="codeline" id="line-1581"><code>			}</code></span>
+<span class="codeline" id="line-1582"><code>			c.out.Unlock()</code></span>
+<span class="codeline" id="line-1583"><code>			// Return an error which wraps both the handshake error and</code></span>
+<span class="codeline" id="line-1584"><code>			// any alert error we may have sent, or alertInternalError</code></span>
+<span class="codeline" id="line-1585"><code>			// if we didn't send an alert.</code></span>
+<span class="codeline" id="line-1586"><code>			// Truncate the text of the alert to 0 characters.</code></span>
+<span class="codeline" id="line-1587"><code>			c.handshakeErr = fmt.Errorf("%w%.0w", c.handshakeErr, AlertError(a))</code></span>
+<span class="codeline" id="line-1588"><code>		}</code></span>
+<span class="codeline" id="line-1589"><code>		close(c.quic.blockedc)</code></span>
+<span class="codeline" id="line-1590"><code>		close(c.quic.signalc)</code></span>
+<span class="codeline" id="line-1591"><code>	}</code></span>
+<span class="codeline" id="line-1592"><code></code></span>
+<span class="codeline" id="line-1593"><code>	return c.handshakeErr</code></span>
+<span class="codeline" id="line-1594"><code>}</code></span>
+<span class="codeline" id="line-1595"><code></code></span>
+<span class="codeline" id="line-1596"><code>// ConnectionState returns basic TLS details about the connection.</code></span>
+<span class="codeline" id="line-1597"><code>func (c *Conn) ConnectionState() ConnectionState {</code></span>
+<span class="codeline" id="line-1598"><code>	c.handshakeMutex.Lock()</code></span>
+<span class="codeline" id="line-1599"><code>	defer c.handshakeMutex.Unlock()</code></span>
+<span class="codeline" id="line-1600"><code>	return c.connectionStateLocked()</code></span>
+<span class="codeline" id="line-1601"><code>}</code></span>
+<span class="codeline" id="line-1602"><code></code></span>
+<span class="codeline" id="line-1603"><code>var tlsunsafeekm = godebug.New("tlsunsafeekm")</code></span>
+<span class="codeline" id="line-1604"><code></code></span>
+<span class="codeline" id="line-1605"><code>func (c *Conn) connectionStateLocked() ConnectionState {</code></span>
+<span class="codeline" id="line-1606"><code>	var state ConnectionState</code></span>
+<span class="codeline" id="line-1607"><code>	state.HandshakeComplete = c.isHandshakeComplete.Load()</code></span>
+<span class="codeline" id="line-1608"><code>	state.Version = c.vers</code></span>
+<span class="codeline" id="line-1609"><code>	state.NegotiatedProtocol = c.clientProtocol</code></span>
+<span class="codeline" id="line-1610"><code>	state.DidResume = c.didResume</code></span>
+<span class="codeline" id="line-1611"><code>	state.NegotiatedProtocolIsMutual = true</code></span>
+<span class="codeline" id="line-1612"><code>	state.ServerName = c.serverName</code></span>
+<span class="codeline" id="line-1613"><code>	state.CipherSuite = c.cipherSuite</code></span>
+<span class="codeline" id="line-1614"><code>	state.PeerCertificates = c.peerCertificates</code></span>
+<span class="codeline" id="line-1615"><code>	state.VerifiedChains = c.verifiedChains</code></span>
+<span class="codeline" id="line-1616"><code>	state.SignedCertificateTimestamps = c.scts</code></span>
+<span class="codeline" id="line-1617"><code>	state.OCSPResponse = c.ocspResponse</code></span>
+<span class="codeline" id="line-1618"><code>	if (!c.didResume || c.extMasterSecret) &amp;&amp; c.vers != VersionTLS13 {</code></span>
+<span class="codeline" id="line-1619"><code>		if c.clientFinishedIsFirst {</code></span>
+<span class="codeline" id="line-1620"><code>			state.TLSUnique = c.clientFinished[:]</code></span>
+<span class="codeline" id="line-1621"><code>		} else {</code></span>
+<span class="codeline" id="line-1622"><code>			state.TLSUnique = c.serverFinished[:]</code></span>
+<span class="codeline" id="line-1623"><code>		}</code></span>
+<span class="codeline" id="line-1624"><code>	}</code></span>
+<span class="codeline" id="line-1625"><code>	if c.config.Renegotiation != RenegotiateNever {</code></span>
+<span class="codeline" id="line-1626"><code>		state.ekm = noEKMBecauseRenegotiation</code></span>
+<span class="codeline" id="line-1627"><code>	} else if c.vers != VersionTLS13 &amp;&amp; !c.extMasterSecret {</code></span>
+<span class="codeline" id="line-1628"><code>		state.ekm = func(label string, context []byte, length int) ([]byte, error) {</code></span>
+<span class="codeline" id="line-1629"><code>			if tlsunsafeekm.Value() == "1" {</code></span>
+<span class="codeline" id="line-1630"><code>				tlsunsafeekm.IncNonDefault()</code></span>
+<span class="codeline" id="line-1631"><code>				return c.ekm(label, context, length)</code></span>
+<span class="codeline" id="line-1632"><code>			}</code></span>
+<span class="codeline" id="line-1633"><code>			return noEKMBecauseNoEMS(label, context, length)</code></span>
+<span class="codeline" id="line-1634"><code>		}</code></span>
+<span class="codeline" id="line-1635"><code>	} else {</code></span>
+<span class="codeline" id="line-1636"><code>		state.ekm = c.ekm</code></span>
+<span class="codeline" id="line-1637"><code>	}</code></span>
+<span class="codeline" id="line-1638"><code>	return state</code></span>
+<span class="codeline" id="line-1639"><code>}</code></span>
+<span class="codeline" id="line-1640"><code></code></span>
+<span class="codeline" id="line-1641"><code>// OCSPResponse returns the stapled OCSP response from the TLS server, if</code></span>
+<span class="codeline" id="line-1642"><code>// any. (Only valid for client connections.)</code></span>
+<span class="codeline" id="line-1643"><code>func (c *Conn) OCSPResponse() []byte {</code></span>
+<span class="codeline" id="line-1644"><code>	c.handshakeMutex.Lock()</code></span>
+<span class="codeline" id="line-1645"><code>	defer c.handshakeMutex.Unlock()</code></span>
+<span class="codeline" id="line-1646"><code></code></span>
+<span class="codeline" id="line-1647"><code>	return c.ocspResponse</code></span>
+<span class="codeline" id="line-1648"><code>}</code></span>
+<span class="codeline" id="line-1649"><code></code></span>
+<span class="codeline" id="line-1650"><code>// VerifyHostname checks that the peer certificate chain is valid for</code></span>
+<span class="codeline" id="line-1651"><code>// connecting to host. If so, it returns nil; if not, it returns an error</code></span>
+<span class="codeline" id="line-1652"><code>// describing the problem.</code></span>
+<span class="codeline" id="line-1653"><code>func (c *Conn) VerifyHostname(host string) error {</code></span>
+<span class="codeline" id="line-1654"><code>	c.handshakeMutex.Lock()</code></span>
+<span class="codeline" id="line-1655"><code>	defer c.handshakeMutex.Unlock()</code></span>
+<span class="codeline" id="line-1656"><code>	if !c.isClient {</code></span>
+<span class="codeline" id="line-1657"><code>		return errors.New("tls: VerifyHostname called on TLS server connection")</code></span>
+<span class="codeline" id="line-1658"><code>	}</code></span>
+<span class="codeline" id="line-1659"><code>	if !c.isHandshakeComplete.Load() {</code></span>
+<span class="codeline" id="line-1660"><code>		return errors.New("tls: handshake has not yet been performed")</code></span>
+<span class="codeline" id="line-1661"><code>	}</code></span>
+<span class="codeline" id="line-1662"><code>	if len(c.verifiedChains) == 0 {</code></span>
+<span class="codeline" id="line-1663"><code>		return errors.New("tls: handshake did not verify certificate chain")</code></span>
+<span class="codeline" id="line-1664"><code>	}</code></span>
+<span class="codeline" id="line-1665"><code>	return c.peerCertificates[0].VerifyHostname(host)</code></span>
+<span class="codeline" id="line-1666"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

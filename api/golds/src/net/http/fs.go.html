@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: fs.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	fs.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// HTTP file system request handler</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package http</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"internal/safefilepath"</code></span>
+<span class="codeline" id="line-13"><code>	"io"</code></span>
+<span class="codeline" id="line-14"><code>	"io/fs"</code></span>
+<span class="codeline" id="line-15"><code>	"mime"</code></span>
+<span class="codeline" id="line-16"><code>	"mime/multipart"</code></span>
+<span class="codeline" id="line-17"><code>	"net/textproto"</code></span>
+<span class="codeline" id="line-18"><code>	"net/url"</code></span>
+<span class="codeline" id="line-19"><code>	"os"</code></span>
+<span class="codeline" id="line-20"><code>	"path"</code></span>
+<span class="codeline" id="line-21"><code>	"path/filepath"</code></span>
+<span class="codeline" id="line-22"><code>	"sort"</code></span>
+<span class="codeline" id="line-23"><code>	"strconv"</code></span>
+<span class="codeline" id="line-24"><code>	"strings"</code></span>
+<span class="codeline" id="line-25"><code>	"time"</code></span>
+<span class="codeline" id="line-26"><code>)</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// A Dir implements [FileSystem] using the native file system restricted to a</code></span>
+<span class="codeline" id="line-29"><code>// specific directory tree.</code></span>
+<span class="codeline" id="line-30"><code>//</code></span>
+<span class="codeline" id="line-31"><code>// While the [FileSystem.Open] method takes '/'-separated paths, a Dir's string</code></span>
+<span class="codeline" id="line-32"><code>// value is a filename on the native file system, not a URL, so it is separated</code></span>
+<span class="codeline" id="line-33"><code>// by [filepath.Separator], which isn't necessarily '/'.</code></span>
+<span class="codeline" id="line-34"><code>//</code></span>
+<span class="codeline" id="line-35"><code>// Note that Dir could expose sensitive files and directories. Dir will follow</code></span>
+<span class="codeline" id="line-36"><code>// symlinks pointing out of the directory tree, which can be especially dangerous</code></span>
+<span class="codeline" id="line-37"><code>// if serving from a directory in which users are able to create arbitrary symlinks.</code></span>
+<span class="codeline" id="line-38"><code>// Dir will also allow access to files and directories starting with a period,</code></span>
+<span class="codeline" id="line-39"><code>// which could expose sensitive directories like .git or sensitive files like</code></span>
+<span class="codeline" id="line-40"><code>// .htpasswd. To exclude files with a leading period, remove the files/directories</code></span>
+<span class="codeline" id="line-41"><code>// from the server or create a custom FileSystem implementation.</code></span>
+<span class="codeline" id="line-42"><code>//</code></span>
+<span class="codeline" id="line-43"><code>// An empty Dir is treated as ".".</code></span>
+<span class="codeline" id="line-44"><code>type Dir string</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>// mapOpenError maps the provided non-nil error from opening name</code></span>
+<span class="codeline" id="line-47"><code>// to a possibly better non-nil error. In particular, it turns OS-specific errors</code></span>
+<span class="codeline" id="line-48"><code>// about opening files in non-directories into fs.ErrNotExist. See Issues 18984 and 49552.</code></span>
+<span class="codeline" id="line-49"><code>func mapOpenError(originalErr error, name string, sep rune, stat func(string) (fs.FileInfo, error)) error {</code></span>
+<span class="codeline" id="line-50"><code>	if errors.Is(originalErr, fs.ErrNotExist) || errors.Is(originalErr, fs.ErrPermission) {</code></span>
+<span class="codeline" id="line-51"><code>		return originalErr</code></span>
+<span class="codeline" id="line-52"><code>	}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>	parts := strings.Split(name, string(sep))</code></span>
+<span class="codeline" id="line-55"><code>	for i := range parts {</code></span>
+<span class="codeline" id="line-56"><code>		if parts[i] == "" {</code></span>
+<span class="codeline" id="line-57"><code>			continue</code></span>
+<span class="codeline" id="line-58"><code>		}</code></span>
+<span class="codeline" id="line-59"><code>		fi, err := stat(strings.Join(parts[:i+1], string(sep)))</code></span>
+<span class="codeline" id="line-60"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-61"><code>			return originalErr</code></span>
+<span class="codeline" id="line-62"><code>		}</code></span>
+<span class="codeline" id="line-63"><code>		if !fi.IsDir() {</code></span>
+<span class="codeline" id="line-64"><code>			return fs.ErrNotExist</code></span>
+<span class="codeline" id="line-65"><code>		}</code></span>
+<span class="codeline" id="line-66"><code>	}</code></span>
+<span class="codeline" id="line-67"><code>	return originalErr</code></span>
+<span class="codeline" id="line-68"><code>}</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>// Open implements [FileSystem] using [os.Open], opening files for reading rooted</code></span>
+<span class="codeline" id="line-71"><code>// and relative to the directory d.</code></span>
+<span class="codeline" id="line-72"><code>func (d Dir) Open(name string) (File, error) {</code></span>
+<span class="codeline" id="line-73"><code>	path, err := safefilepath.FromFS(path.Clean("/" + name))</code></span>
+<span class="codeline" id="line-74"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-75"><code>		return nil, errors.New("http: invalid or unsafe file path")</code></span>
+<span class="codeline" id="line-76"><code>	}</code></span>
+<span class="codeline" id="line-77"><code>	dir := string(d)</code></span>
+<span class="codeline" id="line-78"><code>	if dir == "" {</code></span>
+<span class="codeline" id="line-79"><code>		dir = "."</code></span>
+<span class="codeline" id="line-80"><code>	}</code></span>
+<span class="codeline" id="line-81"><code>	fullName := filepath.Join(dir, path)</code></span>
+<span class="codeline" id="line-82"><code>	f, err := os.Open(fullName)</code></span>
+<span class="codeline" id="line-83"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-84"><code>		return nil, mapOpenError(err, fullName, filepath.Separator, os.Stat)</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code>	return f, nil</code></span>
+<span class="codeline" id="line-87"><code>}</code></span>
+<span class="codeline" id="line-88"><code></code></span>
+<span class="codeline" id="line-89"><code>// A FileSystem implements access to a collection of named files.</code></span>
+<span class="codeline" id="line-90"><code>// The elements in a file path are separated by slash ('/', U+002F)</code></span>
+<span class="codeline" id="line-91"><code>// characters, regardless of host operating system convention.</code></span>
+<span class="codeline" id="line-92"><code>// See the [FileServer] function to convert a FileSystem to a [Handler].</code></span>
+<span class="codeline" id="line-93"><code>//</code></span>
+<span class="codeline" id="line-94"><code>// This interface predates the [fs.FS] interface, which can be used instead:</code></span>
+<span class="codeline" id="line-95"><code>// the [FS] adapter function converts an fs.FS to a FileSystem.</code></span>
+<span class="codeline" id="line-96"><code>type FileSystem interface {</code></span>
+<span class="codeline" id="line-97"><code>	Open(name string) (File, error)</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// A File is returned by a [FileSystem]'s Open method and can be</code></span>
+<span class="codeline" id="line-101"><code>// served by the [FileServer] implementation.</code></span>
+<span class="codeline" id="line-102"><code>//</code></span>
+<span class="codeline" id="line-103"><code>// The methods should behave the same as those on an [*os.File].</code></span>
+<span class="codeline" id="line-104"><code>type File interface {</code></span>
+<span class="codeline" id="line-105"><code>	io.Closer</code></span>
+<span class="codeline" id="line-106"><code>	io.Reader</code></span>
+<span class="codeline" id="line-107"><code>	io.Seeker</code></span>
+<span class="codeline" id="line-108"><code>	Readdir(count int) ([]fs.FileInfo, error)</code></span>
+<span class="codeline" id="line-109"><code>	Stat() (fs.FileInfo, error)</code></span>
+<span class="codeline" id="line-110"><code>}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>type anyDirs interface {</code></span>
+<span class="codeline" id="line-113"><code>	len() int</code></span>
+<span class="codeline" id="line-114"><code>	name(i int) string</code></span>
+<span class="codeline" id="line-115"><code>	isDir(i int) bool</code></span>
+<span class="codeline" id="line-116"><code>}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>type fileInfoDirs []fs.FileInfo</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>func (d fileInfoDirs) len() int          { return len(d) }</code></span>
+<span class="codeline" id="line-121"><code>func (d fileInfoDirs) isDir(i int) bool  { return d[i].IsDir() }</code></span>
+<span class="codeline" id="line-122"><code>func (d fileInfoDirs) name(i int) string { return d[i].Name() }</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>type dirEntryDirs []fs.DirEntry</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>func (d dirEntryDirs) len() int          { return len(d) }</code></span>
+<span class="codeline" id="line-127"><code>func (d dirEntryDirs) isDir(i int) bool  { return d[i].IsDir() }</code></span>
+<span class="codeline" id="line-128"><code>func (d dirEntryDirs) name(i int) string { return d[i].Name() }</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>func dirList(w ResponseWriter, r *Request, f File) {</code></span>
+<span class="codeline" id="line-131"><code>	// Prefer to use ReadDir instead of Readdir,</code></span>
+<span class="codeline" id="line-132"><code>	// because the former doesn't require calling</code></span>
+<span class="codeline" id="line-133"><code>	// Stat on every entry of a directory on Unix.</code></span>
+<span class="codeline" id="line-134"><code>	var dirs anyDirs</code></span>
+<span class="codeline" id="line-135"><code>	var err error</code></span>
+<span class="codeline" id="line-136"><code>	if d, ok := f.(fs.ReadDirFile); ok {</code></span>
+<span class="codeline" id="line-137"><code>		var list dirEntryDirs</code></span>
+<span class="codeline" id="line-138"><code>		list, err = d.ReadDir(-1)</code></span>
+<span class="codeline" id="line-139"><code>		dirs = list</code></span>
+<span class="codeline" id="line-140"><code>	} else {</code></span>
+<span class="codeline" id="line-141"><code>		var list fileInfoDirs</code></span>
+<span class="codeline" id="line-142"><code>		list, err = f.Readdir(-1)</code></span>
+<span class="codeline" id="line-143"><code>		dirs = list</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-147"><code>		logf(r, "http: error reading directory: %v", err)</code></span>
+<span class="codeline" id="line-148"><code>		Error(w, "Error reading directory", StatusInternalServerError)</code></span>
+<span class="codeline" id="line-149"><code>		return</code></span>
+<span class="codeline" id="line-150"><code>	}</code></span>
+<span class="codeline" id="line-151"><code>	sort.Slice(dirs, func(i, j int) bool { return dirs.name(i) &lt; dirs.name(j) })</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>	w.Header().Set("Content-Type", "text/html; charset=utf-8")</code></span>
+<span class="codeline" id="line-154"><code>	fmt.Fprintf(w, "&lt;pre&gt;\n")</code></span>
+<span class="codeline" id="line-155"><code>	for i, n := 0, dirs.len(); i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-156"><code>		name := dirs.name(i)</code></span>
+<span class="codeline" id="line-157"><code>		if dirs.isDir(i) {</code></span>
+<span class="codeline" id="line-158"><code>			name += "/"</code></span>
+<span class="codeline" id="line-159"><code>		}</code></span>
+<span class="codeline" id="line-160"><code>		// name may contain '?' or '#', which must be escaped to remain</code></span>
+<span class="codeline" id="line-161"><code>		// part of the URL path, and not indicate the start of a query</code></span>
+<span class="codeline" id="line-162"><code>		// string or fragment.</code></span>
+<span class="codeline" id="line-163"><code>		url := url.URL{Path: name}</code></span>
+<span class="codeline" id="line-164"><code>		fmt.Fprintf(w, "&lt;a href=\"%s\"&gt;%s&lt;/a&gt;\n", url.String(), htmlReplacer.Replace(name))</code></span>
+<span class="codeline" id="line-165"><code>	}</code></span>
+<span class="codeline" id="line-166"><code>	fmt.Fprintf(w, "&lt;/pre&gt;\n")</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>// ServeContent replies to the request using the content in the</code></span>
+<span class="codeline" id="line-170"><code>// provided ReadSeeker. The main benefit of ServeContent over [io.Copy]</code></span>
+<span class="codeline" id="line-171"><code>// is that it handles Range requests properly, sets the MIME type, and</code></span>
+<span class="codeline" id="line-172"><code>// handles If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since,</code></span>
+<span class="codeline" id="line-173"><code>// and If-Range requests.</code></span>
+<span class="codeline" id="line-174"><code>//</code></span>
+<span class="codeline" id="line-175"><code>// If the response's Content-Type header is not set, ServeContent</code></span>
+<span class="codeline" id="line-176"><code>// first tries to deduce the type from name's file extension and,</code></span>
+<span class="codeline" id="line-177"><code>// if that fails, falls back to reading the first block of the content</code></span>
+<span class="codeline" id="line-178"><code>// and passing it to [DetectContentType].</code></span>
+<span class="codeline" id="line-179"><code>// The name is otherwise unused; in particular it can be empty and is</code></span>
+<span class="codeline" id="line-180"><code>// never sent in the response.</code></span>
+<span class="codeline" id="line-181"><code>//</code></span>
+<span class="codeline" id="line-182"><code>// If modtime is not the zero time or Unix epoch, ServeContent</code></span>
+<span class="codeline" id="line-183"><code>// includes it in a Last-Modified header in the response. If the</code></span>
+<span class="codeline" id="line-184"><code>// request includes an If-Modified-Since header, ServeContent uses</code></span>
+<span class="codeline" id="line-185"><code>// modtime to decide whether the content needs to be sent at all.</code></span>
+<span class="codeline" id="line-186"><code>//</code></span>
+<span class="codeline" id="line-187"><code>// The content's Seek method must work: ServeContent uses</code></span>
+<span class="codeline" id="line-188"><code>// a seek to the end of the content to determine its size.</code></span>
+<span class="codeline" id="line-189"><code>//</code></span>
+<span class="codeline" id="line-190"><code>// If the caller has set w's ETag header formatted per RFC 7232, section 2.3,</code></span>
+<span class="codeline" id="line-191"><code>// ServeContent uses it to handle requests using If-Match, If-None-Match, or If-Range.</code></span>
+<span class="codeline" id="line-192"><code>//</code></span>
+<span class="codeline" id="line-193"><code>// Note that [*os.File] implements the [io.ReadSeeker] interface.</code></span>
+<span class="codeline" id="line-194"><code>func ServeContent(w ResponseWriter, req *Request, name string, modtime time.Time, content io.ReadSeeker) {</code></span>
+<span class="codeline" id="line-195"><code>	sizeFunc := func() (int64, error) {</code></span>
+<span class="codeline" id="line-196"><code>		size, err := content.Seek(0, io.SeekEnd)</code></span>
+<span class="codeline" id="line-197"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-198"><code>			return 0, errSeeker</code></span>
+<span class="codeline" id="line-199"><code>		}</code></span>
+<span class="codeline" id="line-200"><code>		_, err = content.Seek(0, io.SeekStart)</code></span>
+<span class="codeline" id="line-201"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-202"><code>			return 0, errSeeker</code></span>
+<span class="codeline" id="line-203"><code>		}</code></span>
+<span class="codeline" id="line-204"><code>		return size, nil</code></span>
+<span class="codeline" id="line-205"><code>	}</code></span>
+<span class="codeline" id="line-206"><code>	serveContent(w, req, name, modtime, sizeFunc, content)</code></span>
+<span class="codeline" id="line-207"><code>}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>// errSeeker is returned by ServeContent's sizeFunc when the content</code></span>
+<span class="codeline" id="line-210"><code>// doesn't seek properly. The underlying Seeker's error text isn't</code></span>
+<span class="codeline" id="line-211"><code>// included in the sizeFunc reply so it's not sent over HTTP to end</code></span>
+<span class="codeline" id="line-212"><code>// users.</code></span>
+<span class="codeline" id="line-213"><code>var errSeeker = errors.New("seeker can't seek")</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>// errNoOverlap is returned by serveContent's parseRange if first-byte-pos of</code></span>
+<span class="codeline" id="line-216"><code>// all of the byte-range-spec values is greater than the content size.</code></span>
+<span class="codeline" id="line-217"><code>var errNoOverlap = errors.New("invalid range: failed to overlap")</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>// if name is empty, filename is unknown. (used for mime type, before sniffing)</code></span>
+<span class="codeline" id="line-220"><code>// if modtime.IsZero(), modtime is unknown.</code></span>
+<span class="codeline" id="line-221"><code>// content must be seeked to the beginning of the file.</code></span>
+<span class="codeline" id="line-222"><code>// The sizeFunc is called at most once. Its error, if any, is sent in the HTTP response.</code></span>
+<span class="codeline" id="line-223"><code>func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, sizeFunc func() (int64, error), content io.ReadSeeker) {</code></span>
+<span class="codeline" id="line-224"><code>	setLastModified(w, modtime)</code></span>
+<span class="codeline" id="line-225"><code>	done, rangeReq := checkPreconditions(w, r, modtime)</code></span>
+<span class="codeline" id="line-226"><code>	if done {</code></span>
+<span class="codeline" id="line-227"><code>		return</code></span>
+<span class="codeline" id="line-228"><code>	}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>	code := StatusOK</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>	// If Content-Type isn't set, use the file's extension to find it, but</code></span>
+<span class="codeline" id="line-233"><code>	// if the Content-Type is unset explicitly, do not sniff the type.</code></span>
+<span class="codeline" id="line-234"><code>	ctypes, haveType := w.Header()["Content-Type"]</code></span>
+<span class="codeline" id="line-235"><code>	var ctype string</code></span>
+<span class="codeline" id="line-236"><code>	if !haveType {</code></span>
+<span class="codeline" id="line-237"><code>		ctype = mime.TypeByExtension(filepath.Ext(name))</code></span>
+<span class="codeline" id="line-238"><code>		if ctype == "" {</code></span>
+<span class="codeline" id="line-239"><code>			// read a chunk to decide between utf-8 text and binary</code></span>
+<span class="codeline" id="line-240"><code>			var buf [sniffLen]byte</code></span>
+<span class="codeline" id="line-241"><code>			n, _ := io.ReadFull(content, buf[:])</code></span>
+<span class="codeline" id="line-242"><code>			ctype = DetectContentType(buf[:n])</code></span>
+<span class="codeline" id="line-243"><code>			_, err := content.Seek(0, io.SeekStart) // rewind to output whole file</code></span>
+<span class="codeline" id="line-244"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-245"><code>				Error(w, "seeker can't seek", StatusInternalServerError)</code></span>
+<span class="codeline" id="line-246"><code>				return</code></span>
+<span class="codeline" id="line-247"><code>			}</code></span>
+<span class="codeline" id="line-248"><code>		}</code></span>
+<span class="codeline" id="line-249"><code>		w.Header().Set("Content-Type", ctype)</code></span>
+<span class="codeline" id="line-250"><code>	} else if len(ctypes) &gt; 0 {</code></span>
+<span class="codeline" id="line-251"><code>		ctype = ctypes[0]</code></span>
+<span class="codeline" id="line-252"><code>	}</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>	size, err := sizeFunc()</code></span>
+<span class="codeline" id="line-255"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-256"><code>		Error(w, err.Error(), StatusInternalServerError)</code></span>
+<span class="codeline" id="line-257"><code>		return</code></span>
+<span class="codeline" id="line-258"><code>	}</code></span>
+<span class="codeline" id="line-259"><code>	if size &lt; 0 {</code></span>
+<span class="codeline" id="line-260"><code>		// Should never happen but just to be sure</code></span>
+<span class="codeline" id="line-261"><code>		Error(w, "negative content size computed", StatusInternalServerError)</code></span>
+<span class="codeline" id="line-262"><code>		return</code></span>
+<span class="codeline" id="line-263"><code>	}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>	// handle Content-Range header.</code></span>
+<span class="codeline" id="line-266"><code>	sendSize := size</code></span>
+<span class="codeline" id="line-267"><code>	var sendContent io.Reader = content</code></span>
+<span class="codeline" id="line-268"><code>	ranges, err := parseRange(rangeReq, size)</code></span>
+<span class="codeline" id="line-269"><code>	switch err {</code></span>
+<span class="codeline" id="line-270"><code>	case nil:</code></span>
+<span class="codeline" id="line-271"><code>	case errNoOverlap:</code></span>
+<span class="codeline" id="line-272"><code>		if size == 0 {</code></span>
+<span class="codeline" id="line-273"><code>			// Some clients add a Range header to all requests to</code></span>
+<span class="codeline" id="line-274"><code>			// limit the size of the response. If the file is empty,</code></span>
+<span class="codeline" id="line-275"><code>			// ignore the range header and respond with a 200 rather</code></span>
+<span class="codeline" id="line-276"><code>			// than a 416.</code></span>
+<span class="codeline" id="line-277"><code>			ranges = nil</code></span>
+<span class="codeline" id="line-278"><code>			break</code></span>
+<span class="codeline" id="line-279"><code>		}</code></span>
+<span class="codeline" id="line-280"><code>		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))</code></span>
+<span class="codeline" id="line-281"><code>		fallthrough</code></span>
+<span class="codeline" id="line-282"><code>	default:</code></span>
+<span class="codeline" id="line-283"><code>		Error(w, err.Error(), StatusRequestedRangeNotSatisfiable)</code></span>
+<span class="codeline" id="line-284"><code>		return</code></span>
+<span class="codeline" id="line-285"><code>	}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>	if sumRangesSize(ranges) &gt; size {</code></span>
+<span class="codeline" id="line-288"><code>		// The total number of bytes in all the ranges</code></span>
+<span class="codeline" id="line-289"><code>		// is larger than the size of the file by</code></span>
+<span class="codeline" id="line-290"><code>		// itself, so this is probably an attack, or a</code></span>
+<span class="codeline" id="line-291"><code>		// dumb client. Ignore the range request.</code></span>
+<span class="codeline" id="line-292"><code>		ranges = nil</code></span>
+<span class="codeline" id="line-293"><code>	}</code></span>
+<span class="codeline" id="line-294"><code>	switch {</code></span>
+<span class="codeline" id="line-295"><code>	case len(ranges) == 1:</code></span>
+<span class="codeline" id="line-296"><code>		// RFC 7233, Section 4.1:</code></span>
+<span class="codeline" id="line-297"><code>		// "If a single part is being transferred, the server</code></span>
+<span class="codeline" id="line-298"><code>		// generating the 206 response MUST generate a</code></span>
+<span class="codeline" id="line-299"><code>		// Content-Range header field, describing what range</code></span>
+<span class="codeline" id="line-300"><code>		// of the selected representation is enclosed, and a</code></span>
+<span class="codeline" id="line-301"><code>		// payload consisting of the range.</code></span>
+<span class="codeline" id="line-302"><code>		// ...</code></span>
+<span class="codeline" id="line-303"><code>		// A server MUST NOT generate a multipart response to</code></span>
+<span class="codeline" id="line-304"><code>		// a request for a single range, since a client that</code></span>
+<span class="codeline" id="line-305"><code>		// does not request multiple parts might not support</code></span>
+<span class="codeline" id="line-306"><code>		// multipart responses."</code></span>
+<span class="codeline" id="line-307"><code>		ra := ranges[0]</code></span>
+<span class="codeline" id="line-308"><code>		if _, err := content.Seek(ra.start, io.SeekStart); err != nil {</code></span>
+<span class="codeline" id="line-309"><code>			Error(w, err.Error(), StatusRequestedRangeNotSatisfiable)</code></span>
+<span class="codeline" id="line-310"><code>			return</code></span>
+<span class="codeline" id="line-311"><code>		}</code></span>
+<span class="codeline" id="line-312"><code>		sendSize = ra.length</code></span>
+<span class="codeline" id="line-313"><code>		code = StatusPartialContent</code></span>
+<span class="codeline" id="line-314"><code>		w.Header().Set("Content-Range", ra.contentRange(size))</code></span>
+<span class="codeline" id="line-315"><code>	case len(ranges) &gt; 1:</code></span>
+<span class="codeline" id="line-316"><code>		sendSize = rangesMIMESize(ranges, ctype, size)</code></span>
+<span class="codeline" id="line-317"><code>		code = StatusPartialContent</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>		pr, pw := io.Pipe()</code></span>
+<span class="codeline" id="line-320"><code>		mw := multipart.NewWriter(pw)</code></span>
+<span class="codeline" id="line-321"><code>		w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())</code></span>
+<span class="codeline" id="line-322"><code>		sendContent = pr</code></span>
+<span class="codeline" id="line-323"><code>		defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.</code></span>
+<span class="codeline" id="line-324"><code>		go func() {</code></span>
+<span class="codeline" id="line-325"><code>			for _, ra := range ranges {</code></span>
+<span class="codeline" id="line-326"><code>				part, err := mw.CreatePart(ra.mimeHeader(ctype, size))</code></span>
+<span class="codeline" id="line-327"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-328"><code>					pw.CloseWithError(err)</code></span>
+<span class="codeline" id="line-329"><code>					return</code></span>
+<span class="codeline" id="line-330"><code>				}</code></span>
+<span class="codeline" id="line-331"><code>				if _, err := content.Seek(ra.start, io.SeekStart); err != nil {</code></span>
+<span class="codeline" id="line-332"><code>					pw.CloseWithError(err)</code></span>
+<span class="codeline" id="line-333"><code>					return</code></span>
+<span class="codeline" id="line-334"><code>				}</code></span>
+<span class="codeline" id="line-335"><code>				if _, err := io.CopyN(part, content, ra.length); err != nil {</code></span>
+<span class="codeline" id="line-336"><code>					pw.CloseWithError(err)</code></span>
+<span class="codeline" id="line-337"><code>					return</code></span>
+<span class="codeline" id="line-338"><code>				}</code></span>
+<span class="codeline" id="line-339"><code>			}</code></span>
+<span class="codeline" id="line-340"><code>			mw.Close()</code></span>
+<span class="codeline" id="line-341"><code>			pw.Close()</code></span>
+<span class="codeline" id="line-342"><code>		}()</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code></code></span>
+<span class="codeline" id="line-345"><code>	w.Header().Set("Accept-Ranges", "bytes")</code></span>
+<span class="codeline" id="line-346"><code></code></span>
+<span class="codeline" id="line-347"><code>	// We should be able to unconditionally set the Content-Length here.</code></span>
+<span class="codeline" id="line-348"><code>	//</code></span>
+<span class="codeline" id="line-349"><code>	// However, there is a pattern observed in the wild that this breaks:</code></span>
+<span class="codeline" id="line-350"><code>	// The user wraps the ResponseWriter in one which gzips data written to it,</code></span>
+<span class="codeline" id="line-351"><code>	// and sets "Content-Encoding: gzip".</code></span>
+<span class="codeline" id="line-352"><code>	//</code></span>
+<span class="codeline" id="line-353"><code>	// The user shouldn't be doing this; the serveContent path here depends</code></span>
+<span class="codeline" id="line-354"><code>	// on serving seekable data with a known length. If you want to compress</code></span>
+<span class="codeline" id="line-355"><code>	// on the fly, then you shouldn't be using ServeFile/ServeContent, or</code></span>
+<span class="codeline" id="line-356"><code>	// you should compress the entire file up-front and provide a seekable</code></span>
+<span class="codeline" id="line-357"><code>	// view of the compressed data.</code></span>
+<span class="codeline" id="line-358"><code>	//</code></span>
+<span class="codeline" id="line-359"><code>	// However, since we've observed this pattern in the wild, and since</code></span>
+<span class="codeline" id="line-360"><code>	// setting Content-Length here breaks code that mostly-works today,</code></span>
+<span class="codeline" id="line-361"><code>	// skip setting Content-Length if the user set Content-Encoding.</code></span>
+<span class="codeline" id="line-362"><code>	//</code></span>
+<span class="codeline" id="line-363"><code>	// If this is a range request, always set Content-Length.</code></span>
+<span class="codeline" id="line-364"><code>	// If the user isn't changing the bytes sent in the ResponseWrite,</code></span>
+<span class="codeline" id="line-365"><code>	// the Content-Length will be correct.</code></span>
+<span class="codeline" id="line-366"><code>	// If the user is changing the bytes sent, then the range request wasn't</code></span>
+<span class="codeline" id="line-367"><code>	// going to work properly anyway and we aren't worse off.</code></span>
+<span class="codeline" id="line-368"><code>	//</code></span>
+<span class="codeline" id="line-369"><code>	// A possible future improvement on this might be to look at the type</code></span>
+<span class="codeline" id="line-370"><code>	// of the ResponseWriter, and always set Content-Length if it's one</code></span>
+<span class="codeline" id="line-371"><code>	// that we recognize.</code></span>
+<span class="codeline" id="line-372"><code>	if len(ranges) &gt; 0 || w.Header().Get("Content-Encoding") == "" {</code></span>
+<span class="codeline" id="line-373"><code>		w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))</code></span>
+<span class="codeline" id="line-374"><code>	}</code></span>
+<span class="codeline" id="line-375"><code>	w.WriteHeader(code)</code></span>
+<span class="codeline" id="line-376"><code></code></span>
+<span class="codeline" id="line-377"><code>	if r.Method != "HEAD" {</code></span>
+<span class="codeline" id="line-378"><code>		io.CopyN(w, sendContent, sendSize)</code></span>
+<span class="codeline" id="line-379"><code>	}</code></span>
+<span class="codeline" id="line-380"><code>}</code></span>
+<span class="codeline" id="line-381"><code></code></span>
+<span class="codeline" id="line-382"><code>// scanETag determines if a syntactically valid ETag is present at s. If so,</code></span>
+<span class="codeline" id="line-383"><code>// the ETag and remaining text after consuming ETag is returned. Otherwise,</code></span>
+<span class="codeline" id="line-384"><code>// it returns "", "".</code></span>
+<span class="codeline" id="line-385"><code>func scanETag(s string) (etag string, remain string) {</code></span>
+<span class="codeline" id="line-386"><code>	s = textproto.TrimString(s)</code></span>
+<span class="codeline" id="line-387"><code>	start := 0</code></span>
+<span class="codeline" id="line-388"><code>	if strings.HasPrefix(s, "W/") {</code></span>
+<span class="codeline" id="line-389"><code>		start = 2</code></span>
+<span class="codeline" id="line-390"><code>	}</code></span>
+<span class="codeline" id="line-391"><code>	if len(s[start:]) &lt; 2 || s[start] != '"' {</code></span>
+<span class="codeline" id="line-392"><code>		return "", ""</code></span>
+<span class="codeline" id="line-393"><code>	}</code></span>
+<span class="codeline" id="line-394"><code>	// ETag is either W/"text" or "text".</code></span>
+<span class="codeline" id="line-395"><code>	// See RFC 7232 2.3.</code></span>
+<span class="codeline" id="line-396"><code>	for i := start + 1; i &lt; len(s); i++ {</code></span>
+<span class="codeline" id="line-397"><code>		c := s[i]</code></span>
+<span class="codeline" id="line-398"><code>		switch {</code></span>
+<span class="codeline" id="line-399"><code>		// Character values allowed in ETags.</code></span>
+<span class="codeline" id="line-400"><code>		case c == 0x21 || c &gt;= 0x23 &amp;&amp; c &lt;= 0x7E || c &gt;= 0x80:</code></span>
+<span class="codeline" id="line-401"><code>		case c == '"':</code></span>
+<span class="codeline" id="line-402"><code>			return s[:i+1], s[i+1:]</code></span>
+<span class="codeline" id="line-403"><code>		default:</code></span>
+<span class="codeline" id="line-404"><code>			return "", ""</code></span>
+<span class="codeline" id="line-405"><code>		}</code></span>
+<span class="codeline" id="line-406"><code>	}</code></span>
+<span class="codeline" id="line-407"><code>	return "", ""</code></span>
+<span class="codeline" id="line-408"><code>}</code></span>
+<span class="codeline" id="line-409"><code></code></span>
+<span class="codeline" id="line-410"><code>// etagStrongMatch reports whether a and b match using strong ETag comparison.</code></span>
+<span class="codeline" id="line-411"><code>// Assumes a and b are valid ETags.</code></span>
+<span class="codeline" id="line-412"><code>func etagStrongMatch(a, b string) bool {</code></span>
+<span class="codeline" id="line-413"><code>	return a == b &amp;&amp; a != "" &amp;&amp; a[0] == '"'</code></span>
+<span class="codeline" id="line-414"><code>}</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>// etagWeakMatch reports whether a and b match using weak ETag comparison.</code></span>
+<span class="codeline" id="line-417"><code>// Assumes a and b are valid ETags.</code></span>
+<span class="codeline" id="line-418"><code>func etagWeakMatch(a, b string) bool {</code></span>
+<span class="codeline" id="line-419"><code>	return strings.TrimPrefix(a, "W/") == strings.TrimPrefix(b, "W/")</code></span>
+<span class="codeline" id="line-420"><code>}</code></span>
+<span class="codeline" id="line-421"><code></code></span>
+<span class="codeline" id="line-422"><code>// condResult is the result of an HTTP request precondition check.</code></span>
+<span class="codeline" id="line-423"><code>// See https://tools.ietf.org/html/rfc7232 section 3.</code></span>
+<span class="codeline" id="line-424"><code>type condResult int</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>const (</code></span>
+<span class="codeline" id="line-427"><code>	condNone condResult = iota</code></span>
+<span class="codeline" id="line-428"><code>	condTrue</code></span>
+<span class="codeline" id="line-429"><code>	condFalse</code></span>
+<span class="codeline" id="line-430"><code>)</code></span>
+<span class="codeline" id="line-431"><code></code></span>
+<span class="codeline" id="line-432"><code>func checkIfMatch(w ResponseWriter, r *Request) condResult {</code></span>
+<span class="codeline" id="line-433"><code>	im := r.Header.Get("If-Match")</code></span>
+<span class="codeline" id="line-434"><code>	if im == "" {</code></span>
+<span class="codeline" id="line-435"><code>		return condNone</code></span>
+<span class="codeline" id="line-436"><code>	}</code></span>
+<span class="codeline" id="line-437"><code>	for {</code></span>
+<span class="codeline" id="line-438"><code>		im = textproto.TrimString(im)</code></span>
+<span class="codeline" id="line-439"><code>		if len(im) == 0 {</code></span>
+<span class="codeline" id="line-440"><code>			break</code></span>
+<span class="codeline" id="line-441"><code>		}</code></span>
+<span class="codeline" id="line-442"><code>		if im[0] == ',' {</code></span>
+<span class="codeline" id="line-443"><code>			im = im[1:]</code></span>
+<span class="codeline" id="line-444"><code>			continue</code></span>
+<span class="codeline" id="line-445"><code>		}</code></span>
+<span class="codeline" id="line-446"><code>		if im[0] == '*' {</code></span>
+<span class="codeline" id="line-447"><code>			return condTrue</code></span>
+<span class="codeline" id="line-448"><code>		}</code></span>
+<span class="codeline" id="line-449"><code>		etag, remain := scanETag(im)</code></span>
+<span class="codeline" id="line-450"><code>		if etag == "" {</code></span>
+<span class="codeline" id="line-451"><code>			break</code></span>
+<span class="codeline" id="line-452"><code>		}</code></span>
+<span class="codeline" id="line-453"><code>		if etagStrongMatch(etag, w.Header().get("Etag")) {</code></span>
+<span class="codeline" id="line-454"><code>			return condTrue</code></span>
+<span class="codeline" id="line-455"><code>		}</code></span>
+<span class="codeline" id="line-456"><code>		im = remain</code></span>
+<span class="codeline" id="line-457"><code>	}</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>	return condFalse</code></span>
+<span class="codeline" id="line-460"><code>}</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>func checkIfUnmodifiedSince(r *Request, modtime time.Time) condResult {</code></span>
+<span class="codeline" id="line-463"><code>	ius := r.Header.Get("If-Unmodified-Since")</code></span>
+<span class="codeline" id="line-464"><code>	if ius == "" || isZeroTime(modtime) {</code></span>
+<span class="codeline" id="line-465"><code>		return condNone</code></span>
+<span class="codeline" id="line-466"><code>	}</code></span>
+<span class="codeline" id="line-467"><code>	t, err := ParseTime(ius)</code></span>
+<span class="codeline" id="line-468"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-469"><code>		return condNone</code></span>
+<span class="codeline" id="line-470"><code>	}</code></span>
+<span class="codeline" id="line-471"><code></code></span>
+<span class="codeline" id="line-472"><code>	// The Last-Modified header truncates sub-second precision so</code></span>
+<span class="codeline" id="line-473"><code>	// the modtime needs to be truncated too.</code></span>
+<span class="codeline" id="line-474"><code>	modtime = modtime.Truncate(time.Second)</code></span>
+<span class="codeline" id="line-475"><code>	if ret := modtime.Compare(t); ret &lt;= 0 {</code></span>
+<span class="codeline" id="line-476"><code>		return condTrue</code></span>
+<span class="codeline" id="line-477"><code>	}</code></span>
+<span class="codeline" id="line-478"><code>	return condFalse</code></span>
+<span class="codeline" id="line-479"><code>}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>func checkIfNoneMatch(w ResponseWriter, r *Request) condResult {</code></span>
+<span class="codeline" id="line-482"><code>	inm := r.Header.get("If-None-Match")</code></span>
+<span class="codeline" id="line-483"><code>	if inm == "" {</code></span>
+<span class="codeline" id="line-484"><code>		return condNone</code></span>
+<span class="codeline" id="line-485"><code>	}</code></span>
+<span class="codeline" id="line-486"><code>	buf := inm</code></span>
+<span class="codeline" id="line-487"><code>	for {</code></span>
+<span class="codeline" id="line-488"><code>		buf = textproto.TrimString(buf)</code></span>
+<span class="codeline" id="line-489"><code>		if len(buf) == 0 {</code></span>
+<span class="codeline" id="line-490"><code>			break</code></span>
+<span class="codeline" id="line-491"><code>		}</code></span>
+<span class="codeline" id="line-492"><code>		if buf[0] == ',' {</code></span>
+<span class="codeline" id="line-493"><code>			buf = buf[1:]</code></span>
+<span class="codeline" id="line-494"><code>			continue</code></span>
+<span class="codeline" id="line-495"><code>		}</code></span>
+<span class="codeline" id="line-496"><code>		if buf[0] == '*' {</code></span>
+<span class="codeline" id="line-497"><code>			return condFalse</code></span>
+<span class="codeline" id="line-498"><code>		}</code></span>
+<span class="codeline" id="line-499"><code>		etag, remain := scanETag(buf)</code></span>
+<span class="codeline" id="line-500"><code>		if etag == "" {</code></span>
+<span class="codeline" id="line-501"><code>			break</code></span>
+<span class="codeline" id="line-502"><code>		}</code></span>
+<span class="codeline" id="line-503"><code>		if etagWeakMatch(etag, w.Header().get("Etag")) {</code></span>
+<span class="codeline" id="line-504"><code>			return condFalse</code></span>
+<span class="codeline" id="line-505"><code>		}</code></span>
+<span class="codeline" id="line-506"><code>		buf = remain</code></span>
+<span class="codeline" id="line-507"><code>	}</code></span>
+<span class="codeline" id="line-508"><code>	return condTrue</code></span>
+<span class="codeline" id="line-509"><code>}</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>func checkIfModifiedSince(r *Request, modtime time.Time) condResult {</code></span>
+<span class="codeline" id="line-512"><code>	if r.Method != "GET" &amp;&amp; r.Method != "HEAD" {</code></span>
+<span class="codeline" id="line-513"><code>		return condNone</code></span>
+<span class="codeline" id="line-514"><code>	}</code></span>
+<span class="codeline" id="line-515"><code>	ims := r.Header.Get("If-Modified-Since")</code></span>
+<span class="codeline" id="line-516"><code>	if ims == "" || isZeroTime(modtime) {</code></span>
+<span class="codeline" id="line-517"><code>		return condNone</code></span>
+<span class="codeline" id="line-518"><code>	}</code></span>
+<span class="codeline" id="line-519"><code>	t, err := ParseTime(ims)</code></span>
+<span class="codeline" id="line-520"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-521"><code>		return condNone</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code>	// The Last-Modified header truncates sub-second precision so</code></span>
+<span class="codeline" id="line-524"><code>	// the modtime needs to be truncated too.</code></span>
+<span class="codeline" id="line-525"><code>	modtime = modtime.Truncate(time.Second)</code></span>
+<span class="codeline" id="line-526"><code>	if ret := modtime.Compare(t); ret &lt;= 0 {</code></span>
+<span class="codeline" id="line-527"><code>		return condFalse</code></span>
+<span class="codeline" id="line-528"><code>	}</code></span>
+<span class="codeline" id="line-529"><code>	return condTrue</code></span>
+<span class="codeline" id="line-530"><code>}</code></span>
+<span class="codeline" id="line-531"><code></code></span>
+<span class="codeline" id="line-532"><code>func checkIfRange(w ResponseWriter, r *Request, modtime time.Time) condResult {</code></span>
+<span class="codeline" id="line-533"><code>	if r.Method != "GET" &amp;&amp; r.Method != "HEAD" {</code></span>
+<span class="codeline" id="line-534"><code>		return condNone</code></span>
+<span class="codeline" id="line-535"><code>	}</code></span>
+<span class="codeline" id="line-536"><code>	ir := r.Header.get("If-Range")</code></span>
+<span class="codeline" id="line-537"><code>	if ir == "" {</code></span>
+<span class="codeline" id="line-538"><code>		return condNone</code></span>
+<span class="codeline" id="line-539"><code>	}</code></span>
+<span class="codeline" id="line-540"><code>	etag, _ := scanETag(ir)</code></span>
+<span class="codeline" id="line-541"><code>	if etag != "" {</code></span>
+<span class="codeline" id="line-542"><code>		if etagStrongMatch(etag, w.Header().Get("Etag")) {</code></span>
+<span class="codeline" id="line-543"><code>			return condTrue</code></span>
+<span class="codeline" id="line-544"><code>		} else {</code></span>
+<span class="codeline" id="line-545"><code>			return condFalse</code></span>
+<span class="codeline" id="line-546"><code>		}</code></span>
+<span class="codeline" id="line-547"><code>	}</code></span>
+<span class="codeline" id="line-548"><code>	// The If-Range value is typically the ETag value, but it may also be</code></span>
+<span class="codeline" id="line-549"><code>	// the modtime date. See golang.org/issue/8367.</code></span>
+<span class="codeline" id="line-550"><code>	if modtime.IsZero() {</code></span>
+<span class="codeline" id="line-551"><code>		return condFalse</code></span>
+<span class="codeline" id="line-552"><code>	}</code></span>
+<span class="codeline" id="line-553"><code>	t, err := ParseTime(ir)</code></span>
+<span class="codeline" id="line-554"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-555"><code>		return condFalse</code></span>
+<span class="codeline" id="line-556"><code>	}</code></span>
+<span class="codeline" id="line-557"><code>	if t.Unix() == modtime.Unix() {</code></span>
+<span class="codeline" id="line-558"><code>		return condTrue</code></span>
+<span class="codeline" id="line-559"><code>	}</code></span>
+<span class="codeline" id="line-560"><code>	return condFalse</code></span>
+<span class="codeline" id="line-561"><code>}</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>var unixEpochTime = time.Unix(0, 0)</code></span>
+<span class="codeline" id="line-564"><code></code></span>
+<span class="codeline" id="line-565"><code>// isZeroTime reports whether t is obviously unspecified (either zero or Unix()=0).</code></span>
+<span class="codeline" id="line-566"><code>func isZeroTime(t time.Time) bool {</code></span>
+<span class="codeline" id="line-567"><code>	return t.IsZero() || t.Equal(unixEpochTime)</code></span>
+<span class="codeline" id="line-568"><code>}</code></span>
+<span class="codeline" id="line-569"><code></code></span>
+<span class="codeline" id="line-570"><code>func setLastModified(w ResponseWriter, modtime time.Time) {</code></span>
+<span class="codeline" id="line-571"><code>	if !isZeroTime(modtime) {</code></span>
+<span class="codeline" id="line-572"><code>		w.Header().Set("Last-Modified", modtime.UTC().Format(TimeFormat))</code></span>
+<span class="codeline" id="line-573"><code>	}</code></span>
+<span class="codeline" id="line-574"><code>}</code></span>
+<span class="codeline" id="line-575"><code></code></span>
+<span class="codeline" id="line-576"><code>func writeNotModified(w ResponseWriter) {</code></span>
+<span class="codeline" id="line-577"><code>	// RFC 7232 section 4.1:</code></span>
+<span class="codeline" id="line-578"><code>	// a sender SHOULD NOT generate representation metadata other than the</code></span>
+<span class="codeline" id="line-579"><code>	// above listed fields unless said metadata exists for the purpose of</code></span>
+<span class="codeline" id="line-580"><code>	// guiding cache updates (e.g., Last-Modified might be useful if the</code></span>
+<span class="codeline" id="line-581"><code>	// response does not have an ETag field).</code></span>
+<span class="codeline" id="line-582"><code>	h := w.Header()</code></span>
+<span class="codeline" id="line-583"><code>	delete(h, "Content-Type")</code></span>
+<span class="codeline" id="line-584"><code>	delete(h, "Content-Length")</code></span>
+<span class="codeline" id="line-585"><code>	delete(h, "Content-Encoding")</code></span>
+<span class="codeline" id="line-586"><code>	if h.Get("Etag") != "" {</code></span>
+<span class="codeline" id="line-587"><code>		delete(h, "Last-Modified")</code></span>
+<span class="codeline" id="line-588"><code>	}</code></span>
+<span class="codeline" id="line-589"><code>	w.WriteHeader(StatusNotModified)</code></span>
+<span class="codeline" id="line-590"><code>}</code></span>
+<span class="codeline" id="line-591"><code></code></span>
+<span class="codeline" id="line-592"><code>// checkPreconditions evaluates request preconditions and reports whether a precondition</code></span>
+<span class="codeline" id="line-593"><code>// resulted in sending StatusNotModified or StatusPreconditionFailed.</code></span>
+<span class="codeline" id="line-594"><code>func checkPreconditions(w ResponseWriter, r *Request, modtime time.Time) (done bool, rangeHeader string) {</code></span>
+<span class="codeline" id="line-595"><code>	// This function carefully follows RFC 7232 section 6.</code></span>
+<span class="codeline" id="line-596"><code>	ch := checkIfMatch(w, r)</code></span>
+<span class="codeline" id="line-597"><code>	if ch == condNone {</code></span>
+<span class="codeline" id="line-598"><code>		ch = checkIfUnmodifiedSince(r, modtime)</code></span>
+<span class="codeline" id="line-599"><code>	}</code></span>
+<span class="codeline" id="line-600"><code>	if ch == condFalse {</code></span>
+<span class="codeline" id="line-601"><code>		w.WriteHeader(StatusPreconditionFailed)</code></span>
+<span class="codeline" id="line-602"><code>		return true, ""</code></span>
+<span class="codeline" id="line-603"><code>	}</code></span>
+<span class="codeline" id="line-604"><code>	switch checkIfNoneMatch(w, r) {</code></span>
+<span class="codeline" id="line-605"><code>	case condFalse:</code></span>
+<span class="codeline" id="line-606"><code>		if r.Method == "GET" || r.Method == "HEAD" {</code></span>
+<span class="codeline" id="line-607"><code>			writeNotModified(w)</code></span>
+<span class="codeline" id="line-608"><code>			return true, ""</code></span>
+<span class="codeline" id="line-609"><code>		} else {</code></span>
+<span class="codeline" id="line-610"><code>			w.WriteHeader(StatusPreconditionFailed)</code></span>
+<span class="codeline" id="line-611"><code>			return true, ""</code></span>
+<span class="codeline" id="line-612"><code>		}</code></span>
+<span class="codeline" id="line-613"><code>	case condNone:</code></span>
+<span class="codeline" id="line-614"><code>		if checkIfModifiedSince(r, modtime) == condFalse {</code></span>
+<span class="codeline" id="line-615"><code>			writeNotModified(w)</code></span>
+<span class="codeline" id="line-616"><code>			return true, ""</code></span>
+<span class="codeline" id="line-617"><code>		}</code></span>
+<span class="codeline" id="line-618"><code>	}</code></span>
+<span class="codeline" id="line-619"><code></code></span>
+<span class="codeline" id="line-620"><code>	rangeHeader = r.Header.get("Range")</code></span>
+<span class="codeline" id="line-621"><code>	if rangeHeader != "" &amp;&amp; checkIfRange(w, r, modtime) == condFalse {</code></span>
+<span class="codeline" id="line-622"><code>		rangeHeader = ""</code></span>
+<span class="codeline" id="line-623"><code>	}</code></span>
+<span class="codeline" id="line-624"><code>	return false, rangeHeader</code></span>
+<span class="codeline" id="line-625"><code>}</code></span>
+<span class="codeline" id="line-626"><code></code></span>
+<span class="codeline" id="line-627"><code>// name is '/'-separated, not filepath.Separator.</code></span>
+<span class="codeline" id="line-628"><code>func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirect bool) {</code></span>
+<span class="codeline" id="line-629"><code>	const indexPage = "/index.html"</code></span>
+<span class="codeline" id="line-630"><code></code></span>
+<span class="codeline" id="line-631"><code>	// redirect .../index.html to .../</code></span>
+<span class="codeline" id="line-632"><code>	// can't use Redirect() because that would make the path absolute,</code></span>
+<span class="codeline" id="line-633"><code>	// which would be a problem running under StripPrefix</code></span>
+<span class="codeline" id="line-634"><code>	if strings.HasSuffix(r.URL.Path, indexPage) {</code></span>
+<span class="codeline" id="line-635"><code>		localRedirect(w, r, "./")</code></span>
+<span class="codeline" id="line-636"><code>		return</code></span>
+<span class="codeline" id="line-637"><code>	}</code></span>
+<span class="codeline" id="line-638"><code></code></span>
+<span class="codeline" id="line-639"><code>	f, err := fs.Open(name)</code></span>
+<span class="codeline" id="line-640"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-641"><code>		msg, code := toHTTPError(err)</code></span>
+<span class="codeline" id="line-642"><code>		Error(w, msg, code)</code></span>
+<span class="codeline" id="line-643"><code>		return</code></span>
+<span class="codeline" id="line-644"><code>	}</code></span>
+<span class="codeline" id="line-645"><code>	defer f.Close()</code></span>
+<span class="codeline" id="line-646"><code></code></span>
+<span class="codeline" id="line-647"><code>	d, err := f.Stat()</code></span>
+<span class="codeline" id="line-648"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-649"><code>		msg, code := toHTTPError(err)</code></span>
+<span class="codeline" id="line-650"><code>		Error(w, msg, code)</code></span>
+<span class="codeline" id="line-651"><code>		return</code></span>
+<span class="codeline" id="line-652"><code>	}</code></span>
+<span class="codeline" id="line-653"><code></code></span>
+<span class="codeline" id="line-654"><code>	if redirect {</code></span>
+<span class="codeline" id="line-655"><code>		// redirect to canonical path: / at end of directory url</code></span>
+<span class="codeline" id="line-656"><code>		// r.URL.Path always begins with /</code></span>
+<span class="codeline" id="line-657"><code>		url := r.URL.Path</code></span>
+<span class="codeline" id="line-658"><code>		if d.IsDir() {</code></span>
+<span class="codeline" id="line-659"><code>			if url[len(url)-1] != '/' {</code></span>
+<span class="codeline" id="line-660"><code>				localRedirect(w, r, path.Base(url)+"/")</code></span>
+<span class="codeline" id="line-661"><code>				return</code></span>
+<span class="codeline" id="line-662"><code>			}</code></span>
+<span class="codeline" id="line-663"><code>		} else {</code></span>
+<span class="codeline" id="line-664"><code>			if url[len(url)-1] == '/' {</code></span>
+<span class="codeline" id="line-665"><code>				localRedirect(w, r, "../"+path.Base(url))</code></span>
+<span class="codeline" id="line-666"><code>				return</code></span>
+<span class="codeline" id="line-667"><code>			}</code></span>
+<span class="codeline" id="line-668"><code>		}</code></span>
+<span class="codeline" id="line-669"><code>	}</code></span>
+<span class="codeline" id="line-670"><code></code></span>
+<span class="codeline" id="line-671"><code>	if d.IsDir() {</code></span>
+<span class="codeline" id="line-672"><code>		url := r.URL.Path</code></span>
+<span class="codeline" id="line-673"><code>		// redirect if the directory name doesn't end in a slash</code></span>
+<span class="codeline" id="line-674"><code>		if url == "" || url[len(url)-1] != '/' {</code></span>
+<span class="codeline" id="line-675"><code>			localRedirect(w, r, path.Base(url)+"/")</code></span>
+<span class="codeline" id="line-676"><code>			return</code></span>
+<span class="codeline" id="line-677"><code>		}</code></span>
+<span class="codeline" id="line-678"><code></code></span>
+<span class="codeline" id="line-679"><code>		// use contents of index.html for directory, if present</code></span>
+<span class="codeline" id="line-680"><code>		index := strings.TrimSuffix(name, "/") + indexPage</code></span>
+<span class="codeline" id="line-681"><code>		ff, err := fs.Open(index)</code></span>
+<span class="codeline" id="line-682"><code>		if err == nil {</code></span>
+<span class="codeline" id="line-683"><code>			defer ff.Close()</code></span>
+<span class="codeline" id="line-684"><code>			dd, err := ff.Stat()</code></span>
+<span class="codeline" id="line-685"><code>			if err == nil {</code></span>
+<span class="codeline" id="line-686"><code>				d = dd</code></span>
+<span class="codeline" id="line-687"><code>				f = ff</code></span>
+<span class="codeline" id="line-688"><code>			}</code></span>
+<span class="codeline" id="line-689"><code>		}</code></span>
+<span class="codeline" id="line-690"><code>	}</code></span>
+<span class="codeline" id="line-691"><code></code></span>
+<span class="codeline" id="line-692"><code>	// Still a directory? (we didn't find an index.html file)</code></span>
+<span class="codeline" id="line-693"><code>	if d.IsDir() {</code></span>
+<span class="codeline" id="line-694"><code>		if checkIfModifiedSince(r, d.ModTime()) == condFalse {</code></span>
+<span class="codeline" id="line-695"><code>			writeNotModified(w)</code></span>
+<span class="codeline" id="line-696"><code>			return</code></span>
+<span class="codeline" id="line-697"><code>		}</code></span>
+<span class="codeline" id="line-698"><code>		setLastModified(w, d.ModTime())</code></span>
+<span class="codeline" id="line-699"><code>		dirList(w, r, f)</code></span>
+<span class="codeline" id="line-700"><code>		return</code></span>
+<span class="codeline" id="line-701"><code>	}</code></span>
+<span class="codeline" id="line-702"><code></code></span>
+<span class="codeline" id="line-703"><code>	// serveContent will check modification time</code></span>
+<span class="codeline" id="line-704"><code>	sizeFunc := func() (int64, error) { return d.Size(), nil }</code></span>
+<span class="codeline" id="line-705"><code>	serveContent(w, r, d.Name(), d.ModTime(), sizeFunc, f)</code></span>
+<span class="codeline" id="line-706"><code>}</code></span>
+<span class="codeline" id="line-707"><code></code></span>
+<span class="codeline" id="line-708"><code>// toHTTPError returns a non-specific HTTP error message and status code</code></span>
+<span class="codeline" id="line-709"><code>// for a given non-nil error value. It's important that toHTTPError does not</code></span>
+<span class="codeline" id="line-710"><code>// actually return err.Error(), since msg and httpStatus are returned to users,</code></span>
+<span class="codeline" id="line-711"><code>// and historically Go's ServeContent always returned just "404 Not Found" for</code></span>
+<span class="codeline" id="line-712"><code>// all errors. We don't want to start leaking information in error messages.</code></span>
+<span class="codeline" id="line-713"><code>func toHTTPError(err error) (msg string, httpStatus int) {</code></span>
+<span class="codeline" id="line-714"><code>	if errors.Is(err, fs.ErrNotExist) {</code></span>
+<span class="codeline" id="line-715"><code>		return "404 page not found", StatusNotFound</code></span>
+<span class="codeline" id="line-716"><code>	}</code></span>
+<span class="codeline" id="line-717"><code>	if errors.Is(err, fs.ErrPermission) {</code></span>
+<span class="codeline" id="line-718"><code>		return "403 Forbidden", StatusForbidden</code></span>
+<span class="codeline" id="line-719"><code>	}</code></span>
+<span class="codeline" id="line-720"><code>	// Default:</code></span>
+<span class="codeline" id="line-721"><code>	return "500 Internal Server Error", StatusInternalServerError</code></span>
+<span class="codeline" id="line-722"><code>}</code></span>
+<span class="codeline" id="line-723"><code></code></span>
+<span class="codeline" id="line-724"><code>// localRedirect gives a Moved Permanently response.</code></span>
+<span class="codeline" id="line-725"><code>// It does not convert relative paths to absolute paths like Redirect does.</code></span>
+<span class="codeline" id="line-726"><code>func localRedirect(w ResponseWriter, r *Request, newPath string) {</code></span>
+<span class="codeline" id="line-727"><code>	if q := r.URL.RawQuery; q != "" {</code></span>
+<span class="codeline" id="line-728"><code>		newPath += "?" + q</code></span>
+<span class="codeline" id="line-729"><code>	}</code></span>
+<span class="codeline" id="line-730"><code>	w.Header().Set("Location", newPath)</code></span>
+<span class="codeline" id="line-731"><code>	w.WriteHeader(StatusMovedPermanently)</code></span>
+<span class="codeline" id="line-732"><code>}</code></span>
+<span class="codeline" id="line-733"><code></code></span>
+<span class="codeline" id="line-734"><code>// ServeFile replies to the request with the contents of the named</code></span>
+<span class="codeline" id="line-735"><code>// file or directory.</code></span>
+<span class="codeline" id="line-736"><code>//</code></span>
+<span class="codeline" id="line-737"><code>// If the provided file or directory name is a relative path, it is</code></span>
+<span class="codeline" id="line-738"><code>// interpreted relative to the current directory and may ascend to</code></span>
+<span class="codeline" id="line-739"><code>// parent directories. If the provided name is constructed from user</code></span>
+<span class="codeline" id="line-740"><code>// input, it should be sanitized before calling ServeFile.</code></span>
+<span class="codeline" id="line-741"><code>//</code></span>
+<span class="codeline" id="line-742"><code>// As a precaution, ServeFile will reject requests where r.URL.Path</code></span>
+<span class="codeline" id="line-743"><code>// contains a ".." path element; this protects against callers who</code></span>
+<span class="codeline" id="line-744"><code>// might unsafely use [filepath.Join] on r.URL.Path without sanitizing</code></span>
+<span class="codeline" id="line-745"><code>// it and then use that filepath.Join result as the name argument.</code></span>
+<span class="codeline" id="line-746"><code>//</code></span>
+<span class="codeline" id="line-747"><code>// As another special case, ServeFile redirects any request where r.URL.Path</code></span>
+<span class="codeline" id="line-748"><code>// ends in "/index.html" to the same path, without the final</code></span>
+<span class="codeline" id="line-749"><code>// "index.html". To avoid such redirects either modify the path or</code></span>
+<span class="codeline" id="line-750"><code>// use [ServeContent].</code></span>
+<span class="codeline" id="line-751"><code>//</code></span>
+<span class="codeline" id="line-752"><code>// Outside of those two special cases, ServeFile does not use</code></span>
+<span class="codeline" id="line-753"><code>// r.URL.Path for selecting the file or directory to serve; only the</code></span>
+<span class="codeline" id="line-754"><code>// file or directory provided in the name argument is used.</code></span>
+<span class="codeline" id="line-755"><code>func ServeFile(w ResponseWriter, r *Request, name string) {</code></span>
+<span class="codeline" id="line-756"><code>	if containsDotDot(r.URL.Path) {</code></span>
+<span class="codeline" id="line-757"><code>		// Too many programs use r.URL.Path to construct the argument to</code></span>
+<span class="codeline" id="line-758"><code>		// serveFile. Reject the request under the assumption that happened</code></span>
+<span class="codeline" id="line-759"><code>		// here and ".." may not be wanted.</code></span>
+<span class="codeline" id="line-760"><code>		// Note that name might not contain "..", for example if code (still</code></span>
+<span class="codeline" id="line-761"><code>		// incorrectly) used filepath.Join(myDir, r.URL.Path).</code></span>
+<span class="codeline" id="line-762"><code>		Error(w, "invalid URL path", StatusBadRequest)</code></span>
+<span class="codeline" id="line-763"><code>		return</code></span>
+<span class="codeline" id="line-764"><code>	}</code></span>
+<span class="codeline" id="line-765"><code>	dir, file := filepath.Split(name)</code></span>
+<span class="codeline" id="line-766"><code>	serveFile(w, r, Dir(dir), file, false)</code></span>
+<span class="codeline" id="line-767"><code>}</code></span>
+<span class="codeline" id="line-768"><code></code></span>
+<span class="codeline" id="line-769"><code>// ServeFileFS replies to the request with the contents</code></span>
+<span class="codeline" id="line-770"><code>// of the named file or directory from the file system fsys.</code></span>
+<span class="codeline" id="line-771"><code>//</code></span>
+<span class="codeline" id="line-772"><code>// If the provided file or directory name is a relative path, it is</code></span>
+<span class="codeline" id="line-773"><code>// interpreted relative to the current directory and may ascend to</code></span>
+<span class="codeline" id="line-774"><code>// parent directories. If the provided name is constructed from user</code></span>
+<span class="codeline" id="line-775"><code>// input, it should be sanitized before calling [ServeFile].</code></span>
+<span class="codeline" id="line-776"><code>//</code></span>
+<span class="codeline" id="line-777"><code>// As a precaution, ServeFile will reject requests where r.URL.Path</code></span>
+<span class="codeline" id="line-778"><code>// contains a ".." path element; this protects against callers who</code></span>
+<span class="codeline" id="line-779"><code>// might unsafely use [filepath.Join] on r.URL.Path without sanitizing</code></span>
+<span class="codeline" id="line-780"><code>// it and then use that filepath.Join result as the name argument.</code></span>
+<span class="codeline" id="line-781"><code>//</code></span>
+<span class="codeline" id="line-782"><code>// As another special case, ServeFile redirects any request where r.URL.Path</code></span>
+<span class="codeline" id="line-783"><code>// ends in "/index.html" to the same path, without the final</code></span>
+<span class="codeline" id="line-784"><code>// "index.html". To avoid such redirects either modify the path or</code></span>
+<span class="codeline" id="line-785"><code>// use ServeContent.</code></span>
+<span class="codeline" id="line-786"><code>//</code></span>
+<span class="codeline" id="line-787"><code>// Outside of those two special cases, ServeFile does not use</code></span>
+<span class="codeline" id="line-788"><code>// r.URL.Path for selecting the file or directory to serve; only the</code></span>
+<span class="codeline" id="line-789"><code>// file or directory provided in the name argument is used.</code></span>
+<span class="codeline" id="line-790"><code>func ServeFileFS(w ResponseWriter, r *Request, fsys fs.FS, name string) {</code></span>
+<span class="codeline" id="line-791"><code>	if containsDotDot(r.URL.Path) {</code></span>
+<span class="codeline" id="line-792"><code>		// Too many programs use r.URL.Path to construct the argument to</code></span>
+<span class="codeline" id="line-793"><code>		// serveFile. Reject the request under the assumption that happened</code></span>
+<span class="codeline" id="line-794"><code>		// here and ".." may not be wanted.</code></span>
+<span class="codeline" id="line-795"><code>		// Note that name might not contain "..", for example if code (still</code></span>
+<span class="codeline" id="line-796"><code>		// incorrectly) used filepath.Join(myDir, r.URL.Path).</code></span>
+<span class="codeline" id="line-797"><code>		Error(w, "invalid URL path", StatusBadRequest)</code></span>
+<span class="codeline" id="line-798"><code>		return</code></span>
+<span class="codeline" id="line-799"><code>	}</code></span>
+<span class="codeline" id="line-800"><code>	serveFile(w, r, FS(fsys), name, false)</code></span>
+<span class="codeline" id="line-801"><code>}</code></span>
+<span class="codeline" id="line-802"><code></code></span>
+<span class="codeline" id="line-803"><code>func containsDotDot(v string) bool {</code></span>
+<span class="codeline" id="line-804"><code>	if !strings.Contains(v, "..") {</code></span>
+<span class="codeline" id="line-805"><code>		return false</code></span>
+<span class="codeline" id="line-806"><code>	}</code></span>
+<span class="codeline" id="line-807"><code>	for _, ent := range strings.FieldsFunc(v, isSlashRune) {</code></span>
+<span class="codeline" id="line-808"><code>		if ent == ".." {</code></span>
+<span class="codeline" id="line-809"><code>			return true</code></span>
+<span class="codeline" id="line-810"><code>		}</code></span>
+<span class="codeline" id="line-811"><code>	}</code></span>
+<span class="codeline" id="line-812"><code>	return false</code></span>
+<span class="codeline" id="line-813"><code>}</code></span>
+<span class="codeline" id="line-814"><code></code></span>
+<span class="codeline" id="line-815"><code>func isSlashRune(r rune) bool { return r == '/' || r == '\\' }</code></span>
+<span class="codeline" id="line-816"><code></code></span>
+<span class="codeline" id="line-817"><code>type fileHandler struct {</code></span>
+<span class="codeline" id="line-818"><code>	root FileSystem</code></span>
+<span class="codeline" id="line-819"><code>}</code></span>
+<span class="codeline" id="line-820"><code></code></span>
+<span class="codeline" id="line-821"><code>type ioFS struct {</code></span>
+<span class="codeline" id="line-822"><code>	fsys fs.FS</code></span>
+<span class="codeline" id="line-823"><code>}</code></span>
+<span class="codeline" id="line-824"><code></code></span>
+<span class="codeline" id="line-825"><code>type ioFile struct {</code></span>
+<span class="codeline" id="line-826"><code>	file fs.File</code></span>
+<span class="codeline" id="line-827"><code>}</code></span>
+<span class="codeline" id="line-828"><code></code></span>
+<span class="codeline" id="line-829"><code>func (f ioFS) Open(name string) (File, error) {</code></span>
+<span class="codeline" id="line-830"><code>	if name == "/" {</code></span>
+<span class="codeline" id="line-831"><code>		name = "."</code></span>
+<span class="codeline" id="line-832"><code>	} else {</code></span>
+<span class="codeline" id="line-833"><code>		name = strings.TrimPrefix(name, "/")</code></span>
+<span class="codeline" id="line-834"><code>	}</code></span>
+<span class="codeline" id="line-835"><code>	file, err := f.fsys.Open(name)</code></span>
+<span class="codeline" id="line-836"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-837"><code>		return nil, mapOpenError(err, name, '/', func(path string) (fs.FileInfo, error) {</code></span>
+<span class="codeline" id="line-838"><code>			return fs.Stat(f.fsys, path)</code></span>
+<span class="codeline" id="line-839"><code>		})</code></span>
+<span class="codeline" id="line-840"><code>	}</code></span>
+<span class="codeline" id="line-841"><code>	return ioFile{file}, nil</code></span>
+<span class="codeline" id="line-842"><code>}</code></span>
+<span class="codeline" id="line-843"><code></code></span>
+<span class="codeline" id="line-844"><code>func (f ioFile) Close() error               { return f.file.Close() }</code></span>
+<span class="codeline" id="line-845"><code>func (f ioFile) Read(b []byte) (int, error) { return f.file.Read(b) }</code></span>
+<span class="codeline" id="line-846"><code>func (f ioFile) Stat() (fs.FileInfo, error) { return f.file.Stat() }</code></span>
+<span class="codeline" id="line-847"><code></code></span>
+<span class="codeline" id="line-848"><code>var errMissingSeek = errors.New("io.File missing Seek method")</code></span>
+<span class="codeline" id="line-849"><code>var errMissingReadDir = errors.New("io.File directory missing ReadDir method")</code></span>
+<span class="codeline" id="line-850"><code></code></span>
+<span class="codeline" id="line-851"><code>func (f ioFile) Seek(offset int64, whence int) (int64, error) {</code></span>
+<span class="codeline" id="line-852"><code>	s, ok := f.file.(io.Seeker)</code></span>
+<span class="codeline" id="line-853"><code>	if !ok {</code></span>
+<span class="codeline" id="line-854"><code>		return 0, errMissingSeek</code></span>
+<span class="codeline" id="line-855"><code>	}</code></span>
+<span class="codeline" id="line-856"><code>	return s.Seek(offset, whence)</code></span>
+<span class="codeline" id="line-857"><code>}</code></span>
+<span class="codeline" id="line-858"><code></code></span>
+<span class="codeline" id="line-859"><code>func (f ioFile) ReadDir(count int) ([]fs.DirEntry, error) {</code></span>
+<span class="codeline" id="line-860"><code>	d, ok := f.file.(fs.ReadDirFile)</code></span>
+<span class="codeline" id="line-861"><code>	if !ok {</code></span>
+<span class="codeline" id="line-862"><code>		return nil, errMissingReadDir</code></span>
+<span class="codeline" id="line-863"><code>	}</code></span>
+<span class="codeline" id="line-864"><code>	return d.ReadDir(count)</code></span>
+<span class="codeline" id="line-865"><code>}</code></span>
+<span class="codeline" id="line-866"><code></code></span>
+<span class="codeline" id="line-867"><code>func (f ioFile) Readdir(count int) ([]fs.FileInfo, error) {</code></span>
+<span class="codeline" id="line-868"><code>	d, ok := f.file.(fs.ReadDirFile)</code></span>
+<span class="codeline" id="line-869"><code>	if !ok {</code></span>
+<span class="codeline" id="line-870"><code>		return nil, errMissingReadDir</code></span>
+<span class="codeline" id="line-871"><code>	}</code></span>
+<span class="codeline" id="line-872"><code>	var list []fs.FileInfo</code></span>
+<span class="codeline" id="line-873"><code>	for {</code></span>
+<span class="codeline" id="line-874"><code>		dirs, err := d.ReadDir(count - len(list))</code></span>
+<span class="codeline" id="line-875"><code>		for _, dir := range dirs {</code></span>
+<span class="codeline" id="line-876"><code>			info, err := dir.Info()</code></span>
+<span class="codeline" id="line-877"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-878"><code>				// Pretend it doesn't exist, like (*os.File).Readdir does.</code></span>
+<span class="codeline" id="line-879"><code>				continue</code></span>
+<span class="codeline" id="line-880"><code>			}</code></span>
+<span class="codeline" id="line-881"><code>			list = append(list, info)</code></span>
+<span class="codeline" id="line-882"><code>		}</code></span>
+<span class="codeline" id="line-883"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-884"><code>			return list, err</code></span>
+<span class="codeline" id="line-885"><code>		}</code></span>
+<span class="codeline" id="line-886"><code>		if count &lt; 0 || len(list) &gt;= count {</code></span>
+<span class="codeline" id="line-887"><code>			break</code></span>
+<span class="codeline" id="line-888"><code>		}</code></span>
+<span class="codeline" id="line-889"><code>	}</code></span>
+<span class="codeline" id="line-890"><code>	return list, nil</code></span>
+<span class="codeline" id="line-891"><code>}</code></span>
+<span class="codeline" id="line-892"><code></code></span>
+<span class="codeline" id="line-893"><code>// FS converts fsys to a [FileSystem] implementation,</code></span>
+<span class="codeline" id="line-894"><code>// for use with [FileServer] and [NewFileTransport].</code></span>
+<span class="codeline" id="line-895"><code>// The files provided by fsys must implement [io.Seeker].</code></span>
+<span class="codeline" id="line-896"><code>func FS(fsys fs.FS) FileSystem {</code></span>
+<span class="codeline" id="line-897"><code>	return ioFS{fsys}</code></span>
+<span class="codeline" id="line-898"><code>}</code></span>
+<span class="codeline" id="line-899"><code></code></span>
+<span class="codeline" id="line-900"><code>// FileServer returns a handler that serves HTTP requests</code></span>
+<span class="codeline" id="line-901"><code>// with the contents of the file system rooted at root.</code></span>
+<span class="codeline" id="line-902"><code>//</code></span>
+<span class="codeline" id="line-903"><code>// As a special case, the returned file server redirects any request</code></span>
+<span class="codeline" id="line-904"><code>// ending in "/index.html" to the same path, without the final</code></span>
+<span class="codeline" id="line-905"><code>// "index.html".</code></span>
+<span class="codeline" id="line-906"><code>//</code></span>
+<span class="codeline" id="line-907"><code>// To use the operating system's file system implementation,</code></span>
+<span class="codeline" id="line-908"><code>// use [http.Dir]:</code></span>
+<span class="codeline" id="line-909"><code>//</code></span>
+<span class="codeline" id="line-910"><code>//	http.Handle("/", http.FileServer(http.Dir("/tmp")))</code></span>
+<span class="codeline" id="line-911"><code>//</code></span>
+<span class="codeline" id="line-912"><code>// To use an [fs.FS] implementation, use [http.FileServerFS] instead.</code></span>
+<span class="codeline" id="line-913"><code>func FileServer(root FileSystem) Handler {</code></span>
+<span class="codeline" id="line-914"><code>	return &amp;fileHandler{root}</code></span>
+<span class="codeline" id="line-915"><code>}</code></span>
+<span class="codeline" id="line-916"><code></code></span>
+<span class="codeline" id="line-917"><code>// FileServerFS returns a handler that serves HTTP requests</code></span>
+<span class="codeline" id="line-918"><code>// with the contents of the file system fsys.</code></span>
+<span class="codeline" id="line-919"><code>//</code></span>
+<span class="codeline" id="line-920"><code>// As a special case, the returned file server redirects any request</code></span>
+<span class="codeline" id="line-921"><code>// ending in "/index.html" to the same path, without the final</code></span>
+<span class="codeline" id="line-922"><code>// "index.html".</code></span>
+<span class="codeline" id="line-923"><code>//</code></span>
+<span class="codeline" id="line-924"><code>//	http.Handle("/", http.FileServerFS(fsys))</code></span>
+<span class="codeline" id="line-925"><code>func FileServerFS(root fs.FS) Handler {</code></span>
+<span class="codeline" id="line-926"><code>	return FileServer(FS(root))</code></span>
+<span class="codeline" id="line-927"><code>}</code></span>
+<span class="codeline" id="line-928"><code></code></span>
+<span class="codeline" id="line-929"><code>func (f *fileHandler) ServeHTTP(w ResponseWriter, r *Request) {</code></span>
+<span class="codeline" id="line-930"><code>	upath := r.URL.Path</code></span>
+<span class="codeline" id="line-931"><code>	if !strings.HasPrefix(upath, "/") {</code></span>
+<span class="codeline" id="line-932"><code>		upath = "/" + upath</code></span>
+<span class="codeline" id="line-933"><code>		r.URL.Path = upath</code></span>
+<span class="codeline" id="line-934"><code>	}</code></span>
+<span class="codeline" id="line-935"><code>	serveFile(w, r, f.root, path.Clean(upath), true)</code></span>
+<span class="codeline" id="line-936"><code>}</code></span>
+<span class="codeline" id="line-937"><code></code></span>
+<span class="codeline" id="line-938"><code>// httpRange specifies the byte range to be sent to the client.</code></span>
+<span class="codeline" id="line-939"><code>type httpRange struct {</code></span>
+<span class="codeline" id="line-940"><code>	start, length int64</code></span>
+<span class="codeline" id="line-941"><code>}</code></span>
+<span class="codeline" id="line-942"><code></code></span>
+<span class="codeline" id="line-943"><code>func (r httpRange) contentRange(size int64) string {</code></span>
+<span class="codeline" id="line-944"><code>	return fmt.Sprintf("bytes %d-%d/%d", r.start, r.start+r.length-1, size)</code></span>
+<span class="codeline" id="line-945"><code>}</code></span>
+<span class="codeline" id="line-946"><code></code></span>
+<span class="codeline" id="line-947"><code>func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHeader {</code></span>
+<span class="codeline" id="line-948"><code>	return textproto.MIMEHeader{</code></span>
+<span class="codeline" id="line-949"><code>		"Content-Range": {r.contentRange(size)},</code></span>
+<span class="codeline" id="line-950"><code>		"Content-Type":  {contentType},</code></span>
+<span class="codeline" id="line-951"><code>	}</code></span>
+<span class="codeline" id="line-952"><code>}</code></span>
+<span class="codeline" id="line-953"><code></code></span>
+<span class="codeline" id="line-954"><code>// parseRange parses a Range header string as per RFC 7233.</code></span>
+<span class="codeline" id="line-955"><code>// errNoOverlap is returned if none of the ranges overlap.</code></span>
+<span class="codeline" id="line-956"><code>func parseRange(s string, size int64) ([]httpRange, error) {</code></span>
+<span class="codeline" id="line-957"><code>	if s == "" {</code></span>
+<span class="codeline" id="line-958"><code>		return nil, nil // header not present</code></span>
+<span class="codeline" id="line-959"><code>	}</code></span>
+<span class="codeline" id="line-960"><code>	const b = "bytes="</code></span>
+<span class="codeline" id="line-961"><code>	if !strings.HasPrefix(s, b) {</code></span>
+<span class="codeline" id="line-962"><code>		return nil, errors.New("invalid range")</code></span>
+<span class="codeline" id="line-963"><code>	}</code></span>
+<span class="codeline" id="line-964"><code>	var ranges []httpRange</code></span>
+<span class="codeline" id="line-965"><code>	noOverlap := false</code></span>
+<span class="codeline" id="line-966"><code>	for _, ra := range strings.Split(s[len(b):], ",") {</code></span>
+<span class="codeline" id="line-967"><code>		ra = textproto.TrimString(ra)</code></span>
+<span class="codeline" id="line-968"><code>		if ra == "" {</code></span>
+<span class="codeline" id="line-969"><code>			continue</code></span>
+<span class="codeline" id="line-970"><code>		}</code></span>
+<span class="codeline" id="line-971"><code>		start, end, ok := strings.Cut(ra, "-")</code></span>
+<span class="codeline" id="line-972"><code>		if !ok {</code></span>
+<span class="codeline" id="line-973"><code>			return nil, errors.New("invalid range")</code></span>
+<span class="codeline" id="line-974"><code>		}</code></span>
+<span class="codeline" id="line-975"><code>		start, end = textproto.TrimString(start), textproto.TrimString(end)</code></span>
+<span class="codeline" id="line-976"><code>		var r httpRange</code></span>
+<span class="codeline" id="line-977"><code>		if start == "" {</code></span>
+<span class="codeline" id="line-978"><code>			// If no start is specified, end specifies the</code></span>
+<span class="codeline" id="line-979"><code>			// range start relative to the end of the file,</code></span>
+<span class="codeline" id="line-980"><code>			// and we are dealing with &lt;suffix-length&gt;</code></span>
+<span class="codeline" id="line-981"><code>			// which has to be a non-negative integer as per</code></span>
+<span class="codeline" id="line-982"><code>			// RFC 7233 Section 2.1 "Byte-Ranges".</code></span>
+<span class="codeline" id="line-983"><code>			if end == "" || end[0] == '-' {</code></span>
+<span class="codeline" id="line-984"><code>				return nil, errors.New("invalid range")</code></span>
+<span class="codeline" id="line-985"><code>			}</code></span>
+<span class="codeline" id="line-986"><code>			i, err := strconv.ParseInt(end, 10, 64)</code></span>
+<span class="codeline" id="line-987"><code>			if i &lt; 0 || err != nil {</code></span>
+<span class="codeline" id="line-988"><code>				return nil, errors.New("invalid range")</code></span>
+<span class="codeline" id="line-989"><code>			}</code></span>
+<span class="codeline" id="line-990"><code>			if i &gt; size {</code></span>
+<span class="codeline" id="line-991"><code>				i = size</code></span>
+<span class="codeline" id="line-992"><code>			}</code></span>
+<span class="codeline" id="line-993"><code>			r.start = size - i</code></span>
+<span class="codeline" id="line-994"><code>			r.length = size - r.start</code></span>
+<span class="codeline" id="line-995"><code>		} else {</code></span>
+<span class="codeline" id="line-996"><code>			i, err := strconv.ParseInt(start, 10, 64)</code></span>
+<span class="codeline" id="line-997"><code>			if err != nil || i &lt; 0 {</code></span>
+<span class="codeline" id="line-998"><code>				return nil, errors.New("invalid range")</code></span>
+<span class="codeline" id="line-999"><code>			}</code></span>
+<span class="codeline" id="line-1000"><code>			if i &gt;= size {</code></span>
+<span class="codeline" id="line-1001"><code>				// If the range begins after the size of the content,</code></span>
+<span class="codeline" id="line-1002"><code>				// then it does not overlap.</code></span>
+<span class="codeline" id="line-1003"><code>				noOverlap = true</code></span>
+<span class="codeline" id="line-1004"><code>				continue</code></span>
+<span class="codeline" id="line-1005"><code>			}</code></span>
+<span class="codeline" id="line-1006"><code>			r.start = i</code></span>
+<span class="codeline" id="line-1007"><code>			if end == "" {</code></span>
+<span class="codeline" id="line-1008"><code>				// If no end is specified, range extends to end of the file.</code></span>
+<span class="codeline" id="line-1009"><code>				r.length = size - r.start</code></span>
+<span class="codeline" id="line-1010"><code>			} else {</code></span>
+<span class="codeline" id="line-1011"><code>				i, err := strconv.ParseInt(end, 10, 64)</code></span>
+<span class="codeline" id="line-1012"><code>				if err != nil || r.start &gt; i {</code></span>
+<span class="codeline" id="line-1013"><code>					return nil, errors.New("invalid range")</code></span>
+<span class="codeline" id="line-1014"><code>				}</code></span>
+<span class="codeline" id="line-1015"><code>				if i &gt;= size {</code></span>
+<span class="codeline" id="line-1016"><code>					i = size - 1</code></span>
+<span class="codeline" id="line-1017"><code>				}</code></span>
+<span class="codeline" id="line-1018"><code>				r.length = i - r.start + 1</code></span>
+<span class="codeline" id="line-1019"><code>			}</code></span>
+<span class="codeline" id="line-1020"><code>		}</code></span>
+<span class="codeline" id="line-1021"><code>		ranges = append(ranges, r)</code></span>
+<span class="codeline" id="line-1022"><code>	}</code></span>
+<span class="codeline" id="line-1023"><code>	if noOverlap &amp;&amp; len(ranges) == 0 {</code></span>
+<span class="codeline" id="line-1024"><code>		// The specified ranges did not overlap with the content.</code></span>
+<span class="codeline" id="line-1025"><code>		return nil, errNoOverlap</code></span>
+<span class="codeline" id="line-1026"><code>	}</code></span>
+<span class="codeline" id="line-1027"><code>	return ranges, nil</code></span>
+<span class="codeline" id="line-1028"><code>}</code></span>
+<span class="codeline" id="line-1029"><code></code></span>
+<span class="codeline" id="line-1030"><code>// countingWriter counts how many bytes have been written to it.</code></span>
+<span class="codeline" id="line-1031"><code>type countingWriter int64</code></span>
+<span class="codeline" id="line-1032"><code></code></span>
+<span class="codeline" id="line-1033"><code>func (w *countingWriter) Write(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-1034"><code>	*w += countingWriter(len(p))</code></span>
+<span class="codeline" id="line-1035"><code>	return len(p), nil</code></span>
+<span class="codeline" id="line-1036"><code>}</code></span>
+<span class="codeline" id="line-1037"><code></code></span>
+<span class="codeline" id="line-1038"><code>// rangesMIMESize returns the number of bytes it takes to encode the</code></span>
+<span class="codeline" id="line-1039"><code>// provided ranges as a multipart response.</code></span>
+<span class="codeline" id="line-1040"><code>func rangesMIMESize(ranges []httpRange, contentType string, contentSize int64) (encSize int64) {</code></span>
+<span class="codeline" id="line-1041"><code>	var w countingWriter</code></span>
+<span class="codeline" id="line-1042"><code>	mw := multipart.NewWriter(&amp;w)</code></span>
+<span class="codeline" id="line-1043"><code>	for _, ra := range ranges {</code></span>
+<span class="codeline" id="line-1044"><code>		mw.CreatePart(ra.mimeHeader(contentType, contentSize))</code></span>
+<span class="codeline" id="line-1045"><code>		encSize += ra.length</code></span>
+<span class="codeline" id="line-1046"><code>	}</code></span>
+<span class="codeline" id="line-1047"><code>	mw.Close()</code></span>
+<span class="codeline" id="line-1048"><code>	encSize += int64(w)</code></span>
+<span class="codeline" id="line-1049"><code>	return</code></span>
+<span class="codeline" id="line-1050"><code>}</code></span>
+<span class="codeline" id="line-1051"><code></code></span>
+<span class="codeline" id="line-1052"><code>func sumRangesSize(ranges []httpRange) (size int64) {</code></span>
+<span class="codeline" id="line-1053"><code>	for _, ra := range ranges {</code></span>
+<span class="codeline" id="line-1054"><code>		size += ra.length</code></span>
+<span class="codeline" id="line-1055"><code>	}</code></span>
+<span class="codeline" id="line-1056"><code>	return</code></span>
+<span class="codeline" id="line-1057"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: rsa.go in package crypto/rsa</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	rsa.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/rsa.html">crypto/rsa</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package rsa implements RSA encryption as specified in PKCS #1 and RFC 8017.</code></span>
+<span class="codeline" id="line-6"><code>//</code></span>
+<span class="codeline" id="line-7"><code>// RSA is a single, fundamental operation that is used in this package to</code></span>
+<span class="codeline" id="line-8"><code>// implement either public-key encryption or public-key signatures.</code></span>
+<span class="codeline" id="line-9"><code>//</code></span>
+<span class="codeline" id="line-10"><code>// The original specification for encryption and signatures with RSA is PKCS #1</code></span>
+<span class="codeline" id="line-11"><code>// and the terms "RSA encryption" and "RSA signatures" by default refer to</code></span>
+<span class="codeline" id="line-12"><code>// PKCS #1 version 1.5. However, that specification has flaws and new designs</code></span>
+<span class="codeline" id="line-13"><code>// should use version 2, usually called by just OAEP and PSS, where</code></span>
+<span class="codeline" id="line-14"><code>// possible.</code></span>
+<span class="codeline" id="line-15"><code>//</code></span>
+<span class="codeline" id="line-16"><code>// Two sets of interfaces are included in this package. When a more abstract</code></span>
+<span class="codeline" id="line-17"><code>// interface isn't necessary, there are functions for encrypting/decrypting</code></span>
+<span class="codeline" id="line-18"><code>// with v1.5/OAEP and signing/verifying with v1.5/PSS. If one needs to abstract</code></span>
+<span class="codeline" id="line-19"><code>// over the public key primitive, the PrivateKey type implements the</code></span>
+<span class="codeline" id="line-20"><code>// Decrypter and Signer interfaces from the crypto package.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// Operations in this package are implemented using constant-time algorithms,</code></span>
+<span class="codeline" id="line-23"><code>// except for [GenerateKey], [PrivateKey.Precompute], and [PrivateKey.Validate].</code></span>
+<span class="codeline" id="line-24"><code>// Every other operation only leaks the bit size of the involved values, which</code></span>
+<span class="codeline" id="line-25"><code>// all depend on the selected key size.</code></span></div><span class="codeline" id="line-26"><code>package rsa</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>import (</code></span>
+<span class="codeline" id="line-29"><code>	"crypto"</code></span>
+<span class="codeline" id="line-30"><code>	"crypto/internal/bigmod"</code></span>
+<span class="codeline" id="line-31"><code>	"crypto/internal/boring"</code></span>
+<span class="codeline" id="line-32"><code>	"crypto/internal/boring/bbig"</code></span>
+<span class="codeline" id="line-33"><code>	"crypto/internal/randutil"</code></span>
+<span class="codeline" id="line-34"><code>	"crypto/rand"</code></span>
+<span class="codeline" id="line-35"><code>	"crypto/subtle"</code></span>
+<span class="codeline" id="line-36"><code>	"errors"</code></span>
+<span class="codeline" id="line-37"><code>	"hash"</code></span>
+<span class="codeline" id="line-38"><code>	"io"</code></span>
+<span class="codeline" id="line-39"><code>	"math"</code></span>
+<span class="codeline" id="line-40"><code>	"math/big"</code></span>
+<span class="codeline" id="line-41"><code>)</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>var bigOne = big.NewInt(1)</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>// A PublicKey represents the public part of an RSA key.</code></span>
+<span class="codeline" id="line-46"><code>//</code></span>
+<span class="codeline" id="line-47"><code>// The value of the modulus N is considered secret by this library and protected</code></span>
+<span class="codeline" id="line-48"><code>// from leaking through timing side-channels. However, neither the value of the</code></span>
+<span class="codeline" id="line-49"><code>// exponent E nor the precise bit size of N are similarly protected.</code></span>
+<span class="codeline" id="line-50"><code>type PublicKey struct {</code></span>
+<span class="codeline" id="line-51"><code>	N *big.Int // modulus</code></span>
+<span class="codeline" id="line-52"><code>	E int      // public exponent</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>// Any methods implemented on PublicKey might need to also be implemented on</code></span>
+<span class="codeline" id="line-56"><code>// PrivateKey, as the latter embeds the former and will expose its methods.</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// Size returns the modulus size in bytes. Raw signatures and ciphertexts</code></span>
+<span class="codeline" id="line-59"><code>// for or by this public key will have the same size.</code></span>
+<span class="codeline" id="line-60"><code>func (pub *PublicKey) Size() int {</code></span>
+<span class="codeline" id="line-61"><code>	return (pub.N.BitLen() + 7) / 8</code></span>
+<span class="codeline" id="line-62"><code>}</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>// Equal reports whether pub and x have the same value.</code></span>
+<span class="codeline" id="line-65"><code>func (pub *PublicKey) Equal(x crypto.PublicKey) bool {</code></span>
+<span class="codeline" id="line-66"><code>	xx, ok := x.(*PublicKey)</code></span>
+<span class="codeline" id="line-67"><code>	if !ok {</code></span>
+<span class="codeline" id="line-68"><code>		return false</code></span>
+<span class="codeline" id="line-69"><code>	}</code></span>
+<span class="codeline" id="line-70"><code>	return bigIntEqual(pub.N, xx.N) &amp;&amp; pub.E == xx.E</code></span>
+<span class="codeline" id="line-71"><code>}</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>// OAEPOptions is an interface for passing options to OAEP decryption using the</code></span>
+<span class="codeline" id="line-74"><code>// crypto.Decrypter interface.</code></span>
+<span class="codeline" id="line-75"><code>type OAEPOptions struct {</code></span>
+<span class="codeline" id="line-76"><code>	// Hash is the hash function that will be used when generating the mask.</code></span>
+<span class="codeline" id="line-77"><code>	Hash crypto.Hash</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>	// MGFHash is the hash function used for MGF1.</code></span>
+<span class="codeline" id="line-80"><code>	// If zero, Hash is used instead.</code></span>
+<span class="codeline" id="line-81"><code>	MGFHash crypto.Hash</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	// Label is an arbitrary byte string that must be equal to the value</code></span>
+<span class="codeline" id="line-84"><code>	// used when encrypting.</code></span>
+<span class="codeline" id="line-85"><code>	Label []byte</code></span>
+<span class="codeline" id="line-86"><code>}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>var (</code></span>
+<span class="codeline" id="line-89"><code>	errPublicModulus       = errors.New("crypto/rsa: missing public modulus")</code></span>
+<span class="codeline" id="line-90"><code>	errPublicExponentSmall = errors.New("crypto/rsa: public exponent too small")</code></span>
+<span class="codeline" id="line-91"><code>	errPublicExponentLarge = errors.New("crypto/rsa: public exponent too large")</code></span>
+<span class="codeline" id="line-92"><code>)</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>// checkPub sanity checks the public key before we use it.</code></span>
+<span class="codeline" id="line-95"><code>// We require pub.E to fit into a 32-bit integer so that we</code></span>
+<span class="codeline" id="line-96"><code>// do not have different behavior depending on whether</code></span>
+<span class="codeline" id="line-97"><code>// int is 32 or 64 bits. See also</code></span>
+<span class="codeline" id="line-98"><code>// https://www.imperialviolet.org/2012/03/16/rsae.html.</code></span>
+<span class="codeline" id="line-99"><code>func checkPub(pub *PublicKey) error {</code></span>
+<span class="codeline" id="line-100"><code>	if pub.N == nil {</code></span>
+<span class="codeline" id="line-101"><code>		return errPublicModulus</code></span>
+<span class="codeline" id="line-102"><code>	}</code></span>
+<span class="codeline" id="line-103"><code>	if pub.E &lt; 2 {</code></span>
+<span class="codeline" id="line-104"><code>		return errPublicExponentSmall</code></span>
+<span class="codeline" id="line-105"><code>	}</code></span>
+<span class="codeline" id="line-106"><code>	if pub.E &gt; 1&lt;&lt;31-1 {</code></span>
+<span class="codeline" id="line-107"><code>		return errPublicExponentLarge</code></span>
+<span class="codeline" id="line-108"><code>	}</code></span>
+<span class="codeline" id="line-109"><code>	return nil</code></span>
+<span class="codeline" id="line-110"><code>}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>// A PrivateKey represents an RSA key</code></span>
+<span class="codeline" id="line-113"><code>type PrivateKey struct {</code></span>
+<span class="codeline" id="line-114"><code>	PublicKey            // public part.</code></span>
+<span class="codeline" id="line-115"><code>	D         *big.Int   // private exponent</code></span>
+<span class="codeline" id="line-116"><code>	Primes    []*big.Int // prime factors of N, has &gt;= 2 elements.</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	// Precomputed contains precomputed values that speed up RSA operations,</code></span>
+<span class="codeline" id="line-119"><code>	// if available. It must be generated by calling PrivateKey.Precompute and</code></span>
+<span class="codeline" id="line-120"><code>	// must not be modified.</code></span>
+<span class="codeline" id="line-121"><code>	Precomputed PrecomputedValues</code></span>
+<span class="codeline" id="line-122"><code>}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>// Public returns the public key corresponding to priv.</code></span>
+<span class="codeline" id="line-125"><code>func (priv *PrivateKey) Public() crypto.PublicKey {</code></span>
+<span class="codeline" id="line-126"><code>	return &amp;priv.PublicKey</code></span>
+<span class="codeline" id="line-127"><code>}</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>// Equal reports whether priv and x have equivalent values. It ignores</code></span>
+<span class="codeline" id="line-130"><code>// Precomputed values.</code></span>
+<span class="codeline" id="line-131"><code>func (priv *PrivateKey) Equal(x crypto.PrivateKey) bool {</code></span>
+<span class="codeline" id="line-132"><code>	xx, ok := x.(*PrivateKey)</code></span>
+<span class="codeline" id="line-133"><code>	if !ok {</code></span>
+<span class="codeline" id="line-134"><code>		return false</code></span>
+<span class="codeline" id="line-135"><code>	}</code></span>
+<span class="codeline" id="line-136"><code>	if !priv.PublicKey.Equal(&amp;xx.PublicKey) || !bigIntEqual(priv.D, xx.D) {</code></span>
+<span class="codeline" id="line-137"><code>		return false</code></span>
+<span class="codeline" id="line-138"><code>	}</code></span>
+<span class="codeline" id="line-139"><code>	if len(priv.Primes) != len(xx.Primes) {</code></span>
+<span class="codeline" id="line-140"><code>		return false</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code>	for i := range priv.Primes {</code></span>
+<span class="codeline" id="line-143"><code>		if !bigIntEqual(priv.Primes[i], xx.Primes[i]) {</code></span>
+<span class="codeline" id="line-144"><code>			return false</code></span>
+<span class="codeline" id="line-145"><code>		}</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	return true</code></span>
+<span class="codeline" id="line-148"><code>}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// bigIntEqual reports whether a and b are equal leaking only their bit length</code></span>
+<span class="codeline" id="line-151"><code>// through timing side-channels.</code></span>
+<span class="codeline" id="line-152"><code>func bigIntEqual(a, b *big.Int) bool {</code></span>
+<span class="codeline" id="line-153"><code>	return subtle.ConstantTimeCompare(a.Bytes(), b.Bytes()) == 1</code></span>
+<span class="codeline" id="line-154"><code>}</code></span>
+<span class="codeline" id="line-155"><code></code></span>
+<span class="codeline" id="line-156"><code>// Sign signs digest with priv, reading randomness from rand. If opts is a</code></span>
+<span class="codeline" id="line-157"><code>// *[PSSOptions] then the PSS algorithm will be used, otherwise PKCS #1 v1.5 will</code></span>
+<span class="codeline" id="line-158"><code>// be used. digest must be the result of hashing the input message using</code></span>
+<span class="codeline" id="line-159"><code>// opts.HashFunc().</code></span>
+<span class="codeline" id="line-160"><code>//</code></span>
+<span class="codeline" id="line-161"><code>// This method implements [crypto.Signer], which is an interface to support keys</code></span>
+<span class="codeline" id="line-162"><code>// where the private part is kept in, for example, a hardware module. Common</code></span>
+<span class="codeline" id="line-163"><code>// uses should use the Sign* functions in this package directly.</code></span>
+<span class="codeline" id="line-164"><code>func (priv *PrivateKey) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {</code></span>
+<span class="codeline" id="line-165"><code>	if pssOpts, ok := opts.(*PSSOptions); ok {</code></span>
+<span class="codeline" id="line-166"><code>		return SignPSS(rand, priv, pssOpts.Hash, digest, pssOpts)</code></span>
+<span class="codeline" id="line-167"><code>	}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>	return SignPKCS1v15(rand, priv, opts.HashFunc(), digest)</code></span>
+<span class="codeline" id="line-170"><code>}</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>// Decrypt decrypts ciphertext with priv. If opts is nil or of type</code></span>
+<span class="codeline" id="line-173"><code>// *[PKCS1v15DecryptOptions] then PKCS #1 v1.5 decryption is performed. Otherwise</code></span>
+<span class="codeline" id="line-174"><code>// opts must have type *[OAEPOptions] and OAEP decryption is done.</code></span>
+<span class="codeline" id="line-175"><code>func (priv *PrivateKey) Decrypt(rand io.Reader, ciphertext []byte, opts crypto.DecrypterOpts) (plaintext []byte, err error) {</code></span>
+<span class="codeline" id="line-176"><code>	if opts == nil {</code></span>
+<span class="codeline" id="line-177"><code>		return DecryptPKCS1v15(rand, priv, ciphertext)</code></span>
+<span class="codeline" id="line-178"><code>	}</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>	switch opts := opts.(type) {</code></span>
+<span class="codeline" id="line-181"><code>	case *OAEPOptions:</code></span>
+<span class="codeline" id="line-182"><code>		if opts.MGFHash == 0 {</code></span>
+<span class="codeline" id="line-183"><code>			return decryptOAEP(opts.Hash.New(), opts.Hash.New(), rand, priv, ciphertext, opts.Label)</code></span>
+<span class="codeline" id="line-184"><code>		} else {</code></span>
+<span class="codeline" id="line-185"><code>			return decryptOAEP(opts.Hash.New(), opts.MGFHash.New(), rand, priv, ciphertext, opts.Label)</code></span>
+<span class="codeline" id="line-186"><code>		}</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>	case *PKCS1v15DecryptOptions:</code></span>
+<span class="codeline" id="line-189"><code>		if l := opts.SessionKeyLen; l &gt; 0 {</code></span>
+<span class="codeline" id="line-190"><code>			plaintext = make([]byte, l)</code></span>
+<span class="codeline" id="line-191"><code>			if _, err := io.ReadFull(rand, plaintext); err != nil {</code></span>
+<span class="codeline" id="line-192"><code>				return nil, err</code></span>
+<span class="codeline" id="line-193"><code>			}</code></span>
+<span class="codeline" id="line-194"><code>			if err := DecryptPKCS1v15SessionKey(rand, priv, ciphertext, plaintext); err != nil {</code></span>
+<span class="codeline" id="line-195"><code>				return nil, err</code></span>
+<span class="codeline" id="line-196"><code>			}</code></span>
+<span class="codeline" id="line-197"><code>			return plaintext, nil</code></span>
+<span class="codeline" id="line-198"><code>		} else {</code></span>
+<span class="codeline" id="line-199"><code>			return DecryptPKCS1v15(rand, priv, ciphertext)</code></span>
+<span class="codeline" id="line-200"><code>		}</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>	default:</code></span>
+<span class="codeline" id="line-203"><code>		return nil, errors.New("crypto/rsa: invalid options for Decrypt")</code></span>
+<span class="codeline" id="line-204"><code>	}</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>type PrecomputedValues struct {</code></span>
+<span class="codeline" id="line-208"><code>	Dp, Dq *big.Int // D mod (P-1) (or mod Q-1)</code></span>
+<span class="codeline" id="line-209"><code>	Qinv   *big.Int // Q^-1 mod P</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>	// CRTValues is used for the 3rd and subsequent primes. Due to a</code></span>
+<span class="codeline" id="line-212"><code>	// historical accident, the CRT for the first two primes is handled</code></span>
+<span class="codeline" id="line-213"><code>	// differently in PKCS #1 and interoperability is sufficiently</code></span>
+<span class="codeline" id="line-214"><code>	// important that we mirror this.</code></span>
+<span class="codeline" id="line-215"><code>	//</code></span>
+<span class="codeline" id="line-216"><code>	// Deprecated: These values are still filled in by Precompute for</code></span>
+<span class="codeline" id="line-217"><code>	// backwards compatibility but are not used. Multi-prime RSA is very rare,</code></span>
+<span class="codeline" id="line-218"><code>	// and is implemented by this package without CRT optimizations to limit</code></span>
+<span class="codeline" id="line-219"><code>	// complexity.</code></span>
+<span class="codeline" id="line-220"><code>	CRTValues []CRTValue</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>	n, p, q *bigmod.Modulus // moduli for CRT with Montgomery precomputed constants</code></span>
+<span class="codeline" id="line-223"><code>}</code></span>
+<span class="codeline" id="line-224"><code></code></span>
+<span class="codeline" id="line-225"><code>// CRTValue contains the precomputed Chinese remainder theorem values.</code></span>
+<span class="codeline" id="line-226"><code>type CRTValue struct {</code></span>
+<span class="codeline" id="line-227"><code>	Exp   *big.Int // D mod (prime-1).</code></span>
+<span class="codeline" id="line-228"><code>	Coeff *big.Int // R·Coeff ≡ 1 mod Prime.</code></span>
+<span class="codeline" id="line-229"><code>	R     *big.Int // product of primes prior to this (inc p and q).</code></span>
+<span class="codeline" id="line-230"><code>}</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>// Validate performs basic sanity checks on the key.</code></span>
+<span class="codeline" id="line-233"><code>// It returns nil if the key is valid, or else an error describing a problem.</code></span>
+<span class="codeline" id="line-234"><code>func (priv *PrivateKey) Validate() error {</code></span>
+<span class="codeline" id="line-235"><code>	if err := checkPub(&amp;priv.PublicKey); err != nil {</code></span>
+<span class="codeline" id="line-236"><code>		return err</code></span>
+<span class="codeline" id="line-237"><code>	}</code></span>
+<span class="codeline" id="line-238"><code></code></span>
+<span class="codeline" id="line-239"><code>	// Check that Πprimes == n.</code></span>
+<span class="codeline" id="line-240"><code>	modulus := new(big.Int).Set(bigOne)</code></span>
+<span class="codeline" id="line-241"><code>	for _, prime := range priv.Primes {</code></span>
+<span class="codeline" id="line-242"><code>		// Any primes ≤ 1 will cause divide-by-zero panics later.</code></span>
+<span class="codeline" id="line-243"><code>		if prime.Cmp(bigOne) &lt;= 0 {</code></span>
+<span class="codeline" id="line-244"><code>			return errors.New("crypto/rsa: invalid prime value")</code></span>
+<span class="codeline" id="line-245"><code>		}</code></span>
+<span class="codeline" id="line-246"><code>		modulus.Mul(modulus, prime)</code></span>
+<span class="codeline" id="line-247"><code>	}</code></span>
+<span class="codeline" id="line-248"><code>	if modulus.Cmp(priv.N) != 0 {</code></span>
+<span class="codeline" id="line-249"><code>		return errors.New("crypto/rsa: invalid modulus")</code></span>
+<span class="codeline" id="line-250"><code>	}</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>	// Check that de ≡ 1 mod p-1, for each prime.</code></span>
+<span class="codeline" id="line-253"><code>	// This implies that e is coprime to each p-1 as e has a multiplicative</code></span>
+<span class="codeline" id="line-254"><code>	// inverse. Therefore e is coprime to lcm(p-1,q-1,r-1,...) =</code></span>
+<span class="codeline" id="line-255"><code>	// exponent(ℤ/nℤ). It also implies that a^de ≡ a mod p as a^(p-1) ≡ 1</code></span>
+<span class="codeline" id="line-256"><code>	// mod p. Thus a^de ≡ a mod n for all a coprime to n, as required.</code></span>
+<span class="codeline" id="line-257"><code>	congruence := new(big.Int)</code></span>
+<span class="codeline" id="line-258"><code>	de := new(big.Int).SetInt64(int64(priv.E))</code></span>
+<span class="codeline" id="line-259"><code>	de.Mul(de, priv.D)</code></span>
+<span class="codeline" id="line-260"><code>	for _, prime := range priv.Primes {</code></span>
+<span class="codeline" id="line-261"><code>		pminus1 := new(big.Int).Sub(prime, bigOne)</code></span>
+<span class="codeline" id="line-262"><code>		congruence.Mod(de, pminus1)</code></span>
+<span class="codeline" id="line-263"><code>		if congruence.Cmp(bigOne) != 0 {</code></span>
+<span class="codeline" id="line-264"><code>			return errors.New("crypto/rsa: invalid exponents")</code></span>
+<span class="codeline" id="line-265"><code>		}</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code>	return nil</code></span>
+<span class="codeline" id="line-268"><code>}</code></span>
+<span class="codeline" id="line-269"><code></code></span>
+<span class="codeline" id="line-270"><code>// GenerateKey generates a random RSA private key of the given bit size.</code></span>
+<span class="codeline" id="line-271"><code>//</code></span>
+<span class="codeline" id="line-272"><code>// Most applications should use [crypto/rand.Reader] as rand. Note that the</code></span>
+<span class="codeline" id="line-273"><code>// returned key does not depend deterministically on the bytes read from rand,</code></span>
+<span class="codeline" id="line-274"><code>// and may change between calls and/or between versions.</code></span>
+<span class="codeline" id="line-275"><code>func GenerateKey(random io.Reader, bits int) (*PrivateKey, error) {</code></span>
+<span class="codeline" id="line-276"><code>	return GenerateMultiPrimeKey(random, 2, bits)</code></span>
+<span class="codeline" id="line-277"><code>}</code></span>
+<span class="codeline" id="line-278"><code></code></span>
+<span class="codeline" id="line-279"><code>// GenerateMultiPrimeKey generates a multi-prime RSA keypair of the given bit</code></span>
+<span class="codeline" id="line-280"><code>// size and the given random source.</code></span>
+<span class="codeline" id="line-281"><code>//</code></span>
+<span class="codeline" id="line-282"><code>// Table 1 in "[On the Security of Multi-prime RSA]" suggests maximum numbers of</code></span>
+<span class="codeline" id="line-283"><code>// primes for a given bit size.</code></span>
+<span class="codeline" id="line-284"><code>//</code></span>
+<span class="codeline" id="line-285"><code>// Although the public keys are compatible (actually, indistinguishable) from</code></span>
+<span class="codeline" id="line-286"><code>// the 2-prime case, the private keys are not. Thus it may not be possible to</code></span>
+<span class="codeline" id="line-287"><code>// export multi-prime private keys in certain formats or to subsequently import</code></span>
+<span class="codeline" id="line-288"><code>// them into other code.</code></span>
+<span class="codeline" id="line-289"><code>//</code></span>
+<span class="codeline" id="line-290"><code>// This package does not implement CRT optimizations for multi-prime RSA, so the</code></span>
+<span class="codeline" id="line-291"><code>// keys with more than two primes will have worse performance.</code></span>
+<span class="codeline" id="line-292"><code>//</code></span>
+<span class="codeline" id="line-293"><code>// Deprecated: The use of this function with a number of primes different from</code></span>
+<span class="codeline" id="line-294"><code>// two is not recommended for the above security, compatibility, and performance</code></span>
+<span class="codeline" id="line-295"><code>// reasons. Use [GenerateKey] instead.</code></span>
+<span class="codeline" id="line-296"><code>//</code></span>
+<span class="codeline" id="line-297"><code>// [On the Security of Multi-prime RSA]: http://www.cacr.math.uwaterloo.ca/techreports/2006/cacr2006-16.pdf</code></span>
+<span class="codeline" id="line-298"><code>func GenerateMultiPrimeKey(random io.Reader, nprimes int, bits int) (*PrivateKey, error) {</code></span>
+<span class="codeline" id="line-299"><code>	randutil.MaybeReadByte(random)</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>	if boring.Enabled &amp;&amp; random == boring.RandReader &amp;&amp; nprimes == 2 &amp;&amp;</code></span>
+<span class="codeline" id="line-302"><code>		(bits == 2048 || bits == 3072 || bits == 4096) {</code></span>
+<span class="codeline" id="line-303"><code>		bN, bE, bD, bP, bQ, bDp, bDq, bQinv, err := boring.GenerateKeyRSA(bits)</code></span>
+<span class="codeline" id="line-304"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-305"><code>			return nil, err</code></span>
+<span class="codeline" id="line-306"><code>		}</code></span>
+<span class="codeline" id="line-307"><code>		N := bbig.Dec(bN)</code></span>
+<span class="codeline" id="line-308"><code>		E := bbig.Dec(bE)</code></span>
+<span class="codeline" id="line-309"><code>		D := bbig.Dec(bD)</code></span>
+<span class="codeline" id="line-310"><code>		P := bbig.Dec(bP)</code></span>
+<span class="codeline" id="line-311"><code>		Q := bbig.Dec(bQ)</code></span>
+<span class="codeline" id="line-312"><code>		Dp := bbig.Dec(bDp)</code></span>
+<span class="codeline" id="line-313"><code>		Dq := bbig.Dec(bDq)</code></span>
+<span class="codeline" id="line-314"><code>		Qinv := bbig.Dec(bQinv)</code></span>
+<span class="codeline" id="line-315"><code>		e64 := E.Int64()</code></span>
+<span class="codeline" id="line-316"><code>		if !E.IsInt64() || int64(int(e64)) != e64 {</code></span>
+<span class="codeline" id="line-317"><code>			return nil, errors.New("crypto/rsa: generated key exponent too large")</code></span>
+<span class="codeline" id="line-318"><code>		}</code></span>
+<span class="codeline" id="line-319"><code></code></span>
+<span class="codeline" id="line-320"><code>		mn, err := bigmod.NewModulusFromBig(N)</code></span>
+<span class="codeline" id="line-321"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-322"><code>			return nil, err</code></span>
+<span class="codeline" id="line-323"><code>		}</code></span>
+<span class="codeline" id="line-324"><code>		mp, err := bigmod.NewModulusFromBig(P)</code></span>
+<span class="codeline" id="line-325"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-326"><code>			return nil, err</code></span>
+<span class="codeline" id="line-327"><code>		}</code></span>
+<span class="codeline" id="line-328"><code>		mq, err := bigmod.NewModulusFromBig(Q)</code></span>
+<span class="codeline" id="line-329"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-330"><code>			return nil, err</code></span>
+<span class="codeline" id="line-331"><code>		}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>		key := &amp;PrivateKey{</code></span>
+<span class="codeline" id="line-334"><code>			PublicKey: PublicKey{</code></span>
+<span class="codeline" id="line-335"><code>				N: N,</code></span>
+<span class="codeline" id="line-336"><code>				E: int(e64),</code></span>
+<span class="codeline" id="line-337"><code>			},</code></span>
+<span class="codeline" id="line-338"><code>			D:      D,</code></span>
+<span class="codeline" id="line-339"><code>			Primes: []*big.Int{P, Q},</code></span>
+<span class="codeline" id="line-340"><code>			Precomputed: PrecomputedValues{</code></span>
+<span class="codeline" id="line-341"><code>				Dp:        Dp,</code></span>
+<span class="codeline" id="line-342"><code>				Dq:        Dq,</code></span>
+<span class="codeline" id="line-343"><code>				Qinv:      Qinv,</code></span>
+<span class="codeline" id="line-344"><code>				CRTValues: make([]CRTValue, 0), // non-nil, to match Precompute</code></span>
+<span class="codeline" id="line-345"><code>				n:         mn,</code></span>
+<span class="codeline" id="line-346"><code>				p:         mp,</code></span>
+<span class="codeline" id="line-347"><code>				q:         mq,</code></span>
+<span class="codeline" id="line-348"><code>			},</code></span>
+<span class="codeline" id="line-349"><code>		}</code></span>
+<span class="codeline" id="line-350"><code>		return key, nil</code></span>
+<span class="codeline" id="line-351"><code>	}</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>	priv := new(PrivateKey)</code></span>
+<span class="codeline" id="line-354"><code>	priv.E = 65537</code></span>
+<span class="codeline" id="line-355"><code></code></span>
+<span class="codeline" id="line-356"><code>	if nprimes &lt; 2 {</code></span>
+<span class="codeline" id="line-357"><code>		return nil, errors.New("crypto/rsa: GenerateMultiPrimeKey: nprimes must be &gt;= 2")</code></span>
+<span class="codeline" id="line-358"><code>	}</code></span>
+<span class="codeline" id="line-359"><code></code></span>
+<span class="codeline" id="line-360"><code>	if bits &lt; 64 {</code></span>
+<span class="codeline" id="line-361"><code>		primeLimit := float64(uint64(1) &lt;&lt; uint(bits/nprimes))</code></span>
+<span class="codeline" id="line-362"><code>		// pi approximates the number of primes less than primeLimit</code></span>
+<span class="codeline" id="line-363"><code>		pi := primeLimit / (math.Log(primeLimit) - 1)</code></span>
+<span class="codeline" id="line-364"><code>		// Generated primes start with 11 (in binary) so we can only</code></span>
+<span class="codeline" id="line-365"><code>		// use a quarter of them.</code></span>
+<span class="codeline" id="line-366"><code>		pi /= 4</code></span>
+<span class="codeline" id="line-367"><code>		// Use a factor of two to ensure that key generation terminates</code></span>
+<span class="codeline" id="line-368"><code>		// in a reasonable amount of time.</code></span>
+<span class="codeline" id="line-369"><code>		pi /= 2</code></span>
+<span class="codeline" id="line-370"><code>		if pi &lt;= float64(nprimes) {</code></span>
+<span class="codeline" id="line-371"><code>			return nil, errors.New("crypto/rsa: too few primes of given length to generate an RSA key")</code></span>
+<span class="codeline" id="line-372"><code>		}</code></span>
+<span class="codeline" id="line-373"><code>	}</code></span>
+<span class="codeline" id="line-374"><code></code></span>
+<span class="codeline" id="line-375"><code>	primes := make([]*big.Int, nprimes)</code></span>
+<span class="codeline" id="line-376"><code></code></span>
+<span class="codeline" id="line-377"><code>NextSetOfPrimes:</code></span>
+<span class="codeline" id="line-378"><code>	for {</code></span>
+<span class="codeline" id="line-379"><code>		todo := bits</code></span>
+<span class="codeline" id="line-380"><code>		// crypto/rand should set the top two bits in each prime.</code></span>
+<span class="codeline" id="line-381"><code>		// Thus each prime has the form</code></span>
+<span class="codeline" id="line-382"><code>		//   p_i = 2^bitlen(p_i) × 0.11... (in base 2).</code></span>
+<span class="codeline" id="line-383"><code>		// And the product is:</code></span>
+<span class="codeline" id="line-384"><code>		//   P = 2^todo × α</code></span>
+<span class="codeline" id="line-385"><code>		// where α is the product of nprimes numbers of the form 0.11...</code></span>
+<span class="codeline" id="line-386"><code>		//</code></span>
+<span class="codeline" id="line-387"><code>		// If α &lt; 1/2 (which can happen for nprimes &gt; 2), we need to</code></span>
+<span class="codeline" id="line-388"><code>		// shift todo to compensate for lost bits: the mean value of 0.11...</code></span>
+<span class="codeline" id="line-389"><code>		// is 7/8, so todo + shift - nprimes * log2(7/8) ~= bits - 1/2</code></span>
+<span class="codeline" id="line-390"><code>		// will give good results.</code></span>
+<span class="codeline" id="line-391"><code>		if nprimes &gt;= 7 {</code></span>
+<span class="codeline" id="line-392"><code>			todo += (nprimes - 2) / 5</code></span>
+<span class="codeline" id="line-393"><code>		}</code></span>
+<span class="codeline" id="line-394"><code>		for i := 0; i &lt; nprimes; i++ {</code></span>
+<span class="codeline" id="line-395"><code>			var err error</code></span>
+<span class="codeline" id="line-396"><code>			primes[i], err = rand.Prime(random, todo/(nprimes-i))</code></span>
+<span class="codeline" id="line-397"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-398"><code>				return nil, err</code></span>
+<span class="codeline" id="line-399"><code>			}</code></span>
+<span class="codeline" id="line-400"><code>			todo -= primes[i].BitLen()</code></span>
+<span class="codeline" id="line-401"><code>		}</code></span>
+<span class="codeline" id="line-402"><code></code></span>
+<span class="codeline" id="line-403"><code>		// Make sure that primes is pairwise unequal.</code></span>
+<span class="codeline" id="line-404"><code>		for i, prime := range primes {</code></span>
+<span class="codeline" id="line-405"><code>			for j := 0; j &lt; i; j++ {</code></span>
+<span class="codeline" id="line-406"><code>				if prime.Cmp(primes[j]) == 0 {</code></span>
+<span class="codeline" id="line-407"><code>					continue NextSetOfPrimes</code></span>
+<span class="codeline" id="line-408"><code>				}</code></span>
+<span class="codeline" id="line-409"><code>			}</code></span>
+<span class="codeline" id="line-410"><code>		}</code></span>
+<span class="codeline" id="line-411"><code></code></span>
+<span class="codeline" id="line-412"><code>		n := new(big.Int).Set(bigOne)</code></span>
+<span class="codeline" id="line-413"><code>		totient := new(big.Int).Set(bigOne)</code></span>
+<span class="codeline" id="line-414"><code>		pminus1 := new(big.Int)</code></span>
+<span class="codeline" id="line-415"><code>		for _, prime := range primes {</code></span>
+<span class="codeline" id="line-416"><code>			n.Mul(n, prime)</code></span>
+<span class="codeline" id="line-417"><code>			pminus1.Sub(prime, bigOne)</code></span>
+<span class="codeline" id="line-418"><code>			totient.Mul(totient, pminus1)</code></span>
+<span class="codeline" id="line-419"><code>		}</code></span>
+<span class="codeline" id="line-420"><code>		if n.BitLen() != bits {</code></span>
+<span class="codeline" id="line-421"><code>			// This should never happen for nprimes == 2 because</code></span>
+<span class="codeline" id="line-422"><code>			// crypto/rand should set the top two bits in each prime.</code></span>
+<span class="codeline" id="line-423"><code>			// For nprimes &gt; 2 we hope it does not happen often.</code></span>
+<span class="codeline" id="line-424"><code>			continue NextSetOfPrimes</code></span>
+<span class="codeline" id="line-425"><code>		}</code></span>
+<span class="codeline" id="line-426"><code></code></span>
+<span class="codeline" id="line-427"><code>		priv.D = new(big.Int)</code></span>
+<span class="codeline" id="line-428"><code>		e := big.NewInt(int64(priv.E))</code></span>
+<span class="codeline" id="line-429"><code>		ok := priv.D.ModInverse(e, totient)</code></span>
+<span class="codeline" id="line-430"><code></code></span>
+<span class="codeline" id="line-431"><code>		if ok != nil {</code></span>
+<span class="codeline" id="line-432"><code>			priv.Primes = primes</code></span>
+<span class="codeline" id="line-433"><code>			priv.N = n</code></span>
+<span class="codeline" id="line-434"><code>			break</code></span>
+<span class="codeline" id="line-435"><code>		}</code></span>
+<span class="codeline" id="line-436"><code>	}</code></span>
+<span class="codeline" id="line-437"><code></code></span>
+<span class="codeline" id="line-438"><code>	priv.Precompute()</code></span>
+<span class="codeline" id="line-439"><code>	return priv, nil</code></span>
+<span class="codeline" id="line-440"><code>}</code></span>
+<span class="codeline" id="line-441"><code></code></span>
+<span class="codeline" id="line-442"><code>// incCounter increments a four byte, big-endian counter.</code></span>
+<span class="codeline" id="line-443"><code>func incCounter(c *[4]byte) {</code></span>
+<span class="codeline" id="line-444"><code>	if c[3]++; c[3] != 0 {</code></span>
+<span class="codeline" id="line-445"><code>		return</code></span>
+<span class="codeline" id="line-446"><code>	}</code></span>
+<span class="codeline" id="line-447"><code>	if c[2]++; c[2] != 0 {</code></span>
+<span class="codeline" id="line-448"><code>		return</code></span>
+<span class="codeline" id="line-449"><code>	}</code></span>
+<span class="codeline" id="line-450"><code>	if c[1]++; c[1] != 0 {</code></span>
+<span class="codeline" id="line-451"><code>		return</code></span>
+<span class="codeline" id="line-452"><code>	}</code></span>
+<span class="codeline" id="line-453"><code>	c[0]++</code></span>
+<span class="codeline" id="line-454"><code>}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>// mgf1XOR XORs the bytes in out with a mask generated using the MGF1 function</code></span>
+<span class="codeline" id="line-457"><code>// specified in PKCS #1 v2.1.</code></span>
+<span class="codeline" id="line-458"><code>func mgf1XOR(out []byte, hash hash.Hash, seed []byte) {</code></span>
+<span class="codeline" id="line-459"><code>	var counter [4]byte</code></span>
+<span class="codeline" id="line-460"><code>	var digest []byte</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>	done := 0</code></span>
+<span class="codeline" id="line-463"><code>	for done &lt; len(out) {</code></span>
+<span class="codeline" id="line-464"><code>		hash.Write(seed)</code></span>
+<span class="codeline" id="line-465"><code>		hash.Write(counter[0:4])</code></span>
+<span class="codeline" id="line-466"><code>		digest = hash.Sum(digest[:0])</code></span>
+<span class="codeline" id="line-467"><code>		hash.Reset()</code></span>
+<span class="codeline" id="line-468"><code></code></span>
+<span class="codeline" id="line-469"><code>		for i := 0; i &lt; len(digest) &amp;&amp; done &lt; len(out); i++ {</code></span>
+<span class="codeline" id="line-470"><code>			out[done] ^= digest[i]</code></span>
+<span class="codeline" id="line-471"><code>			done++</code></span>
+<span class="codeline" id="line-472"><code>		}</code></span>
+<span class="codeline" id="line-473"><code>		incCounter(&amp;counter)</code></span>
+<span class="codeline" id="line-474"><code>	}</code></span>
+<span class="codeline" id="line-475"><code>}</code></span>
+<span class="codeline" id="line-476"><code></code></span>
+<span class="codeline" id="line-477"><code>// ErrMessageTooLong is returned when attempting to encrypt or sign a message</code></span>
+<span class="codeline" id="line-478"><code>// which is too large for the size of the key. When using [SignPSS], this can also</code></span>
+<span class="codeline" id="line-479"><code>// be returned if the size of the salt is too large.</code></span>
+<span class="codeline" id="line-480"><code>var ErrMessageTooLong = errors.New("crypto/rsa: message too long for RSA key size")</code></span>
+<span class="codeline" id="line-481"><code></code></span>
+<span class="codeline" id="line-482"><code>func encrypt(pub *PublicKey, plaintext []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-483"><code>	boring.Unreachable()</code></span>
+<span class="codeline" id="line-484"><code></code></span>
+<span class="codeline" id="line-485"><code>	N, err := bigmod.NewModulusFromBig(pub.N)</code></span>
+<span class="codeline" id="line-486"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-487"><code>		return nil, err</code></span>
+<span class="codeline" id="line-488"><code>	}</code></span>
+<span class="codeline" id="line-489"><code>	m, err := bigmod.NewNat().SetBytes(plaintext, N)</code></span>
+<span class="codeline" id="line-490"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-491"><code>		return nil, err</code></span>
+<span class="codeline" id="line-492"><code>	}</code></span>
+<span class="codeline" id="line-493"><code>	e := uint(pub.E)</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>	return bigmod.NewNat().ExpShortVarTime(m, e, N).Bytes(N), nil</code></span>
+<span class="codeline" id="line-496"><code>}</code></span>
+<span class="codeline" id="line-497"><code></code></span>
+<span class="codeline" id="line-498"><code>// EncryptOAEP encrypts the given message with RSA-OAEP.</code></span>
+<span class="codeline" id="line-499"><code>//</code></span>
+<span class="codeline" id="line-500"><code>// OAEP is parameterised by a hash function that is used as a random oracle.</code></span>
+<span class="codeline" id="line-501"><code>// Encryption and decryption of a given message must use the same hash function</code></span>
+<span class="codeline" id="line-502"><code>// and sha256.New() is a reasonable choice.</code></span>
+<span class="codeline" id="line-503"><code>//</code></span>
+<span class="codeline" id="line-504"><code>// The random parameter is used as a source of entropy to ensure that</code></span>
+<span class="codeline" id="line-505"><code>// encrypting the same message twice doesn't result in the same ciphertext.</code></span>
+<span class="codeline" id="line-506"><code>// Most applications should use [crypto/rand.Reader] as random.</code></span>
+<span class="codeline" id="line-507"><code>//</code></span>
+<span class="codeline" id="line-508"><code>// The label parameter may contain arbitrary data that will not be encrypted,</code></span>
+<span class="codeline" id="line-509"><code>// but which gives important context to the message. For example, if a given</code></span>
+<span class="codeline" id="line-510"><code>// public key is used to encrypt two types of messages then distinct label</code></span>
+<span class="codeline" id="line-511"><code>// values could be used to ensure that a ciphertext for one purpose cannot be</code></span>
+<span class="codeline" id="line-512"><code>// used for another by an attacker. If not required it can be empty.</code></span>
+<span class="codeline" id="line-513"><code>//</code></span>
+<span class="codeline" id="line-514"><code>// The message must be no longer than the length of the public modulus minus</code></span>
+<span class="codeline" id="line-515"><code>// twice the hash length, minus a further 2.</code></span>
+<span class="codeline" id="line-516"><code>func EncryptOAEP(hash hash.Hash, random io.Reader, pub *PublicKey, msg []byte, label []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-517"><code>	// Note that while we don't commit to deterministic execution with respect</code></span>
+<span class="codeline" id="line-518"><code>	// to the random stream, we also don't apply MaybeReadByte, so per Hyrum's</code></span>
+<span class="codeline" id="line-519"><code>	// Law it's probably relied upon by some. It's a tolerable promise because a</code></span>
+<span class="codeline" id="line-520"><code>	// well-specified number of random bytes is included in the ciphertext, in a</code></span>
+<span class="codeline" id="line-521"><code>	// well-specified way.</code></span>
+<span class="codeline" id="line-522"><code></code></span>
+<span class="codeline" id="line-523"><code>	if err := checkPub(pub); err != nil {</code></span>
+<span class="codeline" id="line-524"><code>		return nil, err</code></span>
+<span class="codeline" id="line-525"><code>	}</code></span>
+<span class="codeline" id="line-526"><code>	hash.Reset()</code></span>
+<span class="codeline" id="line-527"><code>	k := pub.Size()</code></span>
+<span class="codeline" id="line-528"><code>	if len(msg) &gt; k-2*hash.Size()-2 {</code></span>
+<span class="codeline" id="line-529"><code>		return nil, ErrMessageTooLong</code></span>
+<span class="codeline" id="line-530"><code>	}</code></span>
+<span class="codeline" id="line-531"><code></code></span>
+<span class="codeline" id="line-532"><code>	if boring.Enabled &amp;&amp; random == boring.RandReader {</code></span>
+<span class="codeline" id="line-533"><code>		bkey, err := boringPublicKey(pub)</code></span>
+<span class="codeline" id="line-534"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-535"><code>			return nil, err</code></span>
+<span class="codeline" id="line-536"><code>		}</code></span>
+<span class="codeline" id="line-537"><code>		return boring.EncryptRSAOAEP(hash, hash, bkey, msg, label)</code></span>
+<span class="codeline" id="line-538"><code>	}</code></span>
+<span class="codeline" id="line-539"><code>	boring.UnreachableExceptTests()</code></span>
+<span class="codeline" id="line-540"><code></code></span>
+<span class="codeline" id="line-541"><code>	hash.Write(label)</code></span>
+<span class="codeline" id="line-542"><code>	lHash := hash.Sum(nil)</code></span>
+<span class="codeline" id="line-543"><code>	hash.Reset()</code></span>
+<span class="codeline" id="line-544"><code></code></span>
+<span class="codeline" id="line-545"><code>	em := make([]byte, k)</code></span>
+<span class="codeline" id="line-546"><code>	seed := em[1 : 1+hash.Size()]</code></span>
+<span class="codeline" id="line-547"><code>	db := em[1+hash.Size():]</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>	copy(db[0:hash.Size()], lHash)</code></span>
+<span class="codeline" id="line-550"><code>	db[len(db)-len(msg)-1] = 1</code></span>
+<span class="codeline" id="line-551"><code>	copy(db[len(db)-len(msg):], msg)</code></span>
+<span class="codeline" id="line-552"><code></code></span>
+<span class="codeline" id="line-553"><code>	_, err := io.ReadFull(random, seed)</code></span>
+<span class="codeline" id="line-554"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-555"><code>		return nil, err</code></span>
+<span class="codeline" id="line-556"><code>	}</code></span>
+<span class="codeline" id="line-557"><code></code></span>
+<span class="codeline" id="line-558"><code>	mgf1XOR(db, hash, seed)</code></span>
+<span class="codeline" id="line-559"><code>	mgf1XOR(seed, hash, db)</code></span>
+<span class="codeline" id="line-560"><code></code></span>
+<span class="codeline" id="line-561"><code>	if boring.Enabled {</code></span>
+<span class="codeline" id="line-562"><code>		var bkey *boring.PublicKeyRSA</code></span>
+<span class="codeline" id="line-563"><code>		bkey, err = boringPublicKey(pub)</code></span>
+<span class="codeline" id="line-564"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-565"><code>			return nil, err</code></span>
+<span class="codeline" id="line-566"><code>		}</code></span>
+<span class="codeline" id="line-567"><code>		return boring.EncryptRSANoPadding(bkey, em)</code></span>
+<span class="codeline" id="line-568"><code>	}</code></span>
+<span class="codeline" id="line-569"><code></code></span>
+<span class="codeline" id="line-570"><code>	return encrypt(pub, em)</code></span>
+<span class="codeline" id="line-571"><code>}</code></span>
+<span class="codeline" id="line-572"><code></code></span>
+<span class="codeline" id="line-573"><code>// ErrDecryption represents a failure to decrypt a message.</code></span>
+<span class="codeline" id="line-574"><code>// It is deliberately vague to avoid adaptive attacks.</code></span>
+<span class="codeline" id="line-575"><code>var ErrDecryption = errors.New("crypto/rsa: decryption error")</code></span>
+<span class="codeline" id="line-576"><code></code></span>
+<span class="codeline" id="line-577"><code>// ErrVerification represents a failure to verify a signature.</code></span>
+<span class="codeline" id="line-578"><code>// It is deliberately vague to avoid adaptive attacks.</code></span>
+<span class="codeline" id="line-579"><code>var ErrVerification = errors.New("crypto/rsa: verification error")</code></span>
+<span class="codeline" id="line-580"><code></code></span>
+<span class="codeline" id="line-581"><code>// Precompute performs some calculations that speed up private key operations</code></span>
+<span class="codeline" id="line-582"><code>// in the future.</code></span>
+<span class="codeline" id="line-583"><code>func (priv *PrivateKey) Precompute() {</code></span>
+<span class="codeline" id="line-584"><code>	if priv.Precomputed.n == nil &amp;&amp; len(priv.Primes) == 2 {</code></span>
+<span class="codeline" id="line-585"><code>		// Precomputed values _should_ always be valid, but if they aren't</code></span>
+<span class="codeline" id="line-586"><code>		// just return. We could also panic.</code></span>
+<span class="codeline" id="line-587"><code>		var err error</code></span>
+<span class="codeline" id="line-588"><code>		priv.Precomputed.n, err = bigmod.NewModulusFromBig(priv.N)</code></span>
+<span class="codeline" id="line-589"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-590"><code>			return</code></span>
+<span class="codeline" id="line-591"><code>		}</code></span>
+<span class="codeline" id="line-592"><code>		priv.Precomputed.p, err = bigmod.NewModulusFromBig(priv.Primes[0])</code></span>
+<span class="codeline" id="line-593"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-594"><code>			// Unset previous values, so we either have everything or nothing</code></span>
+<span class="codeline" id="line-595"><code>			priv.Precomputed.n = nil</code></span>
+<span class="codeline" id="line-596"><code>			return</code></span>
+<span class="codeline" id="line-597"><code>		}</code></span>
+<span class="codeline" id="line-598"><code>		priv.Precomputed.q, err = bigmod.NewModulusFromBig(priv.Primes[1])</code></span>
+<span class="codeline" id="line-599"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-600"><code>			// Unset previous values, so we either have everything or nothing</code></span>
+<span class="codeline" id="line-601"><code>			priv.Precomputed.n, priv.Precomputed.p = nil, nil</code></span>
+<span class="codeline" id="line-602"><code>			return</code></span>
+<span class="codeline" id="line-603"><code>		}</code></span>
+<span class="codeline" id="line-604"><code>	}</code></span>
+<span class="codeline" id="line-605"><code></code></span>
+<span class="codeline" id="line-606"><code>	// Fill in the backwards-compatibility *big.Int values.</code></span>
+<span class="codeline" id="line-607"><code>	if priv.Precomputed.Dp != nil {</code></span>
+<span class="codeline" id="line-608"><code>		return</code></span>
+<span class="codeline" id="line-609"><code>	}</code></span>
+<span class="codeline" id="line-610"><code></code></span>
+<span class="codeline" id="line-611"><code>	priv.Precomputed.Dp = new(big.Int).Sub(priv.Primes[0], bigOne)</code></span>
+<span class="codeline" id="line-612"><code>	priv.Precomputed.Dp.Mod(priv.D, priv.Precomputed.Dp)</code></span>
+<span class="codeline" id="line-613"><code></code></span>
+<span class="codeline" id="line-614"><code>	priv.Precomputed.Dq = new(big.Int).Sub(priv.Primes[1], bigOne)</code></span>
+<span class="codeline" id="line-615"><code>	priv.Precomputed.Dq.Mod(priv.D, priv.Precomputed.Dq)</code></span>
+<span class="codeline" id="line-616"><code></code></span>
+<span class="codeline" id="line-617"><code>	priv.Precomputed.Qinv = new(big.Int).ModInverse(priv.Primes[1], priv.Primes[0])</code></span>
+<span class="codeline" id="line-618"><code></code></span>
+<span class="codeline" id="line-619"><code>	r := new(big.Int).Mul(priv.Primes[0], priv.Primes[1])</code></span>
+<span class="codeline" id="line-620"><code>	priv.Precomputed.CRTValues = make([]CRTValue, len(priv.Primes)-2)</code></span>
+<span class="codeline" id="line-621"><code>	for i := 2; i &lt; len(priv.Primes); i++ {</code></span>
+<span class="codeline" id="line-622"><code>		prime := priv.Primes[i]</code></span>
+<span class="codeline" id="line-623"><code>		values := &amp;priv.Precomputed.CRTValues[i-2]</code></span>
+<span class="codeline" id="line-624"><code></code></span>
+<span class="codeline" id="line-625"><code>		values.Exp = new(big.Int).Sub(prime, bigOne)</code></span>
+<span class="codeline" id="line-626"><code>		values.Exp.Mod(priv.D, values.Exp)</code></span>
+<span class="codeline" id="line-627"><code></code></span>
+<span class="codeline" id="line-628"><code>		values.R = new(big.Int).Set(r)</code></span>
+<span class="codeline" id="line-629"><code>		values.Coeff = new(big.Int).ModInverse(r, prime)</code></span>
+<span class="codeline" id="line-630"><code></code></span>
+<span class="codeline" id="line-631"><code>		r.Mul(r, prime)</code></span>
+<span class="codeline" id="line-632"><code>	}</code></span>
+<span class="codeline" id="line-633"><code>}</code></span>
+<span class="codeline" id="line-634"><code></code></span>
+<span class="codeline" id="line-635"><code>const withCheck = true</code></span>
+<span class="codeline" id="line-636"><code>const noCheck = false</code></span>
+<span class="codeline" id="line-637"><code></code></span>
+<span class="codeline" id="line-638"><code>// decrypt performs an RSA decryption of ciphertext into out. If check is true,</code></span>
+<span class="codeline" id="line-639"><code>// m^e is calculated and compared with ciphertext, in order to defend against</code></span>
+<span class="codeline" id="line-640"><code>// errors in the CRT computation.</code></span>
+<span class="codeline" id="line-641"><code>func decrypt(priv *PrivateKey, ciphertext []byte, check bool) ([]byte, error) {</code></span>
+<span class="codeline" id="line-642"><code>	if len(priv.Primes) &lt;= 2 {</code></span>
+<span class="codeline" id="line-643"><code>		boring.Unreachable()</code></span>
+<span class="codeline" id="line-644"><code>	}</code></span>
+<span class="codeline" id="line-645"><code></code></span>
+<span class="codeline" id="line-646"><code>	var (</code></span>
+<span class="codeline" id="line-647"><code>		err  error</code></span>
+<span class="codeline" id="line-648"><code>		m, c *bigmod.Nat</code></span>
+<span class="codeline" id="line-649"><code>		N    *bigmod.Modulus</code></span>
+<span class="codeline" id="line-650"><code>		t0   = bigmod.NewNat()</code></span>
+<span class="codeline" id="line-651"><code>	)</code></span>
+<span class="codeline" id="line-652"><code>	if priv.Precomputed.n == nil {</code></span>
+<span class="codeline" id="line-653"><code>		N, err = bigmod.NewModulusFromBig(priv.N)</code></span>
+<span class="codeline" id="line-654"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-655"><code>			return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-656"><code>		}</code></span>
+<span class="codeline" id="line-657"><code>		c, err = bigmod.NewNat().SetBytes(ciphertext, N)</code></span>
+<span class="codeline" id="line-658"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-659"><code>			return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-660"><code>		}</code></span>
+<span class="codeline" id="line-661"><code>		m = bigmod.NewNat().Exp(c, priv.D.Bytes(), N)</code></span>
+<span class="codeline" id="line-662"><code>	} else {</code></span>
+<span class="codeline" id="line-663"><code>		N = priv.Precomputed.n</code></span>
+<span class="codeline" id="line-664"><code>		P, Q := priv.Precomputed.p, priv.Precomputed.q</code></span>
+<span class="codeline" id="line-665"><code>		Qinv, err := bigmod.NewNat().SetBytes(priv.Precomputed.Qinv.Bytes(), P)</code></span>
+<span class="codeline" id="line-666"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-667"><code>			return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-668"><code>		}</code></span>
+<span class="codeline" id="line-669"><code>		c, err = bigmod.NewNat().SetBytes(ciphertext, N)</code></span>
+<span class="codeline" id="line-670"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-671"><code>			return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-672"><code>		}</code></span>
+<span class="codeline" id="line-673"><code></code></span>
+<span class="codeline" id="line-674"><code>		// m = c ^ Dp mod p</code></span>
+<span class="codeline" id="line-675"><code>		m = bigmod.NewNat().Exp(t0.Mod(c, P), priv.Precomputed.Dp.Bytes(), P)</code></span>
+<span class="codeline" id="line-676"><code>		// m2 = c ^ Dq mod q</code></span>
+<span class="codeline" id="line-677"><code>		m2 := bigmod.NewNat().Exp(t0.Mod(c, Q), priv.Precomputed.Dq.Bytes(), Q)</code></span>
+<span class="codeline" id="line-678"><code>		// m = m - m2 mod p</code></span>
+<span class="codeline" id="line-679"><code>		m.Sub(t0.Mod(m2, P), P)</code></span>
+<span class="codeline" id="line-680"><code>		// m = m * Qinv mod p</code></span>
+<span class="codeline" id="line-681"><code>		m.Mul(Qinv, P)</code></span>
+<span class="codeline" id="line-682"><code>		// m = m * q mod N</code></span>
+<span class="codeline" id="line-683"><code>		m.ExpandFor(N).Mul(t0.Mod(Q.Nat(), N), N)</code></span>
+<span class="codeline" id="line-684"><code>		// m = m + m2 mod N</code></span>
+<span class="codeline" id="line-685"><code>		m.Add(m2.ExpandFor(N), N)</code></span>
+<span class="codeline" id="line-686"><code>	}</code></span>
+<span class="codeline" id="line-687"><code></code></span>
+<span class="codeline" id="line-688"><code>	if check {</code></span>
+<span class="codeline" id="line-689"><code>		c1 := bigmod.NewNat().ExpShortVarTime(m, uint(priv.E), N)</code></span>
+<span class="codeline" id="line-690"><code>		if c1.Equal(c) != 1 {</code></span>
+<span class="codeline" id="line-691"><code>			return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-692"><code>		}</code></span>
+<span class="codeline" id="line-693"><code>	}</code></span>
+<span class="codeline" id="line-694"><code></code></span>
+<span class="codeline" id="line-695"><code>	return m.Bytes(N), nil</code></span>
+<span class="codeline" id="line-696"><code>}</code></span>
+<span class="codeline" id="line-697"><code></code></span>
+<span class="codeline" id="line-698"><code>// DecryptOAEP decrypts ciphertext using RSA-OAEP.</code></span>
+<span class="codeline" id="line-699"><code>//</code></span>
+<span class="codeline" id="line-700"><code>// OAEP is parameterised by a hash function that is used as a random oracle.</code></span>
+<span class="codeline" id="line-701"><code>// Encryption and decryption of a given message must use the same hash function</code></span>
+<span class="codeline" id="line-702"><code>// and sha256.New() is a reasonable choice.</code></span>
+<span class="codeline" id="line-703"><code>//</code></span>
+<span class="codeline" id="line-704"><code>// The random parameter is legacy and ignored, and it can be nil.</code></span>
+<span class="codeline" id="line-705"><code>//</code></span>
+<span class="codeline" id="line-706"><code>// The label parameter must match the value given when encrypting. See</code></span>
+<span class="codeline" id="line-707"><code>// [EncryptOAEP] for details.</code></span>
+<span class="codeline" id="line-708"><code>func DecryptOAEP(hash hash.Hash, random io.Reader, priv *PrivateKey, ciphertext []byte, label []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-709"><code>	return decryptOAEP(hash, hash, random, priv, ciphertext, label)</code></span>
+<span class="codeline" id="line-710"><code>}</code></span>
+<span class="codeline" id="line-711"><code></code></span>
+<span class="codeline" id="line-712"><code>func decryptOAEP(hash, mgfHash hash.Hash, random io.Reader, priv *PrivateKey, ciphertext []byte, label []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-713"><code>	if err := checkPub(&amp;priv.PublicKey); err != nil {</code></span>
+<span class="codeline" id="line-714"><code>		return nil, err</code></span>
+<span class="codeline" id="line-715"><code>	}</code></span>
+<span class="codeline" id="line-716"><code>	k := priv.Size()</code></span>
+<span class="codeline" id="line-717"><code>	if len(ciphertext) &gt; k ||</code></span>
+<span class="codeline" id="line-718"><code>		k &lt; hash.Size()*2+2 {</code></span>
+<span class="codeline" id="line-719"><code>		return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-720"><code>	}</code></span>
+<span class="codeline" id="line-721"><code></code></span>
+<span class="codeline" id="line-722"><code>	if boring.Enabled {</code></span>
+<span class="codeline" id="line-723"><code>		bkey, err := boringPrivateKey(priv)</code></span>
+<span class="codeline" id="line-724"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-725"><code>			return nil, err</code></span>
+<span class="codeline" id="line-726"><code>		}</code></span>
+<span class="codeline" id="line-727"><code>		out, err := boring.DecryptRSAOAEP(hash, mgfHash, bkey, ciphertext, label)</code></span>
+<span class="codeline" id="line-728"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-729"><code>			return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-730"><code>		}</code></span>
+<span class="codeline" id="line-731"><code>		return out, nil</code></span>
+<span class="codeline" id="line-732"><code>	}</code></span>
+<span class="codeline" id="line-733"><code></code></span>
+<span class="codeline" id="line-734"><code>	em, err := decrypt(priv, ciphertext, noCheck)</code></span>
+<span class="codeline" id="line-735"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-736"><code>		return nil, err</code></span>
+<span class="codeline" id="line-737"><code>	}</code></span>
+<span class="codeline" id="line-738"><code></code></span>
+<span class="codeline" id="line-739"><code>	hash.Write(label)</code></span>
+<span class="codeline" id="line-740"><code>	lHash := hash.Sum(nil)</code></span>
+<span class="codeline" id="line-741"><code>	hash.Reset()</code></span>
+<span class="codeline" id="line-742"><code></code></span>
+<span class="codeline" id="line-743"><code>	firstByteIsZero := subtle.ConstantTimeByteEq(em[0], 0)</code></span>
+<span class="codeline" id="line-744"><code></code></span>
+<span class="codeline" id="line-745"><code>	seed := em[1 : hash.Size()+1]</code></span>
+<span class="codeline" id="line-746"><code>	db := em[hash.Size()+1:]</code></span>
+<span class="codeline" id="line-747"><code></code></span>
+<span class="codeline" id="line-748"><code>	mgf1XOR(seed, mgfHash, db)</code></span>
+<span class="codeline" id="line-749"><code>	mgf1XOR(db, mgfHash, seed)</code></span>
+<span class="codeline" id="line-750"><code></code></span>
+<span class="codeline" id="line-751"><code>	lHash2 := db[0:hash.Size()]</code></span>
+<span class="codeline" id="line-752"><code></code></span>
+<span class="codeline" id="line-753"><code>	// We have to validate the plaintext in constant time in order to avoid</code></span>
+<span class="codeline" id="line-754"><code>	// attacks like: J. Manger. A Chosen Ciphertext Attack on RSA Optimal</code></span>
+<span class="codeline" id="line-755"><code>	// Asymmetric Encryption Padding (OAEP) as Standardized in PKCS #1</code></span>
+<span class="codeline" id="line-756"><code>	// v2.0. In J. Kilian, editor, Advances in Cryptology.</code></span>
+<span class="codeline" id="line-757"><code>	lHash2Good := subtle.ConstantTimeCompare(lHash, lHash2)</code></span>
+<span class="codeline" id="line-758"><code></code></span>
+<span class="codeline" id="line-759"><code>	// The remainder of the plaintext must be zero or more 0x00, followed</code></span>
+<span class="codeline" id="line-760"><code>	// by 0x01, followed by the message.</code></span>
+<span class="codeline" id="line-761"><code>	//   lookingForIndex: 1 iff we are still looking for the 0x01</code></span>
+<span class="codeline" id="line-762"><code>	//   index: the offset of the first 0x01 byte</code></span>
+<span class="codeline" id="line-763"><code>	//   invalid: 1 iff we saw a non-zero byte before the 0x01.</code></span>
+<span class="codeline" id="line-764"><code>	var lookingForIndex, index, invalid int</code></span>
+<span class="codeline" id="line-765"><code>	lookingForIndex = 1</code></span>
+<span class="codeline" id="line-766"><code>	rest := db[hash.Size():]</code></span>
+<span class="codeline" id="line-767"><code></code></span>
+<span class="codeline" id="line-768"><code>	for i := 0; i &lt; len(rest); i++ {</code></span>
+<span class="codeline" id="line-769"><code>		equals0 := subtle.ConstantTimeByteEq(rest[i], 0)</code></span>
+<span class="codeline" id="line-770"><code>		equals1 := subtle.ConstantTimeByteEq(rest[i], 1)</code></span>
+<span class="codeline" id="line-771"><code>		index = subtle.ConstantTimeSelect(lookingForIndex&amp;equals1, i, index)</code></span>
+<span class="codeline" id="line-772"><code>		lookingForIndex = subtle.ConstantTimeSelect(equals1, 0, lookingForIndex)</code></span>
+<span class="codeline" id="line-773"><code>		invalid = subtle.ConstantTimeSelect(lookingForIndex&amp;^equals0, 1, invalid)</code></span>
+<span class="codeline" id="line-774"><code>	}</code></span>
+<span class="codeline" id="line-775"><code></code></span>
+<span class="codeline" id="line-776"><code>	if firstByteIsZero&amp;lHash2Good&amp;^invalid&amp;^lookingForIndex != 1 {</code></span>
+<span class="codeline" id="line-777"><code>		return nil, ErrDecryption</code></span>
+<span class="codeline" id="line-778"><code>	}</code></span>
+<span class="codeline" id="line-779"><code></code></span>
+<span class="codeline" id="line-780"><code>	return rest[index+1:], nil</code></span>
+<span class="codeline" id="line-781"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

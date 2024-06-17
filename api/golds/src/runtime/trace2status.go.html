@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: trace2status.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	trace2status.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build goexperiment.exectracer2</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// Trace goroutine and P status management.</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>package runtime</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>import "runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// traceGoStatus is the status of a goroutine.</code></span>
+<span class="codeline" id="line-14"><code>//</code></span>
+<span class="codeline" id="line-15"><code>// They correspond directly to the various goroutine</code></span>
+<span class="codeline" id="line-16"><code>// statuses.</code></span>
+<span class="codeline" id="line-17"><code>type traceGoStatus uint8</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>const (</code></span>
+<span class="codeline" id="line-20"><code>	traceGoBad traceGoStatus = iota</code></span>
+<span class="codeline" id="line-21"><code>	traceGoRunnable</code></span>
+<span class="codeline" id="line-22"><code>	traceGoRunning</code></span>
+<span class="codeline" id="line-23"><code>	traceGoSyscall</code></span>
+<span class="codeline" id="line-24"><code>	traceGoWaiting</code></span>
+<span class="codeline" id="line-25"><code>)</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>// traceProcStatus is the status of a P.</code></span>
+<span class="codeline" id="line-28"><code>//</code></span>
+<span class="codeline" id="line-29"><code>// They mostly correspond to the various P statuses.</code></span>
+<span class="codeline" id="line-30"><code>type traceProcStatus uint8</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>const (</code></span>
+<span class="codeline" id="line-33"><code>	traceProcBad traceProcStatus = iota</code></span>
+<span class="codeline" id="line-34"><code>	traceProcRunning</code></span>
+<span class="codeline" id="line-35"><code>	traceProcIdle</code></span>
+<span class="codeline" id="line-36"><code>	traceProcSyscall</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>	// traceProcSyscallAbandoned is a special case of</code></span>
+<span class="codeline" id="line-39"><code>	// traceProcSyscall. It's used in the very specific case</code></span>
+<span class="codeline" id="line-40"><code>	// where the first a P is mentioned in a generation is</code></span>
+<span class="codeline" id="line-41"><code>	// part of a ProcSteal event. If that's the first time</code></span>
+<span class="codeline" id="line-42"><code>	// it's mentioned, then there's no GoSyscallBegin to</code></span>
+<span class="codeline" id="line-43"><code>	// connect the P stealing back to at that point. This</code></span>
+<span class="codeline" id="line-44"><code>	// special state indicates this to the parser, so it</code></span>
+<span class="codeline" id="line-45"><code>	// doesn't try to find a GoSyscallEndBlocked that</code></span>
+<span class="codeline" id="line-46"><code>	// corresponds with the ProcSteal.</code></span>
+<span class="codeline" id="line-47"><code>	traceProcSyscallAbandoned</code></span>
+<span class="codeline" id="line-48"><code>)</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>// writeGoStatus emits a GoStatus event as well as any active ranges on the goroutine.</code></span>
+<span class="codeline" id="line-51"><code>func (w traceWriter) writeGoStatus(goid uint64, mid int64, status traceGoStatus, markAssist bool) traceWriter {</code></span>
+<span class="codeline" id="line-52"><code>	// The status should never be bad. Some invariant must have been violated.</code></span>
+<span class="codeline" id="line-53"><code>	if status == traceGoBad {</code></span>
+<span class="codeline" id="line-54"><code>		print("runtime: goid=", goid, "\n")</code></span>
+<span class="codeline" id="line-55"><code>		throw("attempted to trace a bad status for a goroutine")</code></span>
+<span class="codeline" id="line-56"><code>	}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>	// Trace the status.</code></span>
+<span class="codeline" id="line-59"><code>	w = w.event(traceEvGoStatus, traceArg(goid), traceArg(uint64(mid)), traceArg(status))</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>	// Trace any special ranges that are in-progress.</code></span>
+<span class="codeline" id="line-62"><code>	if markAssist {</code></span>
+<span class="codeline" id="line-63"><code>		w = w.event(traceEvGCMarkAssistActive, traceArg(goid))</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code>	return w</code></span>
+<span class="codeline" id="line-66"><code>}</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>// writeProcStatusForP emits a ProcStatus event for the provided p based on its status.</code></span>
+<span class="codeline" id="line-69"><code>//</code></span>
+<span class="codeline" id="line-70"><code>// The caller must fully own pp and it must be prevented from transitioning (e.g. this can be</code></span>
+<span class="codeline" id="line-71"><code>// called by a forEachP callback or from a STW).</code></span>
+<span class="codeline" id="line-72"><code>func (w traceWriter) writeProcStatusForP(pp *p, inSTW bool) traceWriter {</code></span>
+<span class="codeline" id="line-73"><code>	if !pp.trace.acquireStatus(w.gen) {</code></span>
+<span class="codeline" id="line-74"><code>		return w</code></span>
+<span class="codeline" id="line-75"><code>	}</code></span>
+<span class="codeline" id="line-76"><code>	var status traceProcStatus</code></span>
+<span class="codeline" id="line-77"><code>	switch pp.status {</code></span>
+<span class="codeline" id="line-78"><code>	case _Pidle, _Pgcstop:</code></span>
+<span class="codeline" id="line-79"><code>		status = traceProcIdle</code></span>
+<span class="codeline" id="line-80"><code>		if pp.status == _Pgcstop &amp;&amp; inSTW {</code></span>
+<span class="codeline" id="line-81"><code>			// N.B. a P that is running and currently has the world stopped will be</code></span>
+<span class="codeline" id="line-82"><code>			// in _Pgcstop, but we model it as running in the tracer.</code></span>
+<span class="codeline" id="line-83"><code>			status = traceProcRunning</code></span>
+<span class="codeline" id="line-84"><code>		}</code></span>
+<span class="codeline" id="line-85"><code>	case _Prunning:</code></span>
+<span class="codeline" id="line-86"><code>		status = traceProcRunning</code></span>
+<span class="codeline" id="line-87"><code>		// There's a short window wherein the goroutine may have entered _Gsyscall</code></span>
+<span class="codeline" id="line-88"><code>		// but it still owns the P (it's not in _Psyscall yet). The goroutine entering</code></span>
+<span class="codeline" id="line-89"><code>		// _Gsyscall is the tracer's signal that the P its bound to is also in a syscall,</code></span>
+<span class="codeline" id="line-90"><code>		// so we need to emit a status that matches. See #64318.</code></span>
+<span class="codeline" id="line-91"><code>		if w.mp.p.ptr() == pp &amp;&amp; w.mp.curg != nil &amp;&amp; readgstatus(w.mp.curg)&amp;^_Gscan == _Gsyscall {</code></span>
+<span class="codeline" id="line-92"><code>			status = traceProcSyscall</code></span>
+<span class="codeline" id="line-93"><code>		}</code></span>
+<span class="codeline" id="line-94"><code>	case _Psyscall:</code></span>
+<span class="codeline" id="line-95"><code>		status = traceProcSyscall</code></span>
+<span class="codeline" id="line-96"><code>	default:</code></span>
+<span class="codeline" id="line-97"><code>		throw("attempt to trace invalid or unsupported P status")</code></span>
+<span class="codeline" id="line-98"><code>	}</code></span>
+<span class="codeline" id="line-99"><code>	w = w.writeProcStatus(uint64(pp.id), status, pp.trace.inSweep)</code></span>
+<span class="codeline" id="line-100"><code>	return w</code></span>
+<span class="codeline" id="line-101"><code>}</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>// writeProcStatus emits a ProcStatus event with all the provided information.</code></span>
+<span class="codeline" id="line-104"><code>//</code></span>
+<span class="codeline" id="line-105"><code>// The caller must have taken ownership of a P's status writing, and the P must be</code></span>
+<span class="codeline" id="line-106"><code>// prevented from transitioning.</code></span>
+<span class="codeline" id="line-107"><code>func (w traceWriter) writeProcStatus(pid uint64, status traceProcStatus, inSweep bool) traceWriter {</code></span>
+<span class="codeline" id="line-108"><code>	// The status should never be bad. Some invariant must have been violated.</code></span>
+<span class="codeline" id="line-109"><code>	if status == traceProcBad {</code></span>
+<span class="codeline" id="line-110"><code>		print("runtime: pid=", pid, "\n")</code></span>
+<span class="codeline" id="line-111"><code>		throw("attempted to trace a bad status for a proc")</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>	// Trace the status.</code></span>
+<span class="codeline" id="line-115"><code>	w = w.event(traceEvProcStatus, traceArg(pid), traceArg(status))</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>	// Trace any special ranges that are in-progress.</code></span>
+<span class="codeline" id="line-118"><code>	if inSweep {</code></span>
+<span class="codeline" id="line-119"><code>		w = w.event(traceEvGCSweepActive, traceArg(pid))</code></span>
+<span class="codeline" id="line-120"><code>	}</code></span>
+<span class="codeline" id="line-121"><code>	return w</code></span>
+<span class="codeline" id="line-122"><code>}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>// goStatusToTraceGoStatus translates the internal status to tracGoStatus.</code></span>
+<span class="codeline" id="line-125"><code>//</code></span>
+<span class="codeline" id="line-126"><code>// status must not be _Gdead or any status whose name has the suffix "_unused."</code></span>
+<span class="codeline" id="line-127"><code>func goStatusToTraceGoStatus(status uint32, wr waitReason) traceGoStatus {</code></span>
+<span class="codeline" id="line-128"><code>	// N.B. Ignore the _Gscan bit. We don't model it in the tracer.</code></span>
+<span class="codeline" id="line-129"><code>	var tgs traceGoStatus</code></span>
+<span class="codeline" id="line-130"><code>	switch status &amp;^ _Gscan {</code></span>
+<span class="codeline" id="line-131"><code>	case _Grunnable:</code></span>
+<span class="codeline" id="line-132"><code>		tgs = traceGoRunnable</code></span>
+<span class="codeline" id="line-133"><code>	case _Grunning, _Gcopystack:</code></span>
+<span class="codeline" id="line-134"><code>		tgs = traceGoRunning</code></span>
+<span class="codeline" id="line-135"><code>	case _Gsyscall:</code></span>
+<span class="codeline" id="line-136"><code>		tgs = traceGoSyscall</code></span>
+<span class="codeline" id="line-137"><code>	case _Gwaiting, _Gpreempted:</code></span>
+<span class="codeline" id="line-138"><code>		// There are a number of cases where a G might end up in</code></span>
+<span class="codeline" id="line-139"><code>		// _Gwaiting but it's actually running in a non-preemptive</code></span>
+<span class="codeline" id="line-140"><code>		// state but needs to present itself as preempted to the</code></span>
+<span class="codeline" id="line-141"><code>		// garbage collector. In these cases, we're not going to</code></span>
+<span class="codeline" id="line-142"><code>		// emit an event, and we want these goroutines to appear in</code></span>
+<span class="codeline" id="line-143"><code>		// the final trace as if they're running, not blocked.</code></span>
+<span class="codeline" id="line-144"><code>		tgs = traceGoWaiting</code></span>
+<span class="codeline" id="line-145"><code>		if status == _Gwaiting &amp;&amp;</code></span>
+<span class="codeline" id="line-146"><code>			wr == waitReasonStoppingTheWorld ||</code></span>
+<span class="codeline" id="line-147"><code>			wr == waitReasonGCMarkTermination ||</code></span>
+<span class="codeline" id="line-148"><code>			wr == waitReasonGarbageCollection ||</code></span>
+<span class="codeline" id="line-149"><code>			wr == waitReasonTraceProcStatus ||</code></span>
+<span class="codeline" id="line-150"><code>			wr == waitReasonPageTraceFlush ||</code></span>
+<span class="codeline" id="line-151"><code>			wr == waitReasonGCWorkerActive {</code></span>
+<span class="codeline" id="line-152"><code>			tgs = traceGoRunning</code></span>
+<span class="codeline" id="line-153"><code>		}</code></span>
+<span class="codeline" id="line-154"><code>	case _Gdead:</code></span>
+<span class="codeline" id="line-155"><code>		throw("tried to trace dead goroutine")</code></span>
+<span class="codeline" id="line-156"><code>	default:</code></span>
+<span class="codeline" id="line-157"><code>		throw("tried to trace goroutine with invalid or unsupported status")</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>	return tgs</code></span>
+<span class="codeline" id="line-160"><code>}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>// traceSchedResourceState is shared state for scheduling resources (i.e. fields common to</code></span>
+<span class="codeline" id="line-163"><code>// both Gs and Ps).</code></span>
+<span class="codeline" id="line-164"><code>type traceSchedResourceState struct {</code></span>
+<span class="codeline" id="line-165"><code>	// statusTraced indicates whether a status event was traced for this resource</code></span>
+<span class="codeline" id="line-166"><code>	// a particular generation.</code></span>
+<span class="codeline" id="line-167"><code>	//</code></span>
+<span class="codeline" id="line-168"><code>	// There are 3 of these because when transitioning across generations, traceAdvance</code></span>
+<span class="codeline" id="line-169"><code>	// needs to be able to reliably observe whether a status was traced for the previous</code></span>
+<span class="codeline" id="line-170"><code>	// generation, while we need to clear the value for the next generation.</code></span>
+<span class="codeline" id="line-171"><code>	statusTraced [3]atomic.Uint32</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>	// seq is the sequence counter for this scheduling resource's events.</code></span>
+<span class="codeline" id="line-174"><code>	// The purpose of the sequence counter is to establish a partial order between</code></span>
+<span class="codeline" id="line-175"><code>	// events that don't obviously happen serially (same M) in the stream ofevents.</code></span>
+<span class="codeline" id="line-176"><code>	//</code></span>
+<span class="codeline" id="line-177"><code>	// There are two of these so that we can reset the counter on each generation.</code></span>
+<span class="codeline" id="line-178"><code>	// This saves space in the resulting trace by keeping the counter small and allows</code></span>
+<span class="codeline" id="line-179"><code>	// GoStatus and GoCreate events to omit a sequence number (implicitly 0).</code></span>
+<span class="codeline" id="line-180"><code>	seq [2]uint64</code></span>
+<span class="codeline" id="line-181"><code>}</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>// acquireStatus acquires the right to emit a Status event for the scheduling resource.</code></span>
+<span class="codeline" id="line-184"><code>func (r *traceSchedResourceState) acquireStatus(gen uintptr) bool {</code></span>
+<span class="codeline" id="line-185"><code>	if !r.statusTraced[gen%3].CompareAndSwap(0, 1) {</code></span>
+<span class="codeline" id="line-186"><code>		return false</code></span>
+<span class="codeline" id="line-187"><code>	}</code></span>
+<span class="codeline" id="line-188"><code>	r.readyNextGen(gen)</code></span>
+<span class="codeline" id="line-189"><code>	return true</code></span>
+<span class="codeline" id="line-190"><code>}</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>// readyNextGen readies r for the generation following gen.</code></span>
+<span class="codeline" id="line-193"><code>func (r *traceSchedResourceState) readyNextGen(gen uintptr) {</code></span>
+<span class="codeline" id="line-194"><code>	nextGen := traceNextGen(gen)</code></span>
+<span class="codeline" id="line-195"><code>	r.seq[nextGen%2] = 0</code></span>
+<span class="codeline" id="line-196"><code>	r.statusTraced[nextGen%3].Store(0)</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>// statusWasTraced returns true if the sched resource's status was already acquired for tracing.</code></span>
+<span class="codeline" id="line-200"><code>func (r *traceSchedResourceState) statusWasTraced(gen uintptr) bool {</code></span>
+<span class="codeline" id="line-201"><code>	return r.statusTraced[gen%3].Load() != 0</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>// setStatusTraced indicates that the resource's status was already traced, for example</code></span>
+<span class="codeline" id="line-205"><code>// when a goroutine is created.</code></span>
+<span class="codeline" id="line-206"><code>func (r *traceSchedResourceState) setStatusTraced(gen uintptr) {</code></span>
+<span class="codeline" id="line-207"><code>	r.statusTraced[gen%3].Store(1)</code></span>
+<span class="codeline" id="line-208"><code>}</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>// nextSeq returns the next sequence number for the resource.</code></span>
+<span class="codeline" id="line-211"><code>func (r *traceSchedResourceState) nextSeq(gen uintptr) traceArg {</code></span>
+<span class="codeline" id="line-212"><code>	r.seq[gen%2]++</code></span>
+<span class="codeline" id="line-213"><code>	return traceArg(r.seq[gen%2])</code></span>
+<span class="codeline" id="line-214"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

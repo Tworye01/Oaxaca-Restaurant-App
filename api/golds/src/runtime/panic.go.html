@@ -1,0 +1,1473 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: panic.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	panic.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2014 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/abi"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/goarch"</code></span>
+<span class="codeline" id="line-10"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-11"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-12"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>// throwType indicates the current type of ongoing throw, which affects the</code></span>
+<span class="codeline" id="line-16"><code>// amount of detail printed to stderr. Higher values include more detail.</code></span>
+<span class="codeline" id="line-17"><code>type throwType uint32</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>const (</code></span>
+<span class="codeline" id="line-20"><code>	// throwTypeNone means that we are not throwing.</code></span>
+<span class="codeline" id="line-21"><code>	throwTypeNone throwType = iota</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>	// throwTypeUser is a throw due to a problem with the application.</code></span>
+<span class="codeline" id="line-24"><code>	//</code></span>
+<span class="codeline" id="line-25"><code>	// These throws do not include runtime frames, system goroutines, or</code></span>
+<span class="codeline" id="line-26"><code>	// frame metadata.</code></span>
+<span class="codeline" id="line-27"><code>	throwTypeUser</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>	// throwTypeRuntime is a throw due to a problem with Go itself.</code></span>
+<span class="codeline" id="line-30"><code>	//</code></span>
+<span class="codeline" id="line-31"><code>	// These throws include as much information as possible to aid in</code></span>
+<span class="codeline" id="line-32"><code>	// debugging the runtime, including runtime frames, system goroutines,</code></span>
+<span class="codeline" id="line-33"><code>	// and frame metadata.</code></span>
+<span class="codeline" id="line-34"><code>	throwTypeRuntime</code></span>
+<span class="codeline" id="line-35"><code>)</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// We have two different ways of doing defers. The older way involves creating a</code></span>
+<span class="codeline" id="line-38"><code>// defer record at the time that a defer statement is executing and adding it to a</code></span>
+<span class="codeline" id="line-39"><code>// defer chain. This chain is inspected by the deferreturn call at all function</code></span>
+<span class="codeline" id="line-40"><code>// exits in order to run the appropriate defer calls. A cheaper way (which we call</code></span>
+<span class="codeline" id="line-41"><code>// open-coded defers) is used for functions in which no defer statements occur in</code></span>
+<span class="codeline" id="line-42"><code>// loops. In that case, we simply store the defer function/arg information into</code></span>
+<span class="codeline" id="line-43"><code>// specific stack slots at the point of each defer statement, as well as setting a</code></span>
+<span class="codeline" id="line-44"><code>// bit in a bitmask. At each function exit, we add inline code to directly make</code></span>
+<span class="codeline" id="line-45"><code>// the appropriate defer calls based on the bitmask and fn/arg information stored</code></span>
+<span class="codeline" id="line-46"><code>// on the stack. During panic/Goexit processing, the appropriate defer calls are</code></span>
+<span class="codeline" id="line-47"><code>// made using extra funcdata info that indicates the exact stack slots that</code></span>
+<span class="codeline" id="line-48"><code>// contain the bitmask and defer fn/args.</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>// Check to make sure we can really generate a panic. If the panic</code></span>
+<span class="codeline" id="line-51"><code>// was generated from the runtime, or from inside malloc, then convert</code></span>
+<span class="codeline" id="line-52"><code>// to a throw of msg.</code></span>
+<span class="codeline" id="line-53"><code>// pc should be the program counter of the compiler-generated code that</code></span>
+<span class="codeline" id="line-54"><code>// triggered this panic.</code></span>
+<span class="codeline" id="line-55"><code>func panicCheck1(pc uintptr, msg string) {</code></span>
+<span class="codeline" id="line-56"><code>	if goarch.IsWasm == 0 &amp;&amp; hasPrefix(funcname(findfunc(pc)), "runtime.") {</code></span>
+<span class="codeline" id="line-57"><code>		// Note: wasm can't tail call, so we can't get the original caller's pc.</code></span>
+<span class="codeline" id="line-58"><code>		throw(msg)</code></span>
+<span class="codeline" id="line-59"><code>	}</code></span>
+<span class="codeline" id="line-60"><code>	// TODO: is this redundant? How could we be in malloc</code></span>
+<span class="codeline" id="line-61"><code>	// but not in the runtime? runtime/internal/*, maybe?</code></span>
+<span class="codeline" id="line-62"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-63"><code>	if gp != nil &amp;&amp; gp.m != nil &amp;&amp; gp.m.mallocing != 0 {</code></span>
+<span class="codeline" id="line-64"><code>		throw(msg)</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code>}</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>// Same as above, but calling from the runtime is allowed.</code></span>
+<span class="codeline" id="line-69"><code>//</code></span>
+<span class="codeline" id="line-70"><code>// Using this function is necessary for any panic that may be</code></span>
+<span class="codeline" id="line-71"><code>// generated by runtime.sigpanic, since those are always called by the</code></span>
+<span class="codeline" id="line-72"><code>// runtime.</code></span>
+<span class="codeline" id="line-73"><code>func panicCheck2(err string) {</code></span>
+<span class="codeline" id="line-74"><code>	// panic allocates, so to avoid recursive malloc, turn panics</code></span>
+<span class="codeline" id="line-75"><code>	// during malloc into throws.</code></span>
+<span class="codeline" id="line-76"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-77"><code>	if gp != nil &amp;&amp; gp.m != nil &amp;&amp; gp.m.mallocing != 0 {</code></span>
+<span class="codeline" id="line-78"><code>		throw(err)</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>// Many of the following panic entry-points turn into throws when they</code></span>
+<span class="codeline" id="line-83"><code>// happen in various runtime contexts. These should never happen in</code></span>
+<span class="codeline" id="line-84"><code>// the runtime, and if they do, they indicate a serious issue and</code></span>
+<span class="codeline" id="line-85"><code>// should not be caught by user code.</code></span>
+<span class="codeline" id="line-86"><code>//</code></span>
+<span class="codeline" id="line-87"><code>// The panic{Index,Slice,divide,shift} functions are called by</code></span>
+<span class="codeline" id="line-88"><code>// code generated by the compiler for out of bounds index expressions,</code></span>
+<span class="codeline" id="line-89"><code>// out of bounds slice expressions, division by zero, and shift by negative.</code></span>
+<span class="codeline" id="line-90"><code>// The panicdivide (again), panicoverflow, panicfloat, and panicmem</code></span>
+<span class="codeline" id="line-91"><code>// functions are called by the signal handler when a signal occurs</code></span>
+<span class="codeline" id="line-92"><code>// indicating the respective problem.</code></span>
+<span class="codeline" id="line-93"><code>//</code></span>
+<span class="codeline" id="line-94"><code>// Since panic{Index,Slice,shift} are never called directly, and</code></span>
+<span class="codeline" id="line-95"><code>// since the runtime package should never have an out of bounds slice</code></span>
+<span class="codeline" id="line-96"><code>// or array reference or negative shift, if we see those functions called from the</code></span>
+<span class="codeline" id="line-97"><code>// runtime package we turn the panic into a throw. That will dump the</code></span>
+<span class="codeline" id="line-98"><code>// entire runtime stack for easier debugging.</code></span>
+<span class="codeline" id="line-99"><code>//</code></span>
+<span class="codeline" id="line-100"><code>// The entry points called by the signal handler will be called from</code></span>
+<span class="codeline" id="line-101"><code>// runtime.sigpanic, so we can't disallow calls from the runtime to</code></span>
+<span class="codeline" id="line-102"><code>// these (they always look like they're called from the runtime).</code></span>
+<span class="codeline" id="line-103"><code>// Hence, for these, we just check for clearly bad runtime conditions.</code></span>
+<span class="codeline" id="line-104"><code>//</code></span>
+<span class="codeline" id="line-105"><code>// The panic{Index,Slice} functions are implemented in assembly and tail call</code></span>
+<span class="codeline" id="line-106"><code>// to the goPanic{Index,Slice} functions below. This is done so we can use</code></span>
+<span class="codeline" id="line-107"><code>// a space-minimal register calling convention.</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>// failures in the comparisons for s[x], 0 &lt;= x &lt; y (y == len(s))</code></span>
+<span class="codeline" id="line-110"><code>//</code></span>
+<span class="codeline" id="line-111"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-112"><code>func goPanicIndex(x int, y int) {</code></span>
+<span class="codeline" id="line-113"><code>	panicCheck1(getcallerpc(), "index out of range")</code></span>
+<span class="codeline" id="line-114"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsIndex})</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-118"><code>func goPanicIndexU(x uint, y int) {</code></span>
+<span class="codeline" id="line-119"><code>	panicCheck1(getcallerpc(), "index out of range")</code></span>
+<span class="codeline" id="line-120"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsIndex})</code></span>
+<span class="codeline" id="line-121"><code>}</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>// failures in the comparisons for s[:x], 0 &lt;= x &lt;= y (y == len(s) or cap(s))</code></span>
+<span class="codeline" id="line-124"><code>//</code></span>
+<span class="codeline" id="line-125"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-126"><code>func goPanicSliceAlen(x int, y int) {</code></span>
+<span class="codeline" id="line-127"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-128"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSliceAlen})</code></span>
+<span class="codeline" id="line-129"><code>}</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-132"><code>func goPanicSliceAlenU(x uint, y int) {</code></span>
+<span class="codeline" id="line-133"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-134"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSliceAlen})</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-138"><code>func goPanicSliceAcap(x int, y int) {</code></span>
+<span class="codeline" id="line-139"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-140"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSliceAcap})</code></span>
+<span class="codeline" id="line-141"><code>}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-144"><code>func goPanicSliceAcapU(x uint, y int) {</code></span>
+<span class="codeline" id="line-145"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-146"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSliceAcap})</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>// failures in the comparisons for s[x:y], 0 &lt;= x &lt;= y</code></span>
+<span class="codeline" id="line-150"><code>//</code></span>
+<span class="codeline" id="line-151"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-152"><code>func goPanicSliceB(x int, y int) {</code></span>
+<span class="codeline" id="line-153"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-154"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSliceB})</code></span>
+<span class="codeline" id="line-155"><code>}</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-158"><code>func goPanicSliceBU(x uint, y int) {</code></span>
+<span class="codeline" id="line-159"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-160"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSliceB})</code></span>
+<span class="codeline" id="line-161"><code>}</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>// failures in the comparisons for s[::x], 0 &lt;= x &lt;= y (y == len(s) or cap(s))</code></span>
+<span class="codeline" id="line-164"><code>func goPanicSlice3Alen(x int, y int) {</code></span>
+<span class="codeline" id="line-165"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-166"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSlice3Alen})</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+<span class="codeline" id="line-168"><code>func goPanicSlice3AlenU(x uint, y int) {</code></span>
+<span class="codeline" id="line-169"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-170"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSlice3Alen})</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code>func goPanicSlice3Acap(x int, y int) {</code></span>
+<span class="codeline" id="line-173"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-174"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSlice3Acap})</code></span>
+<span class="codeline" id="line-175"><code>}</code></span>
+<span class="codeline" id="line-176"><code>func goPanicSlice3AcapU(x uint, y int) {</code></span>
+<span class="codeline" id="line-177"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-178"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSlice3Acap})</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>// failures in the comparisons for s[:x:y], 0 &lt;= x &lt;= y</code></span>
+<span class="codeline" id="line-182"><code>func goPanicSlice3B(x int, y int) {</code></span>
+<span class="codeline" id="line-183"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-184"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSlice3B})</code></span>
+<span class="codeline" id="line-185"><code>}</code></span>
+<span class="codeline" id="line-186"><code>func goPanicSlice3BU(x uint, y int) {</code></span>
+<span class="codeline" id="line-187"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-188"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSlice3B})</code></span>
+<span class="codeline" id="line-189"><code>}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>// failures in the comparisons for s[x:y:], 0 &lt;= x &lt;= y</code></span>
+<span class="codeline" id="line-192"><code>func goPanicSlice3C(x int, y int) {</code></span>
+<span class="codeline" id="line-193"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-194"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsSlice3C})</code></span>
+<span class="codeline" id="line-195"><code>}</code></span>
+<span class="codeline" id="line-196"><code>func goPanicSlice3CU(x uint, y int) {</code></span>
+<span class="codeline" id="line-197"><code>	panicCheck1(getcallerpc(), "slice bounds out of range")</code></span>
+<span class="codeline" id="line-198"><code>	panic(boundsError{x: int64(x), signed: false, y: y, code: boundsSlice3C})</code></span>
+<span class="codeline" id="line-199"><code>}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>// failures in the conversion ([x]T)(s) or (*[x]T)(s), 0 &lt;= x &lt;= y, y == len(s)</code></span>
+<span class="codeline" id="line-202"><code>func goPanicSliceConvert(x int, y int) {</code></span>
+<span class="codeline" id="line-203"><code>	panicCheck1(getcallerpc(), "slice length too short to convert to array or pointer to array")</code></span>
+<span class="codeline" id="line-204"><code>	panic(boundsError{x: int64(x), signed: true, y: y, code: boundsConvert})</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>// Implemented in assembly, as they take arguments in registers.</code></span>
+<span class="codeline" id="line-208"><code>// Declared here to mark them as ABIInternal.</code></span>
+<span class="codeline" id="line-209"><code>func panicIndex(x int, y int)</code></span>
+<span class="codeline" id="line-210"><code>func panicIndexU(x uint, y int)</code></span>
+<span class="codeline" id="line-211"><code>func panicSliceAlen(x int, y int)</code></span>
+<span class="codeline" id="line-212"><code>func panicSliceAlenU(x uint, y int)</code></span>
+<span class="codeline" id="line-213"><code>func panicSliceAcap(x int, y int)</code></span>
+<span class="codeline" id="line-214"><code>func panicSliceAcapU(x uint, y int)</code></span>
+<span class="codeline" id="line-215"><code>func panicSliceB(x int, y int)</code></span>
+<span class="codeline" id="line-216"><code>func panicSliceBU(x uint, y int)</code></span>
+<span class="codeline" id="line-217"><code>func panicSlice3Alen(x int, y int)</code></span>
+<span class="codeline" id="line-218"><code>func panicSlice3AlenU(x uint, y int)</code></span>
+<span class="codeline" id="line-219"><code>func panicSlice3Acap(x int, y int)</code></span>
+<span class="codeline" id="line-220"><code>func panicSlice3AcapU(x uint, y int)</code></span>
+<span class="codeline" id="line-221"><code>func panicSlice3B(x int, y int)</code></span>
+<span class="codeline" id="line-222"><code>func panicSlice3BU(x uint, y int)</code></span>
+<span class="codeline" id="line-223"><code>func panicSlice3C(x int, y int)</code></span>
+<span class="codeline" id="line-224"><code>func panicSlice3CU(x uint, y int)</code></span>
+<span class="codeline" id="line-225"><code>func panicSliceConvert(x int, y int)</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>var shiftError = error(errorString("negative shift amount"))</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-230"><code>func panicshift() {</code></span>
+<span class="codeline" id="line-231"><code>	panicCheck1(getcallerpc(), "negative shift amount")</code></span>
+<span class="codeline" id="line-232"><code>	panic(shiftError)</code></span>
+<span class="codeline" id="line-233"><code>}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>var divideError = error(errorString("integer divide by zero"))</code></span>
+<span class="codeline" id="line-236"><code></code></span>
+<span class="codeline" id="line-237"><code>//go:yeswritebarrierrec</code></span>
+<span class="codeline" id="line-238"><code>func panicdivide() {</code></span>
+<span class="codeline" id="line-239"><code>	panicCheck2("integer divide by zero")</code></span>
+<span class="codeline" id="line-240"><code>	panic(divideError)</code></span>
+<span class="codeline" id="line-241"><code>}</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>var overflowError = error(errorString("integer overflow"))</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>func panicoverflow() {</code></span>
+<span class="codeline" id="line-246"><code>	panicCheck2("integer overflow")</code></span>
+<span class="codeline" id="line-247"><code>	panic(overflowError)</code></span>
+<span class="codeline" id="line-248"><code>}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>var floatError = error(errorString("floating point error"))</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>func panicfloat() {</code></span>
+<span class="codeline" id="line-253"><code>	panicCheck2("floating point error")</code></span>
+<span class="codeline" id="line-254"><code>	panic(floatError)</code></span>
+<span class="codeline" id="line-255"><code>}</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>var memoryError = error(errorString("invalid memory address or nil pointer dereference"))</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>func panicmem() {</code></span>
+<span class="codeline" id="line-260"><code>	panicCheck2("invalid memory address or nil pointer dereference")</code></span>
+<span class="codeline" id="line-261"><code>	panic(memoryError)</code></span>
+<span class="codeline" id="line-262"><code>}</code></span>
+<span class="codeline" id="line-263"><code></code></span>
+<span class="codeline" id="line-264"><code>func panicmemAddr(addr uintptr) {</code></span>
+<span class="codeline" id="line-265"><code>	panicCheck2("invalid memory address or nil pointer dereference")</code></span>
+<span class="codeline" id="line-266"><code>	panic(errorAddressString{msg: "invalid memory address or nil pointer dereference", addr: addr})</code></span>
+<span class="codeline" id="line-267"><code>}</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>// Create a new deferred function fn, which has no arguments and results.</code></span>
+<span class="codeline" id="line-270"><code>// The compiler turns a defer statement into a call to this.</code></span>
+<span class="codeline" id="line-271"><code>func deferproc(fn func()) {</code></span>
+<span class="codeline" id="line-272"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-273"><code>	if gp.m.curg != gp {</code></span>
+<span class="codeline" id="line-274"><code>		// go code on the system stack can't defer</code></span>
+<span class="codeline" id="line-275"><code>		throw("defer on system stack")</code></span>
+<span class="codeline" id="line-276"><code>	}</code></span>
+<span class="codeline" id="line-277"><code></code></span>
+<span class="codeline" id="line-278"><code>	d := newdefer()</code></span>
+<span class="codeline" id="line-279"><code>	d.link = gp._defer</code></span>
+<span class="codeline" id="line-280"><code>	gp._defer = d</code></span>
+<span class="codeline" id="line-281"><code>	d.fn = fn</code></span>
+<span class="codeline" id="line-282"><code>	d.pc = getcallerpc()</code></span>
+<span class="codeline" id="line-283"><code>	// We must not be preempted between calling getcallersp and</code></span>
+<span class="codeline" id="line-284"><code>	// storing it to d.sp because getcallersp's result is a</code></span>
+<span class="codeline" id="line-285"><code>	// uintptr stack pointer.</code></span>
+<span class="codeline" id="line-286"><code>	d.sp = getcallersp()</code></span>
+<span class="codeline" id="line-287"><code></code></span>
+<span class="codeline" id="line-288"><code>	// deferproc returns 0 normally.</code></span>
+<span class="codeline" id="line-289"><code>	// a deferred func that stops a panic</code></span>
+<span class="codeline" id="line-290"><code>	// makes the deferproc return 1.</code></span>
+<span class="codeline" id="line-291"><code>	// the code the compiler generates always</code></span>
+<span class="codeline" id="line-292"><code>	// checks the return value and jumps to the</code></span>
+<span class="codeline" id="line-293"><code>	// end of the function if deferproc returns != 0.</code></span>
+<span class="codeline" id="line-294"><code>	return0()</code></span>
+<span class="codeline" id="line-295"><code>	// No code can go here - the C return register has</code></span>
+<span class="codeline" id="line-296"><code>	// been set and must not be clobbered.</code></span>
+<span class="codeline" id="line-297"><code>}</code></span>
+<span class="codeline" id="line-298"><code></code></span>
+<span class="codeline" id="line-299"><code>var rangeExitError = error(errorString("range function continued iteration after exit"))</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>//go:noinline</code></span>
+<span class="codeline" id="line-302"><code>func panicrangeexit() {</code></span>
+<span class="codeline" id="line-303"><code>	panic(rangeExitError)</code></span>
+<span class="codeline" id="line-304"><code>}</code></span>
+<span class="codeline" id="line-305"><code></code></span>
+<span class="codeline" id="line-306"><code>// deferrangefunc is called by functions that are about to</code></span>
+<span class="codeline" id="line-307"><code>// execute a range-over-function loop in which the loop body</code></span>
+<span class="codeline" id="line-308"><code>// may execute a defer statement. That defer needs to add to</code></span>
+<span class="codeline" id="line-309"><code>// the chain for the current function, not the func literal synthesized</code></span>
+<span class="codeline" id="line-310"><code>// to represent the loop body. To do that, the original function</code></span>
+<span class="codeline" id="line-311"><code>// calls deferrangefunc to obtain an opaque token representing</code></span>
+<span class="codeline" id="line-312"><code>// the current frame, and then the loop body uses deferprocat</code></span>
+<span class="codeline" id="line-313"><code>// instead of deferproc to add to that frame's defer lists.</code></span>
+<span class="codeline" id="line-314"><code>//</code></span>
+<span class="codeline" id="line-315"><code>// The token is an 'any' with underlying type *atomic.Pointer[_defer].</code></span>
+<span class="codeline" id="line-316"><code>// It is the atomically-updated head of a linked list of _defer structs</code></span>
+<span class="codeline" id="line-317"><code>// representing deferred calls. At the same time, we create a _defer</code></span>
+<span class="codeline" id="line-318"><code>// struct on the main g._defer list with d.head set to this head pointer.</code></span>
+<span class="codeline" id="line-319"><code>//</code></span>
+<span class="codeline" id="line-320"><code>// The g._defer list is now a linked list of deferred calls,</code></span>
+<span class="codeline" id="line-321"><code>// but an atomic list hanging off:</code></span>
+<span class="codeline" id="line-322"><code>//</code></span>
+<span class="codeline" id="line-323"><code>//		g._defer =&gt; d4 -&gt; d3 -&gt; drangefunc -&gt; d2 -&gt; d1 -&gt; nil</code></span>
+<span class="codeline" id="line-324"><code>//	                             | .head</code></span>
+<span class="codeline" id="line-325"><code>//	                             |</code></span>
+<span class="codeline" id="line-326"><code>//	                             +--&gt; dY -&gt; dX -&gt; nil</code></span>
+<span class="codeline" id="line-327"><code>//</code></span>
+<span class="codeline" id="line-328"><code>// with each -&gt; indicating a d.link pointer, and where drangefunc</code></span>
+<span class="codeline" id="line-329"><code>// has the d.rangefunc = true bit set.</code></span>
+<span class="codeline" id="line-330"><code>// Note that the function being ranged over may have added</code></span>
+<span class="codeline" id="line-331"><code>// its own defers (d4 and d3), so drangefunc need not be at the</code></span>
+<span class="codeline" id="line-332"><code>// top of the list when deferprocat is used. This is why we pass</code></span>
+<span class="codeline" id="line-333"><code>// the atomic head explicitly.</code></span>
+<span class="codeline" id="line-334"><code>//</code></span>
+<span class="codeline" id="line-335"><code>// To keep misbehaving programs from crashing the runtime,</code></span>
+<span class="codeline" id="line-336"><code>// deferprocat pushes new defers onto the .head list atomically.</code></span>
+<span class="codeline" id="line-337"><code>// The fact that it is a separate list from the main goroutine</code></span>
+<span class="codeline" id="line-338"><code>// defer list means that the main goroutine's defers can still</code></span>
+<span class="codeline" id="line-339"><code>// be handled non-atomically.</code></span>
+<span class="codeline" id="line-340"><code>//</code></span>
+<span class="codeline" id="line-341"><code>// In the diagram, dY and dX are meant to be processed when</code></span>
+<span class="codeline" id="line-342"><code>// drangefunc would be processed, which is to say the defer order</code></span>
+<span class="codeline" id="line-343"><code>// should be d4, d3, dY, dX, d2, d1. To make that happen,</code></span>
+<span class="codeline" id="line-344"><code>// when defer processing reaches a d with rangefunc=true,</code></span>
+<span class="codeline" id="line-345"><code>// it calls deferconvert to atomically take the extras</code></span>
+<span class="codeline" id="line-346"><code>// away from d.head and then adds them to the main list.</code></span>
+<span class="codeline" id="line-347"><code>//</code></span>
+<span class="codeline" id="line-348"><code>// That is, deferconvert changes this list:</code></span>
+<span class="codeline" id="line-349"><code>//</code></span>
+<span class="codeline" id="line-350"><code>//		g._defer =&gt; drangefunc -&gt; d2 -&gt; d1 -&gt; nil</code></span>
+<span class="codeline" id="line-351"><code>//	                 | .head</code></span>
+<span class="codeline" id="line-352"><code>//	                 |</code></span>
+<span class="codeline" id="line-353"><code>//	                 +--&gt; dY -&gt; dX -&gt; nil</code></span>
+<span class="codeline" id="line-354"><code>//</code></span>
+<span class="codeline" id="line-355"><code>// into this list:</code></span>
+<span class="codeline" id="line-356"><code>//</code></span>
+<span class="codeline" id="line-357"><code>//	g._defer =&gt; dY -&gt; dX -&gt; d2 -&gt; d1 -&gt; nil</code></span>
+<span class="codeline" id="line-358"><code>//</code></span>
+<span class="codeline" id="line-359"><code>// It also poisons *drangefunc.head so that any future</code></span>
+<span class="codeline" id="line-360"><code>// deferprocat using that head will throw.</code></span>
+<span class="codeline" id="line-361"><code>// (The atomic head is ordinary garbage collected memory so that</code></span>
+<span class="codeline" id="line-362"><code>// it's not a problem if user code holds onto it beyond</code></span>
+<span class="codeline" id="line-363"><code>// the lifetime of drangefunc.)</code></span>
+<span class="codeline" id="line-364"><code>//</code></span>
+<span class="codeline" id="line-365"><code>// TODO: We could arrange for the compiler to call into the</code></span>
+<span class="codeline" id="line-366"><code>// runtime after the loop finishes normally, to do an eager</code></span>
+<span class="codeline" id="line-367"><code>// deferconvert, which would catch calling the loop body</code></span>
+<span class="codeline" id="line-368"><code>// and having it defer after the loop is done. If we have a</code></span>
+<span class="codeline" id="line-369"><code>// more general catch of loop body misuse, though, this</code></span>
+<span class="codeline" id="line-370"><code>// might not be worth worrying about in addition.</code></span>
+<span class="codeline" id="line-371"><code>//</code></span>
+<span class="codeline" id="line-372"><code>// See also ../cmd/compile/internal/rangefunc/rewrite.go.</code></span>
+<span class="codeline" id="line-373"><code>func deferrangefunc() any {</code></span>
+<span class="codeline" id="line-374"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-375"><code>	if gp.m.curg != gp {</code></span>
+<span class="codeline" id="line-376"><code>		// go code on the system stack can't defer</code></span>
+<span class="codeline" id="line-377"><code>		throw("defer on system stack")</code></span>
+<span class="codeline" id="line-378"><code>	}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>	d := newdefer()</code></span>
+<span class="codeline" id="line-381"><code>	d.link = gp._defer</code></span>
+<span class="codeline" id="line-382"><code>	gp._defer = d</code></span>
+<span class="codeline" id="line-383"><code>	d.pc = getcallerpc()</code></span>
+<span class="codeline" id="line-384"><code>	// We must not be preempted between calling getcallersp and</code></span>
+<span class="codeline" id="line-385"><code>	// storing it to d.sp because getcallersp's result is a</code></span>
+<span class="codeline" id="line-386"><code>	// uintptr stack pointer.</code></span>
+<span class="codeline" id="line-387"><code>	d.sp = getcallersp()</code></span>
+<span class="codeline" id="line-388"><code></code></span>
+<span class="codeline" id="line-389"><code>	d.rangefunc = true</code></span>
+<span class="codeline" id="line-390"><code>	d.head = new(atomic.Pointer[_defer])</code></span>
+<span class="codeline" id="line-391"><code></code></span>
+<span class="codeline" id="line-392"><code>	return d.head</code></span>
+<span class="codeline" id="line-393"><code>}</code></span>
+<span class="codeline" id="line-394"><code></code></span>
+<span class="codeline" id="line-395"><code>// badDefer returns a fixed bad defer pointer for poisoning an atomic defer list head.</code></span>
+<span class="codeline" id="line-396"><code>func badDefer() *_defer {</code></span>
+<span class="codeline" id="line-397"><code>	return (*_defer)(unsafe.Pointer(uintptr(1)))</code></span>
+<span class="codeline" id="line-398"><code>}</code></span>
+<span class="codeline" id="line-399"><code></code></span>
+<span class="codeline" id="line-400"><code>// deferprocat is like deferproc but adds to the atomic list represented by frame.</code></span>
+<span class="codeline" id="line-401"><code>// See the doc comment for deferrangefunc for details.</code></span>
+<span class="codeline" id="line-402"><code>func deferprocat(fn func(), frame any) {</code></span>
+<span class="codeline" id="line-403"><code>	head := frame.(*atomic.Pointer[_defer])</code></span>
+<span class="codeline" id="line-404"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-405"><code>		racewritepc(unsafe.Pointer(head), getcallerpc(), abi.FuncPCABIInternal(deferprocat))</code></span>
+<span class="codeline" id="line-406"><code>	}</code></span>
+<span class="codeline" id="line-407"><code>	d1 := newdefer()</code></span>
+<span class="codeline" id="line-408"><code>	d1.fn = fn</code></span>
+<span class="codeline" id="line-409"><code>	for {</code></span>
+<span class="codeline" id="line-410"><code>		d1.link = head.Load()</code></span>
+<span class="codeline" id="line-411"><code>		if d1.link == badDefer() {</code></span>
+<span class="codeline" id="line-412"><code>			throw("defer after range func returned")</code></span>
+<span class="codeline" id="line-413"><code>		}</code></span>
+<span class="codeline" id="line-414"><code>		if head.CompareAndSwap(d1.link, d1) {</code></span>
+<span class="codeline" id="line-415"><code>			break</code></span>
+<span class="codeline" id="line-416"><code>		}</code></span>
+<span class="codeline" id="line-417"><code>	}</code></span>
+<span class="codeline" id="line-418"><code></code></span>
+<span class="codeline" id="line-419"><code>	// Must be last - see deferproc above.</code></span>
+<span class="codeline" id="line-420"><code>	return0()</code></span>
+<span class="codeline" id="line-421"><code>}</code></span>
+<span class="codeline" id="line-422"><code></code></span>
+<span class="codeline" id="line-423"><code>// deferconvert converts a rangefunc defer list into an ordinary list.</code></span>
+<span class="codeline" id="line-424"><code>// See the doc comment for deferrangefunc for details.</code></span>
+<span class="codeline" id="line-425"><code>func deferconvert(d *_defer) *_defer {</code></span>
+<span class="codeline" id="line-426"><code>	head := d.head</code></span>
+<span class="codeline" id="line-427"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-428"><code>		racereadpc(unsafe.Pointer(head), getcallerpc(), abi.FuncPCABIInternal(deferconvert))</code></span>
+<span class="codeline" id="line-429"><code>	}</code></span>
+<span class="codeline" id="line-430"><code>	tail := d.link</code></span>
+<span class="codeline" id="line-431"><code>	d.rangefunc = false</code></span>
+<span class="codeline" id="line-432"><code>	d0 := d</code></span>
+<span class="codeline" id="line-433"><code></code></span>
+<span class="codeline" id="line-434"><code>	for {</code></span>
+<span class="codeline" id="line-435"><code>		d = head.Load()</code></span>
+<span class="codeline" id="line-436"><code>		if head.CompareAndSwap(d, badDefer()) {</code></span>
+<span class="codeline" id="line-437"><code>			break</code></span>
+<span class="codeline" id="line-438"><code>		}</code></span>
+<span class="codeline" id="line-439"><code>	}</code></span>
+<span class="codeline" id="line-440"><code>	if d == nil {</code></span>
+<span class="codeline" id="line-441"><code>		freedefer(d0)</code></span>
+<span class="codeline" id="line-442"><code>		return tail</code></span>
+<span class="codeline" id="line-443"><code>	}</code></span>
+<span class="codeline" id="line-444"><code>	for d1 := d; ; d1 = d1.link {</code></span>
+<span class="codeline" id="line-445"><code>		d1.sp = d0.sp</code></span>
+<span class="codeline" id="line-446"><code>		d1.pc = d0.pc</code></span>
+<span class="codeline" id="line-447"><code>		if d1.link == nil {</code></span>
+<span class="codeline" id="line-448"><code>			d1.link = tail</code></span>
+<span class="codeline" id="line-449"><code>			break</code></span>
+<span class="codeline" id="line-450"><code>		}</code></span>
+<span class="codeline" id="line-451"><code>	}</code></span>
+<span class="codeline" id="line-452"><code>	freedefer(d0)</code></span>
+<span class="codeline" id="line-453"><code>	return d</code></span>
+<span class="codeline" id="line-454"><code>}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>// deferprocStack queues a new deferred function with a defer record on the stack.</code></span>
+<span class="codeline" id="line-457"><code>// The defer record must have its fn field initialized.</code></span>
+<span class="codeline" id="line-458"><code>// All other fields can contain junk.</code></span>
+<span class="codeline" id="line-459"><code>// Nosplit because of the uninitialized pointer fields on the stack.</code></span>
+<span class="codeline" id="line-460"><code>//</code></span>
+<span class="codeline" id="line-461"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-462"><code>func deferprocStack(d *_defer) {</code></span>
+<span class="codeline" id="line-463"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-464"><code>	if gp.m.curg != gp {</code></span>
+<span class="codeline" id="line-465"><code>		// go code on the system stack can't defer</code></span>
+<span class="codeline" id="line-466"><code>		throw("defer on system stack")</code></span>
+<span class="codeline" id="line-467"><code>	}</code></span>
+<span class="codeline" id="line-468"><code>	// fn is already set.</code></span>
+<span class="codeline" id="line-469"><code>	// The other fields are junk on entry to deferprocStack and</code></span>
+<span class="codeline" id="line-470"><code>	// are initialized here.</code></span>
+<span class="codeline" id="line-471"><code>	d.heap = false</code></span>
+<span class="codeline" id="line-472"><code>	d.rangefunc = false</code></span>
+<span class="codeline" id="line-473"><code>	d.sp = getcallersp()</code></span>
+<span class="codeline" id="line-474"><code>	d.pc = getcallerpc()</code></span>
+<span class="codeline" id="line-475"><code>	// The lines below implement:</code></span>
+<span class="codeline" id="line-476"><code>	//   d.panic = nil</code></span>
+<span class="codeline" id="line-477"><code>	//   d.fd = nil</code></span>
+<span class="codeline" id="line-478"><code>	//   d.link = gp._defer</code></span>
+<span class="codeline" id="line-479"><code>	//   d.head = nil</code></span>
+<span class="codeline" id="line-480"><code>	//   gp._defer = d</code></span>
+<span class="codeline" id="line-481"><code>	// But without write barriers. The first three are writes to</code></span>
+<span class="codeline" id="line-482"><code>	// the stack so they don't need a write barrier, and furthermore</code></span>
+<span class="codeline" id="line-483"><code>	// are to uninitialized memory, so they must not use a write barrier.</code></span>
+<span class="codeline" id="line-484"><code>	// The fourth write does not require a write barrier because we</code></span>
+<span class="codeline" id="line-485"><code>	// explicitly mark all the defer structures, so we don't need to</code></span>
+<span class="codeline" id="line-486"><code>	// keep track of pointers to them with a write barrier.</code></span>
+<span class="codeline" id="line-487"><code>	*(*uintptr)(unsafe.Pointer(&amp;d.link)) = uintptr(unsafe.Pointer(gp._defer))</code></span>
+<span class="codeline" id="line-488"><code>	*(*uintptr)(unsafe.Pointer(&amp;d.head)) = 0</code></span>
+<span class="codeline" id="line-489"><code>	*(*uintptr)(unsafe.Pointer(&amp;gp._defer)) = uintptr(unsafe.Pointer(d))</code></span>
+<span class="codeline" id="line-490"><code></code></span>
+<span class="codeline" id="line-491"><code>	return0()</code></span>
+<span class="codeline" id="line-492"><code>	// No code can go here - the C return register has</code></span>
+<span class="codeline" id="line-493"><code>	// been set and must not be clobbered.</code></span>
+<span class="codeline" id="line-494"><code>}</code></span>
+<span class="codeline" id="line-495"><code></code></span>
+<span class="codeline" id="line-496"><code>// Each P holds a pool for defers.</code></span>
+<span class="codeline" id="line-497"><code></code></span>
+<span class="codeline" id="line-498"><code>// Allocate a Defer, usually using per-P pool.</code></span>
+<span class="codeline" id="line-499"><code>// Each defer must be released with freedefer.  The defer is not</code></span>
+<span class="codeline" id="line-500"><code>// added to any defer chain yet.</code></span>
+<span class="codeline" id="line-501"><code>func newdefer() *_defer {</code></span>
+<span class="codeline" id="line-502"><code>	var d *_defer</code></span>
+<span class="codeline" id="line-503"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-504"><code>	pp := mp.p.ptr()</code></span>
+<span class="codeline" id="line-505"><code>	if len(pp.deferpool) == 0 &amp;&amp; sched.deferpool != nil {</code></span>
+<span class="codeline" id="line-506"><code>		lock(&amp;sched.deferlock)</code></span>
+<span class="codeline" id="line-507"><code>		for len(pp.deferpool) &lt; cap(pp.deferpool)/2 &amp;&amp; sched.deferpool != nil {</code></span>
+<span class="codeline" id="line-508"><code>			d := sched.deferpool</code></span>
+<span class="codeline" id="line-509"><code>			sched.deferpool = d.link</code></span>
+<span class="codeline" id="line-510"><code>			d.link = nil</code></span>
+<span class="codeline" id="line-511"><code>			pp.deferpool = append(pp.deferpool, d)</code></span>
+<span class="codeline" id="line-512"><code>		}</code></span>
+<span class="codeline" id="line-513"><code>		unlock(&amp;sched.deferlock)</code></span>
+<span class="codeline" id="line-514"><code>	}</code></span>
+<span class="codeline" id="line-515"><code>	if n := len(pp.deferpool); n &gt; 0 {</code></span>
+<span class="codeline" id="line-516"><code>		d = pp.deferpool[n-1]</code></span>
+<span class="codeline" id="line-517"><code>		pp.deferpool[n-1] = nil</code></span>
+<span class="codeline" id="line-518"><code>		pp.deferpool = pp.deferpool[:n-1]</code></span>
+<span class="codeline" id="line-519"><code>	}</code></span>
+<span class="codeline" id="line-520"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-521"><code>	mp, pp = nil, nil</code></span>
+<span class="codeline" id="line-522"><code></code></span>
+<span class="codeline" id="line-523"><code>	if d == nil {</code></span>
+<span class="codeline" id="line-524"><code>		// Allocate new defer.</code></span>
+<span class="codeline" id="line-525"><code>		d = new(_defer)</code></span>
+<span class="codeline" id="line-526"><code>	}</code></span>
+<span class="codeline" id="line-527"><code>	d.heap = true</code></span>
+<span class="codeline" id="line-528"><code>	return d</code></span>
+<span class="codeline" id="line-529"><code>}</code></span>
+<span class="codeline" id="line-530"><code></code></span>
+<span class="codeline" id="line-531"><code>// Free the given defer.</code></span>
+<span class="codeline" id="line-532"><code>// The defer cannot be used after this call.</code></span>
+<span class="codeline" id="line-533"><code>//</code></span>
+<span class="codeline" id="line-534"><code>// This is nosplit because the incoming defer is in a perilous state.</code></span>
+<span class="codeline" id="line-535"><code>// It's not on any defer list, so stack copying won't adjust stack</code></span>
+<span class="codeline" id="line-536"><code>// pointers in it (namely, d.link). Hence, if we were to copy the</code></span>
+<span class="codeline" id="line-537"><code>// stack, d could then contain a stale pointer.</code></span>
+<span class="codeline" id="line-538"><code>//</code></span>
+<span class="codeline" id="line-539"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-540"><code>func freedefer(d *_defer) {</code></span>
+<span class="codeline" id="line-541"><code>	d.link = nil</code></span>
+<span class="codeline" id="line-542"><code>	// After this point we can copy the stack.</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>	if d.fn != nil {</code></span>
+<span class="codeline" id="line-545"><code>		freedeferfn()</code></span>
+<span class="codeline" id="line-546"><code>	}</code></span>
+<span class="codeline" id="line-547"><code>	if !d.heap {</code></span>
+<span class="codeline" id="line-548"><code>		return</code></span>
+<span class="codeline" id="line-549"><code>	}</code></span>
+<span class="codeline" id="line-550"><code></code></span>
+<span class="codeline" id="line-551"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-552"><code>	pp := mp.p.ptr()</code></span>
+<span class="codeline" id="line-553"><code>	if len(pp.deferpool) == cap(pp.deferpool) {</code></span>
+<span class="codeline" id="line-554"><code>		// Transfer half of local cache to the central cache.</code></span>
+<span class="codeline" id="line-555"><code>		var first, last *_defer</code></span>
+<span class="codeline" id="line-556"><code>		for len(pp.deferpool) &gt; cap(pp.deferpool)/2 {</code></span>
+<span class="codeline" id="line-557"><code>			n := len(pp.deferpool)</code></span>
+<span class="codeline" id="line-558"><code>			d := pp.deferpool[n-1]</code></span>
+<span class="codeline" id="line-559"><code>			pp.deferpool[n-1] = nil</code></span>
+<span class="codeline" id="line-560"><code>			pp.deferpool = pp.deferpool[:n-1]</code></span>
+<span class="codeline" id="line-561"><code>			if first == nil {</code></span>
+<span class="codeline" id="line-562"><code>				first = d</code></span>
+<span class="codeline" id="line-563"><code>			} else {</code></span>
+<span class="codeline" id="line-564"><code>				last.link = d</code></span>
+<span class="codeline" id="line-565"><code>			}</code></span>
+<span class="codeline" id="line-566"><code>			last = d</code></span>
+<span class="codeline" id="line-567"><code>		}</code></span>
+<span class="codeline" id="line-568"><code>		lock(&amp;sched.deferlock)</code></span>
+<span class="codeline" id="line-569"><code>		last.link = sched.deferpool</code></span>
+<span class="codeline" id="line-570"><code>		sched.deferpool = first</code></span>
+<span class="codeline" id="line-571"><code>		unlock(&amp;sched.deferlock)</code></span>
+<span class="codeline" id="line-572"><code>	}</code></span>
+<span class="codeline" id="line-573"><code></code></span>
+<span class="codeline" id="line-574"><code>	*d = _defer{}</code></span>
+<span class="codeline" id="line-575"><code></code></span>
+<span class="codeline" id="line-576"><code>	pp.deferpool = append(pp.deferpool, d)</code></span>
+<span class="codeline" id="line-577"><code></code></span>
+<span class="codeline" id="line-578"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-579"><code>	mp, pp = nil, nil</code></span>
+<span class="codeline" id="line-580"><code>}</code></span>
+<span class="codeline" id="line-581"><code></code></span>
+<span class="codeline" id="line-582"><code>// Separate function so that it can split stack.</code></span>
+<span class="codeline" id="line-583"><code>// Windows otherwise runs out of stack space.</code></span>
+<span class="codeline" id="line-584"><code>func freedeferfn() {</code></span>
+<span class="codeline" id="line-585"><code>	// fn must be cleared before d is unlinked from gp.</code></span>
+<span class="codeline" id="line-586"><code>	throw("freedefer with d.fn != nil")</code></span>
+<span class="codeline" id="line-587"><code>}</code></span>
+<span class="codeline" id="line-588"><code></code></span>
+<span class="codeline" id="line-589"><code>// deferreturn runs deferred functions for the caller's frame.</code></span>
+<span class="codeline" id="line-590"><code>// The compiler inserts a call to this at the end of any</code></span>
+<span class="codeline" id="line-591"><code>// function which calls defer.</code></span>
+<span class="codeline" id="line-592"><code>func deferreturn() {</code></span>
+<span class="codeline" id="line-593"><code>	var p _panic</code></span>
+<span class="codeline" id="line-594"><code>	p.deferreturn = true</code></span>
+<span class="codeline" id="line-595"><code></code></span>
+<span class="codeline" id="line-596"><code>	p.start(getcallerpc(), unsafe.Pointer(getcallersp()))</code></span>
+<span class="codeline" id="line-597"><code>	for {</code></span>
+<span class="codeline" id="line-598"><code>		fn, ok := p.nextDefer()</code></span>
+<span class="codeline" id="line-599"><code>		if !ok {</code></span>
+<span class="codeline" id="line-600"><code>			break</code></span>
+<span class="codeline" id="line-601"><code>		}</code></span>
+<span class="codeline" id="line-602"><code>		fn()</code></span>
+<span class="codeline" id="line-603"><code>	}</code></span>
+<span class="codeline" id="line-604"><code>}</code></span>
+<span class="codeline" id="line-605"><code></code></span>
+<span class="codeline" id="line-606"><code>// Goexit terminates the goroutine that calls it. No other goroutine is affected.</code></span>
+<span class="codeline" id="line-607"><code>// Goexit runs all deferred calls before terminating the goroutine. Because Goexit</code></span>
+<span class="codeline" id="line-608"><code>// is not a panic, any recover calls in those deferred functions will return nil.</code></span>
+<span class="codeline" id="line-609"><code>//</code></span>
+<span class="codeline" id="line-610"><code>// Calling Goexit from the main goroutine terminates that goroutine</code></span>
+<span class="codeline" id="line-611"><code>// without func main returning. Since func main has not returned,</code></span>
+<span class="codeline" id="line-612"><code>// the program continues execution of other goroutines.</code></span>
+<span class="codeline" id="line-613"><code>// If all other goroutines exit, the program crashes.</code></span>
+<span class="codeline" id="line-614"><code>func Goexit() {</code></span>
+<span class="codeline" id="line-615"><code>	// Create a panic object for Goexit, so we can recognize when it might be</code></span>
+<span class="codeline" id="line-616"><code>	// bypassed by a recover().</code></span>
+<span class="codeline" id="line-617"><code>	var p _panic</code></span>
+<span class="codeline" id="line-618"><code>	p.goexit = true</code></span>
+<span class="codeline" id="line-619"><code></code></span>
+<span class="codeline" id="line-620"><code>	p.start(getcallerpc(), unsafe.Pointer(getcallersp()))</code></span>
+<span class="codeline" id="line-621"><code>	for {</code></span>
+<span class="codeline" id="line-622"><code>		fn, ok := p.nextDefer()</code></span>
+<span class="codeline" id="line-623"><code>		if !ok {</code></span>
+<span class="codeline" id="line-624"><code>			break</code></span>
+<span class="codeline" id="line-625"><code>		}</code></span>
+<span class="codeline" id="line-626"><code>		fn()</code></span>
+<span class="codeline" id="line-627"><code>	}</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>	goexit1()</code></span>
+<span class="codeline" id="line-630"><code>}</code></span>
+<span class="codeline" id="line-631"><code></code></span>
+<span class="codeline" id="line-632"><code>// Call all Error and String methods before freezing the world.</code></span>
+<span class="codeline" id="line-633"><code>// Used when crashing with panicking.</code></span>
+<span class="codeline" id="line-634"><code>func preprintpanics(p *_panic) {</code></span>
+<span class="codeline" id="line-635"><code>	defer func() {</code></span>
+<span class="codeline" id="line-636"><code>		text := "panic while printing panic value"</code></span>
+<span class="codeline" id="line-637"><code>		switch r := recover().(type) {</code></span>
+<span class="codeline" id="line-638"><code>		case nil:</code></span>
+<span class="codeline" id="line-639"><code>			// nothing to do</code></span>
+<span class="codeline" id="line-640"><code>		case string:</code></span>
+<span class="codeline" id="line-641"><code>			throw(text + ": " + r)</code></span>
+<span class="codeline" id="line-642"><code>		default:</code></span>
+<span class="codeline" id="line-643"><code>			throw(text + ": type " + toRType(efaceOf(&amp;r)._type).string())</code></span>
+<span class="codeline" id="line-644"><code>		}</code></span>
+<span class="codeline" id="line-645"><code>	}()</code></span>
+<span class="codeline" id="line-646"><code>	for p != nil {</code></span>
+<span class="codeline" id="line-647"><code>		switch v := p.arg.(type) {</code></span>
+<span class="codeline" id="line-648"><code>		case error:</code></span>
+<span class="codeline" id="line-649"><code>			p.arg = v.Error()</code></span>
+<span class="codeline" id="line-650"><code>		case stringer:</code></span>
+<span class="codeline" id="line-651"><code>			p.arg = v.String()</code></span>
+<span class="codeline" id="line-652"><code>		}</code></span>
+<span class="codeline" id="line-653"><code>		p = p.link</code></span>
+<span class="codeline" id="line-654"><code>	}</code></span>
+<span class="codeline" id="line-655"><code>}</code></span>
+<span class="codeline" id="line-656"><code></code></span>
+<span class="codeline" id="line-657"><code>// Print all currently active panics. Used when crashing.</code></span>
+<span class="codeline" id="line-658"><code>// Should only be called after preprintpanics.</code></span>
+<span class="codeline" id="line-659"><code>func printpanics(p *_panic) {</code></span>
+<span class="codeline" id="line-660"><code>	if p.link != nil {</code></span>
+<span class="codeline" id="line-661"><code>		printpanics(p.link)</code></span>
+<span class="codeline" id="line-662"><code>		if !p.link.goexit {</code></span>
+<span class="codeline" id="line-663"><code>			print("\t")</code></span>
+<span class="codeline" id="line-664"><code>		}</code></span>
+<span class="codeline" id="line-665"><code>	}</code></span>
+<span class="codeline" id="line-666"><code>	if p.goexit {</code></span>
+<span class="codeline" id="line-667"><code>		return</code></span>
+<span class="codeline" id="line-668"><code>	}</code></span>
+<span class="codeline" id="line-669"><code>	print("panic: ")</code></span>
+<span class="codeline" id="line-670"><code>	printany(p.arg)</code></span>
+<span class="codeline" id="line-671"><code>	if p.recovered {</code></span>
+<span class="codeline" id="line-672"><code>		print(" [recovered]")</code></span>
+<span class="codeline" id="line-673"><code>	}</code></span>
+<span class="codeline" id="line-674"><code>	print("\n")</code></span>
+<span class="codeline" id="line-675"><code>}</code></span>
+<span class="codeline" id="line-676"><code></code></span>
+<span class="codeline" id="line-677"><code>// readvarintUnsafe reads the uint32 in varint format starting at fd, and returns the</code></span>
+<span class="codeline" id="line-678"><code>// uint32 and a pointer to the byte following the varint.</code></span>
+<span class="codeline" id="line-679"><code>//</code></span>
+<span class="codeline" id="line-680"><code>// The implementation is the same with runtime.readvarint, except that this function</code></span>
+<span class="codeline" id="line-681"><code>// uses unsafe.Pointer for speed.</code></span>
+<span class="codeline" id="line-682"><code>func readvarintUnsafe(fd unsafe.Pointer) (uint32, unsafe.Pointer) {</code></span>
+<span class="codeline" id="line-683"><code>	var r uint32</code></span>
+<span class="codeline" id="line-684"><code>	var shift int</code></span>
+<span class="codeline" id="line-685"><code>	for {</code></span>
+<span class="codeline" id="line-686"><code>		b := *(*uint8)(fd)</code></span>
+<span class="codeline" id="line-687"><code>		fd = add(fd, unsafe.Sizeof(b))</code></span>
+<span class="codeline" id="line-688"><code>		if b &lt; 128 {</code></span>
+<span class="codeline" id="line-689"><code>			return r + uint32(b)&lt;&lt;shift, fd</code></span>
+<span class="codeline" id="line-690"><code>		}</code></span>
+<span class="codeline" id="line-691"><code>		r += uint32(b&amp;0x7F) &lt;&lt; (shift &amp; 31)</code></span>
+<span class="codeline" id="line-692"><code>		shift += 7</code></span>
+<span class="codeline" id="line-693"><code>		if shift &gt; 28 {</code></span>
+<span class="codeline" id="line-694"><code>			panic("Bad varint")</code></span>
+<span class="codeline" id="line-695"><code>		}</code></span>
+<span class="codeline" id="line-696"><code>	}</code></span>
+<span class="codeline" id="line-697"><code>}</code></span>
+<span class="codeline" id="line-698"><code></code></span>
+<span class="codeline" id="line-699"><code>// A PanicNilError happens when code calls panic(nil).</code></span>
+<span class="codeline" id="line-700"><code>//</code></span>
+<span class="codeline" id="line-701"><code>// Before Go 1.21, programs that called panic(nil) observed recover returning nil.</code></span>
+<span class="codeline" id="line-702"><code>// Starting in Go 1.21, programs that call panic(nil) observe recover returning a *PanicNilError.</code></span>
+<span class="codeline" id="line-703"><code>// Programs can change back to the old behavior by setting GODEBUG=panicnil=1.</code></span>
+<span class="codeline" id="line-704"><code>type PanicNilError struct {</code></span>
+<span class="codeline" id="line-705"><code>	// This field makes PanicNilError structurally different from</code></span>
+<span class="codeline" id="line-706"><code>	// any other struct in this package, and the _ makes it different</code></span>
+<span class="codeline" id="line-707"><code>	// from any struct in other packages too.</code></span>
+<span class="codeline" id="line-708"><code>	// This avoids any accidental conversions being possible</code></span>
+<span class="codeline" id="line-709"><code>	// between this struct and some other struct sharing the same fields,</code></span>
+<span class="codeline" id="line-710"><code>	// like happened in go.dev/issue/56603.</code></span>
+<span class="codeline" id="line-711"><code>	_ [0]*PanicNilError</code></span>
+<span class="codeline" id="line-712"><code>}</code></span>
+<span class="codeline" id="line-713"><code></code></span>
+<span class="codeline" id="line-714"><code>func (*PanicNilError) Error() string { return "panic called with nil argument" }</code></span>
+<span class="codeline" id="line-715"><code>func (*PanicNilError) RuntimeError() {}</code></span>
+<span class="codeline" id="line-716"><code></code></span>
+<span class="codeline" id="line-717"><code>var panicnil = &amp;godebugInc{name: "panicnil"}</code></span>
+<span class="codeline" id="line-718"><code></code></span>
+<span class="codeline" id="line-719"><code>// The implementation of the predeclared function panic.</code></span>
+<span class="codeline" id="line-720"><code>func gopanic(e any) {</code></span>
+<span class="codeline" id="line-721"><code>	if e == nil {</code></span>
+<span class="codeline" id="line-722"><code>		if debug.panicnil.Load() != 1 {</code></span>
+<span class="codeline" id="line-723"><code>			e = new(PanicNilError)</code></span>
+<span class="codeline" id="line-724"><code>		} else {</code></span>
+<span class="codeline" id="line-725"><code>			panicnil.IncNonDefault()</code></span>
+<span class="codeline" id="line-726"><code>		}</code></span>
+<span class="codeline" id="line-727"><code>	}</code></span>
+<span class="codeline" id="line-728"><code></code></span>
+<span class="codeline" id="line-729"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-730"><code>	if gp.m.curg != gp {</code></span>
+<span class="codeline" id="line-731"><code>		print("panic: ")</code></span>
+<span class="codeline" id="line-732"><code>		printany(e)</code></span>
+<span class="codeline" id="line-733"><code>		print("\n")</code></span>
+<span class="codeline" id="line-734"><code>		throw("panic on system stack")</code></span>
+<span class="codeline" id="line-735"><code>	}</code></span>
+<span class="codeline" id="line-736"><code></code></span>
+<span class="codeline" id="line-737"><code>	if gp.m.mallocing != 0 {</code></span>
+<span class="codeline" id="line-738"><code>		print("panic: ")</code></span>
+<span class="codeline" id="line-739"><code>		printany(e)</code></span>
+<span class="codeline" id="line-740"><code>		print("\n")</code></span>
+<span class="codeline" id="line-741"><code>		throw("panic during malloc")</code></span>
+<span class="codeline" id="line-742"><code>	}</code></span>
+<span class="codeline" id="line-743"><code>	if gp.m.preemptoff != "" {</code></span>
+<span class="codeline" id="line-744"><code>		print("panic: ")</code></span>
+<span class="codeline" id="line-745"><code>		printany(e)</code></span>
+<span class="codeline" id="line-746"><code>		print("\n")</code></span>
+<span class="codeline" id="line-747"><code>		print("preempt off reason: ")</code></span>
+<span class="codeline" id="line-748"><code>		print(gp.m.preemptoff)</code></span>
+<span class="codeline" id="line-749"><code>		print("\n")</code></span>
+<span class="codeline" id="line-750"><code>		throw("panic during preemptoff")</code></span>
+<span class="codeline" id="line-751"><code>	}</code></span>
+<span class="codeline" id="line-752"><code>	if gp.m.locks != 0 {</code></span>
+<span class="codeline" id="line-753"><code>		print("panic: ")</code></span>
+<span class="codeline" id="line-754"><code>		printany(e)</code></span>
+<span class="codeline" id="line-755"><code>		print("\n")</code></span>
+<span class="codeline" id="line-756"><code>		throw("panic holding locks")</code></span>
+<span class="codeline" id="line-757"><code>	}</code></span>
+<span class="codeline" id="line-758"><code></code></span>
+<span class="codeline" id="line-759"><code>	var p _panic</code></span>
+<span class="codeline" id="line-760"><code>	p.arg = e</code></span>
+<span class="codeline" id="line-761"><code></code></span>
+<span class="codeline" id="line-762"><code>	runningPanicDefers.Add(1)</code></span>
+<span class="codeline" id="line-763"><code></code></span>
+<span class="codeline" id="line-764"><code>	p.start(getcallerpc(), unsafe.Pointer(getcallersp()))</code></span>
+<span class="codeline" id="line-765"><code>	for {</code></span>
+<span class="codeline" id="line-766"><code>		fn, ok := p.nextDefer()</code></span>
+<span class="codeline" id="line-767"><code>		if !ok {</code></span>
+<span class="codeline" id="line-768"><code>			break</code></span>
+<span class="codeline" id="line-769"><code>		}</code></span>
+<span class="codeline" id="line-770"><code>		fn()</code></span>
+<span class="codeline" id="line-771"><code>	}</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>	// ran out of deferred calls - old-school panic now</code></span>
+<span class="codeline" id="line-774"><code>	// Because it is unsafe to call arbitrary user code after freezing</code></span>
+<span class="codeline" id="line-775"><code>	// the world, we call preprintpanics to invoke all necessary Error</code></span>
+<span class="codeline" id="line-776"><code>	// and String methods to prepare the panic strings before startpanic.</code></span>
+<span class="codeline" id="line-777"><code>	preprintpanics(&amp;p)</code></span>
+<span class="codeline" id="line-778"><code></code></span>
+<span class="codeline" id="line-779"><code>	fatalpanic(&amp;p)   // should not return</code></span>
+<span class="codeline" id="line-780"><code>	*(*int)(nil) = 0 // not reached</code></span>
+<span class="codeline" id="line-781"><code>}</code></span>
+<span class="codeline" id="line-782"><code></code></span>
+<span class="codeline" id="line-783"><code>// start initializes a panic to start unwinding the stack.</code></span>
+<span class="codeline" id="line-784"><code>//</code></span>
+<span class="codeline" id="line-785"><code>// If p.goexit is true, then start may return multiple times.</code></span>
+<span class="codeline" id="line-786"><code>func (p *_panic) start(pc uintptr, sp unsafe.Pointer) {</code></span>
+<span class="codeline" id="line-787"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-788"><code></code></span>
+<span class="codeline" id="line-789"><code>	// Record the caller's PC and SP, so recovery can identify panics</code></span>
+<span class="codeline" id="line-790"><code>	// that have been recovered. Also, so that if p is from Goexit, we</code></span>
+<span class="codeline" id="line-791"><code>	// can restart its defer processing loop if a recovered panic tries</code></span>
+<span class="codeline" id="line-792"><code>	// to jump past it.</code></span>
+<span class="codeline" id="line-793"><code>	p.startPC = getcallerpc()</code></span>
+<span class="codeline" id="line-794"><code>	p.startSP = unsafe.Pointer(getcallersp())</code></span>
+<span class="codeline" id="line-795"><code></code></span>
+<span class="codeline" id="line-796"><code>	if p.deferreturn {</code></span>
+<span class="codeline" id="line-797"><code>		p.sp = sp</code></span>
+<span class="codeline" id="line-798"><code></code></span>
+<span class="codeline" id="line-799"><code>		if s := (*savedOpenDeferState)(gp.param); s != nil {</code></span>
+<span class="codeline" id="line-800"><code>			// recovery saved some state for us, so that we can resume</code></span>
+<span class="codeline" id="line-801"><code>			// calling open-coded defers without unwinding the stack.</code></span>
+<span class="codeline" id="line-802"><code></code></span>
+<span class="codeline" id="line-803"><code>			gp.param = nil</code></span>
+<span class="codeline" id="line-804"><code></code></span>
+<span class="codeline" id="line-805"><code>			p.retpc = s.retpc</code></span>
+<span class="codeline" id="line-806"><code>			p.deferBitsPtr = (*byte)(add(sp, s.deferBitsOffset))</code></span>
+<span class="codeline" id="line-807"><code>			p.slotsPtr = add(sp, s.slotsOffset)</code></span>
+<span class="codeline" id="line-808"><code>		}</code></span>
+<span class="codeline" id="line-809"><code></code></span>
+<span class="codeline" id="line-810"><code>		return</code></span>
+<span class="codeline" id="line-811"><code>	}</code></span>
+<span class="codeline" id="line-812"><code></code></span>
+<span class="codeline" id="line-813"><code>	p.link = gp._panic</code></span>
+<span class="codeline" id="line-814"><code>	gp._panic = (*_panic)(noescape(unsafe.Pointer(p)))</code></span>
+<span class="codeline" id="line-815"><code></code></span>
+<span class="codeline" id="line-816"><code>	// Initialize state machine, and find the first frame with a defer.</code></span>
+<span class="codeline" id="line-817"><code>	//</code></span>
+<span class="codeline" id="line-818"><code>	// Note: We could use startPC and startSP here, but callers will</code></span>
+<span class="codeline" id="line-819"><code>	// never have defer statements themselves. By starting at their</code></span>
+<span class="codeline" id="line-820"><code>	// caller instead, we avoid needing to unwind through an extra</code></span>
+<span class="codeline" id="line-821"><code>	// frame. It also somewhat simplifies the terminating condition for</code></span>
+<span class="codeline" id="line-822"><code>	// deferreturn.</code></span>
+<span class="codeline" id="line-823"><code>	p.lr, p.fp = pc, sp</code></span>
+<span class="codeline" id="line-824"><code>	p.nextFrame()</code></span>
+<span class="codeline" id="line-825"><code>}</code></span>
+<span class="codeline" id="line-826"><code></code></span>
+<span class="codeline" id="line-827"><code>// nextDefer returns the next deferred function to invoke, if any.</code></span>
+<span class="codeline" id="line-828"><code>//</code></span>
+<span class="codeline" id="line-829"><code>// Note: The "ok bool" result is necessary to correctly handle when</code></span>
+<span class="codeline" id="line-830"><code>// the deferred function itself was nil (e.g., "defer (func())(nil)").</code></span>
+<span class="codeline" id="line-831"><code>func (p *_panic) nextDefer() (func(), bool) {</code></span>
+<span class="codeline" id="line-832"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-833"><code></code></span>
+<span class="codeline" id="line-834"><code>	if !p.deferreturn {</code></span>
+<span class="codeline" id="line-835"><code>		if gp._panic != p {</code></span>
+<span class="codeline" id="line-836"><code>			throw("bad panic stack")</code></span>
+<span class="codeline" id="line-837"><code>		}</code></span>
+<span class="codeline" id="line-838"><code></code></span>
+<span class="codeline" id="line-839"><code>		if p.recovered {</code></span>
+<span class="codeline" id="line-840"><code>			mcall(recovery) // does not return</code></span>
+<span class="codeline" id="line-841"><code>			throw("recovery failed")</code></span>
+<span class="codeline" id="line-842"><code>		}</code></span>
+<span class="codeline" id="line-843"><code>	}</code></span>
+<span class="codeline" id="line-844"><code></code></span>
+<span class="codeline" id="line-845"><code>	// The assembler adjusts p.argp in wrapper functions that shouldn't</code></span>
+<span class="codeline" id="line-846"><code>	// be visible to recover(), so we need to restore it each iteration.</code></span>
+<span class="codeline" id="line-847"><code>	p.argp = add(p.startSP, sys.MinFrameSize)</code></span>
+<span class="codeline" id="line-848"><code></code></span>
+<span class="codeline" id="line-849"><code>	for {</code></span>
+<span class="codeline" id="line-850"><code>		for p.deferBitsPtr != nil {</code></span>
+<span class="codeline" id="line-851"><code>			bits := *p.deferBitsPtr</code></span>
+<span class="codeline" id="line-852"><code></code></span>
+<span class="codeline" id="line-853"><code>			// Check whether any open-coded defers are still pending.</code></span>
+<span class="codeline" id="line-854"><code>			//</code></span>
+<span class="codeline" id="line-855"><code>			// Note: We need to check this upfront (rather than after</code></span>
+<span class="codeline" id="line-856"><code>			// clearing the top bit) because it's possible that Goexit</code></span>
+<span class="codeline" id="line-857"><code>			// invokes a deferred call, and there were still more pending</code></span>
+<span class="codeline" id="line-858"><code>			// open-coded defers in the frame; but then the deferred call</code></span>
+<span class="codeline" id="line-859"><code>			// panic and invoked the remaining defers in the frame, before</code></span>
+<span class="codeline" id="line-860"><code>			// recovering and restarting the Goexit loop.</code></span>
+<span class="codeline" id="line-861"><code>			if bits == 0 {</code></span>
+<span class="codeline" id="line-862"><code>				p.deferBitsPtr = nil</code></span>
+<span class="codeline" id="line-863"><code>				break</code></span>
+<span class="codeline" id="line-864"><code>			}</code></span>
+<span class="codeline" id="line-865"><code></code></span>
+<span class="codeline" id="line-866"><code>			// Find index of top bit set.</code></span>
+<span class="codeline" id="line-867"><code>			i := 7 - uintptr(sys.LeadingZeros8(bits))</code></span>
+<span class="codeline" id="line-868"><code></code></span>
+<span class="codeline" id="line-869"><code>			// Clear bit and store it back.</code></span>
+<span class="codeline" id="line-870"><code>			bits &amp;^= 1 &lt;&lt; i</code></span>
+<span class="codeline" id="line-871"><code>			*p.deferBitsPtr = bits</code></span>
+<span class="codeline" id="line-872"><code></code></span>
+<span class="codeline" id="line-873"><code>			return *(*func())(add(p.slotsPtr, i*goarch.PtrSize)), true</code></span>
+<span class="codeline" id="line-874"><code>		}</code></span>
+<span class="codeline" id="line-875"><code></code></span>
+<span class="codeline" id="line-876"><code>	Recheck:</code></span>
+<span class="codeline" id="line-877"><code>		if d := gp._defer; d != nil &amp;&amp; d.sp == uintptr(p.sp) {</code></span>
+<span class="codeline" id="line-878"><code>			if d.rangefunc {</code></span>
+<span class="codeline" id="line-879"><code>				gp._defer = deferconvert(d)</code></span>
+<span class="codeline" id="line-880"><code>				goto Recheck</code></span>
+<span class="codeline" id="line-881"><code>			}</code></span>
+<span class="codeline" id="line-882"><code></code></span>
+<span class="codeline" id="line-883"><code>			fn := d.fn</code></span>
+<span class="codeline" id="line-884"><code>			d.fn = nil</code></span>
+<span class="codeline" id="line-885"><code></code></span>
+<span class="codeline" id="line-886"><code>			// TODO(mdempsky): Instead of having each deferproc call have</code></span>
+<span class="codeline" id="line-887"><code>			// its own "deferreturn(); return" sequence, we should just make</code></span>
+<span class="codeline" id="line-888"><code>			// them reuse the one we emit for open-coded defers.</code></span>
+<span class="codeline" id="line-889"><code>			p.retpc = d.pc</code></span>
+<span class="codeline" id="line-890"><code></code></span>
+<span class="codeline" id="line-891"><code>			// Unlink and free.</code></span>
+<span class="codeline" id="line-892"><code>			gp._defer = d.link</code></span>
+<span class="codeline" id="line-893"><code>			freedefer(d)</code></span>
+<span class="codeline" id="line-894"><code></code></span>
+<span class="codeline" id="line-895"><code>			return fn, true</code></span>
+<span class="codeline" id="line-896"><code>		}</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>		if !p.nextFrame() {</code></span>
+<span class="codeline" id="line-899"><code>			return nil, false</code></span>
+<span class="codeline" id="line-900"><code>		}</code></span>
+<span class="codeline" id="line-901"><code>	}</code></span>
+<span class="codeline" id="line-902"><code>}</code></span>
+<span class="codeline" id="line-903"><code></code></span>
+<span class="codeline" id="line-904"><code>// nextFrame finds the next frame that contains deferred calls, if any.</code></span>
+<span class="codeline" id="line-905"><code>func (p *_panic) nextFrame() (ok bool) {</code></span>
+<span class="codeline" id="line-906"><code>	if p.lr == 0 {</code></span>
+<span class="codeline" id="line-907"><code>		return false</code></span>
+<span class="codeline" id="line-908"><code>	}</code></span>
+<span class="codeline" id="line-909"><code></code></span>
+<span class="codeline" id="line-910"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-911"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-912"><code>		var limit uintptr</code></span>
+<span class="codeline" id="line-913"><code>		if d := gp._defer; d != nil {</code></span>
+<span class="codeline" id="line-914"><code>			limit = d.sp</code></span>
+<span class="codeline" id="line-915"><code>		}</code></span>
+<span class="codeline" id="line-916"><code></code></span>
+<span class="codeline" id="line-917"><code>		var u unwinder</code></span>
+<span class="codeline" id="line-918"><code>		u.initAt(p.lr, uintptr(p.fp), 0, gp, 0)</code></span>
+<span class="codeline" id="line-919"><code>		for {</code></span>
+<span class="codeline" id="line-920"><code>			if !u.valid() {</code></span>
+<span class="codeline" id="line-921"><code>				p.lr = 0</code></span>
+<span class="codeline" id="line-922"><code>				return // ok == false</code></span>
+<span class="codeline" id="line-923"><code>			}</code></span>
+<span class="codeline" id="line-924"><code></code></span>
+<span class="codeline" id="line-925"><code>			// TODO(mdempsky): If we populate u.frame.fn.deferreturn for</code></span>
+<span class="codeline" id="line-926"><code>			// every frame containing a defer (not just open-coded defers),</code></span>
+<span class="codeline" id="line-927"><code>			// then we can simply loop until we find the next frame where</code></span>
+<span class="codeline" id="line-928"><code>			// it's non-zero.</code></span>
+<span class="codeline" id="line-929"><code></code></span>
+<span class="codeline" id="line-930"><code>			if u.frame.sp == limit {</code></span>
+<span class="codeline" id="line-931"><code>				break // found a frame with linked defers</code></span>
+<span class="codeline" id="line-932"><code>			}</code></span>
+<span class="codeline" id="line-933"><code></code></span>
+<span class="codeline" id="line-934"><code>			if p.initOpenCodedDefers(u.frame.fn, unsafe.Pointer(u.frame.varp)) {</code></span>
+<span class="codeline" id="line-935"><code>				break // found a frame with open-coded defers</code></span>
+<span class="codeline" id="line-936"><code>			}</code></span>
+<span class="codeline" id="line-937"><code></code></span>
+<span class="codeline" id="line-938"><code>			u.next()</code></span>
+<span class="codeline" id="line-939"><code>		}</code></span>
+<span class="codeline" id="line-940"><code></code></span>
+<span class="codeline" id="line-941"><code>		p.lr = u.frame.lr</code></span>
+<span class="codeline" id="line-942"><code>		p.sp = unsafe.Pointer(u.frame.sp)</code></span>
+<span class="codeline" id="line-943"><code>		p.fp = unsafe.Pointer(u.frame.fp)</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>		ok = true</code></span>
+<span class="codeline" id="line-946"><code>	})</code></span>
+<span class="codeline" id="line-947"><code></code></span>
+<span class="codeline" id="line-948"><code>	return</code></span>
+<span class="codeline" id="line-949"><code>}</code></span>
+<span class="codeline" id="line-950"><code></code></span>
+<span class="codeline" id="line-951"><code>func (p *_panic) initOpenCodedDefers(fn funcInfo, varp unsafe.Pointer) bool {</code></span>
+<span class="codeline" id="line-952"><code>	fd := funcdata(fn, abi.FUNCDATA_OpenCodedDeferInfo)</code></span>
+<span class="codeline" id="line-953"><code>	if fd == nil {</code></span>
+<span class="codeline" id="line-954"><code>		return false</code></span>
+<span class="codeline" id="line-955"><code>	}</code></span>
+<span class="codeline" id="line-956"><code></code></span>
+<span class="codeline" id="line-957"><code>	if fn.deferreturn == 0 {</code></span>
+<span class="codeline" id="line-958"><code>		throw("missing deferreturn")</code></span>
+<span class="codeline" id="line-959"><code>	}</code></span>
+<span class="codeline" id="line-960"><code></code></span>
+<span class="codeline" id="line-961"><code>	deferBitsOffset, fd := readvarintUnsafe(fd)</code></span>
+<span class="codeline" id="line-962"><code>	deferBitsPtr := (*uint8)(add(varp, -uintptr(deferBitsOffset)))</code></span>
+<span class="codeline" id="line-963"><code>	if *deferBitsPtr == 0 {</code></span>
+<span class="codeline" id="line-964"><code>		return false // has open-coded defers, but none pending</code></span>
+<span class="codeline" id="line-965"><code>	}</code></span>
+<span class="codeline" id="line-966"><code></code></span>
+<span class="codeline" id="line-967"><code>	slotsOffset, fd := readvarintUnsafe(fd)</code></span>
+<span class="codeline" id="line-968"><code></code></span>
+<span class="codeline" id="line-969"><code>	p.retpc = fn.entry() + uintptr(fn.deferreturn)</code></span>
+<span class="codeline" id="line-970"><code>	p.deferBitsPtr = deferBitsPtr</code></span>
+<span class="codeline" id="line-971"><code>	p.slotsPtr = add(varp, -uintptr(slotsOffset))</code></span>
+<span class="codeline" id="line-972"><code></code></span>
+<span class="codeline" id="line-973"><code>	return true</code></span>
+<span class="codeline" id="line-974"><code>}</code></span>
+<span class="codeline" id="line-975"><code></code></span>
+<span class="codeline" id="line-976"><code>// The implementation of the predeclared function recover.</code></span>
+<span class="codeline" id="line-977"><code>// Cannot split the stack because it needs to reliably</code></span>
+<span class="codeline" id="line-978"><code>// find the stack segment of its caller.</code></span>
+<span class="codeline" id="line-979"><code>//</code></span>
+<span class="codeline" id="line-980"><code>// TODO(rsc): Once we commit to CopyStackAlways,</code></span>
+<span class="codeline" id="line-981"><code>// this doesn't need to be nosplit.</code></span>
+<span class="codeline" id="line-982"><code>//</code></span>
+<span class="codeline" id="line-983"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-984"><code>func gorecover(argp uintptr) any {</code></span>
+<span class="codeline" id="line-985"><code>	// Must be in a function running as part of a deferred call during the panic.</code></span>
+<span class="codeline" id="line-986"><code>	// Must be called from the topmost function of the call</code></span>
+<span class="codeline" id="line-987"><code>	// (the function used in the defer statement).</code></span>
+<span class="codeline" id="line-988"><code>	// p.argp is the argument pointer of that topmost deferred function call.</code></span>
+<span class="codeline" id="line-989"><code>	// Compare against argp reported by caller.</code></span>
+<span class="codeline" id="line-990"><code>	// If they match, the caller is the one who can recover.</code></span>
+<span class="codeline" id="line-991"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-992"><code>	p := gp._panic</code></span>
+<span class="codeline" id="line-993"><code>	if p != nil &amp;&amp; !p.goexit &amp;&amp; !p.recovered &amp;&amp; argp == uintptr(p.argp) {</code></span>
+<span class="codeline" id="line-994"><code>		p.recovered = true</code></span>
+<span class="codeline" id="line-995"><code>		return p.arg</code></span>
+<span class="codeline" id="line-996"><code>	}</code></span>
+<span class="codeline" id="line-997"><code>	return nil</code></span>
+<span class="codeline" id="line-998"><code>}</code></span>
+<span class="codeline" id="line-999"><code></code></span>
+<span class="codeline" id="line-1000"><code>//go:linkname sync_throw sync.throw</code></span>
+<span class="codeline" id="line-1001"><code>func sync_throw(s string) {</code></span>
+<span class="codeline" id="line-1002"><code>	throw(s)</code></span>
+<span class="codeline" id="line-1003"><code>}</code></span>
+<span class="codeline" id="line-1004"><code></code></span>
+<span class="codeline" id="line-1005"><code>//go:linkname sync_fatal sync.fatal</code></span>
+<span class="codeline" id="line-1006"><code>func sync_fatal(s string) {</code></span>
+<span class="codeline" id="line-1007"><code>	fatal(s)</code></span>
+<span class="codeline" id="line-1008"><code>}</code></span>
+<span class="codeline" id="line-1009"><code></code></span>
+<span class="codeline" id="line-1010"><code>// throw triggers a fatal error that dumps a stack trace and exits.</code></span>
+<span class="codeline" id="line-1011"><code>//</code></span>
+<span class="codeline" id="line-1012"><code>// throw should be used for runtime-internal fatal errors where Go itself,</code></span>
+<span class="codeline" id="line-1013"><code>// rather than user code, may be at fault for the failure.</code></span>
+<span class="codeline" id="line-1014"><code>//</code></span>
+<span class="codeline" id="line-1015"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1016"><code>func throw(s string) {</code></span>
+<span class="codeline" id="line-1017"><code>	// Everything throw does should be recursively nosplit so it</code></span>
+<span class="codeline" id="line-1018"><code>	// can be called even when it's unsafe to grow the stack.</code></span>
+<span class="codeline" id="line-1019"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1020"><code>		print("fatal error: ", s, "\n")</code></span>
+<span class="codeline" id="line-1021"><code>	})</code></span>
+<span class="codeline" id="line-1022"><code></code></span>
+<span class="codeline" id="line-1023"><code>	fatalthrow(throwTypeRuntime)</code></span>
+<span class="codeline" id="line-1024"><code>}</code></span>
+<span class="codeline" id="line-1025"><code></code></span>
+<span class="codeline" id="line-1026"><code>// fatal triggers a fatal error that dumps a stack trace and exits.</code></span>
+<span class="codeline" id="line-1027"><code>//</code></span>
+<span class="codeline" id="line-1028"><code>// fatal is equivalent to throw, but is used when user code is expected to be</code></span>
+<span class="codeline" id="line-1029"><code>// at fault for the failure, such as racing map writes.</code></span>
+<span class="codeline" id="line-1030"><code>//</code></span>
+<span class="codeline" id="line-1031"><code>// fatal does not include runtime frames, system goroutines, or frame metadata</code></span>
+<span class="codeline" id="line-1032"><code>// (fp, sp, pc) in the stack trace unless GOTRACEBACK=system or higher.</code></span>
+<span class="codeline" id="line-1033"><code>//</code></span>
+<span class="codeline" id="line-1034"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1035"><code>func fatal(s string) {</code></span>
+<span class="codeline" id="line-1036"><code>	// Everything fatal does should be recursively nosplit so it</code></span>
+<span class="codeline" id="line-1037"><code>	// can be called even when it's unsafe to grow the stack.</code></span>
+<span class="codeline" id="line-1038"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1039"><code>		print("fatal error: ", s, "\n")</code></span>
+<span class="codeline" id="line-1040"><code>	})</code></span>
+<span class="codeline" id="line-1041"><code></code></span>
+<span class="codeline" id="line-1042"><code>	fatalthrow(throwTypeUser)</code></span>
+<span class="codeline" id="line-1043"><code>}</code></span>
+<span class="codeline" id="line-1044"><code></code></span>
+<span class="codeline" id="line-1045"><code>// runningPanicDefers is non-zero while running deferred functions for panic.</code></span>
+<span class="codeline" id="line-1046"><code>// This is used to try hard to get a panic stack trace out when exiting.</code></span>
+<span class="codeline" id="line-1047"><code>var runningPanicDefers atomic.Uint32</code></span>
+<span class="codeline" id="line-1048"><code></code></span>
+<span class="codeline" id="line-1049"><code>// panicking is non-zero when crashing the program for an unrecovered panic.</code></span>
+<span class="codeline" id="line-1050"><code>var panicking atomic.Uint32</code></span>
+<span class="codeline" id="line-1051"><code></code></span>
+<span class="codeline" id="line-1052"><code>// paniclk is held while printing the panic information and stack trace,</code></span>
+<span class="codeline" id="line-1053"><code>// so that two concurrent panics don't overlap their output.</code></span>
+<span class="codeline" id="line-1054"><code>var paniclk mutex</code></span>
+<span class="codeline" id="line-1055"><code></code></span>
+<span class="codeline" id="line-1056"><code>// Unwind the stack after a deferred function calls recover</code></span>
+<span class="codeline" id="line-1057"><code>// after a panic. Then arrange to continue running as though</code></span>
+<span class="codeline" id="line-1058"><code>// the caller of the deferred function returned normally.</code></span>
+<span class="codeline" id="line-1059"><code>//</code></span>
+<span class="codeline" id="line-1060"><code>// However, if unwinding the stack would skip over a Goexit call, we</code></span>
+<span class="codeline" id="line-1061"><code>// return into the Goexit loop instead, so it can continue processing</code></span>
+<span class="codeline" id="line-1062"><code>// defers instead.</code></span>
+<span class="codeline" id="line-1063"><code>func recovery(gp *g) {</code></span>
+<span class="codeline" id="line-1064"><code>	p := gp._panic</code></span>
+<span class="codeline" id="line-1065"><code>	pc, sp, fp := p.retpc, uintptr(p.sp), uintptr(p.fp)</code></span>
+<span class="codeline" id="line-1066"><code>	p0, saveOpenDeferState := p, p.deferBitsPtr != nil &amp;&amp; *p.deferBitsPtr != 0</code></span>
+<span class="codeline" id="line-1067"><code></code></span>
+<span class="codeline" id="line-1068"><code>	// Unwind the panic stack.</code></span>
+<span class="codeline" id="line-1069"><code>	for ; p != nil &amp;&amp; uintptr(p.startSP) &lt; sp; p = p.link {</code></span>
+<span class="codeline" id="line-1070"><code>		// Don't allow jumping past a pending Goexit.</code></span>
+<span class="codeline" id="line-1071"><code>		// Instead, have its _panic.start() call return again.</code></span>
+<span class="codeline" id="line-1072"><code>		//</code></span>
+<span class="codeline" id="line-1073"><code>		// TODO(mdempsky): In this case, Goexit will resume walking the</code></span>
+<span class="codeline" id="line-1074"><code>		// stack where it left off, which means it will need to rewalk</code></span>
+<span class="codeline" id="line-1075"><code>		// frames that we've already processed.</code></span>
+<span class="codeline" id="line-1076"><code>		//</code></span>
+<span class="codeline" id="line-1077"><code>		// There's a similar issue with nested panics, when the inner</code></span>
+<span class="codeline" id="line-1078"><code>		// panic supercedes the outer panic. Again, we end up needing to</code></span>
+<span class="codeline" id="line-1079"><code>		// walk the same stack frames.</code></span>
+<span class="codeline" id="line-1080"><code>		//</code></span>
+<span class="codeline" id="line-1081"><code>		// These are probably pretty rare occurrences in practice, and</code></span>
+<span class="codeline" id="line-1082"><code>		// they don't seem any worse than the existing logic. But if we</code></span>
+<span class="codeline" id="line-1083"><code>		// move the unwinding state into _panic, we could detect when we</code></span>
+<span class="codeline" id="line-1084"><code>		// run into where the last panic started, and then just pick up</code></span>
+<span class="codeline" id="line-1085"><code>		// where it left off instead.</code></span>
+<span class="codeline" id="line-1086"><code>		//</code></span>
+<span class="codeline" id="line-1087"><code>		// With how subtle defer handling is, this might not actually be</code></span>
+<span class="codeline" id="line-1088"><code>		// worthwhile though.</code></span>
+<span class="codeline" id="line-1089"><code>		if p.goexit {</code></span>
+<span class="codeline" id="line-1090"><code>			pc, sp = p.startPC, uintptr(p.startSP)</code></span>
+<span class="codeline" id="line-1091"><code>			saveOpenDeferState = false // goexit is unwinding the stack anyway</code></span>
+<span class="codeline" id="line-1092"><code>			break</code></span>
+<span class="codeline" id="line-1093"><code>		}</code></span>
+<span class="codeline" id="line-1094"><code></code></span>
+<span class="codeline" id="line-1095"><code>		runningPanicDefers.Add(-1)</code></span>
+<span class="codeline" id="line-1096"><code>	}</code></span>
+<span class="codeline" id="line-1097"><code>	gp._panic = p</code></span>
+<span class="codeline" id="line-1098"><code></code></span>
+<span class="codeline" id="line-1099"><code>	if p == nil { // must be done with signal</code></span>
+<span class="codeline" id="line-1100"><code>		gp.sig = 0</code></span>
+<span class="codeline" id="line-1101"><code>	}</code></span>
+<span class="codeline" id="line-1102"><code></code></span>
+<span class="codeline" id="line-1103"><code>	if gp.param != nil {</code></span>
+<span class="codeline" id="line-1104"><code>		throw("unexpected gp.param")</code></span>
+<span class="codeline" id="line-1105"><code>	}</code></span>
+<span class="codeline" id="line-1106"><code>	if saveOpenDeferState {</code></span>
+<span class="codeline" id="line-1107"><code>		// If we're returning to deferreturn and there are more open-coded</code></span>
+<span class="codeline" id="line-1108"><code>		// defers for it to call, save enough state for it to be able to</code></span>
+<span class="codeline" id="line-1109"><code>		// pick up where p0 left off.</code></span>
+<span class="codeline" id="line-1110"><code>		gp.param = unsafe.Pointer(&amp;savedOpenDeferState{</code></span>
+<span class="codeline" id="line-1111"><code>			retpc: p0.retpc,</code></span>
+<span class="codeline" id="line-1112"><code></code></span>
+<span class="codeline" id="line-1113"><code>			// We need to save deferBitsPtr and slotsPtr too, but those are</code></span>
+<span class="codeline" id="line-1114"><code>			// stack pointers. To avoid issues around heap objects pointing</code></span>
+<span class="codeline" id="line-1115"><code>			// to the stack, save them as offsets from SP.</code></span>
+<span class="codeline" id="line-1116"><code>			deferBitsOffset: uintptr(unsafe.Pointer(p0.deferBitsPtr)) - uintptr(p0.sp),</code></span>
+<span class="codeline" id="line-1117"><code>			slotsOffset:     uintptr(p0.slotsPtr) - uintptr(p0.sp),</code></span>
+<span class="codeline" id="line-1118"><code>		})</code></span>
+<span class="codeline" id="line-1119"><code>	}</code></span>
+<span class="codeline" id="line-1120"><code></code></span>
+<span class="codeline" id="line-1121"><code>	// TODO(mdempsky): Currently, we rely on frames containing "defer"</code></span>
+<span class="codeline" id="line-1122"><code>	// to end with "CALL deferreturn; RET". This allows deferreturn to</code></span>
+<span class="codeline" id="line-1123"><code>	// finish running any pending defers in the frame.</code></span>
+<span class="codeline" id="line-1124"><code>	//</code></span>
+<span class="codeline" id="line-1125"><code>	// But we should be able to tell whether there are still pending</code></span>
+<span class="codeline" id="line-1126"><code>	// defers here. If there aren't, we can just jump directly to the</code></span>
+<span class="codeline" id="line-1127"><code>	// "RET" instruction. And if there are, we don't need an actual</code></span>
+<span class="codeline" id="line-1128"><code>	// "CALL deferreturn" instruction; we can simulate it with something</code></span>
+<span class="codeline" id="line-1129"><code>	// like:</code></span>
+<span class="codeline" id="line-1130"><code>	//</code></span>
+<span class="codeline" id="line-1131"><code>	//	if usesLR {</code></span>
+<span class="codeline" id="line-1132"><code>	//		lr = pc</code></span>
+<span class="codeline" id="line-1133"><code>	//	} else {</code></span>
+<span class="codeline" id="line-1134"><code>	//		sp -= sizeof(pc)</code></span>
+<span class="codeline" id="line-1135"><code>	//		*(*uintptr)(sp) = pc</code></span>
+<span class="codeline" id="line-1136"><code>	//	}</code></span>
+<span class="codeline" id="line-1137"><code>	//	pc = funcPC(deferreturn)</code></span>
+<span class="codeline" id="line-1138"><code>	//</code></span>
+<span class="codeline" id="line-1139"><code>	// So that we effectively tail call into deferreturn, such that it</code></span>
+<span class="codeline" id="line-1140"><code>	// then returns to the simple "RET" epilogue. That would save the</code></span>
+<span class="codeline" id="line-1141"><code>	// overhead of the "deferreturn" call when there aren't actually any</code></span>
+<span class="codeline" id="line-1142"><code>	// pending defers left, and shrink the TEXT size of compiled</code></span>
+<span class="codeline" id="line-1143"><code>	// binaries. (Admittedly, both of these are modest savings.)</code></span>
+<span class="codeline" id="line-1144"><code></code></span>
+<span class="codeline" id="line-1145"><code>	// Ensure we're recovering within the appropriate stack.</code></span>
+<span class="codeline" id="line-1146"><code>	if sp != 0 &amp;&amp; (sp &lt; gp.stack.lo || gp.stack.hi &lt; sp) {</code></span>
+<span class="codeline" id="line-1147"><code>		print("recover: ", hex(sp), " not in [", hex(gp.stack.lo), ", ", hex(gp.stack.hi), "]\n")</code></span>
+<span class="codeline" id="line-1148"><code>		throw("bad recovery")</code></span>
+<span class="codeline" id="line-1149"><code>	}</code></span>
+<span class="codeline" id="line-1150"><code></code></span>
+<span class="codeline" id="line-1151"><code>	// Make the deferproc for this d return again,</code></span>
+<span class="codeline" id="line-1152"><code>	// this time returning 1. The calling function will</code></span>
+<span class="codeline" id="line-1153"><code>	// jump to the standard return epilogue.</code></span>
+<span class="codeline" id="line-1154"><code>	gp.sched.sp = sp</code></span>
+<span class="codeline" id="line-1155"><code>	gp.sched.pc = pc</code></span>
+<span class="codeline" id="line-1156"><code>	gp.sched.lr = 0</code></span>
+<span class="codeline" id="line-1157"><code>	// Restore the bp on platforms that support frame pointers.</code></span>
+<span class="codeline" id="line-1158"><code>	// N.B. It's fine to not set anything for platforms that don't</code></span>
+<span class="codeline" id="line-1159"><code>	// support frame pointers, since nothing consumes them.</code></span>
+<span class="codeline" id="line-1160"><code>	switch {</code></span>
+<span class="codeline" id="line-1161"><code>	case goarch.IsAmd64 != 0:</code></span>
+<span class="codeline" id="line-1162"><code>		// on x86, fp actually points one word higher than the top of</code></span>
+<span class="codeline" id="line-1163"><code>		// the frame since the return address is saved on the stack by</code></span>
+<span class="codeline" id="line-1164"><code>		// the caller</code></span>
+<span class="codeline" id="line-1165"><code>		gp.sched.bp = fp - 2*goarch.PtrSize</code></span>
+<span class="codeline" id="line-1166"><code>	case goarch.IsArm64 != 0:</code></span>
+<span class="codeline" id="line-1167"><code>		// on arm64, the architectural bp points one word higher</code></span>
+<span class="codeline" id="line-1168"><code>		// than the sp. fp is totally useless to us here, because it</code></span>
+<span class="codeline" id="line-1169"><code>		// only gets us to the caller's fp.</code></span>
+<span class="codeline" id="line-1170"><code>		gp.sched.bp = sp - goarch.PtrSize</code></span>
+<span class="codeline" id="line-1171"><code>	}</code></span>
+<span class="codeline" id="line-1172"><code>	gp.sched.ret = 1</code></span>
+<span class="codeline" id="line-1173"><code>	gogo(&amp;gp.sched)</code></span>
+<span class="codeline" id="line-1174"><code>}</code></span>
+<span class="codeline" id="line-1175"><code></code></span>
+<span class="codeline" id="line-1176"><code>// fatalthrow implements an unrecoverable runtime throw. It freezes the</code></span>
+<span class="codeline" id="line-1177"><code>// system, prints stack traces starting from its caller, and terminates the</code></span>
+<span class="codeline" id="line-1178"><code>// process.</code></span>
+<span class="codeline" id="line-1179"><code>//</code></span>
+<span class="codeline" id="line-1180"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1181"><code>func fatalthrow(t throwType) {</code></span>
+<span class="codeline" id="line-1182"><code>	pc := getcallerpc()</code></span>
+<span class="codeline" id="line-1183"><code>	sp := getcallersp()</code></span>
+<span class="codeline" id="line-1184"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-1185"><code></code></span>
+<span class="codeline" id="line-1186"><code>	if gp.m.throwing == throwTypeNone {</code></span>
+<span class="codeline" id="line-1187"><code>		gp.m.throwing = t</code></span>
+<span class="codeline" id="line-1188"><code>	}</code></span>
+<span class="codeline" id="line-1189"><code></code></span>
+<span class="codeline" id="line-1190"><code>	// Switch to the system stack to avoid any stack growth, which may make</code></span>
+<span class="codeline" id="line-1191"><code>	// things worse if the runtime is in a bad state.</code></span>
+<span class="codeline" id="line-1192"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1193"><code>		if isSecureMode() {</code></span>
+<span class="codeline" id="line-1194"><code>			exit(2)</code></span>
+<span class="codeline" id="line-1195"><code>		}</code></span>
+<span class="codeline" id="line-1196"><code></code></span>
+<span class="codeline" id="line-1197"><code>		startpanic_m()</code></span>
+<span class="codeline" id="line-1198"><code></code></span>
+<span class="codeline" id="line-1199"><code>		if dopanic_m(gp, pc, sp) {</code></span>
+<span class="codeline" id="line-1200"><code>			// crash uses a decent amount of nosplit stack and we're already</code></span>
+<span class="codeline" id="line-1201"><code>			// low on stack in throw, so crash on the system stack (unlike</code></span>
+<span class="codeline" id="line-1202"><code>			// fatalpanic).</code></span>
+<span class="codeline" id="line-1203"><code>			crash()</code></span>
+<span class="codeline" id="line-1204"><code>		}</code></span>
+<span class="codeline" id="line-1205"><code></code></span>
+<span class="codeline" id="line-1206"><code>		exit(2)</code></span>
+<span class="codeline" id="line-1207"><code>	})</code></span>
+<span class="codeline" id="line-1208"><code></code></span>
+<span class="codeline" id="line-1209"><code>	*(*int)(nil) = 0 // not reached</code></span>
+<span class="codeline" id="line-1210"><code>}</code></span>
+<span class="codeline" id="line-1211"><code></code></span>
+<span class="codeline" id="line-1212"><code>// fatalpanic implements an unrecoverable panic. It is like fatalthrow, except</code></span>
+<span class="codeline" id="line-1213"><code>// that if msgs != nil, fatalpanic also prints panic messages and decrements</code></span>
+<span class="codeline" id="line-1214"><code>// runningPanicDefers once main is blocked from exiting.</code></span>
+<span class="codeline" id="line-1215"><code>//</code></span>
+<span class="codeline" id="line-1216"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1217"><code>func fatalpanic(msgs *_panic) {</code></span>
+<span class="codeline" id="line-1218"><code>	pc := getcallerpc()</code></span>
+<span class="codeline" id="line-1219"><code>	sp := getcallersp()</code></span>
+<span class="codeline" id="line-1220"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-1221"><code>	var docrash bool</code></span>
+<span class="codeline" id="line-1222"><code>	// Switch to the system stack to avoid any stack growth, which</code></span>
+<span class="codeline" id="line-1223"><code>	// may make things worse if the runtime is in a bad state.</code></span>
+<span class="codeline" id="line-1224"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1225"><code>		if startpanic_m() &amp;&amp; msgs != nil {</code></span>
+<span class="codeline" id="line-1226"><code>			// There were panic messages and startpanic_m</code></span>
+<span class="codeline" id="line-1227"><code>			// says it's okay to try to print them.</code></span>
+<span class="codeline" id="line-1228"><code></code></span>
+<span class="codeline" id="line-1229"><code>			// startpanic_m set panicking, which will</code></span>
+<span class="codeline" id="line-1230"><code>			// block main from exiting, so now OK to</code></span>
+<span class="codeline" id="line-1231"><code>			// decrement runningPanicDefers.</code></span>
+<span class="codeline" id="line-1232"><code>			runningPanicDefers.Add(-1)</code></span>
+<span class="codeline" id="line-1233"><code></code></span>
+<span class="codeline" id="line-1234"><code>			printpanics(msgs)</code></span>
+<span class="codeline" id="line-1235"><code>		}</code></span>
+<span class="codeline" id="line-1236"><code></code></span>
+<span class="codeline" id="line-1237"><code>		docrash = dopanic_m(gp, pc, sp)</code></span>
+<span class="codeline" id="line-1238"><code>	})</code></span>
+<span class="codeline" id="line-1239"><code></code></span>
+<span class="codeline" id="line-1240"><code>	if docrash {</code></span>
+<span class="codeline" id="line-1241"><code>		// By crashing outside the above systemstack call, debuggers</code></span>
+<span class="codeline" id="line-1242"><code>		// will not be confused when generating a backtrace.</code></span>
+<span class="codeline" id="line-1243"><code>		// Function crash is marked nosplit to avoid stack growth.</code></span>
+<span class="codeline" id="line-1244"><code>		crash()</code></span>
+<span class="codeline" id="line-1245"><code>	}</code></span>
+<span class="codeline" id="line-1246"><code></code></span>
+<span class="codeline" id="line-1247"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1248"><code>		exit(2)</code></span>
+<span class="codeline" id="line-1249"><code>	})</code></span>
+<span class="codeline" id="line-1250"><code></code></span>
+<span class="codeline" id="line-1251"><code>	*(*int)(nil) = 0 // not reached</code></span>
+<span class="codeline" id="line-1252"><code>}</code></span>
+<span class="codeline" id="line-1253"><code></code></span>
+<span class="codeline" id="line-1254"><code>// startpanic_m prepares for an unrecoverable panic.</code></span>
+<span class="codeline" id="line-1255"><code>//</code></span>
+<span class="codeline" id="line-1256"><code>// It returns true if panic messages should be printed, or false if</code></span>
+<span class="codeline" id="line-1257"><code>// the runtime is in bad shape and should just print stacks.</code></span>
+<span class="codeline" id="line-1258"><code>//</code></span>
+<span class="codeline" id="line-1259"><code>// It must not have write barriers even though the write barrier</code></span>
+<span class="codeline" id="line-1260"><code>// explicitly ignores writes once dying &gt; 0. Write barriers still</code></span>
+<span class="codeline" id="line-1261"><code>// assume that g.m.p != nil, and this function may not have P</code></span>
+<span class="codeline" id="line-1262"><code>// in some contexts (e.g. a panic in a signal handler for a signal</code></span>
+<span class="codeline" id="line-1263"><code>// sent to an M with no P).</code></span>
+<span class="codeline" id="line-1264"><code>//</code></span>
+<span class="codeline" id="line-1265"><code>//go:nowritebarrierrec</code></span>
+<span class="codeline" id="line-1266"><code>func startpanic_m() bool {</code></span>
+<span class="codeline" id="line-1267"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-1268"><code>	if mheap_.cachealloc.size == 0 { // very early</code></span>
+<span class="codeline" id="line-1269"><code>		print("runtime: panic before malloc heap initialized\n")</code></span>
+<span class="codeline" id="line-1270"><code>	}</code></span>
+<span class="codeline" id="line-1271"><code>	// Disallow malloc during an unrecoverable panic. A panic</code></span>
+<span class="codeline" id="line-1272"><code>	// could happen in a signal handler, or in a throw, or inside</code></span>
+<span class="codeline" id="line-1273"><code>	// malloc itself. We want to catch if an allocation ever does</code></span>
+<span class="codeline" id="line-1274"><code>	// happen (even if we're not in one of these situations).</code></span>
+<span class="codeline" id="line-1275"><code>	gp.m.mallocing++</code></span>
+<span class="codeline" id="line-1276"><code></code></span>
+<span class="codeline" id="line-1277"><code>	// If we're dying because of a bad lock count, set it to a</code></span>
+<span class="codeline" id="line-1278"><code>	// good lock count so we don't recursively panic below.</code></span>
+<span class="codeline" id="line-1279"><code>	if gp.m.locks &lt; 0 {</code></span>
+<span class="codeline" id="line-1280"><code>		gp.m.locks = 1</code></span>
+<span class="codeline" id="line-1281"><code>	}</code></span>
+<span class="codeline" id="line-1282"><code></code></span>
+<span class="codeline" id="line-1283"><code>	switch gp.m.dying {</code></span>
+<span class="codeline" id="line-1284"><code>	case 0:</code></span>
+<span class="codeline" id="line-1285"><code>		// Setting dying &gt;0 has the side-effect of disabling this G's writebuf.</code></span>
+<span class="codeline" id="line-1286"><code>		gp.m.dying = 1</code></span>
+<span class="codeline" id="line-1287"><code>		panicking.Add(1)</code></span>
+<span class="codeline" id="line-1288"><code>		lock(&amp;paniclk)</code></span>
+<span class="codeline" id="line-1289"><code>		if debug.schedtrace &gt; 0 || debug.scheddetail &gt; 0 {</code></span>
+<span class="codeline" id="line-1290"><code>			schedtrace(true)</code></span>
+<span class="codeline" id="line-1291"><code>		}</code></span>
+<span class="codeline" id="line-1292"><code>		freezetheworld()</code></span>
+<span class="codeline" id="line-1293"><code>		return true</code></span>
+<span class="codeline" id="line-1294"><code>	case 1:</code></span>
+<span class="codeline" id="line-1295"><code>		// Something failed while panicking.</code></span>
+<span class="codeline" id="line-1296"><code>		// Just print a stack trace and exit.</code></span>
+<span class="codeline" id="line-1297"><code>		gp.m.dying = 2</code></span>
+<span class="codeline" id="line-1298"><code>		print("panic during panic\n")</code></span>
+<span class="codeline" id="line-1299"><code>		return false</code></span>
+<span class="codeline" id="line-1300"><code>	case 2:</code></span>
+<span class="codeline" id="line-1301"><code>		// This is a genuine bug in the runtime, we couldn't even</code></span>
+<span class="codeline" id="line-1302"><code>		// print the stack trace successfully.</code></span>
+<span class="codeline" id="line-1303"><code>		gp.m.dying = 3</code></span>
+<span class="codeline" id="line-1304"><code>		print("stack trace unavailable\n")</code></span>
+<span class="codeline" id="line-1305"><code>		exit(4)</code></span>
+<span class="codeline" id="line-1306"><code>		fallthrough</code></span>
+<span class="codeline" id="line-1307"><code>	default:</code></span>
+<span class="codeline" id="line-1308"><code>		// Can't even print! Just exit.</code></span>
+<span class="codeline" id="line-1309"><code>		exit(5)</code></span>
+<span class="codeline" id="line-1310"><code>		return false // Need to return something.</code></span>
+<span class="codeline" id="line-1311"><code>	}</code></span>
+<span class="codeline" id="line-1312"><code>}</code></span>
+<span class="codeline" id="line-1313"><code></code></span>
+<span class="codeline" id="line-1314"><code>var didothers bool</code></span>
+<span class="codeline" id="line-1315"><code>var deadlock mutex</code></span>
+<span class="codeline" id="line-1316"><code></code></span>
+<span class="codeline" id="line-1317"><code>// gp is the crashing g running on this M, but may be a user G, while getg() is</code></span>
+<span class="codeline" id="line-1318"><code>// always g0.</code></span>
+<span class="codeline" id="line-1319"><code>func dopanic_m(gp *g, pc, sp uintptr) bool {</code></span>
+<span class="codeline" id="line-1320"><code>	if gp.sig != 0 {</code></span>
+<span class="codeline" id="line-1321"><code>		signame := signame(gp.sig)</code></span>
+<span class="codeline" id="line-1322"><code>		if signame != "" {</code></span>
+<span class="codeline" id="line-1323"><code>			print("[signal ", signame)</code></span>
+<span class="codeline" id="line-1324"><code>		} else {</code></span>
+<span class="codeline" id="line-1325"><code>			print("[signal ", hex(gp.sig))</code></span>
+<span class="codeline" id="line-1326"><code>		}</code></span>
+<span class="codeline" id="line-1327"><code>		print(" code=", hex(gp.sigcode0), " addr=", hex(gp.sigcode1), " pc=", hex(gp.sigpc), "]\n")</code></span>
+<span class="codeline" id="line-1328"><code>	}</code></span>
+<span class="codeline" id="line-1329"><code></code></span>
+<span class="codeline" id="line-1330"><code>	level, all, docrash := gotraceback()</code></span>
+<span class="codeline" id="line-1331"><code>	if level &gt; 0 {</code></span>
+<span class="codeline" id="line-1332"><code>		if gp != gp.m.curg {</code></span>
+<span class="codeline" id="line-1333"><code>			all = true</code></span>
+<span class="codeline" id="line-1334"><code>		}</code></span>
+<span class="codeline" id="line-1335"><code>		if gp != gp.m.g0 {</code></span>
+<span class="codeline" id="line-1336"><code>			print("\n")</code></span>
+<span class="codeline" id="line-1337"><code>			goroutineheader(gp)</code></span>
+<span class="codeline" id="line-1338"><code>			traceback(pc, sp, 0, gp)</code></span>
+<span class="codeline" id="line-1339"><code>		} else if level &gt;= 2 || gp.m.throwing &gt;= throwTypeRuntime {</code></span>
+<span class="codeline" id="line-1340"><code>			print("\nruntime stack:\n")</code></span>
+<span class="codeline" id="line-1341"><code>			traceback(pc, sp, 0, gp)</code></span>
+<span class="codeline" id="line-1342"><code>		}</code></span>
+<span class="codeline" id="line-1343"><code>		if !didothers &amp;&amp; all {</code></span>
+<span class="codeline" id="line-1344"><code>			didothers = true</code></span>
+<span class="codeline" id="line-1345"><code>			tracebackothers(gp)</code></span>
+<span class="codeline" id="line-1346"><code>		}</code></span>
+<span class="codeline" id="line-1347"><code>	}</code></span>
+<span class="codeline" id="line-1348"><code>	unlock(&amp;paniclk)</code></span>
+<span class="codeline" id="line-1349"><code></code></span>
+<span class="codeline" id="line-1350"><code>	if panicking.Add(-1) != 0 {</code></span>
+<span class="codeline" id="line-1351"><code>		// Some other m is panicking too.</code></span>
+<span class="codeline" id="line-1352"><code>		// Let it print what it needs to print.</code></span>
+<span class="codeline" id="line-1353"><code>		// Wait forever without chewing up cpu.</code></span>
+<span class="codeline" id="line-1354"><code>		// It will exit when it's done.</code></span>
+<span class="codeline" id="line-1355"><code>		lock(&amp;deadlock)</code></span>
+<span class="codeline" id="line-1356"><code>		lock(&amp;deadlock)</code></span>
+<span class="codeline" id="line-1357"><code>	}</code></span>
+<span class="codeline" id="line-1358"><code></code></span>
+<span class="codeline" id="line-1359"><code>	printDebugLog()</code></span>
+<span class="codeline" id="line-1360"><code></code></span>
+<span class="codeline" id="line-1361"><code>	return docrash</code></span>
+<span class="codeline" id="line-1362"><code>}</code></span>
+<span class="codeline" id="line-1363"><code></code></span>
+<span class="codeline" id="line-1364"><code>// canpanic returns false if a signal should throw instead of</code></span>
+<span class="codeline" id="line-1365"><code>// panicking.</code></span>
+<span class="codeline" id="line-1366"><code>//</code></span>
+<span class="codeline" id="line-1367"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1368"><code>func canpanic() bool {</code></span>
+<span class="codeline" id="line-1369"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-1370"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-1371"><code></code></span>
+<span class="codeline" id="line-1372"><code>	// Is it okay for gp to panic instead of crashing the program?</code></span>
+<span class="codeline" id="line-1373"><code>	// Yes, as long as it is running Go code, not runtime code,</code></span>
+<span class="codeline" id="line-1374"><code>	// and not stuck in a system call.</code></span>
+<span class="codeline" id="line-1375"><code>	if gp != mp.curg {</code></span>
+<span class="codeline" id="line-1376"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-1377"><code>		return false</code></span>
+<span class="codeline" id="line-1378"><code>	}</code></span>
+<span class="codeline" id="line-1379"><code>	// N.B. mp.locks != 1 instead of 0 to account for acquirem.</code></span>
+<span class="codeline" id="line-1380"><code>	if mp.locks != 1 || mp.mallocing != 0 || mp.throwing != throwTypeNone || mp.preemptoff != "" || mp.dying != 0 {</code></span>
+<span class="codeline" id="line-1381"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-1382"><code>		return false</code></span>
+<span class="codeline" id="line-1383"><code>	}</code></span>
+<span class="codeline" id="line-1384"><code>	status := readgstatus(gp)</code></span>
+<span class="codeline" id="line-1385"><code>	if status&amp;^_Gscan != _Grunning || gp.syscallsp != 0 {</code></span>
+<span class="codeline" id="line-1386"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-1387"><code>		return false</code></span>
+<span class="codeline" id="line-1388"><code>	}</code></span>
+<span class="codeline" id="line-1389"><code>	if GOOS == "windows" &amp;&amp; mp.libcallsp != 0 {</code></span>
+<span class="codeline" id="line-1390"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-1391"><code>		return false</code></span>
+<span class="codeline" id="line-1392"><code>	}</code></span>
+<span class="codeline" id="line-1393"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-1394"><code>	return true</code></span>
+<span class="codeline" id="line-1395"><code>}</code></span>
+<span class="codeline" id="line-1396"><code></code></span>
+<span class="codeline" id="line-1397"><code>// shouldPushSigpanic reports whether pc should be used as sigpanic's</code></span>
+<span class="codeline" id="line-1398"><code>// return PC (pushing a frame for the call). Otherwise, it should be</code></span>
+<span class="codeline" id="line-1399"><code>// left alone so that LR is used as sigpanic's return PC, effectively</code></span>
+<span class="codeline" id="line-1400"><code>// replacing the top-most frame with sigpanic. This is used by</code></span>
+<span class="codeline" id="line-1401"><code>// preparePanic.</code></span>
+<span class="codeline" id="line-1402"><code>func shouldPushSigpanic(gp *g, pc, lr uintptr) bool {</code></span>
+<span class="codeline" id="line-1403"><code>	if pc == 0 {</code></span>
+<span class="codeline" id="line-1404"><code>		// Probably a call to a nil func. The old LR is more</code></span>
+<span class="codeline" id="line-1405"><code>		// useful in the stack trace. Not pushing the frame</code></span>
+<span class="codeline" id="line-1406"><code>		// will make the trace look like a call to sigpanic</code></span>
+<span class="codeline" id="line-1407"><code>		// instead. (Otherwise the trace will end at sigpanic</code></span>
+<span class="codeline" id="line-1408"><code>		// and we won't get to see who faulted.)</code></span>
+<span class="codeline" id="line-1409"><code>		return false</code></span>
+<span class="codeline" id="line-1410"><code>	}</code></span>
+<span class="codeline" id="line-1411"><code>	// If we don't recognize the PC as code, but we do recognize</code></span>
+<span class="codeline" id="line-1412"><code>	// the link register as code, then this assumes the panic was</code></span>
+<span class="codeline" id="line-1413"><code>	// caused by a call to non-code. In this case, we want to</code></span>
+<span class="codeline" id="line-1414"><code>	// ignore this call to make unwinding show the context.</code></span>
+<span class="codeline" id="line-1415"><code>	//</code></span>
+<span class="codeline" id="line-1416"><code>	// If we running C code, we're not going to recognize pc as a</code></span>
+<span class="codeline" id="line-1417"><code>	// Go function, so just assume it's good. Otherwise, traceback</code></span>
+<span class="codeline" id="line-1418"><code>	// may try to read a stale LR that looks like a Go code</code></span>
+<span class="codeline" id="line-1419"><code>	// pointer and wander into the woods.</code></span>
+<span class="codeline" id="line-1420"><code>	if gp.m.incgo || findfunc(pc).valid() {</code></span>
+<span class="codeline" id="line-1421"><code>		// This wasn't a bad call, so use PC as sigpanic's</code></span>
+<span class="codeline" id="line-1422"><code>		// return PC.</code></span>
+<span class="codeline" id="line-1423"><code>		return true</code></span>
+<span class="codeline" id="line-1424"><code>	}</code></span>
+<span class="codeline" id="line-1425"><code>	if findfunc(lr).valid() {</code></span>
+<span class="codeline" id="line-1426"><code>		// This was a bad call, but the LR is good, so use the</code></span>
+<span class="codeline" id="line-1427"><code>		// LR as sigpanic's return PC.</code></span>
+<span class="codeline" id="line-1428"><code>		return false</code></span>
+<span class="codeline" id="line-1429"><code>	}</code></span>
+<span class="codeline" id="line-1430"><code>	// Neither the PC or LR is good. Hopefully pushing a frame</code></span>
+<span class="codeline" id="line-1431"><code>	// will work.</code></span>
+<span class="codeline" id="line-1432"><code>	return true</code></span>
+<span class="codeline" id="line-1433"><code>}</code></span>
+<span class="codeline" id="line-1434"><code></code></span>
+<span class="codeline" id="line-1435"><code>// isAbortPC reports whether pc is the program counter at which</code></span>
+<span class="codeline" id="line-1436"><code>// runtime.abort raises a signal.</code></span>
+<span class="codeline" id="line-1437"><code>//</code></span>
+<span class="codeline" id="line-1438"><code>// It is nosplit because it's part of the isgoexception</code></span>
+<span class="codeline" id="line-1439"><code>// implementation.</code></span>
+<span class="codeline" id="line-1440"><code>//</code></span>
+<span class="codeline" id="line-1441"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1442"><code>func isAbortPC(pc uintptr) bool {</code></span>
+<span class="codeline" id="line-1443"><code>	f := findfunc(pc)</code></span>
+<span class="codeline" id="line-1444"><code>	if !f.valid() {</code></span>
+<span class="codeline" id="line-1445"><code>		return false</code></span>
+<span class="codeline" id="line-1446"><code>	}</code></span>
+<span class="codeline" id="line-1447"><code>	return f.funcID == abi.FuncID_abort</code></span>
+<span class="codeline" id="line-1448"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

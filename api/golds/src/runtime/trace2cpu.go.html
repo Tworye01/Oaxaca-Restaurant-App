@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: trace2cpu.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	trace2cpu.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build goexperiment.exectracer2</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// CPU profile -&gt; trace</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>package runtime</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>// traceInitReadCPU initializes CPU profile -&gt; tracer state for tracing.</code></span>
+<span class="codeline" id="line-12"><code>//</code></span>
+<span class="codeline" id="line-13"><code>// Returns a profBuf for reading from.</code></span>
+<span class="codeline" id="line-14"><code>func traceInitReadCPU() {</code></span>
+<span class="codeline" id="line-15"><code>	if traceEnabled() {</code></span>
+<span class="codeline" id="line-16"><code>		throw("traceInitReadCPU called with trace enabled")</code></span>
+<span class="codeline" id="line-17"><code>	}</code></span>
+<span class="codeline" id="line-18"><code>	// Create new profBuf for CPU samples that will be emitted as events.</code></span>
+<span class="codeline" id="line-19"><code>	// Format: after the timestamp, header is [pp.id, gp.goid, mp.procid].</code></span>
+<span class="codeline" id="line-20"><code>	trace.cpuLogRead[0] = newProfBuf(3, profBufWordCount, profBufTagCount)</code></span>
+<span class="codeline" id="line-21"><code>	trace.cpuLogRead[1] = newProfBuf(3, profBufWordCount, profBufTagCount)</code></span>
+<span class="codeline" id="line-22"><code>	// We must not acquire trace.signalLock outside of a signal handler: a</code></span>
+<span class="codeline" id="line-23"><code>	// profiling signal may arrive at any time and try to acquire it, leading to</code></span>
+<span class="codeline" id="line-24"><code>	// deadlock. Because we can't use that lock to protect updates to</code></span>
+<span class="codeline" id="line-25"><code>	// trace.cpuLogWrite (only use of the structure it references), reads and</code></span>
+<span class="codeline" id="line-26"><code>	// writes of the pointer must be atomic. (And although this field is never</code></span>
+<span class="codeline" id="line-27"><code>	// the sole pointer to the profBuf value, it's best to allow a write barrier</code></span>
+<span class="codeline" id="line-28"><code>	// here.)</code></span>
+<span class="codeline" id="line-29"><code>	trace.cpuLogWrite[0].Store(trace.cpuLogRead[0])</code></span>
+<span class="codeline" id="line-30"><code>	trace.cpuLogWrite[1].Store(trace.cpuLogRead[1])</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>// traceStartReadCPU creates a goroutine to start reading CPU profile</code></span>
+<span class="codeline" id="line-34"><code>// data into an active trace.</code></span>
+<span class="codeline" id="line-35"><code>//</code></span>
+<span class="codeline" id="line-36"><code>// traceAdvanceSema must be held.</code></span>
+<span class="codeline" id="line-37"><code>func traceStartReadCPU() {</code></span>
+<span class="codeline" id="line-38"><code>	if !traceEnabled() {</code></span>
+<span class="codeline" id="line-39"><code>		throw("traceStartReadCPU called with trace disabled")</code></span>
+<span class="codeline" id="line-40"><code>	}</code></span>
+<span class="codeline" id="line-41"><code>	// Spin up the logger goroutine.</code></span>
+<span class="codeline" id="line-42"><code>	trace.cpuSleep = newWakeableSleep()</code></span>
+<span class="codeline" id="line-43"><code>	done := make(chan struct{}, 1)</code></span>
+<span class="codeline" id="line-44"><code>	go func() {</code></span>
+<span class="codeline" id="line-45"><code>		for traceEnabled() {</code></span>
+<span class="codeline" id="line-46"><code>			// Sleep here because traceReadCPU is non-blocking. This mirrors</code></span>
+<span class="codeline" id="line-47"><code>			// how the runtime/pprof package obtains CPU profile data.</code></span>
+<span class="codeline" id="line-48"><code>			//</code></span>
+<span class="codeline" id="line-49"><code>			// We can't do a blocking read here because Darwin can't do a</code></span>
+<span class="codeline" id="line-50"><code>			// wakeup from a signal handler, so all CPU profiling is just</code></span>
+<span class="codeline" id="line-51"><code>			// non-blocking. See #61768 for more details.</code></span>
+<span class="codeline" id="line-52"><code>			//</code></span>
+<span class="codeline" id="line-53"><code>			// Like the runtime/pprof package, even if that bug didn't exist</code></span>
+<span class="codeline" id="line-54"><code>			// we would still want to do a goroutine-level sleep in between</code></span>
+<span class="codeline" id="line-55"><code>			// reads to avoid frequent wakeups.</code></span>
+<span class="codeline" id="line-56"><code>			trace.cpuSleep.sleep(100_000_000)</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>			tl := traceAcquire()</code></span>
+<span class="codeline" id="line-59"><code>			if !tl.ok() {</code></span>
+<span class="codeline" id="line-60"><code>				// Tracing disabled.</code></span>
+<span class="codeline" id="line-61"><code>				break</code></span>
+<span class="codeline" id="line-62"><code>			}</code></span>
+<span class="codeline" id="line-63"><code>			keepGoing := traceReadCPU(tl.gen)</code></span>
+<span class="codeline" id="line-64"><code>			traceRelease(tl)</code></span>
+<span class="codeline" id="line-65"><code>			if !keepGoing {</code></span>
+<span class="codeline" id="line-66"><code>				break</code></span>
+<span class="codeline" id="line-67"><code>			}</code></span>
+<span class="codeline" id="line-68"><code>		}</code></span>
+<span class="codeline" id="line-69"><code>		done &lt;- struct{}{}</code></span>
+<span class="codeline" id="line-70"><code>	}()</code></span>
+<span class="codeline" id="line-71"><code>	trace.cpuLogDone = done</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>// traceStopReadCPU blocks until the trace CPU reading goroutine exits.</code></span>
+<span class="codeline" id="line-75"><code>//</code></span>
+<span class="codeline" id="line-76"><code>// traceAdvanceSema must be held, and tracing must be disabled.</code></span>
+<span class="codeline" id="line-77"><code>func traceStopReadCPU() {</code></span>
+<span class="codeline" id="line-78"><code>	if traceEnabled() {</code></span>
+<span class="codeline" id="line-79"><code>		throw("traceStopReadCPU called with trace enabled")</code></span>
+<span class="codeline" id="line-80"><code>	}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>	// Once we close the profbuf, we'll be in one of two situations:</code></span>
+<span class="codeline" id="line-83"><code>	// - The logger goroutine has already exited because it observed</code></span>
+<span class="codeline" id="line-84"><code>	//   that the trace is disabled.</code></span>
+<span class="codeline" id="line-85"><code>	// - The logger goroutine is asleep.</code></span>
+<span class="codeline" id="line-86"><code>	//</code></span>
+<span class="codeline" id="line-87"><code>	// Wake the goroutine so it can observe that their the buffer is</code></span>
+<span class="codeline" id="line-88"><code>	// closed an exit.</code></span>
+<span class="codeline" id="line-89"><code>	trace.cpuLogWrite[0].Store(nil)</code></span>
+<span class="codeline" id="line-90"><code>	trace.cpuLogWrite[1].Store(nil)</code></span>
+<span class="codeline" id="line-91"><code>	trace.cpuLogRead[0].close()</code></span>
+<span class="codeline" id="line-92"><code>	trace.cpuLogRead[1].close()</code></span>
+<span class="codeline" id="line-93"><code>	trace.cpuSleep.wake()</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>	// Wait until the logger goroutine exits.</code></span>
+<span class="codeline" id="line-96"><code>	&lt;-trace.cpuLogDone</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>	// Clear state for the next trace.</code></span>
+<span class="codeline" id="line-99"><code>	trace.cpuLogDone = nil</code></span>
+<span class="codeline" id="line-100"><code>	trace.cpuLogRead[0] = nil</code></span>
+<span class="codeline" id="line-101"><code>	trace.cpuLogRead[1] = nil</code></span>
+<span class="codeline" id="line-102"><code>	trace.cpuSleep.close()</code></span>
+<span class="codeline" id="line-103"><code>}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>// traceReadCPU attempts to read from the provided profBuf[gen%2] and write</code></span>
+<span class="codeline" id="line-106"><code>// into the trace. Returns true if there might be more to read or false</code></span>
+<span class="codeline" id="line-107"><code>// if the profBuf is closed or the caller should otherwise stop reading.</code></span>
+<span class="codeline" id="line-108"><code>//</code></span>
+<span class="codeline" id="line-109"><code>// The caller is responsible for ensuring that gen does not change. Either</code></span>
+<span class="codeline" id="line-110"><code>// the caller must be in a traceAcquire/traceRelease block, or must be calling</code></span>
+<span class="codeline" id="line-111"><code>// with traceAdvanceSema held.</code></span>
+<span class="codeline" id="line-112"><code>//</code></span>
+<span class="codeline" id="line-113"><code>// No more than one goroutine may be in traceReadCPU for the same</code></span>
+<span class="codeline" id="line-114"><code>// profBuf at a time.</code></span>
+<span class="codeline" id="line-115"><code>//</code></span>
+<span class="codeline" id="line-116"><code>// Must not run on the system stack because profBuf.read performs race</code></span>
+<span class="codeline" id="line-117"><code>// operations.</code></span>
+<span class="codeline" id="line-118"><code>func traceReadCPU(gen uintptr) bool {</code></span>
+<span class="codeline" id="line-119"><code>	var pcBuf [traceStackSize]uintptr</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>	data, tags, eof := trace.cpuLogRead[gen%2].read(profBufNonBlocking)</code></span>
+<span class="codeline" id="line-122"><code>	for len(data) &gt; 0 {</code></span>
+<span class="codeline" id="line-123"><code>		if len(data) &lt; 4 || data[0] &gt; uint64(len(data)) {</code></span>
+<span class="codeline" id="line-124"><code>			break // truncated profile</code></span>
+<span class="codeline" id="line-125"><code>		}</code></span>
+<span class="codeline" id="line-126"><code>		if data[0] &lt; 4 || tags != nil &amp;&amp; len(tags) &lt; 1 {</code></span>
+<span class="codeline" id="line-127"><code>			break // malformed profile</code></span>
+<span class="codeline" id="line-128"><code>		}</code></span>
+<span class="codeline" id="line-129"><code>		if len(tags) &lt; 1 {</code></span>
+<span class="codeline" id="line-130"><code>			break // mismatched profile records and tags</code></span>
+<span class="codeline" id="line-131"><code>		}</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>		// Deserialize the data in the profile buffer.</code></span>
+<span class="codeline" id="line-134"><code>		recordLen := data[0]</code></span>
+<span class="codeline" id="line-135"><code>		timestamp := data[1]</code></span>
+<span class="codeline" id="line-136"><code>		ppid := data[2] &gt;&gt; 1</code></span>
+<span class="codeline" id="line-137"><code>		if hasP := (data[2] &amp; 0b1) != 0; !hasP {</code></span>
+<span class="codeline" id="line-138"><code>			ppid = ^uint64(0)</code></span>
+<span class="codeline" id="line-139"><code>		}</code></span>
+<span class="codeline" id="line-140"><code>		goid := data[3]</code></span>
+<span class="codeline" id="line-141"><code>		mpid := data[4]</code></span>
+<span class="codeline" id="line-142"><code>		stk := data[5:recordLen]</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>		// Overflow records always have their headers contain</code></span>
+<span class="codeline" id="line-145"><code>		// all zeroes.</code></span>
+<span class="codeline" id="line-146"><code>		isOverflowRecord := len(stk) == 1 &amp;&amp; data[2] == 0 &amp;&amp; data[3] == 0 &amp;&amp; data[4] == 0</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>		// Move the data iterator forward.</code></span>
+<span class="codeline" id="line-149"><code>		data = data[recordLen:]</code></span>
+<span class="codeline" id="line-150"><code>		// No support here for reporting goroutine tags at the moment; if</code></span>
+<span class="codeline" id="line-151"><code>		// that information is to be part of the execution trace, we'd</code></span>
+<span class="codeline" id="line-152"><code>		// probably want to see when the tags are applied and when they</code></span>
+<span class="codeline" id="line-153"><code>		// change, instead of only seeing them when we get a CPU sample.</code></span>
+<span class="codeline" id="line-154"><code>		tags = tags[1:]</code></span>
+<span class="codeline" id="line-155"><code></code></span>
+<span class="codeline" id="line-156"><code>		if isOverflowRecord {</code></span>
+<span class="codeline" id="line-157"><code>			// Looks like an overflow record from the profBuf. Not much to</code></span>
+<span class="codeline" id="line-158"><code>			// do here, we only want to report full records.</code></span>
+<span class="codeline" id="line-159"><code>			continue</code></span>
+<span class="codeline" id="line-160"><code>		}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>		// Construct the stack for insertion to the stack table.</code></span>
+<span class="codeline" id="line-163"><code>		nstk := 1</code></span>
+<span class="codeline" id="line-164"><code>		pcBuf[0] = logicalStackSentinel</code></span>
+<span class="codeline" id="line-165"><code>		for ; nstk &lt; len(pcBuf) &amp;&amp; nstk-1 &lt; len(stk); nstk++ {</code></span>
+<span class="codeline" id="line-166"><code>			pcBuf[nstk] = uintptr(stk[nstk-1])</code></span>
+<span class="codeline" id="line-167"><code>		}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>		// Write out a trace event.</code></span>
+<span class="codeline" id="line-170"><code>		w := unsafeTraceWriter(gen, trace.cpuBuf[gen%2])</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>		// Ensure we have a place to write to.</code></span>
+<span class="codeline" id="line-173"><code>		var flushed bool</code></span>
+<span class="codeline" id="line-174"><code>		w, flushed = w.ensure(2 + 5*traceBytesPerNumber /* traceEvCPUSamples + traceEvCPUSample + timestamp + g + m + p + stack ID */)</code></span>
+<span class="codeline" id="line-175"><code>		if flushed {</code></span>
+<span class="codeline" id="line-176"><code>			// Annotate the batch as containing strings.</code></span>
+<span class="codeline" id="line-177"><code>			w.byte(byte(traceEvCPUSamples))</code></span>
+<span class="codeline" id="line-178"><code>		}</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>		// Add the stack to the table.</code></span>
+<span class="codeline" id="line-181"><code>		stackID := trace.stackTab[gen%2].put(pcBuf[:nstk])</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>		// Write out the CPU sample.</code></span>
+<span class="codeline" id="line-184"><code>		w.byte(byte(traceEvCPUSample))</code></span>
+<span class="codeline" id="line-185"><code>		w.varint(timestamp)</code></span>
+<span class="codeline" id="line-186"><code>		w.varint(mpid)</code></span>
+<span class="codeline" id="line-187"><code>		w.varint(ppid)</code></span>
+<span class="codeline" id="line-188"><code>		w.varint(goid)</code></span>
+<span class="codeline" id="line-189"><code>		w.varint(stackID)</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>		trace.cpuBuf[gen%2] = w.traceBuf</code></span>
+<span class="codeline" id="line-192"><code>	}</code></span>
+<span class="codeline" id="line-193"><code>	return !eof</code></span>
+<span class="codeline" id="line-194"><code>}</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>// traceCPUFlush flushes trace.cpuBuf[gen%2]. The caller must be certain that gen</code></span>
+<span class="codeline" id="line-197"><code>// has completed and that there are no more writers to it.</code></span>
+<span class="codeline" id="line-198"><code>//</code></span>
+<span class="codeline" id="line-199"><code>// Must run on the systemstack because it flushes buffers and acquires trace.lock</code></span>
+<span class="codeline" id="line-200"><code>// to do so.</code></span>
+<span class="codeline" id="line-201"><code>//</code></span>
+<span class="codeline" id="line-202"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-203"><code>func traceCPUFlush(gen uintptr) {</code></span>
+<span class="codeline" id="line-204"><code>	// Flush any remaining trace buffers containing CPU samples.</code></span>
+<span class="codeline" id="line-205"><code>	if buf := trace.cpuBuf[gen%2]; buf != nil {</code></span>
+<span class="codeline" id="line-206"><code>		lock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-207"><code>		traceBufFlush(buf, gen)</code></span>
+<span class="codeline" id="line-208"><code>		unlock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-209"><code>		trace.cpuBuf[gen%2] = nil</code></span>
+<span class="codeline" id="line-210"><code>	}</code></span>
+<span class="codeline" id="line-211"><code>}</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>// traceCPUSample writes a CPU profile sample stack to the execution tracer's</code></span>
+<span class="codeline" id="line-214"><code>// profiling buffer. It is called from a signal handler, so is limited in what</code></span>
+<span class="codeline" id="line-215"><code>// it can do. mp must be the thread that is currently stopped in a signal.</code></span>
+<span class="codeline" id="line-216"><code>func traceCPUSample(gp *g, mp *m, pp *p, stk []uintptr) {</code></span>
+<span class="codeline" id="line-217"><code>	if !traceEnabled() {</code></span>
+<span class="codeline" id="line-218"><code>		// Tracing is usually turned off; don't spend time acquiring the signal</code></span>
+<span class="codeline" id="line-219"><code>		// lock unless it's active.</code></span>
+<span class="codeline" id="line-220"><code>		return</code></span>
+<span class="codeline" id="line-221"><code>	}</code></span>
+<span class="codeline" id="line-222"><code>	if mp == nil {</code></span>
+<span class="codeline" id="line-223"><code>		// Drop samples that don't have an identifiable thread. We can't render</code></span>
+<span class="codeline" id="line-224"><code>		// this in any useful way anyway.</code></span>
+<span class="codeline" id="line-225"><code>		return</code></span>
+<span class="codeline" id="line-226"><code>	}</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>	// We're going to conditionally write to one of two buffers based on the</code></span>
+<span class="codeline" id="line-229"><code>	// generation. To make sure we write to the correct one, we need to make</code></span>
+<span class="codeline" id="line-230"><code>	// sure this thread's trace seqlock is held. If it already is, then we're</code></span>
+<span class="codeline" id="line-231"><code>	// in the tracer and we can just take advantage of that. If it isn't, then</code></span>
+<span class="codeline" id="line-232"><code>	// we need to acquire it and read the generation.</code></span>
+<span class="codeline" id="line-233"><code>	locked := false</code></span>
+<span class="codeline" id="line-234"><code>	if mp.trace.seqlock.Load()%2 == 0 {</code></span>
+<span class="codeline" id="line-235"><code>		mp.trace.seqlock.Add(1)</code></span>
+<span class="codeline" id="line-236"><code>		locked = true</code></span>
+<span class="codeline" id="line-237"><code>	}</code></span>
+<span class="codeline" id="line-238"><code>	gen := trace.gen.Load()</code></span>
+<span class="codeline" id="line-239"><code>	if gen == 0 {</code></span>
+<span class="codeline" id="line-240"><code>		// Tracing is disabled, as it turns out. Release the seqlock if necessary</code></span>
+<span class="codeline" id="line-241"><code>		// and exit.</code></span>
+<span class="codeline" id="line-242"><code>		if locked {</code></span>
+<span class="codeline" id="line-243"><code>			mp.trace.seqlock.Add(1)</code></span>
+<span class="codeline" id="line-244"><code>		}</code></span>
+<span class="codeline" id="line-245"><code>		return</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code></code></span>
+<span class="codeline" id="line-248"><code>	now := traceClockNow()</code></span>
+<span class="codeline" id="line-249"><code>	// The "header" here is the ID of the M that was running the profiled code,</code></span>
+<span class="codeline" id="line-250"><code>	// followed by the IDs of the P and goroutine. (For normal CPU profiling, it's</code></span>
+<span class="codeline" id="line-251"><code>	// usually the number of samples with the given stack.) Near syscalls, pp</code></span>
+<span class="codeline" id="line-252"><code>	// may be nil. Reporting goid of 0 is fine for either g0 or a nil gp.</code></span>
+<span class="codeline" id="line-253"><code>	var hdr [3]uint64</code></span>
+<span class="codeline" id="line-254"><code>	if pp != nil {</code></span>
+<span class="codeline" id="line-255"><code>		// Overflow records in profBuf have all header values set to zero. Make</code></span>
+<span class="codeline" id="line-256"><code>		// sure that real headers have at least one bit set.</code></span>
+<span class="codeline" id="line-257"><code>		hdr[0] = uint64(pp.id)&lt;&lt;1 | 0b1</code></span>
+<span class="codeline" id="line-258"><code>	} else {</code></span>
+<span class="codeline" id="line-259"><code>		hdr[0] = 0b10</code></span>
+<span class="codeline" id="line-260"><code>	}</code></span>
+<span class="codeline" id="line-261"><code>	if gp != nil {</code></span>
+<span class="codeline" id="line-262"><code>		hdr[1] = gp.goid</code></span>
+<span class="codeline" id="line-263"><code>	}</code></span>
+<span class="codeline" id="line-264"><code>	if mp != nil {</code></span>
+<span class="codeline" id="line-265"><code>		hdr[2] = uint64(mp.procid)</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>	// Allow only one writer at a time</code></span>
+<span class="codeline" id="line-269"><code>	for !trace.signalLock.CompareAndSwap(0, 1) {</code></span>
+<span class="codeline" id="line-270"><code>		// TODO: Is it safe to osyield here? https://go.dev/issue/52672</code></span>
+<span class="codeline" id="line-271"><code>		osyield()</code></span>
+<span class="codeline" id="line-272"><code>	}</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>	if log := trace.cpuLogWrite[gen%2].Load(); log != nil {</code></span>
+<span class="codeline" id="line-275"><code>		// Note: we don't pass a tag pointer here (how should profiling tags</code></span>
+<span class="codeline" id="line-276"><code>		// interact with the execution tracer?), but if we did we'd need to be</code></span>
+<span class="codeline" id="line-277"><code>		// careful about write barriers. See the long comment in profBuf.write.</code></span>
+<span class="codeline" id="line-278"><code>		log.write(nil, int64(now), hdr[:], stk)</code></span>
+<span class="codeline" id="line-279"><code>	}</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	trace.signalLock.Store(0)</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>	// Release the seqlock if we acquired it earlier.</code></span>
+<span class="codeline" id="line-284"><code>	if locked {</code></span>
+<span class="codeline" id="line-285"><code>		mp.trace.seqlock.Add(1)</code></span>
+<span class="codeline" id="line-286"><code>	}</code></span>
+<span class="codeline" id="line-287"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

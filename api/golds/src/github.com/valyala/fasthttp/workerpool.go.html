@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: workerpool.go in package github.com/valyala/fasthttp</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	workerpool.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/valyala/fasthttp.html">github.com/valyala/fasthttp</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package fasthttp</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"errors"</code></span>
+<span class="codeline" id="line-5"><code>	"net"</code></span>
+<span class="codeline" id="line-6"><code>	"runtime"</code></span>
+<span class="codeline" id="line-7"><code>	"strings"</code></span>
+<span class="codeline" id="line-8"><code>	"sync"</code></span>
+<span class="codeline" id="line-9"><code>	"time"</code></span>
+<span class="codeline" id="line-10"><code>)</code></span>
+<span class="codeline" id="line-11"><code></code></span>
+<span class="codeline" id="line-12"><code>// workerPool serves incoming connections via a pool of workers</code></span>
+<span class="codeline" id="line-13"><code>// in FILO order, i.e. the most recently stopped worker will serve the next</code></span>
+<span class="codeline" id="line-14"><code>// incoming connection.</code></span>
+<span class="codeline" id="line-15"><code>//</code></span>
+<span class="codeline" id="line-16"><code>// Such a scheme keeps CPU caches hot (in theory).</code></span>
+<span class="codeline" id="line-17"><code>type workerPool struct {</code></span>
+<span class="codeline" id="line-18"><code>	// Function for serving server connections.</code></span>
+<span class="codeline" id="line-19"><code>	// It must leave c unclosed.</code></span>
+<span class="codeline" id="line-20"><code>	WorkerFunc ServeHandler</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>	MaxWorkersCount int</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>	LogAllErrors bool</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>	MaxIdleWorkerDuration time.Duration</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>	Logger Logger</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>	lock         sync.Mutex</code></span>
+<span class="codeline" id="line-31"><code>	workersCount int</code></span>
+<span class="codeline" id="line-32"><code>	mustStop     bool</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>	ready []*workerChan</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>	stopCh chan struct{}</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>	workerChanPool sync.Pool</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	connState func(net.Conn, ConnState)</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>type workerChan struct {</code></span>
+<span class="codeline" id="line-44"><code>	lastUseTime time.Time</code></span>
+<span class="codeline" id="line-45"><code>	ch          chan net.Conn</code></span>
+<span class="codeline" id="line-46"><code>}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>func (wp *workerPool) Start() {</code></span>
+<span class="codeline" id="line-49"><code>	if wp.stopCh != nil {</code></span>
+<span class="codeline" id="line-50"><code>		return</code></span>
+<span class="codeline" id="line-51"><code>	}</code></span>
+<span class="codeline" id="line-52"><code>	wp.stopCh = make(chan struct{})</code></span>
+<span class="codeline" id="line-53"><code>	stopCh := wp.stopCh</code></span>
+<span class="codeline" id="line-54"><code>	wp.workerChanPool.New = func() any {</code></span>
+<span class="codeline" id="line-55"><code>		return &amp;workerChan{</code></span>
+<span class="codeline" id="line-56"><code>			ch: make(chan net.Conn, workerChanCap),</code></span>
+<span class="codeline" id="line-57"><code>		}</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code>	go func() {</code></span>
+<span class="codeline" id="line-60"><code>		var scratch []*workerChan</code></span>
+<span class="codeline" id="line-61"><code>		for {</code></span>
+<span class="codeline" id="line-62"><code>			wp.clean(&amp;scratch)</code></span>
+<span class="codeline" id="line-63"><code>			select {</code></span>
+<span class="codeline" id="line-64"><code>			case &lt;-stopCh:</code></span>
+<span class="codeline" id="line-65"><code>				return</code></span>
+<span class="codeline" id="line-66"><code>			default:</code></span>
+<span class="codeline" id="line-67"><code>				time.Sleep(wp.getMaxIdleWorkerDuration())</code></span>
+<span class="codeline" id="line-68"><code>			}</code></span>
+<span class="codeline" id="line-69"><code>		}</code></span>
+<span class="codeline" id="line-70"><code>	}()</code></span>
+<span class="codeline" id="line-71"><code>}</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>func (wp *workerPool) Stop() {</code></span>
+<span class="codeline" id="line-74"><code>	if wp.stopCh == nil {</code></span>
+<span class="codeline" id="line-75"><code>		return</code></span>
+<span class="codeline" id="line-76"><code>	}</code></span>
+<span class="codeline" id="line-77"><code>	close(wp.stopCh)</code></span>
+<span class="codeline" id="line-78"><code>	wp.stopCh = nil</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>	// Stop all the workers waiting for incoming connections.</code></span>
+<span class="codeline" id="line-81"><code>	// Do not wait for busy workers - they will stop after</code></span>
+<span class="codeline" id="line-82"><code>	// serving the connection and noticing wp.mustStop = true.</code></span>
+<span class="codeline" id="line-83"><code>	wp.lock.Lock()</code></span>
+<span class="codeline" id="line-84"><code>	ready := wp.ready</code></span>
+<span class="codeline" id="line-85"><code>	for i := range ready {</code></span>
+<span class="codeline" id="line-86"><code>		ready[i].ch &lt;- nil</code></span>
+<span class="codeline" id="line-87"><code>		ready[i] = nil</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code>	wp.ready = ready[:0]</code></span>
+<span class="codeline" id="line-90"><code>	wp.mustStop = true</code></span>
+<span class="codeline" id="line-91"><code>	wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-92"><code>}</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>func (wp *workerPool) getMaxIdleWorkerDuration() time.Duration {</code></span>
+<span class="codeline" id="line-95"><code>	if wp.MaxIdleWorkerDuration &lt;= 0 {</code></span>
+<span class="codeline" id="line-96"><code>		return 10 * time.Second</code></span>
+<span class="codeline" id="line-97"><code>	}</code></span>
+<span class="codeline" id="line-98"><code>	return wp.MaxIdleWorkerDuration</code></span>
+<span class="codeline" id="line-99"><code>}</code></span>
+<span class="codeline" id="line-100"><code></code></span>
+<span class="codeline" id="line-101"><code>func (wp *workerPool) clean(scratch *[]*workerChan) {</code></span>
+<span class="codeline" id="line-102"><code>	maxIdleWorkerDuration := wp.getMaxIdleWorkerDuration()</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	// Clean least recently used workers if they didn't serve connections</code></span>
+<span class="codeline" id="line-105"><code>	// for more than maxIdleWorkerDuration.</code></span>
+<span class="codeline" id="line-106"><code>	criticalTime := time.Now().Add(-maxIdleWorkerDuration)</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	wp.lock.Lock()</code></span>
+<span class="codeline" id="line-109"><code>	ready := wp.ready</code></span>
+<span class="codeline" id="line-110"><code>	n := len(ready)</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	// Use binary-search algorithm to find out the index of the least recently worker which can be cleaned up.</code></span>
+<span class="codeline" id="line-113"><code>	l, r := 0, n-1</code></span>
+<span class="codeline" id="line-114"><code>	for l &lt;= r {</code></span>
+<span class="codeline" id="line-115"><code>		mid := (l + r) / 2</code></span>
+<span class="codeline" id="line-116"><code>		if criticalTime.After(wp.ready[mid].lastUseTime) {</code></span>
+<span class="codeline" id="line-117"><code>			l = mid + 1</code></span>
+<span class="codeline" id="line-118"><code>		} else {</code></span>
+<span class="codeline" id="line-119"><code>			r = mid - 1</code></span>
+<span class="codeline" id="line-120"><code>		}</code></span>
+<span class="codeline" id="line-121"><code>	}</code></span>
+<span class="codeline" id="line-122"><code>	i := r</code></span>
+<span class="codeline" id="line-123"><code>	if i == -1 {</code></span>
+<span class="codeline" id="line-124"><code>		wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-125"><code>		return</code></span>
+<span class="codeline" id="line-126"><code>	}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>	*scratch = append((*scratch)[:0], ready[:i+1]...)</code></span>
+<span class="codeline" id="line-129"><code>	m := copy(ready, ready[i+1:])</code></span>
+<span class="codeline" id="line-130"><code>	for i = m; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-131"><code>		ready[i] = nil</code></span>
+<span class="codeline" id="line-132"><code>	}</code></span>
+<span class="codeline" id="line-133"><code>	wp.ready = ready[:m]</code></span>
+<span class="codeline" id="line-134"><code>	wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>	// Notify obsolete workers to stop.</code></span>
+<span class="codeline" id="line-137"><code>	// This notification must be outside the wp.lock, since ch.ch</code></span>
+<span class="codeline" id="line-138"><code>	// may be blocking and may consume a lot of time if many workers</code></span>
+<span class="codeline" id="line-139"><code>	// are located on non-local CPUs.</code></span>
+<span class="codeline" id="line-140"><code>	tmp := *scratch</code></span>
+<span class="codeline" id="line-141"><code>	for i := range tmp {</code></span>
+<span class="codeline" id="line-142"><code>		tmp[i].ch &lt;- nil</code></span>
+<span class="codeline" id="line-143"><code>		tmp[i] = nil</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>func (wp *workerPool) Serve(c net.Conn) bool {</code></span>
+<span class="codeline" id="line-148"><code>	ch := wp.getCh()</code></span>
+<span class="codeline" id="line-149"><code>	if ch == nil {</code></span>
+<span class="codeline" id="line-150"><code>		return false</code></span>
+<span class="codeline" id="line-151"><code>	}</code></span>
+<span class="codeline" id="line-152"><code>	ch.ch &lt;- c</code></span>
+<span class="codeline" id="line-153"><code>	return true</code></span>
+<span class="codeline" id="line-154"><code>}</code></span>
+<span class="codeline" id="line-155"><code></code></span>
+<span class="codeline" id="line-156"><code>var workerChanCap = func() int {</code></span>
+<span class="codeline" id="line-157"><code>	// Use blocking workerChan if GOMAXPROCS=1.</code></span>
+<span class="codeline" id="line-158"><code>	// This immediately switches Serve to WorkerFunc, which results</code></span>
+<span class="codeline" id="line-159"><code>	// in higher performance (under go1.5 at least).</code></span>
+<span class="codeline" id="line-160"><code>	if runtime.GOMAXPROCS(0) == 1 {</code></span>
+<span class="codeline" id="line-161"><code>		return 0</code></span>
+<span class="codeline" id="line-162"><code>	}</code></span>
+<span class="codeline" id="line-163"><code></code></span>
+<span class="codeline" id="line-164"><code>	// Use non-blocking workerChan if GOMAXPROCS&gt;1,</code></span>
+<span class="codeline" id="line-165"><code>	// since otherwise the Serve caller (Acceptor) may lag accepting</code></span>
+<span class="codeline" id="line-166"><code>	// new connections if WorkerFunc is CPU-bound.</code></span>
+<span class="codeline" id="line-167"><code>	return 1</code></span>
+<span class="codeline" id="line-168"><code>}()</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>func (wp *workerPool) getCh() *workerChan {</code></span>
+<span class="codeline" id="line-171"><code>	var ch *workerChan</code></span>
+<span class="codeline" id="line-172"><code>	createWorker := false</code></span>
+<span class="codeline" id="line-173"><code></code></span>
+<span class="codeline" id="line-174"><code>	wp.lock.Lock()</code></span>
+<span class="codeline" id="line-175"><code>	ready := wp.ready</code></span>
+<span class="codeline" id="line-176"><code>	n := len(ready) - 1</code></span>
+<span class="codeline" id="line-177"><code>	if n &lt; 0 {</code></span>
+<span class="codeline" id="line-178"><code>		if wp.workersCount &lt; wp.MaxWorkersCount {</code></span>
+<span class="codeline" id="line-179"><code>			createWorker = true</code></span>
+<span class="codeline" id="line-180"><code>			wp.workersCount++</code></span>
+<span class="codeline" id="line-181"><code>		}</code></span>
+<span class="codeline" id="line-182"><code>	} else {</code></span>
+<span class="codeline" id="line-183"><code>		ch = ready[n]</code></span>
+<span class="codeline" id="line-184"><code>		ready[n] = nil</code></span>
+<span class="codeline" id="line-185"><code>		wp.ready = ready[:n]</code></span>
+<span class="codeline" id="line-186"><code>	}</code></span>
+<span class="codeline" id="line-187"><code>	wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>	if ch == nil {</code></span>
+<span class="codeline" id="line-190"><code>		if !createWorker {</code></span>
+<span class="codeline" id="line-191"><code>			return nil</code></span>
+<span class="codeline" id="line-192"><code>		}</code></span>
+<span class="codeline" id="line-193"><code>		vch := wp.workerChanPool.Get()</code></span>
+<span class="codeline" id="line-194"><code>		ch = vch.(*workerChan)</code></span>
+<span class="codeline" id="line-195"><code>		go func() {</code></span>
+<span class="codeline" id="line-196"><code>			wp.workerFunc(ch)</code></span>
+<span class="codeline" id="line-197"><code>			wp.workerChanPool.Put(vch)</code></span>
+<span class="codeline" id="line-198"><code>		}()</code></span>
+<span class="codeline" id="line-199"><code>	}</code></span>
+<span class="codeline" id="line-200"><code>	return ch</code></span>
+<span class="codeline" id="line-201"><code>}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>func (wp *workerPool) release(ch *workerChan) bool {</code></span>
+<span class="codeline" id="line-204"><code>	ch.lastUseTime = time.Now()</code></span>
+<span class="codeline" id="line-205"><code>	wp.lock.Lock()</code></span>
+<span class="codeline" id="line-206"><code>	if wp.mustStop {</code></span>
+<span class="codeline" id="line-207"><code>		wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-208"><code>		return false</code></span>
+<span class="codeline" id="line-209"><code>	}</code></span>
+<span class="codeline" id="line-210"><code>	wp.ready = append(wp.ready, ch)</code></span>
+<span class="codeline" id="line-211"><code>	wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-212"><code>	return true</code></span>
+<span class="codeline" id="line-213"><code>}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>func (wp *workerPool) workerFunc(ch *workerChan) {</code></span>
+<span class="codeline" id="line-216"><code>	var c net.Conn</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>	var err error</code></span>
+<span class="codeline" id="line-219"><code>	for c = range ch.ch {</code></span>
+<span class="codeline" id="line-220"><code>		if c == nil {</code></span>
+<span class="codeline" id="line-221"><code>			break</code></span>
+<span class="codeline" id="line-222"><code>		}</code></span>
+<span class="codeline" id="line-223"><code></code></span>
+<span class="codeline" id="line-224"><code>		if err = wp.WorkerFunc(c); err != nil &amp;&amp; err != errHijacked {</code></span>
+<span class="codeline" id="line-225"><code>			errStr := err.Error()</code></span>
+<span class="codeline" id="line-226"><code>			if wp.LogAllErrors || !(strings.Contains(errStr, "broken pipe") ||</code></span>
+<span class="codeline" id="line-227"><code>				strings.Contains(errStr, "reset by peer") ||</code></span>
+<span class="codeline" id="line-228"><code>				strings.Contains(errStr, "request headers: small read buffer") ||</code></span>
+<span class="codeline" id="line-229"><code>				strings.Contains(errStr, "unexpected EOF") ||</code></span>
+<span class="codeline" id="line-230"><code>				strings.Contains(errStr, "i/o timeout") ||</code></span>
+<span class="codeline" id="line-231"><code>				errors.Is(err, ErrBadTrailer)) {</code></span>
+<span class="codeline" id="line-232"><code>				wp.Logger.Printf("error when serving connection %q&lt;-&gt;%q: %v", c.LocalAddr(), c.RemoteAddr(), err)</code></span>
+<span class="codeline" id="line-233"><code>			}</code></span>
+<span class="codeline" id="line-234"><code>		}</code></span>
+<span class="codeline" id="line-235"><code>		if err == errHijacked {</code></span>
+<span class="codeline" id="line-236"><code>			wp.connState(c, StateHijacked)</code></span>
+<span class="codeline" id="line-237"><code>		} else {</code></span>
+<span class="codeline" id="line-238"><code>			_ = c.Close()</code></span>
+<span class="codeline" id="line-239"><code>			wp.connState(c, StateClosed)</code></span>
+<span class="codeline" id="line-240"><code>		}</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>		if !wp.release(ch) {</code></span>
+<span class="codeline" id="line-243"><code>			break</code></span>
+<span class="codeline" id="line-244"><code>		}</code></span>
+<span class="codeline" id="line-245"><code>	}</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>	wp.lock.Lock()</code></span>
+<span class="codeline" id="line-248"><code>	wp.workersCount--</code></span>
+<span class="codeline" id="line-249"><code>	wp.lock.Unlock()</code></span>
+<span class="codeline" id="line-250"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: lbclient.go in package github.com/valyala/fasthttp</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	lbclient.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/valyala/fasthttp.html">github.com/valyala/fasthttp</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package fasthttp</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"sync"</code></span>
+<span class="codeline" id="line-5"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-6"><code>	"time"</code></span>
+<span class="codeline" id="line-7"><code>)</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// BalancingClient is the interface for clients, which may be passed</code></span>
+<span class="codeline" id="line-10"><code>// to LBClient.Clients.</code></span>
+<span class="codeline" id="line-11"><code>type BalancingClient interface {</code></span>
+<span class="codeline" id="line-12"><code>	DoDeadline(req *Request, resp *Response, deadline time.Time) error</code></span>
+<span class="codeline" id="line-13"><code>	PendingRequests() int</code></span>
+<span class="codeline" id="line-14"><code>}</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// LBClient balances requests among available LBClient.Clients.</code></span>
+<span class="codeline" id="line-17"><code>//</code></span>
+<span class="codeline" id="line-18"><code>// It has the following features:</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>//   - Balances load among available clients using 'least loaded' + 'least total'</code></span>
+<span class="codeline" id="line-21"><code>//     hybrid technique.</code></span>
+<span class="codeline" id="line-22"><code>//   - Dynamically decreases load on unhealthy clients.</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>// It is forbidden copying LBClient instances. Create new instances instead.</code></span>
+<span class="codeline" id="line-25"><code>//</code></span>
+<span class="codeline" id="line-26"><code>// It is safe calling LBClient methods from concurrently running goroutines.</code></span>
+<span class="codeline" id="line-27"><code>type LBClient struct {</code></span>
+<span class="codeline" id="line-28"><code>	noCopy noCopy</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>	// Clients must contain non-zero clients list.</code></span>
+<span class="codeline" id="line-31"><code>	// Incoming requests are balanced among these clients.</code></span>
+<span class="codeline" id="line-32"><code>	Clients []BalancingClient</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>	// HealthCheck is a callback called after each request.</code></span>
+<span class="codeline" id="line-35"><code>	//</code></span>
+<span class="codeline" id="line-36"><code>	// The request, response and the error returned by the client</code></span>
+<span class="codeline" id="line-37"><code>	// is passed to HealthCheck, so the callback may determine whether</code></span>
+<span class="codeline" id="line-38"><code>	// the client is healthy.</code></span>
+<span class="codeline" id="line-39"><code>	//</code></span>
+<span class="codeline" id="line-40"><code>	// Load on the current client is decreased if HealthCheck returns false.</code></span>
+<span class="codeline" id="line-41"><code>	//</code></span>
+<span class="codeline" id="line-42"><code>	// By default HealthCheck returns false if err != nil.</code></span>
+<span class="codeline" id="line-43"><code>	HealthCheck func(req *Request, resp *Response, err error) bool</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>	// Timeout is the request timeout used when calling LBClient.Do.</code></span>
+<span class="codeline" id="line-46"><code>	//</code></span>
+<span class="codeline" id="line-47"><code>	// DefaultLBClientTimeout is used by default.</code></span>
+<span class="codeline" id="line-48"><code>	Timeout time.Duration</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>	cs []*lbClient</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>	once sync.Once</code></span>
+<span class="codeline" id="line-53"><code>	mu   sync.RWMutex</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>// DefaultLBClientTimeout is the default request timeout used by LBClient</code></span>
+<span class="codeline" id="line-57"><code>// when calling LBClient.Do.</code></span>
+<span class="codeline" id="line-58"><code>//</code></span>
+<span class="codeline" id="line-59"><code>// The timeout may be overridden via LBClient.Timeout.</code></span>
+<span class="codeline" id="line-60"><code>const DefaultLBClientTimeout = time.Second</code></span>
+<span class="codeline" id="line-61"><code></code></span>
+<span class="codeline" id="line-62"><code>// DoDeadline calls DoDeadline on the least loaded client.</code></span>
+<span class="codeline" id="line-63"><code>func (cc *LBClient) DoDeadline(req *Request, resp *Response, deadline time.Time) error {</code></span>
+<span class="codeline" id="line-64"><code>	return cc.get().DoDeadline(req, resp, deadline)</code></span>
+<span class="codeline" id="line-65"><code>}</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// DoTimeout calculates deadline and calls DoDeadline on the least loaded client.</code></span>
+<span class="codeline" id="line-68"><code>func (cc *LBClient) DoTimeout(req *Request, resp *Response, timeout time.Duration) error {</code></span>
+<span class="codeline" id="line-69"><code>	deadline := time.Now().Add(timeout)</code></span>
+<span class="codeline" id="line-70"><code>	return cc.get().DoDeadline(req, resp, deadline)</code></span>
+<span class="codeline" id="line-71"><code>}</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>// Do calculates timeout using LBClient.Timeout and calls DoTimeout</code></span>
+<span class="codeline" id="line-74"><code>// on the least loaded client.</code></span>
+<span class="codeline" id="line-75"><code>func (cc *LBClient) Do(req *Request, resp *Response) error {</code></span>
+<span class="codeline" id="line-76"><code>	timeout := cc.Timeout</code></span>
+<span class="codeline" id="line-77"><code>	if timeout &lt;= 0 {</code></span>
+<span class="codeline" id="line-78"><code>		timeout = DefaultLBClientTimeout</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code>	return cc.DoTimeout(req, resp, timeout)</code></span>
+<span class="codeline" id="line-81"><code>}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>func (cc *LBClient) init() {</code></span>
+<span class="codeline" id="line-84"><code>	cc.mu.Lock()</code></span>
+<span class="codeline" id="line-85"><code>	defer cc.mu.Unlock()</code></span>
+<span class="codeline" id="line-86"><code>	if len(cc.Clients) == 0 {</code></span>
+<span class="codeline" id="line-87"><code>		// developer sanity-check</code></span>
+<span class="codeline" id="line-88"><code>		panic("BUG: LBClient.Clients cannot be empty")</code></span>
+<span class="codeline" id="line-89"><code>	}</code></span>
+<span class="codeline" id="line-90"><code>	for _, c := range cc.Clients {</code></span>
+<span class="codeline" id="line-91"><code>		cc.cs = append(cc.cs, &amp;lbClient{</code></span>
+<span class="codeline" id="line-92"><code>			c:           c,</code></span>
+<span class="codeline" id="line-93"><code>			healthCheck: cc.HealthCheck,</code></span>
+<span class="codeline" id="line-94"><code>		})</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>}</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>// AddClient adds a new client to the balanced clients and</code></span>
+<span class="codeline" id="line-99"><code>// returns the new total number of clients.</code></span>
+<span class="codeline" id="line-100"><code>func (cc *LBClient) AddClient(c BalancingClient) int {</code></span>
+<span class="codeline" id="line-101"><code>	cc.mu.Lock()</code></span>
+<span class="codeline" id="line-102"><code>	cc.cs = append(cc.cs, &amp;lbClient{</code></span>
+<span class="codeline" id="line-103"><code>		c:           c,</code></span>
+<span class="codeline" id="line-104"><code>		healthCheck: cc.HealthCheck,</code></span>
+<span class="codeline" id="line-105"><code>	})</code></span>
+<span class="codeline" id="line-106"><code>	cc.mu.Unlock()</code></span>
+<span class="codeline" id="line-107"><code>	return len(cc.cs)</code></span>
+<span class="codeline" id="line-108"><code>}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>// RemoveClients removes clients using the provided callback.</code></span>
+<span class="codeline" id="line-111"><code>// If rc returns true, the passed client will be removed.</code></span>
+<span class="codeline" id="line-112"><code>// Returns the new total number of clients.</code></span>
+<span class="codeline" id="line-113"><code>func (cc *LBClient) RemoveClients(rc func(BalancingClient) bool) int {</code></span>
+<span class="codeline" id="line-114"><code>	cc.mu.Lock()</code></span>
+<span class="codeline" id="line-115"><code>	n := 0</code></span>
+<span class="codeline" id="line-116"><code>	for idx, cs := range cc.cs {</code></span>
+<span class="codeline" id="line-117"><code>		cc.cs[idx] = nil</code></span>
+<span class="codeline" id="line-118"><code>		if rc(cs.c) {</code></span>
+<span class="codeline" id="line-119"><code>			continue</code></span>
+<span class="codeline" id="line-120"><code>		}</code></span>
+<span class="codeline" id="line-121"><code>		cc.cs[n] = cs</code></span>
+<span class="codeline" id="line-122"><code>		n++</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	cc.cs = cc.cs[:n]</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	cc.mu.Unlock()</code></span>
+<span class="codeline" id="line-127"><code>	return len(cc.cs)</code></span>
+<span class="codeline" id="line-128"><code>}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>func (cc *LBClient) get() *lbClient {</code></span>
+<span class="codeline" id="line-131"><code>	cc.once.Do(cc.init)</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>	cc.mu.RLock()</code></span>
+<span class="codeline" id="line-134"><code>	cs := cc.cs</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>	minC := cs[0]</code></span>
+<span class="codeline" id="line-137"><code>	minN := minC.PendingRequests()</code></span>
+<span class="codeline" id="line-138"><code>	minT := atomic.LoadUint64(&amp;minC.total)</code></span>
+<span class="codeline" id="line-139"><code>	for _, c := range cs[1:] {</code></span>
+<span class="codeline" id="line-140"><code>		n := c.PendingRequests()</code></span>
+<span class="codeline" id="line-141"><code>		t := atomic.LoadUint64(&amp;c.total) /* #nosec G601 */</code></span>
+<span class="codeline" id="line-142"><code>		if n &lt; minN || (n == minN &amp;&amp; t &lt; minT) {</code></span>
+<span class="codeline" id="line-143"><code>			minC = c</code></span>
+<span class="codeline" id="line-144"><code>			minN = n</code></span>
+<span class="codeline" id="line-145"><code>			minT = t</code></span>
+<span class="codeline" id="line-146"><code>		}</code></span>
+<span class="codeline" id="line-147"><code>	}</code></span>
+<span class="codeline" id="line-148"><code>	cc.mu.RUnlock()</code></span>
+<span class="codeline" id="line-149"><code>	return minC</code></span>
+<span class="codeline" id="line-150"><code>}</code></span>
+<span class="codeline" id="line-151"><code></code></span>
+<span class="codeline" id="line-152"><code>type lbClient struct {</code></span>
+<span class="codeline" id="line-153"><code>	c           BalancingClient</code></span>
+<span class="codeline" id="line-154"><code>	healthCheck func(req *Request, resp *Response, err error) bool</code></span>
+<span class="codeline" id="line-155"><code>	penalty     uint32</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>	// total amount of requests handled.</code></span>
+<span class="codeline" id="line-158"><code>	total uint64</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>func (c *lbClient) DoDeadline(req *Request, resp *Response, deadline time.Time) error {</code></span>
+<span class="codeline" id="line-162"><code>	err := c.c.DoDeadline(req, resp, deadline)</code></span>
+<span class="codeline" id="line-163"><code>	if !c.isHealthy(req, resp, err) &amp;&amp; c.incPenalty() {</code></span>
+<span class="codeline" id="line-164"><code>		// Penalize the client returning error, so the next requests</code></span>
+<span class="codeline" id="line-165"><code>		// are routed to another clients.</code></span>
+<span class="codeline" id="line-166"><code>		time.AfterFunc(penaltyDuration, c.decPenalty)</code></span>
+<span class="codeline" id="line-167"><code>	} else {</code></span>
+<span class="codeline" id="line-168"><code>		atomic.AddUint64(&amp;c.total, 1)</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code>	return err</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>func (c *lbClient) PendingRequests() int {</code></span>
+<span class="codeline" id="line-174"><code>	n := c.c.PendingRequests()</code></span>
+<span class="codeline" id="line-175"><code>	m := atomic.LoadUint32(&amp;c.penalty)</code></span>
+<span class="codeline" id="line-176"><code>	return n + int(m)</code></span>
+<span class="codeline" id="line-177"><code>}</code></span>
+<span class="codeline" id="line-178"><code></code></span>
+<span class="codeline" id="line-179"><code>func (c *lbClient) isHealthy(req *Request, resp *Response, err error) bool {</code></span>
+<span class="codeline" id="line-180"><code>	if c.healthCheck == nil {</code></span>
+<span class="codeline" id="line-181"><code>		return err == nil</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	return c.healthCheck(req, resp, err)</code></span>
+<span class="codeline" id="line-184"><code>}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>func (c *lbClient) incPenalty() bool {</code></span>
+<span class="codeline" id="line-187"><code>	m := atomic.AddUint32(&amp;c.penalty, 1)</code></span>
+<span class="codeline" id="line-188"><code>	if m &gt; maxPenalty {</code></span>
+<span class="codeline" id="line-189"><code>		c.decPenalty()</code></span>
+<span class="codeline" id="line-190"><code>		return false</code></span>
+<span class="codeline" id="line-191"><code>	}</code></span>
+<span class="codeline" id="line-192"><code>	return true</code></span>
+<span class="codeline" id="line-193"><code>}</code></span>
+<span class="codeline" id="line-194"><code></code></span>
+<span class="codeline" id="line-195"><code>func (c *lbClient) decPenalty() {</code></span>
+<span class="codeline" id="line-196"><code>	atomic.AddUint32(&amp;c.penalty, ^uint32(0))</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>const (</code></span>
+<span class="codeline" id="line-200"><code>	maxPenalty = 300</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>	penaltyDuration = 3 * time.Second</code></span>
+<span class="codeline" id="line-203"><code>)</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

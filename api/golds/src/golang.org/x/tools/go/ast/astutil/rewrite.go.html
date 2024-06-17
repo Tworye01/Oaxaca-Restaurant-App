@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: rewrite.go in package golang.org/x/tools/go/ast/astutil</title>
+<link href="../../../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	rewrite.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../../../pkg/golang.org/x/tools/go/ast/astutil.html">golang.org/x/tools/go/ast/astutil</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2017 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package astutil</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"fmt"</code></span>
+<span class="codeline" id="line-9"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-10"><code>	"reflect"</code></span>
+<span class="codeline" id="line-11"><code>	"sort"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>// An ApplyFunc is invoked by Apply for each node n, even if n is nil,</code></span>
+<span class="codeline" id="line-15"><code>// before and/or after the node's children, using a Cursor describing</code></span>
+<span class="codeline" id="line-16"><code>// the current node and providing operations on it.</code></span>
+<span class="codeline" id="line-17"><code>//</code></span>
+<span class="codeline" id="line-18"><code>// The return value of ApplyFunc controls the syntax tree traversal.</code></span>
+<span class="codeline" id="line-19"><code>// See Apply for details.</code></span>
+<span class="codeline" id="line-20"><code>type ApplyFunc func(*Cursor) bool</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>// Apply traverses a syntax tree recursively, starting with root,</code></span>
+<span class="codeline" id="line-23"><code>// and calling pre and post for each node as described below.</code></span>
+<span class="codeline" id="line-24"><code>// Apply returns the syntax tree, possibly modified.</code></span>
+<span class="codeline" id="line-25"><code>//</code></span>
+<span class="codeline" id="line-26"><code>// If pre is not nil, it is called for each node before the node's</code></span>
+<span class="codeline" id="line-27"><code>// children are traversed (pre-order). If pre returns false, no</code></span>
+<span class="codeline" id="line-28"><code>// children are traversed, and post is not called for that node.</code></span>
+<span class="codeline" id="line-29"><code>//</code></span>
+<span class="codeline" id="line-30"><code>// If post is not nil, and a prior call of pre didn't return false,</code></span>
+<span class="codeline" id="line-31"><code>// post is called for each node after its children are traversed</code></span>
+<span class="codeline" id="line-32"><code>// (post-order). If post returns false, traversal is terminated and</code></span>
+<span class="codeline" id="line-33"><code>// Apply returns immediately.</code></span>
+<span class="codeline" id="line-34"><code>//</code></span>
+<span class="codeline" id="line-35"><code>// Only fields that refer to AST nodes are considered children;</code></span>
+<span class="codeline" id="line-36"><code>// i.e., token.Pos, Scopes, Objects, and fields of basic types</code></span>
+<span class="codeline" id="line-37"><code>// (strings, etc.) are ignored.</code></span>
+<span class="codeline" id="line-38"><code>//</code></span>
+<span class="codeline" id="line-39"><code>// Children are traversed in the order in which they appear in the</code></span>
+<span class="codeline" id="line-40"><code>// respective node's struct definition. A package's files are</code></span>
+<span class="codeline" id="line-41"><code>// traversed in the filenames' alphabetical order.</code></span>
+<span class="codeline" id="line-42"><code>func Apply(root ast.Node, pre, post ApplyFunc) (result ast.Node) {</code></span>
+<span class="codeline" id="line-43"><code>	parent := &amp;struct{ ast.Node }{root}</code></span>
+<span class="codeline" id="line-44"><code>	defer func() {</code></span>
+<span class="codeline" id="line-45"><code>		if r := recover(); r != nil &amp;&amp; r != abort {</code></span>
+<span class="codeline" id="line-46"><code>			panic(r)</code></span>
+<span class="codeline" id="line-47"><code>		}</code></span>
+<span class="codeline" id="line-48"><code>		result = parent.Node</code></span>
+<span class="codeline" id="line-49"><code>	}()</code></span>
+<span class="codeline" id="line-50"><code>	a := &amp;application{pre: pre, post: post}</code></span>
+<span class="codeline" id="line-51"><code>	a.apply(parent, "Node", nil, root)</code></span>
+<span class="codeline" id="line-52"><code>	return</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>var abort = new(int) // singleton, to signal termination of Apply</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>// A Cursor describes a node encountered during Apply.</code></span>
+<span class="codeline" id="line-58"><code>// Information about the node and its parent is available</code></span>
+<span class="codeline" id="line-59"><code>// from the Node, Parent, Name, and Index methods.</code></span>
+<span class="codeline" id="line-60"><code>//</code></span>
+<span class="codeline" id="line-61"><code>// If p is a variable of type and value of the current parent node</code></span>
+<span class="codeline" id="line-62"><code>// c.Parent(), and f is the field identifier with name c.Name(),</code></span>
+<span class="codeline" id="line-63"><code>// the following invariants hold:</code></span>
+<span class="codeline" id="line-64"><code>//</code></span>
+<span class="codeline" id="line-65"><code>//	p.f            == c.Node()  if c.Index() &lt;  0</code></span>
+<span class="codeline" id="line-66"><code>//	p.f[c.Index()] == c.Node()  if c.Index() &gt;= 0</code></span>
+<span class="codeline" id="line-67"><code>//</code></span>
+<span class="codeline" id="line-68"><code>// The methods Replace, Delete, InsertBefore, and InsertAfter</code></span>
+<span class="codeline" id="line-69"><code>// can be used to change the AST without disrupting Apply.</code></span>
+<span class="codeline" id="line-70"><code>type Cursor struct {</code></span>
+<span class="codeline" id="line-71"><code>	parent ast.Node</code></span>
+<span class="codeline" id="line-72"><code>	name   string</code></span>
+<span class="codeline" id="line-73"><code>	iter   *iterator // valid if non-nil</code></span>
+<span class="codeline" id="line-74"><code>	node   ast.Node</code></span>
+<span class="codeline" id="line-75"><code>}</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>// Node returns the current Node.</code></span>
+<span class="codeline" id="line-78"><code>func (c *Cursor) Node() ast.Node { return c.node }</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>// Parent returns the parent of the current Node.</code></span>
+<span class="codeline" id="line-81"><code>func (c *Cursor) Parent() ast.Node { return c.parent }</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>// Name returns the name of the parent Node field that contains the current Node.</code></span>
+<span class="codeline" id="line-84"><code>// If the parent is a *ast.Package and the current Node is a *ast.File, Name returns</code></span>
+<span class="codeline" id="line-85"><code>// the filename for the current Node.</code></span>
+<span class="codeline" id="line-86"><code>func (c *Cursor) Name() string { return c.name }</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>// Index reports the index &gt;= 0 of the current Node in the slice of Nodes that</code></span>
+<span class="codeline" id="line-89"><code>// contains it, or a value &lt; 0 if the current Node is not part of a slice.</code></span>
+<span class="codeline" id="line-90"><code>// The index of the current node changes if InsertBefore is called while</code></span>
+<span class="codeline" id="line-91"><code>// processing the current node.</code></span>
+<span class="codeline" id="line-92"><code>func (c *Cursor) Index() int {</code></span>
+<span class="codeline" id="line-93"><code>	if c.iter != nil {</code></span>
+<span class="codeline" id="line-94"><code>		return c.iter.index</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>	return -1</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>// field returns the current node's parent field value.</code></span>
+<span class="codeline" id="line-100"><code>func (c *Cursor) field() reflect.Value {</code></span>
+<span class="codeline" id="line-101"><code>	return reflect.Indirect(reflect.ValueOf(c.parent)).FieldByName(c.name)</code></span>
+<span class="codeline" id="line-102"><code>}</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>// Replace replaces the current Node with n.</code></span>
+<span class="codeline" id="line-105"><code>// The replacement node is not walked by Apply.</code></span>
+<span class="codeline" id="line-106"><code>func (c *Cursor) Replace(n ast.Node) {</code></span>
+<span class="codeline" id="line-107"><code>	if _, ok := c.node.(*ast.File); ok {</code></span>
+<span class="codeline" id="line-108"><code>		file, ok := n.(*ast.File)</code></span>
+<span class="codeline" id="line-109"><code>		if !ok {</code></span>
+<span class="codeline" id="line-110"><code>			panic("attempt to replace *ast.File with non-*ast.File")</code></span>
+<span class="codeline" id="line-111"><code>		}</code></span>
+<span class="codeline" id="line-112"><code>		c.parent.(*ast.Package).Files[c.name] = file</code></span>
+<span class="codeline" id="line-113"><code>		return</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	v := c.field()</code></span>
+<span class="codeline" id="line-117"><code>	if i := c.Index(); i &gt;= 0 {</code></span>
+<span class="codeline" id="line-118"><code>		v = v.Index(i)</code></span>
+<span class="codeline" id="line-119"><code>	}</code></span>
+<span class="codeline" id="line-120"><code>	v.Set(reflect.ValueOf(n))</code></span>
+<span class="codeline" id="line-121"><code>}</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>// Delete deletes the current Node from its containing slice.</code></span>
+<span class="codeline" id="line-124"><code>// If the current Node is not part of a slice, Delete panics.</code></span>
+<span class="codeline" id="line-125"><code>// As a special case, if the current node is a package file,</code></span>
+<span class="codeline" id="line-126"><code>// Delete removes it from the package's Files map.</code></span>
+<span class="codeline" id="line-127"><code>func (c *Cursor) Delete() {</code></span>
+<span class="codeline" id="line-128"><code>	if _, ok := c.node.(*ast.File); ok {</code></span>
+<span class="codeline" id="line-129"><code>		delete(c.parent.(*ast.Package).Files, c.name)</code></span>
+<span class="codeline" id="line-130"><code>		return</code></span>
+<span class="codeline" id="line-131"><code>	}</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>	i := c.Index()</code></span>
+<span class="codeline" id="line-134"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-135"><code>		panic("Delete node not contained in slice")</code></span>
+<span class="codeline" id="line-136"><code>	}</code></span>
+<span class="codeline" id="line-137"><code>	v := c.field()</code></span>
+<span class="codeline" id="line-138"><code>	l := v.Len()</code></span>
+<span class="codeline" id="line-139"><code>	reflect.Copy(v.Slice(i, l), v.Slice(i+1, l))</code></span>
+<span class="codeline" id="line-140"><code>	v.Index(l - 1).Set(reflect.Zero(v.Type().Elem()))</code></span>
+<span class="codeline" id="line-141"><code>	v.SetLen(l - 1)</code></span>
+<span class="codeline" id="line-142"><code>	c.iter.step--</code></span>
+<span class="codeline" id="line-143"><code>}</code></span>
+<span class="codeline" id="line-144"><code></code></span>
+<span class="codeline" id="line-145"><code>// InsertAfter inserts n after the current Node in its containing slice.</code></span>
+<span class="codeline" id="line-146"><code>// If the current Node is not part of a slice, InsertAfter panics.</code></span>
+<span class="codeline" id="line-147"><code>// Apply does not walk n.</code></span>
+<span class="codeline" id="line-148"><code>func (c *Cursor) InsertAfter(n ast.Node) {</code></span>
+<span class="codeline" id="line-149"><code>	i := c.Index()</code></span>
+<span class="codeline" id="line-150"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-151"><code>		panic("InsertAfter node not contained in slice")</code></span>
+<span class="codeline" id="line-152"><code>	}</code></span>
+<span class="codeline" id="line-153"><code>	v := c.field()</code></span>
+<span class="codeline" id="line-154"><code>	v.Set(reflect.Append(v, reflect.Zero(v.Type().Elem())))</code></span>
+<span class="codeline" id="line-155"><code>	l := v.Len()</code></span>
+<span class="codeline" id="line-156"><code>	reflect.Copy(v.Slice(i+2, l), v.Slice(i+1, l))</code></span>
+<span class="codeline" id="line-157"><code>	v.Index(i + 1).Set(reflect.ValueOf(n))</code></span>
+<span class="codeline" id="line-158"><code>	c.iter.step++</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>// InsertBefore inserts n before the current Node in its containing slice.</code></span>
+<span class="codeline" id="line-162"><code>// If the current Node is not part of a slice, InsertBefore panics.</code></span>
+<span class="codeline" id="line-163"><code>// Apply will not walk n.</code></span>
+<span class="codeline" id="line-164"><code>func (c *Cursor) InsertBefore(n ast.Node) {</code></span>
+<span class="codeline" id="line-165"><code>	i := c.Index()</code></span>
+<span class="codeline" id="line-166"><code>	if i &lt; 0 {</code></span>
+<span class="codeline" id="line-167"><code>		panic("InsertBefore node not contained in slice")</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code>	v := c.field()</code></span>
+<span class="codeline" id="line-170"><code>	v.Set(reflect.Append(v, reflect.Zero(v.Type().Elem())))</code></span>
+<span class="codeline" id="line-171"><code>	l := v.Len()</code></span>
+<span class="codeline" id="line-172"><code>	reflect.Copy(v.Slice(i+1, l), v.Slice(i, l))</code></span>
+<span class="codeline" id="line-173"><code>	v.Index(i).Set(reflect.ValueOf(n))</code></span>
+<span class="codeline" id="line-174"><code>	c.iter.index++</code></span>
+<span class="codeline" id="line-175"><code>}</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>// application carries all the shared data so we can pass it around cheaply.</code></span>
+<span class="codeline" id="line-178"><code>type application struct {</code></span>
+<span class="codeline" id="line-179"><code>	pre, post ApplyFunc</code></span>
+<span class="codeline" id="line-180"><code>	cursor    Cursor</code></span>
+<span class="codeline" id="line-181"><code>	iter      iterator</code></span>
+<span class="codeline" id="line-182"><code>}</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>func (a *application) apply(parent ast.Node, name string, iter *iterator, n ast.Node) {</code></span>
+<span class="codeline" id="line-185"><code>	// convert typed nil into untyped nil</code></span>
+<span class="codeline" id="line-186"><code>	if v := reflect.ValueOf(n); v.Kind() == reflect.Ptr &amp;&amp; v.IsNil() {</code></span>
+<span class="codeline" id="line-187"><code>		n = nil</code></span>
+<span class="codeline" id="line-188"><code>	}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>	// avoid heap-allocating a new cursor for each apply call; reuse a.cursor instead</code></span>
+<span class="codeline" id="line-191"><code>	saved := a.cursor</code></span>
+<span class="codeline" id="line-192"><code>	a.cursor.parent = parent</code></span>
+<span class="codeline" id="line-193"><code>	a.cursor.name = name</code></span>
+<span class="codeline" id="line-194"><code>	a.cursor.iter = iter</code></span>
+<span class="codeline" id="line-195"><code>	a.cursor.node = n</code></span>
+<span class="codeline" id="line-196"><code></code></span>
+<span class="codeline" id="line-197"><code>	if a.pre != nil &amp;&amp; !a.pre(&amp;a.cursor) {</code></span>
+<span class="codeline" id="line-198"><code>		a.cursor = saved</code></span>
+<span class="codeline" id="line-199"><code>		return</code></span>
+<span class="codeline" id="line-200"><code>	}</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>	// walk children</code></span>
+<span class="codeline" id="line-203"><code>	// (the order of the cases matches the order of the corresponding node types in go/ast)</code></span>
+<span class="codeline" id="line-204"><code>	switch n := n.(type) {</code></span>
+<span class="codeline" id="line-205"><code>	case nil:</code></span>
+<span class="codeline" id="line-206"><code>		// nothing to do</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>	// Comments and fields</code></span>
+<span class="codeline" id="line-209"><code>	case *ast.Comment:</code></span>
+<span class="codeline" id="line-210"><code>		// nothing to do</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>	case *ast.CommentGroup:</code></span>
+<span class="codeline" id="line-213"><code>		if n != nil {</code></span>
+<span class="codeline" id="line-214"><code>			a.applyList(n, "List")</code></span>
+<span class="codeline" id="line-215"><code>		}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>	case *ast.Field:</code></span>
+<span class="codeline" id="line-218"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-219"><code>		a.applyList(n, "Names")</code></span>
+<span class="codeline" id="line-220"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-221"><code>		a.apply(n, "Tag", nil, n.Tag)</code></span>
+<span class="codeline" id="line-222"><code>		a.apply(n, "Comment", nil, n.Comment)</code></span>
+<span class="codeline" id="line-223"><code></code></span>
+<span class="codeline" id="line-224"><code>	case *ast.FieldList:</code></span>
+<span class="codeline" id="line-225"><code>		a.applyList(n, "List")</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>	// Expressions</code></span>
+<span class="codeline" id="line-228"><code>	case *ast.BadExpr, *ast.Ident, *ast.BasicLit:</code></span>
+<span class="codeline" id="line-229"><code>		// nothing to do</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>	case *ast.Ellipsis:</code></span>
+<span class="codeline" id="line-232"><code>		a.apply(n, "Elt", nil, n.Elt)</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>	case *ast.FuncLit:</code></span>
+<span class="codeline" id="line-235"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-236"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-237"><code></code></span>
+<span class="codeline" id="line-238"><code>	case *ast.CompositeLit:</code></span>
+<span class="codeline" id="line-239"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-240"><code>		a.applyList(n, "Elts")</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>	case *ast.ParenExpr:</code></span>
+<span class="codeline" id="line-243"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>	case *ast.SelectorExpr:</code></span>
+<span class="codeline" id="line-246"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-247"><code>		a.apply(n, "Sel", nil, n.Sel)</code></span>
+<span class="codeline" id="line-248"><code></code></span>
+<span class="codeline" id="line-249"><code>	case *ast.IndexExpr:</code></span>
+<span class="codeline" id="line-250"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-251"><code>		a.apply(n, "Index", nil, n.Index)</code></span>
+<span class="codeline" id="line-252"><code></code></span>
+<span class="codeline" id="line-253"><code>	case *ast.IndexListExpr:</code></span>
+<span class="codeline" id="line-254"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-255"><code>		a.applyList(n, "Indices")</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>	case *ast.SliceExpr:</code></span>
+<span class="codeline" id="line-258"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-259"><code>		a.apply(n, "Low", nil, n.Low)</code></span>
+<span class="codeline" id="line-260"><code>		a.apply(n, "High", nil, n.High)</code></span>
+<span class="codeline" id="line-261"><code>		a.apply(n, "Max", nil, n.Max)</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>	case *ast.TypeAssertExpr:</code></span>
+<span class="codeline" id="line-264"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-265"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>	case *ast.CallExpr:</code></span>
+<span class="codeline" id="line-268"><code>		a.apply(n, "Fun", nil, n.Fun)</code></span>
+<span class="codeline" id="line-269"><code>		a.applyList(n, "Args")</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>	case *ast.StarExpr:</code></span>
+<span class="codeline" id="line-272"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>	case *ast.UnaryExpr:</code></span>
+<span class="codeline" id="line-275"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>	case *ast.BinaryExpr:</code></span>
+<span class="codeline" id="line-278"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-279"><code>		a.apply(n, "Y", nil, n.Y)</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	case *ast.KeyValueExpr:</code></span>
+<span class="codeline" id="line-282"><code>		a.apply(n, "Key", nil, n.Key)</code></span>
+<span class="codeline" id="line-283"><code>		a.apply(n, "Value", nil, n.Value)</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	// Types</code></span>
+<span class="codeline" id="line-286"><code>	case *ast.ArrayType:</code></span>
+<span class="codeline" id="line-287"><code>		a.apply(n, "Len", nil, n.Len)</code></span>
+<span class="codeline" id="line-288"><code>		a.apply(n, "Elt", nil, n.Elt)</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	case *ast.StructType:</code></span>
+<span class="codeline" id="line-291"><code>		a.apply(n, "Fields", nil, n.Fields)</code></span>
+<span class="codeline" id="line-292"><code></code></span>
+<span class="codeline" id="line-293"><code>	case *ast.FuncType:</code></span>
+<span class="codeline" id="line-294"><code>		if tparams := n.TypeParams; tparams != nil {</code></span>
+<span class="codeline" id="line-295"><code>			a.apply(n, "TypeParams", nil, tparams)</code></span>
+<span class="codeline" id="line-296"><code>		}</code></span>
+<span class="codeline" id="line-297"><code>		a.apply(n, "Params", nil, n.Params)</code></span>
+<span class="codeline" id="line-298"><code>		a.apply(n, "Results", nil, n.Results)</code></span>
+<span class="codeline" id="line-299"><code></code></span>
+<span class="codeline" id="line-300"><code>	case *ast.InterfaceType:</code></span>
+<span class="codeline" id="line-301"><code>		a.apply(n, "Methods", nil, n.Methods)</code></span>
+<span class="codeline" id="line-302"><code></code></span>
+<span class="codeline" id="line-303"><code>	case *ast.MapType:</code></span>
+<span class="codeline" id="line-304"><code>		a.apply(n, "Key", nil, n.Key)</code></span>
+<span class="codeline" id="line-305"><code>		a.apply(n, "Value", nil, n.Value)</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>	case *ast.ChanType:</code></span>
+<span class="codeline" id="line-308"><code>		a.apply(n, "Value", nil, n.Value)</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>	// Statements</code></span>
+<span class="codeline" id="line-311"><code>	case *ast.BadStmt:</code></span>
+<span class="codeline" id="line-312"><code>		// nothing to do</code></span>
+<span class="codeline" id="line-313"><code></code></span>
+<span class="codeline" id="line-314"><code>	case *ast.DeclStmt:</code></span>
+<span class="codeline" id="line-315"><code>		a.apply(n, "Decl", nil, n.Decl)</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>	case *ast.EmptyStmt:</code></span>
+<span class="codeline" id="line-318"><code>		// nothing to do</code></span>
+<span class="codeline" id="line-319"><code></code></span>
+<span class="codeline" id="line-320"><code>	case *ast.LabeledStmt:</code></span>
+<span class="codeline" id="line-321"><code>		a.apply(n, "Label", nil, n.Label)</code></span>
+<span class="codeline" id="line-322"><code>		a.apply(n, "Stmt", nil, n.Stmt)</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>	case *ast.ExprStmt:</code></span>
+<span class="codeline" id="line-325"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>	case *ast.SendStmt:</code></span>
+<span class="codeline" id="line-328"><code>		a.apply(n, "Chan", nil, n.Chan)</code></span>
+<span class="codeline" id="line-329"><code>		a.apply(n, "Value", nil, n.Value)</code></span>
+<span class="codeline" id="line-330"><code></code></span>
+<span class="codeline" id="line-331"><code>	case *ast.IncDecStmt:</code></span>
+<span class="codeline" id="line-332"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>	case *ast.AssignStmt:</code></span>
+<span class="codeline" id="line-335"><code>		a.applyList(n, "Lhs")</code></span>
+<span class="codeline" id="line-336"><code>		a.applyList(n, "Rhs")</code></span>
+<span class="codeline" id="line-337"><code></code></span>
+<span class="codeline" id="line-338"><code>	case *ast.GoStmt:</code></span>
+<span class="codeline" id="line-339"><code>		a.apply(n, "Call", nil, n.Call)</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>	case *ast.DeferStmt:</code></span>
+<span class="codeline" id="line-342"><code>		a.apply(n, "Call", nil, n.Call)</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>	case *ast.ReturnStmt:</code></span>
+<span class="codeline" id="line-345"><code>		a.applyList(n, "Results")</code></span>
+<span class="codeline" id="line-346"><code></code></span>
+<span class="codeline" id="line-347"><code>	case *ast.BranchStmt:</code></span>
+<span class="codeline" id="line-348"><code>		a.apply(n, "Label", nil, n.Label)</code></span>
+<span class="codeline" id="line-349"><code></code></span>
+<span class="codeline" id="line-350"><code>	case *ast.BlockStmt:</code></span>
+<span class="codeline" id="line-351"><code>		a.applyList(n, "List")</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>	case *ast.IfStmt:</code></span>
+<span class="codeline" id="line-354"><code>		a.apply(n, "Init", nil, n.Init)</code></span>
+<span class="codeline" id="line-355"><code>		a.apply(n, "Cond", nil, n.Cond)</code></span>
+<span class="codeline" id="line-356"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-357"><code>		a.apply(n, "Else", nil, n.Else)</code></span>
+<span class="codeline" id="line-358"><code></code></span>
+<span class="codeline" id="line-359"><code>	case *ast.CaseClause:</code></span>
+<span class="codeline" id="line-360"><code>		a.applyList(n, "List")</code></span>
+<span class="codeline" id="line-361"><code>		a.applyList(n, "Body")</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>	case *ast.SwitchStmt:</code></span>
+<span class="codeline" id="line-364"><code>		a.apply(n, "Init", nil, n.Init)</code></span>
+<span class="codeline" id="line-365"><code>		a.apply(n, "Tag", nil, n.Tag)</code></span>
+<span class="codeline" id="line-366"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-367"><code></code></span>
+<span class="codeline" id="line-368"><code>	case *ast.TypeSwitchStmt:</code></span>
+<span class="codeline" id="line-369"><code>		a.apply(n, "Init", nil, n.Init)</code></span>
+<span class="codeline" id="line-370"><code>		a.apply(n, "Assign", nil, n.Assign)</code></span>
+<span class="codeline" id="line-371"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-372"><code></code></span>
+<span class="codeline" id="line-373"><code>	case *ast.CommClause:</code></span>
+<span class="codeline" id="line-374"><code>		a.apply(n, "Comm", nil, n.Comm)</code></span>
+<span class="codeline" id="line-375"><code>		a.applyList(n, "Body")</code></span>
+<span class="codeline" id="line-376"><code></code></span>
+<span class="codeline" id="line-377"><code>	case *ast.SelectStmt:</code></span>
+<span class="codeline" id="line-378"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>	case *ast.ForStmt:</code></span>
+<span class="codeline" id="line-381"><code>		a.apply(n, "Init", nil, n.Init)</code></span>
+<span class="codeline" id="line-382"><code>		a.apply(n, "Cond", nil, n.Cond)</code></span>
+<span class="codeline" id="line-383"><code>		a.apply(n, "Post", nil, n.Post)</code></span>
+<span class="codeline" id="line-384"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>	case *ast.RangeStmt:</code></span>
+<span class="codeline" id="line-387"><code>		a.apply(n, "Key", nil, n.Key)</code></span>
+<span class="codeline" id="line-388"><code>		a.apply(n, "Value", nil, n.Value)</code></span>
+<span class="codeline" id="line-389"><code>		a.apply(n, "X", nil, n.X)</code></span>
+<span class="codeline" id="line-390"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-391"><code></code></span>
+<span class="codeline" id="line-392"><code>	// Declarations</code></span>
+<span class="codeline" id="line-393"><code>	case *ast.ImportSpec:</code></span>
+<span class="codeline" id="line-394"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-395"><code>		a.apply(n, "Name", nil, n.Name)</code></span>
+<span class="codeline" id="line-396"><code>		a.apply(n, "Path", nil, n.Path)</code></span>
+<span class="codeline" id="line-397"><code>		a.apply(n, "Comment", nil, n.Comment)</code></span>
+<span class="codeline" id="line-398"><code></code></span>
+<span class="codeline" id="line-399"><code>	case *ast.ValueSpec:</code></span>
+<span class="codeline" id="line-400"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-401"><code>		a.applyList(n, "Names")</code></span>
+<span class="codeline" id="line-402"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-403"><code>		a.applyList(n, "Values")</code></span>
+<span class="codeline" id="line-404"><code>		a.apply(n, "Comment", nil, n.Comment)</code></span>
+<span class="codeline" id="line-405"><code></code></span>
+<span class="codeline" id="line-406"><code>	case *ast.TypeSpec:</code></span>
+<span class="codeline" id="line-407"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-408"><code>		a.apply(n, "Name", nil, n.Name)</code></span>
+<span class="codeline" id="line-409"><code>		if tparams := n.TypeParams; tparams != nil {</code></span>
+<span class="codeline" id="line-410"><code>			a.apply(n, "TypeParams", nil, tparams)</code></span>
+<span class="codeline" id="line-411"><code>		}</code></span>
+<span class="codeline" id="line-412"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-413"><code>		a.apply(n, "Comment", nil, n.Comment)</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>	case *ast.BadDecl:</code></span>
+<span class="codeline" id="line-416"><code>		// nothing to do</code></span>
+<span class="codeline" id="line-417"><code></code></span>
+<span class="codeline" id="line-418"><code>	case *ast.GenDecl:</code></span>
+<span class="codeline" id="line-419"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-420"><code>		a.applyList(n, "Specs")</code></span>
+<span class="codeline" id="line-421"><code></code></span>
+<span class="codeline" id="line-422"><code>	case *ast.FuncDecl:</code></span>
+<span class="codeline" id="line-423"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-424"><code>		a.apply(n, "Recv", nil, n.Recv)</code></span>
+<span class="codeline" id="line-425"><code>		a.apply(n, "Name", nil, n.Name)</code></span>
+<span class="codeline" id="line-426"><code>		a.apply(n, "Type", nil, n.Type)</code></span>
+<span class="codeline" id="line-427"><code>		a.apply(n, "Body", nil, n.Body)</code></span>
+<span class="codeline" id="line-428"><code></code></span>
+<span class="codeline" id="line-429"><code>	// Files and packages</code></span>
+<span class="codeline" id="line-430"><code>	case *ast.File:</code></span>
+<span class="codeline" id="line-431"><code>		a.apply(n, "Doc", nil, n.Doc)</code></span>
+<span class="codeline" id="line-432"><code>		a.apply(n, "Name", nil, n.Name)</code></span>
+<span class="codeline" id="line-433"><code>		a.applyList(n, "Decls")</code></span>
+<span class="codeline" id="line-434"><code>		// Don't walk n.Comments; they have either been walked already if</code></span>
+<span class="codeline" id="line-435"><code>		// they are Doc comments, or they can be easily walked explicitly.</code></span>
+<span class="codeline" id="line-436"><code></code></span>
+<span class="codeline" id="line-437"><code>	case *ast.Package:</code></span>
+<span class="codeline" id="line-438"><code>		// collect and sort names for reproducible behavior</code></span>
+<span class="codeline" id="line-439"><code>		var names []string</code></span>
+<span class="codeline" id="line-440"><code>		for name := range n.Files {</code></span>
+<span class="codeline" id="line-441"><code>			names = append(names, name)</code></span>
+<span class="codeline" id="line-442"><code>		}</code></span>
+<span class="codeline" id="line-443"><code>		sort.Strings(names)</code></span>
+<span class="codeline" id="line-444"><code>		for _, name := range names {</code></span>
+<span class="codeline" id="line-445"><code>			a.apply(n, name, nil, n.Files[name])</code></span>
+<span class="codeline" id="line-446"><code>		}</code></span>
+<span class="codeline" id="line-447"><code></code></span>
+<span class="codeline" id="line-448"><code>	default:</code></span>
+<span class="codeline" id="line-449"><code>		panic(fmt.Sprintf("Apply: unexpected node type %T", n))</code></span>
+<span class="codeline" id="line-450"><code>	}</code></span>
+<span class="codeline" id="line-451"><code></code></span>
+<span class="codeline" id="line-452"><code>	if a.post != nil &amp;&amp; !a.post(&amp;a.cursor) {</code></span>
+<span class="codeline" id="line-453"><code>		panic(abort)</code></span>
+<span class="codeline" id="line-454"><code>	}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>	a.cursor = saved</code></span>
+<span class="codeline" id="line-457"><code>}</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>// An iterator controls iteration over a slice of nodes.</code></span>
+<span class="codeline" id="line-460"><code>type iterator struct {</code></span>
+<span class="codeline" id="line-461"><code>	index, step int</code></span>
+<span class="codeline" id="line-462"><code>}</code></span>
+<span class="codeline" id="line-463"><code></code></span>
+<span class="codeline" id="line-464"><code>func (a *application) applyList(parent ast.Node, name string) {</code></span>
+<span class="codeline" id="line-465"><code>	// avoid heap-allocating a new iterator for each applyList call; reuse a.iter instead</code></span>
+<span class="codeline" id="line-466"><code>	saved := a.iter</code></span>
+<span class="codeline" id="line-467"><code>	a.iter.index = 0</code></span>
+<span class="codeline" id="line-468"><code>	for {</code></span>
+<span class="codeline" id="line-469"><code>		// must reload parent.name each time, since cursor modifications might change it</code></span>
+<span class="codeline" id="line-470"><code>		v := reflect.Indirect(reflect.ValueOf(parent)).FieldByName(name)</code></span>
+<span class="codeline" id="line-471"><code>		if a.iter.index &gt;= v.Len() {</code></span>
+<span class="codeline" id="line-472"><code>			break</code></span>
+<span class="codeline" id="line-473"><code>		}</code></span>
+<span class="codeline" id="line-474"><code></code></span>
+<span class="codeline" id="line-475"><code>		// element x may be nil in a bad AST - be cautious</code></span>
+<span class="codeline" id="line-476"><code>		var x ast.Node</code></span>
+<span class="codeline" id="line-477"><code>		if e := v.Index(a.iter.index); e.IsValid() {</code></span>
+<span class="codeline" id="line-478"><code>			x = e.Interface().(ast.Node)</code></span>
+<span class="codeline" id="line-479"><code>		}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>		a.iter.step = 1</code></span>
+<span class="codeline" id="line-482"><code>		a.apply(parent, name, &amp;a.iter, x)</code></span>
+<span class="codeline" id="line-483"><code>		a.iter.index += a.iter.step</code></span>
+<span class="codeline" id="line-484"><code>	}</code></span>
+<span class="codeline" id="line-485"><code>	a.iter = saved</code></span>
+<span class="codeline" id="line-486"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

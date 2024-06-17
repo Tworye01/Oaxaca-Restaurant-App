@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: mem.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	mem.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2022 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import "unsafe"</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// OS memory management abstraction layer</code></span>
+<span class="codeline" id="line-10"><code>//</code></span>
+<span class="codeline" id="line-11"><code>// Regions of the address space managed by the runtime may be in one of four</code></span>
+<span class="codeline" id="line-12"><code>// states at any given time:</code></span>
+<span class="codeline" id="line-13"><code>// 1) None - Unreserved and unmapped, the default state of any region.</code></span>
+<span class="codeline" id="line-14"><code>// 2) Reserved - Owned by the runtime, but accessing it would cause a fault.</code></span>
+<span class="codeline" id="line-15"><code>//               Does not count against the process' memory footprint.</code></span>
+<span class="codeline" id="line-16"><code>// 3) Prepared - Reserved, intended not to be backed by physical memory (though</code></span>
+<span class="codeline" id="line-17"><code>//               an OS may implement this lazily). Can transition efficiently to</code></span>
+<span class="codeline" id="line-18"><code>//               Ready. Accessing memory in such a region is undefined (may</code></span>
+<span class="codeline" id="line-19"><code>//               fault, may give back unexpected zeroes, etc.).</code></span>
+<span class="codeline" id="line-20"><code>// 4) Ready - may be accessed safely.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// This set of states is more than is strictly necessary to support all the</code></span>
+<span class="codeline" id="line-23"><code>// currently supported platforms. One could get by with just None, Reserved, and</code></span>
+<span class="codeline" id="line-24"><code>// Ready. However, the Prepared state gives us flexibility for performance</code></span>
+<span class="codeline" id="line-25"><code>// purposes. For example, on POSIX-y operating systems, Reserved is usually a</code></span>
+<span class="codeline" id="line-26"><code>// private anonymous mmap'd region with PROT_NONE set, and to transition</code></span>
+<span class="codeline" id="line-27"><code>// to Ready would require setting PROT_READ|PROT_WRITE. However the</code></span>
+<span class="codeline" id="line-28"><code>// underspecification of Prepared lets us use just MADV_FREE to transition from</code></span>
+<span class="codeline" id="line-29"><code>// Ready to Prepared. Thus with the Prepared state we can set the permission</code></span>
+<span class="codeline" id="line-30"><code>// bits just once early on, we can efficiently tell the OS that it's free to</code></span>
+<span class="codeline" id="line-31"><code>// take pages away from us when we don't strictly need them.</code></span>
+<span class="codeline" id="line-32"><code>//</code></span>
+<span class="codeline" id="line-33"><code>// This file defines a cross-OS interface for a common set of helpers</code></span>
+<span class="codeline" id="line-34"><code>// that transition memory regions between these states. The helpers call into</code></span>
+<span class="codeline" id="line-35"><code>// OS-specific implementations that handle errors, while the interface boundary</code></span>
+<span class="codeline" id="line-36"><code>// implements cross-OS functionality, like updating runtime accounting.</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>// sysAlloc transitions an OS-chosen region of memory from None to Ready.</code></span>
+<span class="codeline" id="line-39"><code>// More specifically, it obtains a large chunk of zeroed memory from the</code></span>
+<span class="codeline" id="line-40"><code>// operating system, typically on the order of a hundred kilobytes</code></span>
+<span class="codeline" id="line-41"><code>// or a megabyte. This memory is always immediately available for use.</code></span>
+<span class="codeline" id="line-42"><code>//</code></span>
+<span class="codeline" id="line-43"><code>// sysStat must be non-nil.</code></span>
+<span class="codeline" id="line-44"><code>//</code></span>
+<span class="codeline" id="line-45"><code>// Don't split the stack as this function may be invoked without a valid G,</code></span>
+<span class="codeline" id="line-46"><code>// which prevents us from allocating more stack.</code></span>
+<span class="codeline" id="line-47"><code>//</code></span>
+<span class="codeline" id="line-48"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-49"><code>func sysAlloc(n uintptr, sysStat *sysMemStat) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-50"><code>	sysStat.add(int64(n))</code></span>
+<span class="codeline" id="line-51"><code>	gcController.mappedReady.Add(int64(n))</code></span>
+<span class="codeline" id="line-52"><code>	return sysAllocOS(n)</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>// sysUnused transitions a memory region from Ready to Prepared. It notifies the</code></span>
+<span class="codeline" id="line-56"><code>// operating system that the physical pages backing this memory region are no</code></span>
+<span class="codeline" id="line-57"><code>// longer needed and can be reused for other purposes. The contents of a</code></span>
+<span class="codeline" id="line-58"><code>// sysUnused memory region are considered forfeit and the region must not be</code></span>
+<span class="codeline" id="line-59"><code>// accessed again until sysUsed is called.</code></span>
+<span class="codeline" id="line-60"><code>func sysUnused(v unsafe.Pointer, n uintptr) {</code></span>
+<span class="codeline" id="line-61"><code>	gcController.mappedReady.Add(-int64(n))</code></span>
+<span class="codeline" id="line-62"><code>	sysUnusedOS(v, n)</code></span>
+<span class="codeline" id="line-63"><code>}</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>// sysUsed transitions a memory region from Prepared to Ready. It notifies the</code></span>
+<span class="codeline" id="line-66"><code>// operating system that the memory region is needed and ensures that the region</code></span>
+<span class="codeline" id="line-67"><code>// may be safely accessed. This is typically a no-op on systems that don't have</code></span>
+<span class="codeline" id="line-68"><code>// an explicit commit step and hard over-commit limits, but is critical on</code></span>
+<span class="codeline" id="line-69"><code>// Windows, for example.</code></span>
+<span class="codeline" id="line-70"><code>//</code></span>
+<span class="codeline" id="line-71"><code>// This operation is idempotent for memory already in the Prepared state, so</code></span>
+<span class="codeline" id="line-72"><code>// it is safe to refer, with v and n, to a range of memory that includes both</code></span>
+<span class="codeline" id="line-73"><code>// Prepared and Ready memory. However, the caller must provide the exact amount</code></span>
+<span class="codeline" id="line-74"><code>// of Prepared memory for accounting purposes.</code></span>
+<span class="codeline" id="line-75"><code>func sysUsed(v unsafe.Pointer, n, prepared uintptr) {</code></span>
+<span class="codeline" id="line-76"><code>	gcController.mappedReady.Add(int64(prepared))</code></span>
+<span class="codeline" id="line-77"><code>	sysUsedOS(v, n)</code></span>
+<span class="codeline" id="line-78"><code>}</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>// sysHugePage does not transition memory regions, but instead provides a</code></span>
+<span class="codeline" id="line-81"><code>// hint to the OS that it would be more efficient to back this memory region</code></span>
+<span class="codeline" id="line-82"><code>// with pages of a larger size transparently.</code></span>
+<span class="codeline" id="line-83"><code>func sysHugePage(v unsafe.Pointer, n uintptr) {</code></span>
+<span class="codeline" id="line-84"><code>	sysHugePageOS(v, n)</code></span>
+<span class="codeline" id="line-85"><code>}</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>// sysNoHugePage does not transition memory regions, but instead provides a</code></span>
+<span class="codeline" id="line-88"><code>// hint to the OS that it would be less efficient to back this memory region</code></span>
+<span class="codeline" id="line-89"><code>// with pages of a larger size transparently.</code></span>
+<span class="codeline" id="line-90"><code>func sysNoHugePage(v unsafe.Pointer, n uintptr) {</code></span>
+<span class="codeline" id="line-91"><code>	sysNoHugePageOS(v, n)</code></span>
+<span class="codeline" id="line-92"><code>}</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>// sysHugePageCollapse attempts to immediately back the provided memory region</code></span>
+<span class="codeline" id="line-95"><code>// with huge pages. It is best-effort and may fail silently.</code></span>
+<span class="codeline" id="line-96"><code>func sysHugePageCollapse(v unsafe.Pointer, n uintptr) {</code></span>
+<span class="codeline" id="line-97"><code>	sysHugePageCollapseOS(v, n)</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// sysFree transitions a memory region from any state to None. Therefore, it</code></span>
+<span class="codeline" id="line-101"><code>// returns memory unconditionally. It is used if an out-of-memory error has been</code></span>
+<span class="codeline" id="line-102"><code>// detected midway through an allocation or to carve out an aligned section of</code></span>
+<span class="codeline" id="line-103"><code>// the address space. It is okay if sysFree is a no-op only if sysReserve always</code></span>
+<span class="codeline" id="line-104"><code>// returns a memory region aligned to the heap allocator's alignment</code></span>
+<span class="codeline" id="line-105"><code>// restrictions.</code></span>
+<span class="codeline" id="line-106"><code>//</code></span>
+<span class="codeline" id="line-107"><code>// sysStat must be non-nil.</code></span>
+<span class="codeline" id="line-108"><code>//</code></span>
+<span class="codeline" id="line-109"><code>// Don't split the stack as this function may be invoked without a valid G,</code></span>
+<span class="codeline" id="line-110"><code>// which prevents us from allocating more stack.</code></span>
+<span class="codeline" id="line-111"><code>//</code></span>
+<span class="codeline" id="line-112"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-113"><code>func sysFree(v unsafe.Pointer, n uintptr, sysStat *sysMemStat) {</code></span>
+<span class="codeline" id="line-114"><code>	sysStat.add(-int64(n))</code></span>
+<span class="codeline" id="line-115"><code>	gcController.mappedReady.Add(-int64(n))</code></span>
+<span class="codeline" id="line-116"><code>	sysFreeOS(v, n)</code></span>
+<span class="codeline" id="line-117"><code>}</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>// sysFault transitions a memory region from Ready to Reserved. It</code></span>
+<span class="codeline" id="line-120"><code>// marks a region such that it will always fault if accessed. Used only for</code></span>
+<span class="codeline" id="line-121"><code>// debugging the runtime.</code></span>
+<span class="codeline" id="line-122"><code>//</code></span>
+<span class="codeline" id="line-123"><code>// TODO(mknyszek): Currently it's true that all uses of sysFault transition</code></span>
+<span class="codeline" id="line-124"><code>// memory from Ready to Reserved, but this may not be true in the future</code></span>
+<span class="codeline" id="line-125"><code>// since on every platform the operation is much more general than that.</code></span>
+<span class="codeline" id="line-126"><code>// If a transition from Prepared is ever introduced, create a new function</code></span>
+<span class="codeline" id="line-127"><code>// that elides the Ready state accounting.</code></span>
+<span class="codeline" id="line-128"><code>func sysFault(v unsafe.Pointer, n uintptr) {</code></span>
+<span class="codeline" id="line-129"><code>	gcController.mappedReady.Add(-int64(n))</code></span>
+<span class="codeline" id="line-130"><code>	sysFaultOS(v, n)</code></span>
+<span class="codeline" id="line-131"><code>}</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>// sysReserve transitions a memory region from None to Reserved. It reserves</code></span>
+<span class="codeline" id="line-134"><code>// address space in such a way that it would cause a fatal fault upon access</code></span>
+<span class="codeline" id="line-135"><code>// (either via permissions or not committing the memory). Such a reservation is</code></span>
+<span class="codeline" id="line-136"><code>// thus never backed by physical memory.</code></span>
+<span class="codeline" id="line-137"><code>//</code></span>
+<span class="codeline" id="line-138"><code>// If the pointer passed to it is non-nil, the caller wants the</code></span>
+<span class="codeline" id="line-139"><code>// reservation there, but sysReserve can still choose another</code></span>
+<span class="codeline" id="line-140"><code>// location if that one is unavailable.</code></span>
+<span class="codeline" id="line-141"><code>//</code></span>
+<span class="codeline" id="line-142"><code>// NOTE: sysReserve returns OS-aligned memory, but the heap allocator</code></span>
+<span class="codeline" id="line-143"><code>// may use larger alignment, so the caller must be careful to realign the</code></span>
+<span class="codeline" id="line-144"><code>// memory obtained by sysReserve.</code></span>
+<span class="codeline" id="line-145"><code>func sysReserve(v unsafe.Pointer, n uintptr) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-146"><code>	return sysReserveOS(v, n)</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>// sysMap transitions a memory region from Reserved to Prepared. It ensures the</code></span>
+<span class="codeline" id="line-150"><code>// memory region can be efficiently transitioned to Ready.</code></span>
+<span class="codeline" id="line-151"><code>//</code></span>
+<span class="codeline" id="line-152"><code>// sysStat must be non-nil.</code></span>
+<span class="codeline" id="line-153"><code>func sysMap(v unsafe.Pointer, n uintptr, sysStat *sysMemStat) {</code></span>
+<span class="codeline" id="line-154"><code>	sysStat.add(int64(n))</code></span>
+<span class="codeline" id="line-155"><code>	sysMapOS(v, n)</code></span>
+<span class="codeline" id="line-156"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: coro.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	coro.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import "unsafe"</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// A coro represents extra concurrency without extra parallelism,</code></span>
+<span class="codeline" id="line-10"><code>// as would be needed for a coroutine implementation.</code></span>
+<span class="codeline" id="line-11"><code>// The coro does not represent a specific coroutine, only the ability</code></span>
+<span class="codeline" id="line-12"><code>// to do coroutine-style control transfers.</code></span>
+<span class="codeline" id="line-13"><code>// It can be thought of as like a special channel that always has</code></span>
+<span class="codeline" id="line-14"><code>// a goroutine blocked on it. If another goroutine calls coroswitch(c),</code></span>
+<span class="codeline" id="line-15"><code>// the caller becomes the goroutine blocked in c, and the goroutine</code></span>
+<span class="codeline" id="line-16"><code>// formerly blocked in c starts running.</code></span>
+<span class="codeline" id="line-17"><code>// These switches continue until a call to coroexit(c),</code></span>
+<span class="codeline" id="line-18"><code>// which ends the use of the coro by releasing the blocked</code></span>
+<span class="codeline" id="line-19"><code>// goroutine in c and exiting the current goroutine.</code></span>
+<span class="codeline" id="line-20"><code>//</code></span>
+<span class="codeline" id="line-21"><code>// Coros are heap allocated and garbage collected, so that user code</code></span>
+<span class="codeline" id="line-22"><code>// can hold a pointer to a coro without causing potential dangling</code></span>
+<span class="codeline" id="line-23"><code>// pointer errors.</code></span>
+<span class="codeline" id="line-24"><code>type coro struct {</code></span>
+<span class="codeline" id="line-25"><code>	gp guintptr</code></span>
+<span class="codeline" id="line-26"><code>	f  func(*coro)</code></span>
+<span class="codeline" id="line-27"><code>}</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>//go:linkname newcoro</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>// newcoro creates a new coro containing a</code></span>
+<span class="codeline" id="line-32"><code>// goroutine blocked waiting to run f</code></span>
+<span class="codeline" id="line-33"><code>// and returns that coro.</code></span>
+<span class="codeline" id="line-34"><code>func newcoro(f func(*coro)) *coro {</code></span>
+<span class="codeline" id="line-35"><code>	c := new(coro)</code></span>
+<span class="codeline" id="line-36"><code>	c.f = f</code></span>
+<span class="codeline" id="line-37"><code>	pc := getcallerpc()</code></span>
+<span class="codeline" id="line-38"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-39"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-40"><code>		start := corostart</code></span>
+<span class="codeline" id="line-41"><code>		startfv := *(**funcval)(unsafe.Pointer(&amp;start))</code></span>
+<span class="codeline" id="line-42"><code>		gp = newproc1(startfv, gp, pc)</code></span>
+<span class="codeline" id="line-43"><code>	})</code></span>
+<span class="codeline" id="line-44"><code>	gp.coroarg = c</code></span>
+<span class="codeline" id="line-45"><code>	gp.waitreason = waitReasonCoroutine</code></span>
+<span class="codeline" id="line-46"><code>	casgstatus(gp, _Grunnable, _Gwaiting)</code></span>
+<span class="codeline" id="line-47"><code>	c.gp.set(gp)</code></span>
+<span class="codeline" id="line-48"><code>	return c</code></span>
+<span class="codeline" id="line-49"><code>}</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>//go:linkname corostart</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>// corostart is the entry func for a new coroutine.</code></span>
+<span class="codeline" id="line-54"><code>// It runs the coroutine user function f passed to corostart</code></span>
+<span class="codeline" id="line-55"><code>// and then calls coroexit to remove the extra concurrency.</code></span>
+<span class="codeline" id="line-56"><code>func corostart() {</code></span>
+<span class="codeline" id="line-57"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-58"><code>	c := gp.coroarg</code></span>
+<span class="codeline" id="line-59"><code>	gp.coroarg = nil</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>	c.f(c)</code></span>
+<span class="codeline" id="line-62"><code>	coroexit(c)</code></span>
+<span class="codeline" id="line-63"><code>}</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>// coroexit is like coroswitch but closes the coro</code></span>
+<span class="codeline" id="line-66"><code>// and exits the current goroutine</code></span>
+<span class="codeline" id="line-67"><code>func coroexit(c *coro) {</code></span>
+<span class="codeline" id="line-68"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-69"><code>	gp.coroarg = c</code></span>
+<span class="codeline" id="line-70"><code>	gp.coroexit = true</code></span>
+<span class="codeline" id="line-71"><code>	mcall(coroswitch_m)</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>//go:linkname coroswitch</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>// coroswitch switches to the goroutine blocked on c</code></span>
+<span class="codeline" id="line-77"><code>// and then blocks the current goroutine on c.</code></span>
+<span class="codeline" id="line-78"><code>func coroswitch(c *coro) {</code></span>
+<span class="codeline" id="line-79"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-80"><code>	gp.coroarg = c</code></span>
+<span class="codeline" id="line-81"><code>	mcall(coroswitch_m)</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// coroswitch_m is the implementation of coroswitch</code></span>
+<span class="codeline" id="line-85"><code>// that runs on the m stack.</code></span>
+<span class="codeline" id="line-86"><code>//</code></span>
+<span class="codeline" id="line-87"><code>// Note: Coroutine switches are expected to happen at</code></span>
+<span class="codeline" id="line-88"><code>// an order of magnitude (or more) higher frequency</code></span>
+<span class="codeline" id="line-89"><code>// than regular goroutine switches, so this path is heavily</code></span>
+<span class="codeline" id="line-90"><code>// optimized to remove unnecessary work.</code></span>
+<span class="codeline" id="line-91"><code>// The fast path here is three CAS: the one at the top on gp.atomicstatus,</code></span>
+<span class="codeline" id="line-92"><code>// the one in the middle to choose the next g,</code></span>
+<span class="codeline" id="line-93"><code>// and the one at the bottom on gnext.atomicstatus.</code></span>
+<span class="codeline" id="line-94"><code>// It is important not to add more atomic operations or other</code></span>
+<span class="codeline" id="line-95"><code>// expensive operations to the fast path.</code></span>
+<span class="codeline" id="line-96"><code>func coroswitch_m(gp *g) {</code></span>
+<span class="codeline" id="line-97"><code>	// TODO(rsc,mknyszek): add tracing support in a lightweight manner.</code></span>
+<span class="codeline" id="line-98"><code>	// Probably the tracer will need a global bool (set and cleared during STW)</code></span>
+<span class="codeline" id="line-99"><code>	// that this code can check to decide whether to use trace.gen.Load();</code></span>
+<span class="codeline" id="line-100"><code>	// we do not want to do the atomic load all the time, especially when</code></span>
+<span class="codeline" id="line-101"><code>	// tracer use is relatively rare.</code></span>
+<span class="codeline" id="line-102"><code>	c := gp.coroarg</code></span>
+<span class="codeline" id="line-103"><code>	gp.coroarg = nil</code></span>
+<span class="codeline" id="line-104"><code>	exit := gp.coroexit</code></span>
+<span class="codeline" id="line-105"><code>	gp.coroexit = false</code></span>
+<span class="codeline" id="line-106"><code>	mp := gp.m</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	if exit {</code></span>
+<span class="codeline" id="line-109"><code>		gdestroy(gp)</code></span>
+<span class="codeline" id="line-110"><code>		gp = nil</code></span>
+<span class="codeline" id="line-111"><code>	} else {</code></span>
+<span class="codeline" id="line-112"><code>		// If we can CAS ourselves directly from running to waiting, so do,</code></span>
+<span class="codeline" id="line-113"><code>		// keeping the control transfer as lightweight as possible.</code></span>
+<span class="codeline" id="line-114"><code>		gp.waitreason = waitReasonCoroutine</code></span>
+<span class="codeline" id="line-115"><code>		if !gp.atomicstatus.CompareAndSwap(_Grunning, _Gwaiting) {</code></span>
+<span class="codeline" id="line-116"><code>			// The CAS failed: use casgstatus, which will take care of</code></span>
+<span class="codeline" id="line-117"><code>			// coordinating with the garbage collector about the state change.</code></span>
+<span class="codeline" id="line-118"><code>			casgstatus(gp, _Grunning, _Gwaiting)</code></span>
+<span class="codeline" id="line-119"><code>		}</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>		// Clear gp.m.</code></span>
+<span class="codeline" id="line-122"><code>		setMNoWB(&amp;gp.m, nil)</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>	// The goroutine stored in c is the one to run next.</code></span>
+<span class="codeline" id="line-126"><code>	// Swap it with ourselves.</code></span>
+<span class="codeline" id="line-127"><code>	var gnext *g</code></span>
+<span class="codeline" id="line-128"><code>	for {</code></span>
+<span class="codeline" id="line-129"><code>		// Note: this is a racy load, but it will eventually</code></span>
+<span class="codeline" id="line-130"><code>		// get the right value, and if it gets the wrong value,</code></span>
+<span class="codeline" id="line-131"><code>		// the c.gp.cas will fail, so no harm done other than</code></span>
+<span class="codeline" id="line-132"><code>		// a wasted loop iteration.</code></span>
+<span class="codeline" id="line-133"><code>		// The cas will also sync c.gp's</code></span>
+<span class="codeline" id="line-134"><code>		// memory enough that the next iteration of the racy load</code></span>
+<span class="codeline" id="line-135"><code>		// should see the correct value.</code></span>
+<span class="codeline" id="line-136"><code>		// We are avoiding the atomic load to keep this path</code></span>
+<span class="codeline" id="line-137"><code>		// as lightweight as absolutely possible.</code></span>
+<span class="codeline" id="line-138"><code>		// (The atomic load is free on x86 but not free elsewhere.)</code></span>
+<span class="codeline" id="line-139"><code>		next := c.gp</code></span>
+<span class="codeline" id="line-140"><code>		if next.ptr() == nil {</code></span>
+<span class="codeline" id="line-141"><code>			throw("coroswitch on exited coro")</code></span>
+<span class="codeline" id="line-142"><code>		}</code></span>
+<span class="codeline" id="line-143"><code>		var self guintptr</code></span>
+<span class="codeline" id="line-144"><code>		self.set(gp)</code></span>
+<span class="codeline" id="line-145"><code>		if c.gp.cas(next, self) {</code></span>
+<span class="codeline" id="line-146"><code>			gnext = next.ptr()</code></span>
+<span class="codeline" id="line-147"><code>			break</code></span>
+<span class="codeline" id="line-148"><code>		}</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	// Start running next, without heavy scheduling machinery.</code></span>
+<span class="codeline" id="line-152"><code>	// Set mp.curg and gnext.m and then update scheduling state</code></span>
+<span class="codeline" id="line-153"><code>	// directly if possible.</code></span>
+<span class="codeline" id="line-154"><code>	setGNoWB(&amp;mp.curg, gnext)</code></span>
+<span class="codeline" id="line-155"><code>	setMNoWB(&amp;gnext.m, mp)</code></span>
+<span class="codeline" id="line-156"><code>	if !gnext.atomicstatus.CompareAndSwap(_Gwaiting, _Grunning) {</code></span>
+<span class="codeline" id="line-157"><code>		// The CAS failed: use casgstatus, which will take care of</code></span>
+<span class="codeline" id="line-158"><code>		// coordinating with the garbage collector about the state change.</code></span>
+<span class="codeline" id="line-159"><code>		casgstatus(gnext, _Gwaiting, _Grunnable)</code></span>
+<span class="codeline" id="line-160"><code>		casgstatus(gnext, _Grunnable, _Grunning)</code></span>
+<span class="codeline" id="line-161"><code>	}</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>	// Switch to gnext. Does not return.</code></span>
+<span class="codeline" id="line-164"><code>	gogo(&amp;gnext.sched)</code></span>
+<span class="codeline" id="line-165"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

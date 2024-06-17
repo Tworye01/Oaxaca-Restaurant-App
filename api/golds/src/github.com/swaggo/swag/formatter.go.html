@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: formatter.go in package github.com/swaggo/swag</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	formatter.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/swaggo/swag.html">github.com/swaggo/swag</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package swag</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"bytes"</code></span>
+<span class="codeline" id="line-5"><code>	"fmt"</code></span>
+<span class="codeline" id="line-6"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-7"><code>	goparser "go/parser"</code></span>
+<span class="codeline" id="line-8"><code>	"go/token"</code></span>
+<span class="codeline" id="line-9"><code>	"log"</code></span>
+<span class="codeline" id="line-10"><code>	"os"</code></span>
+<span class="codeline" id="line-11"><code>	"regexp"</code></span>
+<span class="codeline" id="line-12"><code>	"sort"</code></span>
+<span class="codeline" id="line-13"><code>	"strings"</code></span>
+<span class="codeline" id="line-14"><code>	"text/tabwriter"</code></span>
+<span class="codeline" id="line-15"><code>)</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>// Check of @Param @Success @Failure @Response @Header</code></span>
+<span class="codeline" id="line-18"><code>var specialTagForSplit = map[string]bool{</code></span>
+<span class="codeline" id="line-19"><code>	paramAttr:    true,</code></span>
+<span class="codeline" id="line-20"><code>	successAttr:  true,</code></span>
+<span class="codeline" id="line-21"><code>	failureAttr:  true,</code></span>
+<span class="codeline" id="line-22"><code>	responseAttr: true,</code></span>
+<span class="codeline" id="line-23"><code>	headerAttr:   true,</code></span>
+<span class="codeline" id="line-24"><code>}</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>var skipChar = map[byte]byte{</code></span>
+<span class="codeline" id="line-27"><code>	'"': '"',</code></span>
+<span class="codeline" id="line-28"><code>	'(': ')',</code></span>
+<span class="codeline" id="line-29"><code>	'{': '}',</code></span>
+<span class="codeline" id="line-30"><code>	'[': ']',</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>// Formatter implements a formatter for Go source files.</code></span>
+<span class="codeline" id="line-34"><code>type Formatter struct {</code></span>
+<span class="codeline" id="line-35"><code>	// debugging output goes here</code></span>
+<span class="codeline" id="line-36"><code>	debug Debugger</code></span>
+<span class="codeline" id="line-37"><code>}</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>// NewFormatter create a new formatter instance.</code></span>
+<span class="codeline" id="line-40"><code>func NewFormatter() *Formatter {</code></span>
+<span class="codeline" id="line-41"><code>	formatter := &amp;Formatter{</code></span>
+<span class="codeline" id="line-42"><code>		debug: log.New(os.Stdout, "", log.LstdFlags),</code></span>
+<span class="codeline" id="line-43"><code>	}</code></span>
+<span class="codeline" id="line-44"><code>	return formatter</code></span>
+<span class="codeline" id="line-45"><code>}</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>// Format formats swag comments in contents. It uses fileName to report errors</code></span>
+<span class="codeline" id="line-48"><code>// that happen during parsing of contents.</code></span>
+<span class="codeline" id="line-49"><code>func (f *Formatter) Format(fileName string, contents []byte) ([]byte, error) {</code></span>
+<span class="codeline" id="line-50"><code>	fileSet := token.NewFileSet()</code></span>
+<span class="codeline" id="line-51"><code>	ast, err := goparser.ParseFile(fileSet, fileName, contents, goparser.ParseComments)</code></span>
+<span class="codeline" id="line-52"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-53"><code>		return nil, err</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>	// Formatting changes are described as an edit list of byte range</code></span>
+<span class="codeline" id="line-57"><code>	// replacements. We make these content-level edits directly rather than</code></span>
+<span class="codeline" id="line-58"><code>	// changing the AST nodes and writing those out (via [go/printer] or</code></span>
+<span class="codeline" id="line-59"><code>	// [go/format]) so that we only change the formatting of Swag attribute</code></span>
+<span class="codeline" id="line-60"><code>	// comments. This won't touch the formatting of any other comments, or of</code></span>
+<span class="codeline" id="line-61"><code>	// functions, etc.</code></span>
+<span class="codeline" id="line-62"><code>	maxEdits := 0</code></span>
+<span class="codeline" id="line-63"><code>	for _, comment := range ast.Comments {</code></span>
+<span class="codeline" id="line-64"><code>		maxEdits += len(comment.List)</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code>	edits := make(edits, 0, maxEdits)</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>	for _, comment := range ast.Comments {</code></span>
+<span class="codeline" id="line-69"><code>		formatFuncDoc(fileSet, comment.List, &amp;edits)</code></span>
+<span class="codeline" id="line-70"><code>	}</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	return edits.apply(contents), nil</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>type edit struct {</code></span>
+<span class="codeline" id="line-76"><code>	begin       int</code></span>
+<span class="codeline" id="line-77"><code>	end         int</code></span>
+<span class="codeline" id="line-78"><code>	replacement []byte</code></span>
+<span class="codeline" id="line-79"><code>}</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>type edits []edit</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>func (edits edits) apply(contents []byte) []byte {</code></span>
+<span class="codeline" id="line-84"><code>	// Apply the edits with the highest offset first, so that earlier edits</code></span>
+<span class="codeline" id="line-85"><code>	// don't affect the offsets of later edits.</code></span>
+<span class="codeline" id="line-86"><code>	sort.Slice(edits, func(i, j int) bool {</code></span>
+<span class="codeline" id="line-87"><code>		return edits[i].begin &gt; edits[j].begin</code></span>
+<span class="codeline" id="line-88"><code>	})</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	for _, edit := range edits {</code></span>
+<span class="codeline" id="line-91"><code>		prefix := contents[:edit.begin]</code></span>
+<span class="codeline" id="line-92"><code>		suffix := contents[edit.end:]</code></span>
+<span class="codeline" id="line-93"><code>		contents = append(prefix, append(edit.replacement, suffix...)...)</code></span>
+<span class="codeline" id="line-94"><code>	}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>	return contents</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>// formatFuncDoc reformats the comment lines in commentList, and appends any</code></span>
+<span class="codeline" id="line-100"><code>// changes to the edit list.</code></span>
+<span class="codeline" id="line-101"><code>func formatFuncDoc(fileSet *token.FileSet, commentList []*ast.Comment, edits *edits) {</code></span>
+<span class="codeline" id="line-102"><code>	// Building the edit list to format a comment block is a two-step process.</code></span>
+<span class="codeline" id="line-103"><code>	// First, we iterate over each comment line looking for Swag attributes. In</code></span>
+<span class="codeline" id="line-104"><code>	// each one we find, we replace alignment whitespace with a tab character,</code></span>
+<span class="codeline" id="line-105"><code>	// then write the result into a tab writer.</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>	linesToComments := make(map[int]int, len(commentList))</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>	buffer := &amp;bytes.Buffer{}</code></span>
+<span class="codeline" id="line-110"><code>	w := tabwriter.NewWriter(buffer, 1, 4, 1, '\t', 0)</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	for commentIndex, comment := range commentList {</code></span>
+<span class="codeline" id="line-113"><code>		text := comment.Text</code></span>
+<span class="codeline" id="line-114"><code>		if attr, body, found := swagComment(text); found {</code></span>
+<span class="codeline" id="line-115"><code>			formatted := "//\t" + attr</code></span>
+<span class="codeline" id="line-116"><code>			if body != "" {</code></span>
+<span class="codeline" id="line-117"><code>				formatted += "\t" + splitComment2(attr, body)</code></span>
+<span class="codeline" id="line-118"><code>			}</code></span>
+<span class="codeline" id="line-119"><code>			_, _ = fmt.Fprintln(w, formatted)</code></span>
+<span class="codeline" id="line-120"><code>			linesToComments[len(linesToComments)] = commentIndex</code></span>
+<span class="codeline" id="line-121"><code>		}</code></span>
+<span class="codeline" id="line-122"><code>	}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>	// Once we've loaded all of the comment lines to be aligned into the tab</code></span>
+<span class="codeline" id="line-125"><code>	// writer, flushing it causes the aligned text to be written out to the</code></span>
+<span class="codeline" id="line-126"><code>	// backing buffer.</code></span>
+<span class="codeline" id="line-127"><code>	_ = w.Flush()</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>	// Now the second step: we iterate over the aligned comment lines that were</code></span>
+<span class="codeline" id="line-130"><code>	// written into the backing buffer, pair each one up to its original</code></span>
+<span class="codeline" id="line-131"><code>	// comment line, and use the combination to describe the edit that needs to</code></span>
+<span class="codeline" id="line-132"><code>	// be made to the original input.</code></span>
+<span class="codeline" id="line-133"><code>	formattedComments := bytes.Split(buffer.Bytes(), []byte("\n"))</code></span>
+<span class="codeline" id="line-134"><code>	for lineIndex, commentIndex := range linesToComments {</code></span>
+<span class="codeline" id="line-135"><code>		comment := commentList[commentIndex]</code></span>
+<span class="codeline" id="line-136"><code>		*edits = append(*edits, edit{</code></span>
+<span class="codeline" id="line-137"><code>			begin:       fileSet.Position(comment.Pos()).Offset,</code></span>
+<span class="codeline" id="line-138"><code>			end:         fileSet.Position(comment.End()).Offset,</code></span>
+<span class="codeline" id="line-139"><code>			replacement: formattedComments[lineIndex],</code></span>
+<span class="codeline" id="line-140"><code>		})</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>func splitComment2(attr, body string) string {</code></span>
+<span class="codeline" id="line-145"><code>	if specialTagForSplit[strings.ToLower(attr)] {</code></span>
+<span class="codeline" id="line-146"><code>		for i := 0; i &lt; len(body); i++ {</code></span>
+<span class="codeline" id="line-147"><code>			if skipEnd, ok := skipChar[body[i]]; ok {</code></span>
+<span class="codeline" id="line-148"><code>				skipStart, n := body[i], 1</code></span>
+<span class="codeline" id="line-149"><code>				for i++; i &lt; len(body); i++ {</code></span>
+<span class="codeline" id="line-150"><code>					if skipStart != skipEnd &amp;&amp; body[i] == skipStart {</code></span>
+<span class="codeline" id="line-151"><code>						n++</code></span>
+<span class="codeline" id="line-152"><code>					} else if body[i] == skipEnd {</code></span>
+<span class="codeline" id="line-153"><code>						n--</code></span>
+<span class="codeline" id="line-154"><code>						if n == 0 {</code></span>
+<span class="codeline" id="line-155"><code>							break</code></span>
+<span class="codeline" id="line-156"><code>						}</code></span>
+<span class="codeline" id="line-157"><code>					}</code></span>
+<span class="codeline" id="line-158"><code>				}</code></span>
+<span class="codeline" id="line-159"><code>			} else if body[i] == ' ' || body[i] == '\t' {</code></span>
+<span class="codeline" id="line-160"><code>				j := i</code></span>
+<span class="codeline" id="line-161"><code>				for ; j &lt; len(body) &amp;&amp; (body[j] == ' ' || body[j] == '\t'); j++ {</code></span>
+<span class="codeline" id="line-162"><code>				}</code></span>
+<span class="codeline" id="line-163"><code>				body = replaceRange(body, i, j, "\t")</code></span>
+<span class="codeline" id="line-164"><code>			}</code></span>
+<span class="codeline" id="line-165"><code>		}</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>	return body</code></span>
+<span class="codeline" id="line-168"><code>}</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>func replaceRange(s string, start, end int, new string) string {</code></span>
+<span class="codeline" id="line-171"><code>	return s[:start] + new + s[end:]</code></span>
+<span class="codeline" id="line-172"><code>}</code></span>
+<span class="codeline" id="line-173"><code></code></span>
+<span class="codeline" id="line-174"><code>var swagCommentLineExpression = regexp.MustCompile(`^\/\/\s+(@[\S.]+)\s*(.*)`)</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>func swagComment(comment string) (string, string, bool) {</code></span>
+<span class="codeline" id="line-177"><code>	matches := swagCommentLineExpression.FindStringSubmatch(comment)</code></span>
+<span class="codeline" id="line-178"><code>	if matches == nil {</code></span>
+<span class="codeline" id="line-179"><code>		return "", "", false</code></span>
+<span class="codeline" id="line-180"><code>	}</code></span>
+<span class="codeline" id="line-181"><code>	return matches[1], matches[2], true</code></span>
+<span class="codeline" id="line-182"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: routing_index.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	routing_index.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package http</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import "math"</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// A routingIndex optimizes conflict detection by indexing patterns.</code></span>
+<span class="codeline" id="line-10"><code>//</code></span>
+<span class="codeline" id="line-11"><code>// The basic idea is to rule out patterns that cannot conflict with a given</code></span>
+<span class="codeline" id="line-12"><code>// pattern because they have a different literal in a corresponding segment.</code></span>
+<span class="codeline" id="line-13"><code>// See the comments in [routingIndex.possiblyConflictingPatterns] for more details.</code></span>
+<span class="codeline" id="line-14"><code>type routingIndex struct {</code></span>
+<span class="codeline" id="line-15"><code>	// map from a particular segment position and value to all registered patterns</code></span>
+<span class="codeline" id="line-16"><code>	// with that value in that position.</code></span>
+<span class="codeline" id="line-17"><code>	// For example, the key {1, "b"} would hold the patterns "/a/b" and "/a/b/c"</code></span>
+<span class="codeline" id="line-18"><code>	// but not "/a", "b/a", "/a/c" or "/a/{x}".</code></span>
+<span class="codeline" id="line-19"><code>	segments map[routingIndexKey][]*pattern</code></span>
+<span class="codeline" id="line-20"><code>	// All patterns that end in a multi wildcard (including trailing slash).</code></span>
+<span class="codeline" id="line-21"><code>	// We do not try to be clever about indexing multi patterns, because there</code></span>
+<span class="codeline" id="line-22"><code>	// are unlikely to be many of them.</code></span>
+<span class="codeline" id="line-23"><code>	multis []*pattern</code></span>
+<span class="codeline" id="line-24"><code>}</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>type routingIndexKey struct {</code></span>
+<span class="codeline" id="line-27"><code>	pos int    // 0-based segment position</code></span>
+<span class="codeline" id="line-28"><code>	s   string // literal, or empty for wildcard</code></span>
+<span class="codeline" id="line-29"><code>}</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>func (idx *routingIndex) addPattern(pat *pattern) {</code></span>
+<span class="codeline" id="line-32"><code>	if pat.lastSegment().multi {</code></span>
+<span class="codeline" id="line-33"><code>		idx.multis = append(idx.multis, pat)</code></span>
+<span class="codeline" id="line-34"><code>	} else {</code></span>
+<span class="codeline" id="line-35"><code>		if idx.segments == nil {</code></span>
+<span class="codeline" id="line-36"><code>			idx.segments = map[routingIndexKey][]*pattern{}</code></span>
+<span class="codeline" id="line-37"><code>		}</code></span>
+<span class="codeline" id="line-38"><code>		for pos, seg := range pat.segments {</code></span>
+<span class="codeline" id="line-39"><code>			key := routingIndexKey{pos: pos, s: ""}</code></span>
+<span class="codeline" id="line-40"><code>			if !seg.wild {</code></span>
+<span class="codeline" id="line-41"><code>				key.s = seg.s</code></span>
+<span class="codeline" id="line-42"><code>			}</code></span>
+<span class="codeline" id="line-43"><code>			idx.segments[key] = append(idx.segments[key], pat)</code></span>
+<span class="codeline" id="line-44"><code>		}</code></span>
+<span class="codeline" id="line-45"><code>	}</code></span>
+<span class="codeline" id="line-46"><code>}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>// possiblyConflictingPatterns calls f on all patterns that might conflict with</code></span>
+<span class="codeline" id="line-49"><code>// pat. If f returns a non-nil error, possiblyConflictingPatterns returns immediately</code></span>
+<span class="codeline" id="line-50"><code>// with that error.</code></span>
+<span class="codeline" id="line-51"><code>//</code></span>
+<span class="codeline" id="line-52"><code>// To be correct, possiblyConflictingPatterns must include all patterns that</code></span>
+<span class="codeline" id="line-53"><code>// might conflict. But it may also include patterns that cannot conflict.</code></span>
+<span class="codeline" id="line-54"><code>// For instance, an implementation that returns all registered patterns is correct.</code></span>
+<span class="codeline" id="line-55"><code>// We use this fact throughout, simplifying the implementation by returning more</code></span>
+<span class="codeline" id="line-56"><code>// patterns that we might need to.</code></span>
+<span class="codeline" id="line-57"><code>func (idx *routingIndex) possiblyConflictingPatterns(pat *pattern, f func(*pattern) error) (err error) {</code></span>
+<span class="codeline" id="line-58"><code>	// Terminology:</code></span>
+<span class="codeline" id="line-59"><code>	//   dollar pattern: one ending in "{$}"</code></span>
+<span class="codeline" id="line-60"><code>	//   multi pattern: one ending in a trailing slash or "{x...}" wildcard</code></span>
+<span class="codeline" id="line-61"><code>	//   ordinary pattern: neither of the above</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>	// apply f to all the pats, stopping on error.</code></span>
+<span class="codeline" id="line-64"><code>	apply := func(pats []*pattern) error {</code></span>
+<span class="codeline" id="line-65"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-66"><code>			return err</code></span>
+<span class="codeline" id="line-67"><code>		}</code></span>
+<span class="codeline" id="line-68"><code>		for _, p := range pats {</code></span>
+<span class="codeline" id="line-69"><code>			err = f(p)</code></span>
+<span class="codeline" id="line-70"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-71"><code>				return err</code></span>
+<span class="codeline" id="line-72"><code>			}</code></span>
+<span class="codeline" id="line-73"><code>		}</code></span>
+<span class="codeline" id="line-74"><code>		return nil</code></span>
+<span class="codeline" id="line-75"><code>	}</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>	// Our simple indexing scheme doesn't try to prune multi patterns; assume</code></span>
+<span class="codeline" id="line-78"><code>	// any of them can match the argument.</code></span>
+<span class="codeline" id="line-79"><code>	if err := apply(idx.multis); err != nil {</code></span>
+<span class="codeline" id="line-80"><code>		return err</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code>	if pat.lastSegment().s == "/" {</code></span>
+<span class="codeline" id="line-83"><code>		// All paths that a dollar pattern matches end in a slash; no paths that</code></span>
+<span class="codeline" id="line-84"><code>		// an ordinary pattern matches do. So only other dollar or multi</code></span>
+<span class="codeline" id="line-85"><code>		// patterns can conflict with a dollar pattern. Furthermore, conflicting</code></span>
+<span class="codeline" id="line-86"><code>		// dollar patterns must have the {$} in the same position.</code></span>
+<span class="codeline" id="line-87"><code>		return apply(idx.segments[routingIndexKey{s: "/", pos: len(pat.segments) - 1}])</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code>	// For ordinary and multi patterns, the only conflicts can be with a multi,</code></span>
+<span class="codeline" id="line-90"><code>	// or a pattern that has the same literal or a wildcard at some literal</code></span>
+<span class="codeline" id="line-91"><code>	// position.</code></span>
+<span class="codeline" id="line-92"><code>	// We could intersect all the possible matches at each position, but we</code></span>
+<span class="codeline" id="line-93"><code>	// do something simpler: we find the position with the fewest patterns.</code></span>
+<span class="codeline" id="line-94"><code>	var lmin, wmin []*pattern</code></span>
+<span class="codeline" id="line-95"><code>	min := math.MaxInt</code></span>
+<span class="codeline" id="line-96"><code>	hasLit := false</code></span>
+<span class="codeline" id="line-97"><code>	for i, seg := range pat.segments {</code></span>
+<span class="codeline" id="line-98"><code>		if seg.multi {</code></span>
+<span class="codeline" id="line-99"><code>			break</code></span>
+<span class="codeline" id="line-100"><code>		}</code></span>
+<span class="codeline" id="line-101"><code>		if !seg.wild {</code></span>
+<span class="codeline" id="line-102"><code>			hasLit = true</code></span>
+<span class="codeline" id="line-103"><code>			lpats := idx.segments[routingIndexKey{s: seg.s, pos: i}]</code></span>
+<span class="codeline" id="line-104"><code>			wpats := idx.segments[routingIndexKey{s: "", pos: i}]</code></span>
+<span class="codeline" id="line-105"><code>			if sum := len(lpats) + len(wpats); sum &lt; min {</code></span>
+<span class="codeline" id="line-106"><code>				lmin = lpats</code></span>
+<span class="codeline" id="line-107"><code>				wmin = wpats</code></span>
+<span class="codeline" id="line-108"><code>				min = sum</code></span>
+<span class="codeline" id="line-109"><code>			}</code></span>
+<span class="codeline" id="line-110"><code>		}</code></span>
+<span class="codeline" id="line-111"><code>	}</code></span>
+<span class="codeline" id="line-112"><code>	if hasLit {</code></span>
+<span class="codeline" id="line-113"><code>		apply(lmin)</code></span>
+<span class="codeline" id="line-114"><code>		apply(wmin)</code></span>
+<span class="codeline" id="line-115"><code>		return err</code></span>
+<span class="codeline" id="line-116"><code>	}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	// This pattern is all wildcards.</code></span>
+<span class="codeline" id="line-119"><code>	// Check it against everything.</code></span>
+<span class="codeline" id="line-120"><code>	for _, pats := range idx.segments {</code></span>
+<span class="codeline" id="line-121"><code>		apply(pats)</code></span>
+<span class="codeline" id="line-122"><code>	}</code></span>
+<span class="codeline" id="line-123"><code>	return err</code></span>
+<span class="codeline" id="line-124"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

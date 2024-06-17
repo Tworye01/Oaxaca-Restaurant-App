@@ -1,0 +1,859 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: compress_fragment.go in package github.com/andybalholm/brotli</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	compress_fragment.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/andybalholm/brotli.html">github.com/andybalholm/brotli</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package brotli</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import "encoding/binary"</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>/* Copyright 2015 Google Inc. All Rights Reserved.</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>   Distributed under MIT license.</code></span>
+<span class="codeline" id="line-8"><code>   See file LICENSE for detail or copy at https://opensource.org/licenses/MIT</code></span>
+<span class="codeline" id="line-9"><code>*/</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>/* Function for fast encoding of an input fragment, independently from the input</code></span>
+<span class="codeline" id="line-12"><code>   history. This function uses one-pass processing: when we find a backward</code></span>
+<span class="codeline" id="line-13"><code>   match, we immediately emit the corresponding command and literal codes to</code></span>
+<span class="codeline" id="line-14"><code>   the bit stream.</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>   Adapted from the CompressFragment() function in</code></span>
+<span class="codeline" id="line-17"><code>   https://github.com/google/snappy/blob/master/snappy.cc */</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>const maxDistance_compress_fragment = 262128</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>func hash5(p []byte, shift uint) uint32 {</code></span>
+<span class="codeline" id="line-22"><code>	var h uint64 = (binary.LittleEndian.Uint64(p) &lt;&lt; 24) * uint64(kHashMul32)</code></span>
+<span class="codeline" id="line-23"><code>	return uint32(h &gt;&gt; shift)</code></span>
+<span class="codeline" id="line-24"><code>}</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>func hashBytesAtOffset5(v uint64, offset int, shift uint) uint32 {</code></span>
+<span class="codeline" id="line-27"><code>	assert(offset &gt;= 0)</code></span>
+<span class="codeline" id="line-28"><code>	assert(offset &lt;= 3)</code></span>
+<span class="codeline" id="line-29"><code>	{</code></span>
+<span class="codeline" id="line-30"><code>		var h uint64 = ((v &gt;&gt; uint(8*offset)) &lt;&lt; 24) * uint64(kHashMul32)</code></span>
+<span class="codeline" id="line-31"><code>		return uint32(h &gt;&gt; shift)</code></span>
+<span class="codeline" id="line-32"><code>	}</code></span>
+<span class="codeline" id="line-33"><code>}</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>func isMatch5(p1 []byte, p2 []byte) bool {</code></span>
+<span class="codeline" id="line-36"><code>	return binary.LittleEndian.Uint32(p1) == binary.LittleEndian.Uint32(p2) &amp;&amp;</code></span>
+<span class="codeline" id="line-37"><code>		p1[4] == p2[4]</code></span>
+<span class="codeline" id="line-38"><code>}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>/* Builds a literal prefix code into "depths" and "bits" based on the statistics</code></span>
+<span class="codeline" id="line-41"><code>   of the "input" string and stores it into the bit stream.</code></span>
+<span class="codeline" id="line-42"><code>   Note that the prefix code here is built from the pre-LZ77 input, therefore</code></span>
+<span class="codeline" id="line-43"><code>   we can only approximate the statistics of the actual literal stream.</code></span>
+<span class="codeline" id="line-44"><code>   Moreover, for long inputs we build a histogram from a sample of the input</code></span>
+<span class="codeline" id="line-45"><code>   and thus have to assign a non-zero depth for each literal.</code></span>
+<span class="codeline" id="line-46"><code>   Returns estimated compression ratio millibytes/char for encoding given input</code></span>
+<span class="codeline" id="line-47"><code>   with generated code. */</code></span>
+<span class="codeline" id="line-48"><code>func buildAndStoreLiteralPrefixCode(input []byte, input_size uint, depths []byte, bits []uint16, storage_ix *uint, storage []byte) uint {</code></span>
+<span class="codeline" id="line-49"><code>	var histogram = [256]uint32{0}</code></span>
+<span class="codeline" id="line-50"><code>	var histogram_total uint</code></span>
+<span class="codeline" id="line-51"><code>	var i uint</code></span>
+<span class="codeline" id="line-52"><code>	if input_size &lt; 1&lt;&lt;15 {</code></span>
+<span class="codeline" id="line-53"><code>		for i = 0; i &lt; input_size; i++ {</code></span>
+<span class="codeline" id="line-54"><code>			histogram[input[i]]++</code></span>
+<span class="codeline" id="line-55"><code>		}</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>		histogram_total = input_size</code></span>
+<span class="codeline" id="line-58"><code>		for i = 0; i &lt; 256; i++ {</code></span>
+<span class="codeline" id="line-59"><code>			/* We weigh the first 11 samples with weight 3 to account for the</code></span>
+<span class="codeline" id="line-60"><code>			   balancing effect of the LZ77 phase on the histogram. */</code></span>
+<span class="codeline" id="line-61"><code>			var adjust uint32 = 2 * brotli_min_uint32_t(histogram[i], 11)</code></span>
+<span class="codeline" id="line-62"><code>			histogram[i] += adjust</code></span>
+<span class="codeline" id="line-63"><code>			histogram_total += uint(adjust)</code></span>
+<span class="codeline" id="line-64"><code>		}</code></span>
+<span class="codeline" id="line-65"><code>	} else {</code></span>
+<span class="codeline" id="line-66"><code>		const kSampleRate uint = 29</code></span>
+<span class="codeline" id="line-67"><code>		for i = 0; i &lt; input_size; i += kSampleRate {</code></span>
+<span class="codeline" id="line-68"><code>			histogram[input[i]]++</code></span>
+<span class="codeline" id="line-69"><code>		}</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>		histogram_total = (input_size + kSampleRate - 1) / kSampleRate</code></span>
+<span class="codeline" id="line-72"><code>		for i = 0; i &lt; 256; i++ {</code></span>
+<span class="codeline" id="line-73"><code>			/* We add 1 to each population count to avoid 0 bit depths (since this is</code></span>
+<span class="codeline" id="line-74"><code>			   only a sample and we don't know if the symbol appears or not), and we</code></span>
+<span class="codeline" id="line-75"><code>			   weigh the first 11 samples with weight 3 to account for the balancing</code></span>
+<span class="codeline" id="line-76"><code>			   effect of the LZ77 phase on the histogram (more frequent symbols are</code></span>
+<span class="codeline" id="line-77"><code>			   more likely to be in backward references instead as literals). */</code></span>
+<span class="codeline" id="line-78"><code>			var adjust uint32 = 1 + 2*brotli_min_uint32_t(histogram[i], 11)</code></span>
+<span class="codeline" id="line-79"><code>			histogram[i] += adjust</code></span>
+<span class="codeline" id="line-80"><code>			histogram_total += uint(adjust)</code></span>
+<span class="codeline" id="line-81"><code>		}</code></span>
+<span class="codeline" id="line-82"><code>	}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>	buildAndStoreHuffmanTreeFast(histogram[:], histogram_total, /* max_bits = */</code></span>
+<span class="codeline" id="line-85"><code>		8, depths, bits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-86"><code>	{</code></span>
+<span class="codeline" id="line-87"><code>		var literal_ratio uint = 0</code></span>
+<span class="codeline" id="line-88"><code>		for i = 0; i &lt; 256; i++ {</code></span>
+<span class="codeline" id="line-89"><code>			if histogram[i] != 0 {</code></span>
+<span class="codeline" id="line-90"><code>				literal_ratio += uint(histogram[i] * uint32(depths[i]))</code></span>
+<span class="codeline" id="line-91"><code>			}</code></span>
+<span class="codeline" id="line-92"><code>		}</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>		/* Estimated encoding ratio, millibytes per symbol. */</code></span>
+<span class="codeline" id="line-95"><code>		return (literal_ratio * 125) / histogram_total</code></span>
+<span class="codeline" id="line-96"><code>	}</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>/* Builds a command and distance prefix code (each 64 symbols) into "depth" and</code></span>
+<span class="codeline" id="line-100"><code>   "bits" based on "histogram" and stores it into the bit stream. */</code></span>
+<span class="codeline" id="line-101"><code>func buildAndStoreCommandPrefixCode1(histogram []uint32, depth []byte, bits []uint16, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-102"><code>	var tree [129]huffmanTree</code></span>
+<span class="codeline" id="line-103"><code>	var cmd_depth = [numCommandSymbols]byte{0}</code></span>
+<span class="codeline" id="line-104"><code>	/* Tree size for building a tree over 64 symbols is 2 * 64 + 1. */</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>	var cmd_bits [64]uint16</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	createHuffmanTree(histogram, 64, 15, tree[:], depth)</code></span>
+<span class="codeline" id="line-109"><code>	createHuffmanTree(histogram[64:], 64, 14, tree[:], depth[64:])</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>	/* We have to jump through a few hoops here in order to compute</code></span>
+<span class="codeline" id="line-112"><code>	   the command bits because the symbols are in a different order than in</code></span>
+<span class="codeline" id="line-113"><code>	   the full alphabet. This looks complicated, but having the symbols</code></span>
+<span class="codeline" id="line-114"><code>	   in this order in the command bits saves a few branches in the Emit*</code></span>
+<span class="codeline" id="line-115"><code>	   functions. */</code></span>
+<span class="codeline" id="line-116"><code>	copy(cmd_depth[:], depth[:24])</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	copy(cmd_depth[24:][:], depth[40:][:8])</code></span>
+<span class="codeline" id="line-119"><code>	copy(cmd_depth[32:][:], depth[24:][:8])</code></span>
+<span class="codeline" id="line-120"><code>	copy(cmd_depth[40:][:], depth[48:][:8])</code></span>
+<span class="codeline" id="line-121"><code>	copy(cmd_depth[48:][:], depth[32:][:8])</code></span>
+<span class="codeline" id="line-122"><code>	copy(cmd_depth[56:][:], depth[56:][:8])</code></span>
+<span class="codeline" id="line-123"><code>	convertBitDepthsToSymbols(cmd_depth[:], 64, cmd_bits[:])</code></span>
+<span class="codeline" id="line-124"><code>	copy(bits, cmd_bits[:24])</code></span>
+<span class="codeline" id="line-125"><code>	copy(bits[24:], cmd_bits[32:][:8])</code></span>
+<span class="codeline" id="line-126"><code>	copy(bits[32:], cmd_bits[48:][:8])</code></span>
+<span class="codeline" id="line-127"><code>	copy(bits[40:], cmd_bits[24:][:8])</code></span>
+<span class="codeline" id="line-128"><code>	copy(bits[48:], cmd_bits[40:][:8])</code></span>
+<span class="codeline" id="line-129"><code>	copy(bits[56:], cmd_bits[56:][:8])</code></span>
+<span class="codeline" id="line-130"><code>	convertBitDepthsToSymbols(depth[64:], 64, bits[64:])</code></span>
+<span class="codeline" id="line-131"><code>	{</code></span>
+<span class="codeline" id="line-132"><code>		/* Create the bit length array for the full command alphabet. */</code></span>
+<span class="codeline" id="line-133"><code>		var i uint</code></span>
+<span class="codeline" id="line-134"><code>		for i := 0; i &lt; int(64); i++ {</code></span>
+<span class="codeline" id="line-135"><code>			cmd_depth[i] = 0</code></span>
+<span class="codeline" id="line-136"><code>		} /* only 64 first values were used */</code></span>
+<span class="codeline" id="line-137"><code>		copy(cmd_depth[:], depth[:8])</code></span>
+<span class="codeline" id="line-138"><code>		copy(cmd_depth[64:][:], depth[8:][:8])</code></span>
+<span class="codeline" id="line-139"><code>		copy(cmd_depth[128:][:], depth[16:][:8])</code></span>
+<span class="codeline" id="line-140"><code>		copy(cmd_depth[192:][:], depth[24:][:8])</code></span>
+<span class="codeline" id="line-141"><code>		copy(cmd_depth[384:][:], depth[32:][:8])</code></span>
+<span class="codeline" id="line-142"><code>		for i = 0; i &lt; 8; i++ {</code></span>
+<span class="codeline" id="line-143"><code>			cmd_depth[128+8*i] = depth[40+i]</code></span>
+<span class="codeline" id="line-144"><code>			cmd_depth[256+8*i] = depth[48+i]</code></span>
+<span class="codeline" id="line-145"><code>			cmd_depth[448+8*i] = depth[56+i]</code></span>
+<span class="codeline" id="line-146"><code>		}</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>		storeHuffmanTree(cmd_depth[:], numCommandSymbols, tree[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	storeHuffmanTree(depth[64:], 64, tree[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-152"><code>}</code></span>
+<span class="codeline" id="line-153"><code></code></span>
+<span class="codeline" id="line-154"><code>/* REQUIRES: insertlen &lt; 6210 */</code></span>
+<span class="codeline" id="line-155"><code>func emitInsertLen1(insertlen uint, depth []byte, bits []uint16, histo []uint32, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-156"><code>	if insertlen &lt; 6 {</code></span>
+<span class="codeline" id="line-157"><code>		var code uint = insertlen + 40</code></span>
+<span class="codeline" id="line-158"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-159"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-160"><code>	} else if insertlen &lt; 130 {</code></span>
+<span class="codeline" id="line-161"><code>		var tail uint = insertlen - 2</code></span>
+<span class="codeline" id="line-162"><code>		var nbits uint32 = log2FloorNonZero(tail) - 1</code></span>
+<span class="codeline" id="line-163"><code>		var prefix uint = tail &gt;&gt; nbits</code></span>
+<span class="codeline" id="line-164"><code>		var inscode uint = uint((nbits &lt;&lt; 1) + uint32(prefix) + 42)</code></span>
+<span class="codeline" id="line-165"><code>		writeBits(uint(depth[inscode]), uint64(bits[inscode]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-166"><code>		writeBits(uint(nbits), uint64(tail)-(uint64(prefix)&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-167"><code>		histo[inscode]++</code></span>
+<span class="codeline" id="line-168"><code>	} else if insertlen &lt; 2114 {</code></span>
+<span class="codeline" id="line-169"><code>		var tail uint = insertlen - 66</code></span>
+<span class="codeline" id="line-170"><code>		var nbits uint32 = log2FloorNonZero(tail)</code></span>
+<span class="codeline" id="line-171"><code>		var code uint = uint(nbits + 50)</code></span>
+<span class="codeline" id="line-172"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-173"><code>		writeBits(uint(nbits), uint64(tail)-(uint64(uint(1))&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-174"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-175"><code>	} else {</code></span>
+<span class="codeline" id="line-176"><code>		writeBits(uint(depth[61]), uint64(bits[61]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-177"><code>		writeBits(12, uint64(insertlen)-2114, storage_ix, storage)</code></span>
+<span class="codeline" id="line-178"><code>		histo[61]++</code></span>
+<span class="codeline" id="line-179"><code>	}</code></span>
+<span class="codeline" id="line-180"><code>}</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>func emitLongInsertLen(insertlen uint, depth []byte, bits []uint16, histo []uint32, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-183"><code>	if insertlen &lt; 22594 {</code></span>
+<span class="codeline" id="line-184"><code>		writeBits(uint(depth[62]), uint64(bits[62]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-185"><code>		writeBits(14, uint64(insertlen)-6210, storage_ix, storage)</code></span>
+<span class="codeline" id="line-186"><code>		histo[62]++</code></span>
+<span class="codeline" id="line-187"><code>	} else {</code></span>
+<span class="codeline" id="line-188"><code>		writeBits(uint(depth[63]), uint64(bits[63]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-189"><code>		writeBits(24, uint64(insertlen)-22594, storage_ix, storage)</code></span>
+<span class="codeline" id="line-190"><code>		histo[63]++</code></span>
+<span class="codeline" id="line-191"><code>	}</code></span>
+<span class="codeline" id="line-192"><code>}</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>func emitCopyLen1(copylen uint, depth []byte, bits []uint16, histo []uint32, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-195"><code>	if copylen &lt; 10 {</code></span>
+<span class="codeline" id="line-196"><code>		writeBits(uint(depth[copylen+14]), uint64(bits[copylen+14]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-197"><code>		histo[copylen+14]++</code></span>
+<span class="codeline" id="line-198"><code>	} else if copylen &lt; 134 {</code></span>
+<span class="codeline" id="line-199"><code>		var tail uint = copylen - 6</code></span>
+<span class="codeline" id="line-200"><code>		var nbits uint32 = log2FloorNonZero(tail) - 1</code></span>
+<span class="codeline" id="line-201"><code>		var prefix uint = tail &gt;&gt; nbits</code></span>
+<span class="codeline" id="line-202"><code>		var code uint = uint((nbits &lt;&lt; 1) + uint32(prefix) + 20)</code></span>
+<span class="codeline" id="line-203"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-204"><code>		writeBits(uint(nbits), uint64(tail)-(uint64(prefix)&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-205"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-206"><code>	} else if copylen &lt; 2118 {</code></span>
+<span class="codeline" id="line-207"><code>		var tail uint = copylen - 70</code></span>
+<span class="codeline" id="line-208"><code>		var nbits uint32 = log2FloorNonZero(tail)</code></span>
+<span class="codeline" id="line-209"><code>		var code uint = uint(nbits + 28)</code></span>
+<span class="codeline" id="line-210"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-211"><code>		writeBits(uint(nbits), uint64(tail)-(uint64(uint(1))&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-212"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-213"><code>	} else {</code></span>
+<span class="codeline" id="line-214"><code>		writeBits(uint(depth[39]), uint64(bits[39]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-215"><code>		writeBits(24, uint64(copylen)-2118, storage_ix, storage)</code></span>
+<span class="codeline" id="line-216"><code>		histo[39]++</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code>}</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>func emitCopyLenLastDistance1(copylen uint, depth []byte, bits []uint16, histo []uint32, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-221"><code>	if copylen &lt; 12 {</code></span>
+<span class="codeline" id="line-222"><code>		writeBits(uint(depth[copylen-4]), uint64(bits[copylen-4]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-223"><code>		histo[copylen-4]++</code></span>
+<span class="codeline" id="line-224"><code>	} else if copylen &lt; 72 {</code></span>
+<span class="codeline" id="line-225"><code>		var tail uint = copylen - 8</code></span>
+<span class="codeline" id="line-226"><code>		var nbits uint32 = log2FloorNonZero(tail) - 1</code></span>
+<span class="codeline" id="line-227"><code>		var prefix uint = tail &gt;&gt; nbits</code></span>
+<span class="codeline" id="line-228"><code>		var code uint = uint((nbits &lt;&lt; 1) + uint32(prefix) + 4)</code></span>
+<span class="codeline" id="line-229"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-230"><code>		writeBits(uint(nbits), uint64(tail)-(uint64(prefix)&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-231"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-232"><code>	} else if copylen &lt; 136 {</code></span>
+<span class="codeline" id="line-233"><code>		var tail uint = copylen - 8</code></span>
+<span class="codeline" id="line-234"><code>		var code uint = (tail &gt;&gt; 5) + 30</code></span>
+<span class="codeline" id="line-235"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-236"><code>		writeBits(5, uint64(tail)&amp;31, storage_ix, storage)</code></span>
+<span class="codeline" id="line-237"><code>		writeBits(uint(depth[64]), uint64(bits[64]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-238"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-239"><code>		histo[64]++</code></span>
+<span class="codeline" id="line-240"><code>	} else if copylen &lt; 2120 {</code></span>
+<span class="codeline" id="line-241"><code>		var tail uint = copylen - 72</code></span>
+<span class="codeline" id="line-242"><code>		var nbits uint32 = log2FloorNonZero(tail)</code></span>
+<span class="codeline" id="line-243"><code>		var code uint = uint(nbits + 28)</code></span>
+<span class="codeline" id="line-244"><code>		writeBits(uint(depth[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-245"><code>		writeBits(uint(nbits), uint64(tail)-(uint64(uint(1))&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-246"><code>		writeBits(uint(depth[64]), uint64(bits[64]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-247"><code>		histo[code]++</code></span>
+<span class="codeline" id="line-248"><code>		histo[64]++</code></span>
+<span class="codeline" id="line-249"><code>	} else {</code></span>
+<span class="codeline" id="line-250"><code>		writeBits(uint(depth[39]), uint64(bits[39]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-251"><code>		writeBits(24, uint64(copylen)-2120, storage_ix, storage)</code></span>
+<span class="codeline" id="line-252"><code>		writeBits(uint(depth[64]), uint64(bits[64]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-253"><code>		histo[39]++</code></span>
+<span class="codeline" id="line-254"><code>		histo[64]++</code></span>
+<span class="codeline" id="line-255"><code>	}</code></span>
+<span class="codeline" id="line-256"><code>}</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>func emitDistance1(distance uint, depth []byte, bits []uint16, histo []uint32, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-259"><code>	var d uint = distance + 3</code></span>
+<span class="codeline" id="line-260"><code>	var nbits uint32 = log2FloorNonZero(d) - 1</code></span>
+<span class="codeline" id="line-261"><code>	var prefix uint = (d &gt;&gt; nbits) &amp; 1</code></span>
+<span class="codeline" id="line-262"><code>	var offset uint = (2 + prefix) &lt;&lt; nbits</code></span>
+<span class="codeline" id="line-263"><code>	var distcode uint = uint(2*(nbits-1) + uint32(prefix) + 80)</code></span>
+<span class="codeline" id="line-264"><code>	writeBits(uint(depth[distcode]), uint64(bits[distcode]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-265"><code>	writeBits(uint(nbits), uint64(d)-uint64(offset), storage_ix, storage)</code></span>
+<span class="codeline" id="line-266"><code>	histo[distcode]++</code></span>
+<span class="codeline" id="line-267"><code>}</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>func emitLiterals(input []byte, len uint, depth []byte, bits []uint16, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-270"><code>	var j uint</code></span>
+<span class="codeline" id="line-271"><code>	for j = 0; j &lt; len; j++ {</code></span>
+<span class="codeline" id="line-272"><code>		var lit byte = input[j]</code></span>
+<span class="codeline" id="line-273"><code>		writeBits(uint(depth[lit]), uint64(bits[lit]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-274"><code>	}</code></span>
+<span class="codeline" id="line-275"><code>}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>/* REQUIRES: len &lt;= 1 &lt;&lt; 24. */</code></span>
+<span class="codeline" id="line-278"><code>func storeMetaBlockHeader1(len uint, is_uncompressed bool, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-279"><code>	var nibbles uint = 6</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	/* ISLAST */</code></span>
+<span class="codeline" id="line-282"><code>	writeBits(1, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-283"><code></code></span>
+<span class="codeline" id="line-284"><code>	if len &lt;= 1&lt;&lt;16 {</code></span>
+<span class="codeline" id="line-285"><code>		nibbles = 4</code></span>
+<span class="codeline" id="line-286"><code>	} else if len &lt;= 1&lt;&lt;20 {</code></span>
+<span class="codeline" id="line-287"><code>		nibbles = 5</code></span>
+<span class="codeline" id="line-288"><code>	}</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	writeBits(2, uint64(nibbles)-4, storage_ix, storage)</code></span>
+<span class="codeline" id="line-291"><code>	writeBits(nibbles*4, uint64(len)-1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-292"><code></code></span>
+<span class="codeline" id="line-293"><code>	/* ISUNCOMPRESSED */</code></span>
+<span class="codeline" id="line-294"><code>	writeSingleBit(is_uncompressed, storage_ix, storage)</code></span>
+<span class="codeline" id="line-295"><code>}</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>func updateBits(n_bits uint, bits uint32, pos uint, array []byte) {</code></span>
+<span class="codeline" id="line-298"><code>	for n_bits &gt; 0 {</code></span>
+<span class="codeline" id="line-299"><code>		var byte_pos uint = pos &gt;&gt; 3</code></span>
+<span class="codeline" id="line-300"><code>		var n_unchanged_bits uint = pos &amp; 7</code></span>
+<span class="codeline" id="line-301"><code>		var n_changed_bits uint = brotli_min_size_t(n_bits, 8-n_unchanged_bits)</code></span>
+<span class="codeline" id="line-302"><code>		var total_bits uint = n_unchanged_bits + n_changed_bits</code></span>
+<span class="codeline" id="line-303"><code>		var mask uint32 = (^((1 &lt;&lt; total_bits) - 1)) | ((1 &lt;&lt; n_unchanged_bits) - 1)</code></span>
+<span class="codeline" id="line-304"><code>		var unchanged_bits uint32 = uint32(array[byte_pos]) &amp; mask</code></span>
+<span class="codeline" id="line-305"><code>		var changed_bits uint32 = bits &amp; ((1 &lt;&lt; n_changed_bits) - 1)</code></span>
+<span class="codeline" id="line-306"><code>		array[byte_pos] = byte(changed_bits&lt;&lt;n_unchanged_bits | unchanged_bits)</code></span>
+<span class="codeline" id="line-307"><code>		n_bits -= n_changed_bits</code></span>
+<span class="codeline" id="line-308"><code>		bits &gt;&gt;= n_changed_bits</code></span>
+<span class="codeline" id="line-309"><code>		pos += n_changed_bits</code></span>
+<span class="codeline" id="line-310"><code>	}</code></span>
+<span class="codeline" id="line-311"><code>}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>func rewindBitPosition1(new_storage_ix uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-314"><code>	var bitpos uint = new_storage_ix &amp; 7</code></span>
+<span class="codeline" id="line-315"><code>	var mask uint = (1 &lt;&lt; bitpos) - 1</code></span>
+<span class="codeline" id="line-316"><code>	storage[new_storage_ix&gt;&gt;3] &amp;= byte(mask)</code></span>
+<span class="codeline" id="line-317"><code>	*storage_ix = new_storage_ix</code></span>
+<span class="codeline" id="line-318"><code>}</code></span>
+<span class="codeline" id="line-319"><code></code></span>
+<span class="codeline" id="line-320"><code>var shouldMergeBlock_kSampleRate uint = 43</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>func shouldMergeBlock(data []byte, len uint, depths []byte) bool {</code></span>
+<span class="codeline" id="line-323"><code>	var histo = [256]uint{0}</code></span>
+<span class="codeline" id="line-324"><code>	var i uint</code></span>
+<span class="codeline" id="line-325"><code>	for i = 0; i &lt; len; i += shouldMergeBlock_kSampleRate {</code></span>
+<span class="codeline" id="line-326"><code>		histo[data[i]]++</code></span>
+<span class="codeline" id="line-327"><code>	}</code></span>
+<span class="codeline" id="line-328"><code>	{</code></span>
+<span class="codeline" id="line-329"><code>		var total uint = (len + shouldMergeBlock_kSampleRate - 1) / shouldMergeBlock_kSampleRate</code></span>
+<span class="codeline" id="line-330"><code>		var r float64 = (fastLog2(total)+0.5)*float64(total) + 200</code></span>
+<span class="codeline" id="line-331"><code>		for i = 0; i &lt; 256; i++ {</code></span>
+<span class="codeline" id="line-332"><code>			r -= float64(histo[i]) * (float64(depths[i]) + fastLog2(histo[i]))</code></span>
+<span class="codeline" id="line-333"><code>		}</code></span>
+<span class="codeline" id="line-334"><code></code></span>
+<span class="codeline" id="line-335"><code>		return r &gt;= 0.0</code></span>
+<span class="codeline" id="line-336"><code>	}</code></span>
+<span class="codeline" id="line-337"><code>}</code></span>
+<span class="codeline" id="line-338"><code></code></span>
+<span class="codeline" id="line-339"><code>func shouldUseUncompressedMode(metablock_start []byte, next_emit []byte, insertlen uint, literal_ratio uint) bool {</code></span>
+<span class="codeline" id="line-340"><code>	var compressed uint = uint(-cap(next_emit) + cap(metablock_start))</code></span>
+<span class="codeline" id="line-341"><code>	if compressed*50 &gt; insertlen {</code></span>
+<span class="codeline" id="line-342"><code>		return false</code></span>
+<span class="codeline" id="line-343"><code>	} else {</code></span>
+<span class="codeline" id="line-344"><code>		return literal_ratio &gt; 980</code></span>
+<span class="codeline" id="line-345"><code>	}</code></span>
+<span class="codeline" id="line-346"><code>}</code></span>
+<span class="codeline" id="line-347"><code></code></span>
+<span class="codeline" id="line-348"><code>func emitUncompressedMetaBlock1(begin []byte, end []byte, storage_ix_start uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-349"><code>	var len uint = uint(-cap(end) + cap(begin))</code></span>
+<span class="codeline" id="line-350"><code>	rewindBitPosition1(storage_ix_start, storage_ix, storage)</code></span>
+<span class="codeline" id="line-351"><code>	storeMetaBlockHeader1(uint(len), true, storage_ix, storage)</code></span>
+<span class="codeline" id="line-352"><code>	*storage_ix = (*storage_ix + 7) &amp;^ 7</code></span>
+<span class="codeline" id="line-353"><code>	copy(storage[*storage_ix&gt;&gt;3:], begin[:len])</code></span>
+<span class="codeline" id="line-354"><code>	*storage_ix += uint(len &lt;&lt; 3)</code></span>
+<span class="codeline" id="line-355"><code>	storage[*storage_ix&gt;&gt;3] = 0</code></span>
+<span class="codeline" id="line-356"><code>}</code></span>
+<span class="codeline" id="line-357"><code></code></span>
+<span class="codeline" id="line-358"><code>var kCmdHistoSeed = [128]uint32{</code></span>
+<span class="codeline" id="line-359"><code>	0,</code></span>
+<span class="codeline" id="line-360"><code>	1,</code></span>
+<span class="codeline" id="line-361"><code>	1,</code></span>
+<span class="codeline" id="line-362"><code>	1,</code></span>
+<span class="codeline" id="line-363"><code>	1,</code></span>
+<span class="codeline" id="line-364"><code>	1,</code></span>
+<span class="codeline" id="line-365"><code>	1,</code></span>
+<span class="codeline" id="line-366"><code>	1,</code></span>
+<span class="codeline" id="line-367"><code>	1,</code></span>
+<span class="codeline" id="line-368"><code>	1,</code></span>
+<span class="codeline" id="line-369"><code>	1,</code></span>
+<span class="codeline" id="line-370"><code>	1,</code></span>
+<span class="codeline" id="line-371"><code>	1,</code></span>
+<span class="codeline" id="line-372"><code>	1,</code></span>
+<span class="codeline" id="line-373"><code>	1,</code></span>
+<span class="codeline" id="line-374"><code>	1,</code></span>
+<span class="codeline" id="line-375"><code>	0,</code></span>
+<span class="codeline" id="line-376"><code>	0,</code></span>
+<span class="codeline" id="line-377"><code>	0,</code></span>
+<span class="codeline" id="line-378"><code>	1,</code></span>
+<span class="codeline" id="line-379"><code>	1,</code></span>
+<span class="codeline" id="line-380"><code>	1,</code></span>
+<span class="codeline" id="line-381"><code>	1,</code></span>
+<span class="codeline" id="line-382"><code>	1,</code></span>
+<span class="codeline" id="line-383"><code>	1,</code></span>
+<span class="codeline" id="line-384"><code>	1,</code></span>
+<span class="codeline" id="line-385"><code>	1,</code></span>
+<span class="codeline" id="line-386"><code>	1,</code></span>
+<span class="codeline" id="line-387"><code>	1,</code></span>
+<span class="codeline" id="line-388"><code>	1,</code></span>
+<span class="codeline" id="line-389"><code>	1,</code></span>
+<span class="codeline" id="line-390"><code>	1,</code></span>
+<span class="codeline" id="line-391"><code>	1,</code></span>
+<span class="codeline" id="line-392"><code>	1,</code></span>
+<span class="codeline" id="line-393"><code>	1,</code></span>
+<span class="codeline" id="line-394"><code>	1,</code></span>
+<span class="codeline" id="line-395"><code>	1,</code></span>
+<span class="codeline" id="line-396"><code>	1,</code></span>
+<span class="codeline" id="line-397"><code>	1,</code></span>
+<span class="codeline" id="line-398"><code>	1,</code></span>
+<span class="codeline" id="line-399"><code>	0,</code></span>
+<span class="codeline" id="line-400"><code>	1,</code></span>
+<span class="codeline" id="line-401"><code>	1,</code></span>
+<span class="codeline" id="line-402"><code>	1,</code></span>
+<span class="codeline" id="line-403"><code>	1,</code></span>
+<span class="codeline" id="line-404"><code>	1,</code></span>
+<span class="codeline" id="line-405"><code>	1,</code></span>
+<span class="codeline" id="line-406"><code>	1,</code></span>
+<span class="codeline" id="line-407"><code>	1,</code></span>
+<span class="codeline" id="line-408"><code>	1,</code></span>
+<span class="codeline" id="line-409"><code>	1,</code></span>
+<span class="codeline" id="line-410"><code>	1,</code></span>
+<span class="codeline" id="line-411"><code>	1,</code></span>
+<span class="codeline" id="line-412"><code>	1,</code></span>
+<span class="codeline" id="line-413"><code>	1,</code></span>
+<span class="codeline" id="line-414"><code>	1,</code></span>
+<span class="codeline" id="line-415"><code>	1,</code></span>
+<span class="codeline" id="line-416"><code>	1,</code></span>
+<span class="codeline" id="line-417"><code>	1,</code></span>
+<span class="codeline" id="line-418"><code>	1,</code></span>
+<span class="codeline" id="line-419"><code>	1,</code></span>
+<span class="codeline" id="line-420"><code>	1,</code></span>
+<span class="codeline" id="line-421"><code>	1,</code></span>
+<span class="codeline" id="line-422"><code>	1,</code></span>
+<span class="codeline" id="line-423"><code>	1,</code></span>
+<span class="codeline" id="line-424"><code>	0,</code></span>
+<span class="codeline" id="line-425"><code>	0,</code></span>
+<span class="codeline" id="line-426"><code>	0,</code></span>
+<span class="codeline" id="line-427"><code>	0,</code></span>
+<span class="codeline" id="line-428"><code>	0,</code></span>
+<span class="codeline" id="line-429"><code>	0,</code></span>
+<span class="codeline" id="line-430"><code>	0,</code></span>
+<span class="codeline" id="line-431"><code>	0,</code></span>
+<span class="codeline" id="line-432"><code>	0,</code></span>
+<span class="codeline" id="line-433"><code>	0,</code></span>
+<span class="codeline" id="line-434"><code>	0,</code></span>
+<span class="codeline" id="line-435"><code>	0,</code></span>
+<span class="codeline" id="line-436"><code>	0,</code></span>
+<span class="codeline" id="line-437"><code>	0,</code></span>
+<span class="codeline" id="line-438"><code>	0,</code></span>
+<span class="codeline" id="line-439"><code>	1,</code></span>
+<span class="codeline" id="line-440"><code>	1,</code></span>
+<span class="codeline" id="line-441"><code>	1,</code></span>
+<span class="codeline" id="line-442"><code>	1,</code></span>
+<span class="codeline" id="line-443"><code>	1,</code></span>
+<span class="codeline" id="line-444"><code>	1,</code></span>
+<span class="codeline" id="line-445"><code>	1,</code></span>
+<span class="codeline" id="line-446"><code>	1,</code></span>
+<span class="codeline" id="line-447"><code>	1,</code></span>
+<span class="codeline" id="line-448"><code>	1,</code></span>
+<span class="codeline" id="line-449"><code>	1,</code></span>
+<span class="codeline" id="line-450"><code>	1,</code></span>
+<span class="codeline" id="line-451"><code>	1,</code></span>
+<span class="codeline" id="line-452"><code>	1,</code></span>
+<span class="codeline" id="line-453"><code>	1,</code></span>
+<span class="codeline" id="line-454"><code>	1,</code></span>
+<span class="codeline" id="line-455"><code>	1,</code></span>
+<span class="codeline" id="line-456"><code>	1,</code></span>
+<span class="codeline" id="line-457"><code>	1,</code></span>
+<span class="codeline" id="line-458"><code>	1,</code></span>
+<span class="codeline" id="line-459"><code>	1,</code></span>
+<span class="codeline" id="line-460"><code>	1,</code></span>
+<span class="codeline" id="line-461"><code>	1,</code></span>
+<span class="codeline" id="line-462"><code>	1,</code></span>
+<span class="codeline" id="line-463"><code>	1,</code></span>
+<span class="codeline" id="line-464"><code>	1,</code></span>
+<span class="codeline" id="line-465"><code>	1,</code></span>
+<span class="codeline" id="line-466"><code>	1,</code></span>
+<span class="codeline" id="line-467"><code>	1,</code></span>
+<span class="codeline" id="line-468"><code>	1,</code></span>
+<span class="codeline" id="line-469"><code>	1,</code></span>
+<span class="codeline" id="line-470"><code>	1,</code></span>
+<span class="codeline" id="line-471"><code>	1,</code></span>
+<span class="codeline" id="line-472"><code>	1,</code></span>
+<span class="codeline" id="line-473"><code>	1,</code></span>
+<span class="codeline" id="line-474"><code>	1,</code></span>
+<span class="codeline" id="line-475"><code>	1,</code></span>
+<span class="codeline" id="line-476"><code>	1,</code></span>
+<span class="codeline" id="line-477"><code>	1,</code></span>
+<span class="codeline" id="line-478"><code>	1,</code></span>
+<span class="codeline" id="line-479"><code>	1,</code></span>
+<span class="codeline" id="line-480"><code>	1,</code></span>
+<span class="codeline" id="line-481"><code>	1,</code></span>
+<span class="codeline" id="line-482"><code>	1,</code></span>
+<span class="codeline" id="line-483"><code>	0,</code></span>
+<span class="codeline" id="line-484"><code>	0,</code></span>
+<span class="codeline" id="line-485"><code>	0,</code></span>
+<span class="codeline" id="line-486"><code>	0,</code></span>
+<span class="codeline" id="line-487"><code>}</code></span>
+<span class="codeline" id="line-488"><code></code></span>
+<span class="codeline" id="line-489"><code>var compressFragmentFastImpl_kFirstBlockSize uint = 3 &lt;&lt; 15</code></span>
+<span class="codeline" id="line-490"><code>var compressFragmentFastImpl_kMergeBlockSize uint = 1 &lt;&lt; 16</code></span>
+<span class="codeline" id="line-491"><code></code></span>
+<span class="codeline" id="line-492"><code>func compressFragmentFastImpl(in []byte, input_size uint, is_last bool, table []int, table_bits uint, cmd_depth []byte, cmd_bits []uint16, cmd_code_numbits *uint, cmd_code []byte, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-493"><code>	var cmd_histo [128]uint32</code></span>
+<span class="codeline" id="line-494"><code>	var ip_end int</code></span>
+<span class="codeline" id="line-495"><code>	var next_emit int = 0</code></span>
+<span class="codeline" id="line-496"><code>	var base_ip int = 0</code></span>
+<span class="codeline" id="line-497"><code>	var input int = 0</code></span>
+<span class="codeline" id="line-498"><code>	const kInputMarginBytes uint = windowGap</code></span>
+<span class="codeline" id="line-499"><code>	const kMinMatchLen uint = 5</code></span>
+<span class="codeline" id="line-500"><code>	var metablock_start int = input</code></span>
+<span class="codeline" id="line-501"><code>	var block_size uint = brotli_min_size_t(input_size, compressFragmentFastImpl_kFirstBlockSize)</code></span>
+<span class="codeline" id="line-502"><code>	var total_block_size uint = block_size</code></span>
+<span class="codeline" id="line-503"><code>	var mlen_storage_ix uint = *storage_ix + 3</code></span>
+<span class="codeline" id="line-504"><code>	var lit_depth [256]byte</code></span>
+<span class="codeline" id="line-505"><code>	var lit_bits [256]uint16</code></span>
+<span class="codeline" id="line-506"><code>	var literal_ratio uint</code></span>
+<span class="codeline" id="line-507"><code>	var ip int</code></span>
+<span class="codeline" id="line-508"><code>	var last_distance int</code></span>
+<span class="codeline" id="line-509"><code>	var shift uint = 64 - table_bits</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>	/* "next_emit" is a pointer to the first byte that is not covered by a</code></span>
+<span class="codeline" id="line-512"><code>	   previous copy. Bytes between "next_emit" and the start of the next copy or</code></span>
+<span class="codeline" id="line-513"><code>	   the end of the input will be emitted as literal bytes. */</code></span>
+<span class="codeline" id="line-514"><code></code></span>
+<span class="codeline" id="line-515"><code>	/* Save the start of the first block for position and distance computations.</code></span>
+<span class="codeline" id="line-516"><code>	 */</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>	/* Save the bit position of the MLEN field of the meta-block header, so that</code></span>
+<span class="codeline" id="line-519"><code>	   we can update it later if we decide to extend this meta-block. */</code></span>
+<span class="codeline" id="line-520"><code>	storeMetaBlockHeader1(block_size, false, storage_ix, storage)</code></span>
+<span class="codeline" id="line-521"><code></code></span>
+<span class="codeline" id="line-522"><code>	/* No block splits, no contexts. */</code></span>
+<span class="codeline" id="line-523"><code>	writeBits(13, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>	literal_ratio = buildAndStoreLiteralPrefixCode(in[input:], block_size, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-526"><code>	{</code></span>
+<span class="codeline" id="line-527"><code>		/* Store the pre-compressed command and distance prefix codes. */</code></span>
+<span class="codeline" id="line-528"><code>		var i uint</code></span>
+<span class="codeline" id="line-529"><code>		for i = 0; i+7 &lt; *cmd_code_numbits; i += 8 {</code></span>
+<span class="codeline" id="line-530"><code>			writeBits(8, uint64(cmd_code[i&gt;&gt;3]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-531"><code>		}</code></span>
+<span class="codeline" id="line-532"><code>	}</code></span>
+<span class="codeline" id="line-533"><code></code></span>
+<span class="codeline" id="line-534"><code>	writeBits(*cmd_code_numbits&amp;7, uint64(cmd_code[*cmd_code_numbits&gt;&gt;3]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>	/* Initialize the command and distance histograms. We will gather</code></span>
+<span class="codeline" id="line-537"><code>	   statistics of command and distance codes during the processing</code></span>
+<span class="codeline" id="line-538"><code>	   of this block and use it to update the command and distance</code></span>
+<span class="codeline" id="line-539"><code>	   prefix codes for the next block. */</code></span>
+<span class="codeline" id="line-540"><code>emit_commands:</code></span>
+<span class="codeline" id="line-541"><code>	copy(cmd_histo[:], kCmdHistoSeed[:])</code></span>
+<span class="codeline" id="line-542"><code></code></span>
+<span class="codeline" id="line-543"><code>	/* "ip" is the input pointer. */</code></span>
+<span class="codeline" id="line-544"><code>	ip = input</code></span>
+<span class="codeline" id="line-545"><code></code></span>
+<span class="codeline" id="line-546"><code>	last_distance = -1</code></span>
+<span class="codeline" id="line-547"><code>	ip_end = int(uint(input) + block_size)</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>	if block_size &gt;= kInputMarginBytes {</code></span>
+<span class="codeline" id="line-550"><code>		var len_limit uint = brotli_min_size_t(block_size-kMinMatchLen, input_size-kInputMarginBytes)</code></span>
+<span class="codeline" id="line-551"><code>		var ip_limit int = int(uint(input) + len_limit)</code></span>
+<span class="codeline" id="line-552"><code>		/* For the last block, we need to keep a 16 bytes margin so that we can be</code></span>
+<span class="codeline" id="line-553"><code>		   sure that all distances are at most window size - 16.</code></span>
+<span class="codeline" id="line-554"><code>		   For all other blocks, we only need to keep a margin of 5 bytes so that</code></span>
+<span class="codeline" id="line-555"><code>		   we don't go over the block size with a copy. */</code></span>
+<span class="codeline" id="line-556"><code></code></span>
+<span class="codeline" id="line-557"><code>		var next_hash uint32</code></span>
+<span class="codeline" id="line-558"><code>		ip++</code></span>
+<span class="codeline" id="line-559"><code>		for next_hash = hash5(in[ip:], shift); ; {</code></span>
+<span class="codeline" id="line-560"><code>			var skip uint32 = 32</code></span>
+<span class="codeline" id="line-561"><code>			var next_ip int = ip</code></span>
+<span class="codeline" id="line-562"><code>			/* Step 1: Scan forward in the input looking for a 5-byte-long match.</code></span>
+<span class="codeline" id="line-563"><code>			   If we get close to exhausting the input then goto emit_remainder.</code></span>
+<span class="codeline" id="line-564"><code></code></span>
+<span class="codeline" id="line-565"><code>			   Heuristic match skipping: If 32 bytes are scanned with no matches</code></span>
+<span class="codeline" id="line-566"><code>			   found, start looking only at every other byte. If 32 more bytes are</code></span>
+<span class="codeline" id="line-567"><code>			   scanned, look at every third byte, etc.. When a match is found,</code></span>
+<span class="codeline" id="line-568"><code>			   immediately go back to looking at every byte. This is a small loss</code></span>
+<span class="codeline" id="line-569"><code>			   (~5% performance, ~0.1% density) for compressible data due to more</code></span>
+<span class="codeline" id="line-570"><code>			   bookkeeping, but for non-compressible data (such as JPEG) it's a huge</code></span>
+<span class="codeline" id="line-571"><code>			   win since the compressor quickly "realizes" the data is incompressible</code></span>
+<span class="codeline" id="line-572"><code>			   and doesn't bother looking for matches everywhere.</code></span>
+<span class="codeline" id="line-573"><code></code></span>
+<span class="codeline" id="line-574"><code>			   The "skip" variable keeps track of how many bytes there are since the</code></span>
+<span class="codeline" id="line-575"><code>			   last match; dividing it by 32 (i.e. right-shifting by five) gives the</code></span>
+<span class="codeline" id="line-576"><code>			   number of bytes to move ahead for each iteration. */</code></span>
+<span class="codeline" id="line-577"><code></code></span>
+<span class="codeline" id="line-578"><code>			var candidate int</code></span>
+<span class="codeline" id="line-579"><code>			assert(next_emit &lt; ip)</code></span>
+<span class="codeline" id="line-580"><code></code></span>
+<span class="codeline" id="line-581"><code>		trawl:</code></span>
+<span class="codeline" id="line-582"><code>			for {</code></span>
+<span class="codeline" id="line-583"><code>				var hash uint32 = next_hash</code></span>
+<span class="codeline" id="line-584"><code>				var bytes_between_hash_lookups uint32 = skip &gt;&gt; 5</code></span>
+<span class="codeline" id="line-585"><code>				skip++</code></span>
+<span class="codeline" id="line-586"><code>				assert(hash == hash5(in[next_ip:], shift))</code></span>
+<span class="codeline" id="line-587"><code>				ip = next_ip</code></span>
+<span class="codeline" id="line-588"><code>				next_ip = int(uint32(ip) + bytes_between_hash_lookups)</code></span>
+<span class="codeline" id="line-589"><code>				if next_ip &gt; ip_limit {</code></span>
+<span class="codeline" id="line-590"><code>					goto emit_remainder</code></span>
+<span class="codeline" id="line-591"><code>				}</code></span>
+<span class="codeline" id="line-592"><code></code></span>
+<span class="codeline" id="line-593"><code>				next_hash = hash5(in[next_ip:], shift)</code></span>
+<span class="codeline" id="line-594"><code>				candidate = ip - last_distance</code></span>
+<span class="codeline" id="line-595"><code>				if isMatch5(in[ip:], in[candidate:]) {</code></span>
+<span class="codeline" id="line-596"><code>					if candidate &lt; ip {</code></span>
+<span class="codeline" id="line-597"><code>						table[hash] = int(ip - base_ip)</code></span>
+<span class="codeline" id="line-598"><code>						break</code></span>
+<span class="codeline" id="line-599"><code>					}</code></span>
+<span class="codeline" id="line-600"><code>				}</code></span>
+<span class="codeline" id="line-601"><code></code></span>
+<span class="codeline" id="line-602"><code>				candidate = base_ip + table[hash]</code></span>
+<span class="codeline" id="line-603"><code>				assert(candidate &gt;= base_ip)</code></span>
+<span class="codeline" id="line-604"><code>				assert(candidate &lt; ip)</code></span>
+<span class="codeline" id="line-605"><code></code></span>
+<span class="codeline" id="line-606"><code>				table[hash] = int(ip - base_ip)</code></span>
+<span class="codeline" id="line-607"><code>				if isMatch5(in[ip:], in[candidate:]) {</code></span>
+<span class="codeline" id="line-608"><code>					break</code></span>
+<span class="codeline" id="line-609"><code>				}</code></span>
+<span class="codeline" id="line-610"><code>			}</code></span>
+<span class="codeline" id="line-611"><code></code></span>
+<span class="codeline" id="line-612"><code>			/* Check copy distance. If candidate is not feasible, continue search.</code></span>
+<span class="codeline" id="line-613"><code>			   Checking is done outside of hot loop to reduce overhead. */</code></span>
+<span class="codeline" id="line-614"><code>			if ip-candidate &gt; maxDistance_compress_fragment {</code></span>
+<span class="codeline" id="line-615"><code>				goto trawl</code></span>
+<span class="codeline" id="line-616"><code>			}</code></span>
+<span class="codeline" id="line-617"><code></code></span>
+<span class="codeline" id="line-618"><code>			/* Step 2: Emit the found match together with the literal bytes from</code></span>
+<span class="codeline" id="line-619"><code>			   "next_emit" to the bit stream, and then see if we can find a next match</code></span>
+<span class="codeline" id="line-620"><code>			   immediately afterwards. Repeat until we find no match for the input</code></span>
+<span class="codeline" id="line-621"><code>			   without emitting some literal bytes. */</code></span>
+<span class="codeline" id="line-622"><code>			{</code></span>
+<span class="codeline" id="line-623"><code>				var base int = ip</code></span>
+<span class="codeline" id="line-624"><code>				/* &gt; 0 */</code></span>
+<span class="codeline" id="line-625"><code>				var matched uint = 5 + findMatchLengthWithLimit(in[candidate+5:], in[ip+5:], uint(ip_end-ip)-5)</code></span>
+<span class="codeline" id="line-626"><code>				var distance int = int(base - candidate)</code></span>
+<span class="codeline" id="line-627"><code>				/* We have a 5-byte match at ip, and we need to emit bytes in</code></span>
+<span class="codeline" id="line-628"><code>				   [next_emit, ip). */</code></span>
+<span class="codeline" id="line-629"><code></code></span>
+<span class="codeline" id="line-630"><code>				var insert uint = uint(base - next_emit)</code></span>
+<span class="codeline" id="line-631"><code>				ip += int(matched)</code></span>
+<span class="codeline" id="line-632"><code>				if insert &lt; 6210 {</code></span>
+<span class="codeline" id="line-633"><code>					emitInsertLen1(insert, cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-634"><code>				} else if shouldUseUncompressedMode(in[metablock_start:], in[next_emit:], insert, literal_ratio) {</code></span>
+<span class="codeline" id="line-635"><code>					emitUncompressedMetaBlock1(in[metablock_start:], in[base:], mlen_storage_ix-3, storage_ix, storage)</code></span>
+<span class="codeline" id="line-636"><code>					input_size -= uint(base - input)</code></span>
+<span class="codeline" id="line-637"><code>					input = base</code></span>
+<span class="codeline" id="line-638"><code>					next_emit = input</code></span>
+<span class="codeline" id="line-639"><code>					goto next_block</code></span>
+<span class="codeline" id="line-640"><code>				} else {</code></span>
+<span class="codeline" id="line-641"><code>					emitLongInsertLen(insert, cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-642"><code>				}</code></span>
+<span class="codeline" id="line-643"><code></code></span>
+<span class="codeline" id="line-644"><code>				emitLiterals(in[next_emit:], insert, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-645"><code>				if distance == last_distance {</code></span>
+<span class="codeline" id="line-646"><code>					writeBits(uint(cmd_depth[64]), uint64(cmd_bits[64]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-647"><code>					cmd_histo[64]++</code></span>
+<span class="codeline" id="line-648"><code>				} else {</code></span>
+<span class="codeline" id="line-649"><code>					emitDistance1(uint(distance), cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-650"><code>					last_distance = distance</code></span>
+<span class="codeline" id="line-651"><code>				}</code></span>
+<span class="codeline" id="line-652"><code></code></span>
+<span class="codeline" id="line-653"><code>				emitCopyLenLastDistance1(matched, cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-654"><code></code></span>
+<span class="codeline" id="line-655"><code>				next_emit = ip</code></span>
+<span class="codeline" id="line-656"><code>				if ip &gt;= ip_limit {</code></span>
+<span class="codeline" id="line-657"><code>					goto emit_remainder</code></span>
+<span class="codeline" id="line-658"><code>				}</code></span>
+<span class="codeline" id="line-659"><code></code></span>
+<span class="codeline" id="line-660"><code>				/* We could immediately start working at ip now, but to improve</code></span>
+<span class="codeline" id="line-661"><code>				   compression we first update "table" with the hashes of some positions</code></span>
+<span class="codeline" id="line-662"><code>				   within the last copy. */</code></span>
+<span class="codeline" id="line-663"><code>				{</code></span>
+<span class="codeline" id="line-664"><code>					var input_bytes uint64 = binary.LittleEndian.Uint64(in[ip-3:])</code></span>
+<span class="codeline" id="line-665"><code>					var prev_hash uint32 = hashBytesAtOffset5(input_bytes, 0, shift)</code></span>
+<span class="codeline" id="line-666"><code>					var cur_hash uint32 = hashBytesAtOffset5(input_bytes, 3, shift)</code></span>
+<span class="codeline" id="line-667"><code>					table[prev_hash] = int(ip - base_ip - 3)</code></span>
+<span class="codeline" id="line-668"><code>					prev_hash = hashBytesAtOffset5(input_bytes, 1, shift)</code></span>
+<span class="codeline" id="line-669"><code>					table[prev_hash] = int(ip - base_ip - 2)</code></span>
+<span class="codeline" id="line-670"><code>					prev_hash = hashBytesAtOffset5(input_bytes, 2, shift)</code></span>
+<span class="codeline" id="line-671"><code>					table[prev_hash] = int(ip - base_ip - 1)</code></span>
+<span class="codeline" id="line-672"><code></code></span>
+<span class="codeline" id="line-673"><code>					candidate = base_ip + table[cur_hash]</code></span>
+<span class="codeline" id="line-674"><code>					table[cur_hash] = int(ip - base_ip)</code></span>
+<span class="codeline" id="line-675"><code>				}</code></span>
+<span class="codeline" id="line-676"><code>			}</code></span>
+<span class="codeline" id="line-677"><code></code></span>
+<span class="codeline" id="line-678"><code>			for isMatch5(in[ip:], in[candidate:]) {</code></span>
+<span class="codeline" id="line-679"><code>				var base int = ip</code></span>
+<span class="codeline" id="line-680"><code>				/* We have a 5-byte match at ip, and no need to emit any literal bytes</code></span>
+<span class="codeline" id="line-681"><code>				   prior to ip. */</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>				var matched uint = 5 + findMatchLengthWithLimit(in[candidate+5:], in[ip+5:], uint(ip_end-ip)-5)</code></span>
+<span class="codeline" id="line-684"><code>				if ip-candidate &gt; maxDistance_compress_fragment {</code></span>
+<span class="codeline" id="line-685"><code>					break</code></span>
+<span class="codeline" id="line-686"><code>				}</code></span>
+<span class="codeline" id="line-687"><code>				ip += int(matched)</code></span>
+<span class="codeline" id="line-688"><code>				last_distance = int(base - candidate) /* &gt; 0 */</code></span>
+<span class="codeline" id="line-689"><code>				emitCopyLen1(matched, cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-690"><code>				emitDistance1(uint(last_distance), cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-691"><code></code></span>
+<span class="codeline" id="line-692"><code>				next_emit = ip</code></span>
+<span class="codeline" id="line-693"><code>				if ip &gt;= ip_limit {</code></span>
+<span class="codeline" id="line-694"><code>					goto emit_remainder</code></span>
+<span class="codeline" id="line-695"><code>				}</code></span>
+<span class="codeline" id="line-696"><code></code></span>
+<span class="codeline" id="line-697"><code>				/* We could immediately start working at ip now, but to improve</code></span>
+<span class="codeline" id="line-698"><code>				   compression we first update "table" with the hashes of some positions</code></span>
+<span class="codeline" id="line-699"><code>				   within the last copy. */</code></span>
+<span class="codeline" id="line-700"><code>				{</code></span>
+<span class="codeline" id="line-701"><code>					var input_bytes uint64 = binary.LittleEndian.Uint64(in[ip-3:])</code></span>
+<span class="codeline" id="line-702"><code>					var prev_hash uint32 = hashBytesAtOffset5(input_bytes, 0, shift)</code></span>
+<span class="codeline" id="line-703"><code>					var cur_hash uint32 = hashBytesAtOffset5(input_bytes, 3, shift)</code></span>
+<span class="codeline" id="line-704"><code>					table[prev_hash] = int(ip - base_ip - 3)</code></span>
+<span class="codeline" id="line-705"><code>					prev_hash = hashBytesAtOffset5(input_bytes, 1, shift)</code></span>
+<span class="codeline" id="line-706"><code>					table[prev_hash] = int(ip - base_ip - 2)</code></span>
+<span class="codeline" id="line-707"><code>					prev_hash = hashBytesAtOffset5(input_bytes, 2, shift)</code></span>
+<span class="codeline" id="line-708"><code>					table[prev_hash] = int(ip - base_ip - 1)</code></span>
+<span class="codeline" id="line-709"><code></code></span>
+<span class="codeline" id="line-710"><code>					candidate = base_ip + table[cur_hash]</code></span>
+<span class="codeline" id="line-711"><code>					table[cur_hash] = int(ip - base_ip)</code></span>
+<span class="codeline" id="line-712"><code>				}</code></span>
+<span class="codeline" id="line-713"><code>			}</code></span>
+<span class="codeline" id="line-714"><code></code></span>
+<span class="codeline" id="line-715"><code>			ip++</code></span>
+<span class="codeline" id="line-716"><code>			next_hash = hash5(in[ip:], shift)</code></span>
+<span class="codeline" id="line-717"><code>		}</code></span>
+<span class="codeline" id="line-718"><code>	}</code></span>
+<span class="codeline" id="line-719"><code></code></span>
+<span class="codeline" id="line-720"><code>emit_remainder:</code></span>
+<span class="codeline" id="line-721"><code>	assert(next_emit &lt;= ip_end)</code></span>
+<span class="codeline" id="line-722"><code>	input += int(block_size)</code></span>
+<span class="codeline" id="line-723"><code>	input_size -= block_size</code></span>
+<span class="codeline" id="line-724"><code>	block_size = brotli_min_size_t(input_size, compressFragmentFastImpl_kMergeBlockSize)</code></span>
+<span class="codeline" id="line-725"><code></code></span>
+<span class="codeline" id="line-726"><code>	/* Decide if we want to continue this meta-block instead of emitting the</code></span>
+<span class="codeline" id="line-727"><code>	   last insert-only command. */</code></span>
+<span class="codeline" id="line-728"><code>	if input_size &gt; 0 &amp;&amp; total_block_size+block_size &lt;= 1&lt;&lt;20 &amp;&amp; shouldMergeBlock(in[input:], block_size, lit_depth[:]) {</code></span>
+<span class="codeline" id="line-729"><code>		assert(total_block_size &gt; 1&lt;&lt;16)</code></span>
+<span class="codeline" id="line-730"><code></code></span>
+<span class="codeline" id="line-731"><code>		/* Update the size of the current meta-block and continue emitting commands.</code></span>
+<span class="codeline" id="line-732"><code>		   We can do this because the current size and the new size both have 5</code></span>
+<span class="codeline" id="line-733"><code>		   nibbles. */</code></span>
+<span class="codeline" id="line-734"><code>		total_block_size += block_size</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>		updateBits(20, uint32(total_block_size-1), mlen_storage_ix, storage)</code></span>
+<span class="codeline" id="line-737"><code>		goto emit_commands</code></span>
+<span class="codeline" id="line-738"><code>	}</code></span>
+<span class="codeline" id="line-739"><code></code></span>
+<span class="codeline" id="line-740"><code>	/* Emit the remaining bytes as literals. */</code></span>
+<span class="codeline" id="line-741"><code>	if next_emit &lt; ip_end {</code></span>
+<span class="codeline" id="line-742"><code>		var insert uint = uint(ip_end - next_emit)</code></span>
+<span class="codeline" id="line-743"><code>		if insert &lt; 6210 {</code></span>
+<span class="codeline" id="line-744"><code>			emitInsertLen1(insert, cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-745"><code>			emitLiterals(in[next_emit:], insert, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-746"><code>		} else if shouldUseUncompressedMode(in[metablock_start:], in[next_emit:], insert, literal_ratio) {</code></span>
+<span class="codeline" id="line-747"><code>			emitUncompressedMetaBlock1(in[metablock_start:], in[ip_end:], mlen_storage_ix-3, storage_ix, storage)</code></span>
+<span class="codeline" id="line-748"><code>		} else {</code></span>
+<span class="codeline" id="line-749"><code>			emitLongInsertLen(insert, cmd_depth, cmd_bits, cmd_histo[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-750"><code>			emitLiterals(in[next_emit:], insert, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-751"><code>		}</code></span>
+<span class="codeline" id="line-752"><code>	}</code></span>
+<span class="codeline" id="line-753"><code></code></span>
+<span class="codeline" id="line-754"><code>	next_emit = ip_end</code></span>
+<span class="codeline" id="line-755"><code></code></span>
+<span class="codeline" id="line-756"><code>	/* If we have more data, write a new meta-block header and prefix codes and</code></span>
+<span class="codeline" id="line-757"><code>	   then continue emitting commands. */</code></span>
+<span class="codeline" id="line-758"><code>next_block:</code></span>
+<span class="codeline" id="line-759"><code>	if input_size &gt; 0 {</code></span>
+<span class="codeline" id="line-760"><code>		metablock_start = input</code></span>
+<span class="codeline" id="line-761"><code>		block_size = brotli_min_size_t(input_size, compressFragmentFastImpl_kFirstBlockSize)</code></span>
+<span class="codeline" id="line-762"><code>		total_block_size = block_size</code></span>
+<span class="codeline" id="line-763"><code></code></span>
+<span class="codeline" id="line-764"><code>		/* Save the bit position of the MLEN field of the meta-block header, so that</code></span>
+<span class="codeline" id="line-765"><code>		   we can update it later if we decide to extend this meta-block. */</code></span>
+<span class="codeline" id="line-766"><code>		mlen_storage_ix = *storage_ix + 3</code></span>
+<span class="codeline" id="line-767"><code></code></span>
+<span class="codeline" id="line-768"><code>		storeMetaBlockHeader1(block_size, false, storage_ix, storage)</code></span>
+<span class="codeline" id="line-769"><code></code></span>
+<span class="codeline" id="line-770"><code>		/* No block splits, no contexts. */</code></span>
+<span class="codeline" id="line-771"><code>		writeBits(13, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>		literal_ratio = buildAndStoreLiteralPrefixCode(in[input:], block_size, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-774"><code>		buildAndStoreCommandPrefixCode1(cmd_histo[:], cmd_depth, cmd_bits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-775"><code>		goto emit_commands</code></span>
+<span class="codeline" id="line-776"><code>	}</code></span>
+<span class="codeline" id="line-777"><code></code></span>
+<span class="codeline" id="line-778"><code>	if !is_last {</code></span>
+<span class="codeline" id="line-779"><code>		/* If this is not the last block, update the command and distance prefix</code></span>
+<span class="codeline" id="line-780"><code>		   codes for the next block and store the compressed forms. */</code></span>
+<span class="codeline" id="line-781"><code>		cmd_code[0] = 0</code></span>
+<span class="codeline" id="line-782"><code></code></span>
+<span class="codeline" id="line-783"><code>		*cmd_code_numbits = 0</code></span>
+<span class="codeline" id="line-784"><code>		buildAndStoreCommandPrefixCode1(cmd_histo[:], cmd_depth, cmd_bits, cmd_code_numbits, cmd_code)</code></span>
+<span class="codeline" id="line-785"><code>	}</code></span>
+<span class="codeline" id="line-786"><code>}</code></span>
+<span class="codeline" id="line-787"><code></code></span>
+<span class="codeline" id="line-788"><code>/* Compresses "input" string to the "*storage" buffer as one or more complete</code></span>
+<span class="codeline" id="line-789"><code>   meta-blocks, and updates the "*storage_ix" bit position.</code></span>
+<span class="codeline" id="line-790"><code></code></span>
+<span class="codeline" id="line-791"><code>   If "is_last" is 1, emits an additional empty last meta-block.</code></span>
+<span class="codeline" id="line-792"><code></code></span>
+<span class="codeline" id="line-793"><code>   "cmd_depth" and "cmd_bits" contain the command and distance prefix codes</code></span>
+<span class="codeline" id="line-794"><code>   (see comment in encode.h) used for the encoding of this input fragment.</code></span>
+<span class="codeline" id="line-795"><code>   If "is_last" is 0, they are updated to reflect the statistics</code></span>
+<span class="codeline" id="line-796"><code>   of this input fragment, to be used for the encoding of the next fragment.</code></span>
+<span class="codeline" id="line-797"><code></code></span>
+<span class="codeline" id="line-798"><code>   "*cmd_code_numbits" is the number of bits of the compressed representation</code></span>
+<span class="codeline" id="line-799"><code>   of the command and distance prefix codes, and "cmd_code" is an array of</code></span>
+<span class="codeline" id="line-800"><code>   at least "(*cmd_code_numbits + 7) &gt;&gt; 3" size that contains the compressed</code></span>
+<span class="codeline" id="line-801"><code>   command and distance prefix codes. If "is_last" is 0, these are also</code></span>
+<span class="codeline" id="line-802"><code>   updated to represent the updated "cmd_depth" and "cmd_bits".</code></span>
+<span class="codeline" id="line-803"><code></code></span>
+<span class="codeline" id="line-804"><code>   REQUIRES: "input_size" is greater than zero, or "is_last" is 1.</code></span>
+<span class="codeline" id="line-805"><code>   REQUIRES: "input_size" is less or equal to maximal metablock size (1 &lt;&lt; 24).</code></span>
+<span class="codeline" id="line-806"><code>   REQUIRES: All elements in "table[0..table_size-1]" are initialized to zero.</code></span>
+<span class="codeline" id="line-807"><code>   REQUIRES: "table_size" is an odd (9, 11, 13, 15) power of two</code></span>
+<span class="codeline" id="line-808"><code>   OUTPUT: maximal copy distance &lt;= |input_size|</code></span>
+<span class="codeline" id="line-809"><code>   OUTPUT: maximal copy distance &lt;= BROTLI_MAX_BACKWARD_LIMIT(18) */</code></span>
+<span class="codeline" id="line-810"><code>func compressFragmentFast(input []byte, input_size uint, is_last bool, table []int, table_size uint, cmd_depth []byte, cmd_bits []uint16, cmd_code_numbits *uint, cmd_code []byte, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-811"><code>	var initial_storage_ix uint = *storage_ix</code></span>
+<span class="codeline" id="line-812"><code>	var table_bits uint = uint(log2FloorNonZero(table_size))</code></span>
+<span class="codeline" id="line-813"><code></code></span>
+<span class="codeline" id="line-814"><code>	if input_size == 0 {</code></span>
+<span class="codeline" id="line-815"><code>		assert(is_last)</code></span>
+<span class="codeline" id="line-816"><code>		writeBits(1, 1, storage_ix, storage) /* islast */</code></span>
+<span class="codeline" id="line-817"><code>		writeBits(1, 1, storage_ix, storage) /* isempty */</code></span>
+<span class="codeline" id="line-818"><code>		*storage_ix = (*storage_ix + 7) &amp;^ 7</code></span>
+<span class="codeline" id="line-819"><code>		return</code></span>
+<span class="codeline" id="line-820"><code>	}</code></span>
+<span class="codeline" id="line-821"><code></code></span>
+<span class="codeline" id="line-822"><code>	compressFragmentFastImpl(input, input_size, is_last, table, table_bits, cmd_depth, cmd_bits, cmd_code_numbits, cmd_code, storage_ix, storage)</code></span>
+<span class="codeline" id="line-823"><code></code></span>
+<span class="codeline" id="line-824"><code>	/* If output is larger than single uncompressed block, rewrite it. */</code></span>
+<span class="codeline" id="line-825"><code>	if *storage_ix-initial_storage_ix &gt; 31+(input_size&lt;&lt;3) {</code></span>
+<span class="codeline" id="line-826"><code>		emitUncompressedMetaBlock1(input, input[input_size:], initial_storage_ix, storage_ix, storage)</code></span>
+<span class="codeline" id="line-827"><code>	}</code></span>
+<span class="codeline" id="line-828"><code></code></span>
+<span class="codeline" id="line-829"><code>	if is_last {</code></span>
+<span class="codeline" id="line-830"><code>		writeBits(1, 1, storage_ix, storage) /* islast */</code></span>
+<span class="codeline" id="line-831"><code>		writeBits(1, 1, storage_ix, storage) /* isempty */</code></span>
+<span class="codeline" id="line-832"><code>		*storage_ix = (*storage_ix + 7) &amp;^ 7</code></span>
+<span class="codeline" id="line-833"><code>	}</code></span>
+<span class="codeline" id="line-834"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

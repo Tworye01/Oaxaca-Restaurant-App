@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: cookie.go in package net/http</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	cookie.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/net/http.html">net/http</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package http</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"errors"</code></span>
+<span class="codeline" id="line-9"><code>	"fmt"</code></span>
+<span class="codeline" id="line-10"><code>	"log"</code></span>
+<span class="codeline" id="line-11"><code>	"net"</code></span>
+<span class="codeline" id="line-12"><code>	"net/http/internal/ascii"</code></span>
+<span class="codeline" id="line-13"><code>	"net/textproto"</code></span>
+<span class="codeline" id="line-14"><code>	"strconv"</code></span>
+<span class="codeline" id="line-15"><code>	"strings"</code></span>
+<span class="codeline" id="line-16"><code>	"time"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// A Cookie represents an HTTP cookie as sent in the Set-Cookie header of an</code></span>
+<span class="codeline" id="line-20"><code>// HTTP response or the Cookie header of an HTTP request.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// See https://tools.ietf.org/html/rfc6265 for details.</code></span>
+<span class="codeline" id="line-23"><code>type Cookie struct {</code></span>
+<span class="codeline" id="line-24"><code>	Name  string</code></span>
+<span class="codeline" id="line-25"><code>	Value string</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>	Path       string    // optional</code></span>
+<span class="codeline" id="line-28"><code>	Domain     string    // optional</code></span>
+<span class="codeline" id="line-29"><code>	Expires    time.Time // optional</code></span>
+<span class="codeline" id="line-30"><code>	RawExpires string    // for reading cookies only</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>	// MaxAge=0 means no 'Max-Age' attribute specified.</code></span>
+<span class="codeline" id="line-33"><code>	// MaxAge&lt;0 means delete cookie now, equivalently 'Max-Age: 0'</code></span>
+<span class="codeline" id="line-34"><code>	// MaxAge&gt;0 means Max-Age attribute present and given in seconds</code></span>
+<span class="codeline" id="line-35"><code>	MaxAge   int</code></span>
+<span class="codeline" id="line-36"><code>	Secure   bool</code></span>
+<span class="codeline" id="line-37"><code>	HttpOnly bool</code></span>
+<span class="codeline" id="line-38"><code>	SameSite SameSite</code></span>
+<span class="codeline" id="line-39"><code>	Raw      string</code></span>
+<span class="codeline" id="line-40"><code>	Unparsed []string // Raw text of unparsed attribute-value pairs</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>// SameSite allows a server to define a cookie attribute making it impossible for</code></span>
+<span class="codeline" id="line-44"><code>// the browser to send this cookie along with cross-site requests. The main</code></span>
+<span class="codeline" id="line-45"><code>// goal is to mitigate the risk of cross-origin information leakage, and provide</code></span>
+<span class="codeline" id="line-46"><code>// some protection against cross-site request forgery attacks.</code></span>
+<span class="codeline" id="line-47"><code>//</code></span>
+<span class="codeline" id="line-48"><code>// See https://tools.ietf.org/html/draft-ietf-httpbis-cookie-same-site-00 for details.</code></span>
+<span class="codeline" id="line-49"><code>type SameSite int</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>const (</code></span>
+<span class="codeline" id="line-52"><code>	SameSiteDefaultMode SameSite = iota + 1</code></span>
+<span class="codeline" id="line-53"><code>	SameSiteLaxMode</code></span>
+<span class="codeline" id="line-54"><code>	SameSiteStrictMode</code></span>
+<span class="codeline" id="line-55"><code>	SameSiteNoneMode</code></span>
+<span class="codeline" id="line-56"><code>)</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// readSetCookies parses all "Set-Cookie" values from</code></span>
+<span class="codeline" id="line-59"><code>// the header h and returns the successfully parsed Cookies.</code></span>
+<span class="codeline" id="line-60"><code>func readSetCookies(h Header) []*Cookie {</code></span>
+<span class="codeline" id="line-61"><code>	cookieCount := len(h["Set-Cookie"])</code></span>
+<span class="codeline" id="line-62"><code>	if cookieCount == 0 {</code></span>
+<span class="codeline" id="line-63"><code>		return []*Cookie{}</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code>	cookies := make([]*Cookie, 0, cookieCount)</code></span>
+<span class="codeline" id="line-66"><code>	for _, line := range h["Set-Cookie"] {</code></span>
+<span class="codeline" id="line-67"><code>		parts := strings.Split(textproto.TrimString(line), ";")</code></span>
+<span class="codeline" id="line-68"><code>		if len(parts) == 1 &amp;&amp; parts[0] == "" {</code></span>
+<span class="codeline" id="line-69"><code>			continue</code></span>
+<span class="codeline" id="line-70"><code>		}</code></span>
+<span class="codeline" id="line-71"><code>		parts[0] = textproto.TrimString(parts[0])</code></span>
+<span class="codeline" id="line-72"><code>		name, value, ok := strings.Cut(parts[0], "=")</code></span>
+<span class="codeline" id="line-73"><code>		if !ok {</code></span>
+<span class="codeline" id="line-74"><code>			continue</code></span>
+<span class="codeline" id="line-75"><code>		}</code></span>
+<span class="codeline" id="line-76"><code>		name = textproto.TrimString(name)</code></span>
+<span class="codeline" id="line-77"><code>		if !isCookieNameValid(name) {</code></span>
+<span class="codeline" id="line-78"><code>			continue</code></span>
+<span class="codeline" id="line-79"><code>		}</code></span>
+<span class="codeline" id="line-80"><code>		value, ok = parseCookieValue(value, true)</code></span>
+<span class="codeline" id="line-81"><code>		if !ok {</code></span>
+<span class="codeline" id="line-82"><code>			continue</code></span>
+<span class="codeline" id="line-83"><code>		}</code></span>
+<span class="codeline" id="line-84"><code>		c := &amp;Cookie{</code></span>
+<span class="codeline" id="line-85"><code>			Name:  name,</code></span>
+<span class="codeline" id="line-86"><code>			Value: value,</code></span>
+<span class="codeline" id="line-87"><code>			Raw:   line,</code></span>
+<span class="codeline" id="line-88"><code>		}</code></span>
+<span class="codeline" id="line-89"><code>		for i := 1; i &lt; len(parts); i++ {</code></span>
+<span class="codeline" id="line-90"><code>			parts[i] = textproto.TrimString(parts[i])</code></span>
+<span class="codeline" id="line-91"><code>			if len(parts[i]) == 0 {</code></span>
+<span class="codeline" id="line-92"><code>				continue</code></span>
+<span class="codeline" id="line-93"><code>			}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>			attr, val, _ := strings.Cut(parts[i], "=")</code></span>
+<span class="codeline" id="line-96"><code>			lowerAttr, isASCII := ascii.ToLower(attr)</code></span>
+<span class="codeline" id="line-97"><code>			if !isASCII {</code></span>
+<span class="codeline" id="line-98"><code>				continue</code></span>
+<span class="codeline" id="line-99"><code>			}</code></span>
+<span class="codeline" id="line-100"><code>			val, ok = parseCookieValue(val, false)</code></span>
+<span class="codeline" id="line-101"><code>			if !ok {</code></span>
+<span class="codeline" id="line-102"><code>				c.Unparsed = append(c.Unparsed, parts[i])</code></span>
+<span class="codeline" id="line-103"><code>				continue</code></span>
+<span class="codeline" id="line-104"><code>			}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>			switch lowerAttr {</code></span>
+<span class="codeline" id="line-107"><code>			case "samesite":</code></span>
+<span class="codeline" id="line-108"><code>				lowerVal, ascii := ascii.ToLower(val)</code></span>
+<span class="codeline" id="line-109"><code>				if !ascii {</code></span>
+<span class="codeline" id="line-110"><code>					c.SameSite = SameSiteDefaultMode</code></span>
+<span class="codeline" id="line-111"><code>					continue</code></span>
+<span class="codeline" id="line-112"><code>				}</code></span>
+<span class="codeline" id="line-113"><code>				switch lowerVal {</code></span>
+<span class="codeline" id="line-114"><code>				case "lax":</code></span>
+<span class="codeline" id="line-115"><code>					c.SameSite = SameSiteLaxMode</code></span>
+<span class="codeline" id="line-116"><code>				case "strict":</code></span>
+<span class="codeline" id="line-117"><code>					c.SameSite = SameSiteStrictMode</code></span>
+<span class="codeline" id="line-118"><code>				case "none":</code></span>
+<span class="codeline" id="line-119"><code>					c.SameSite = SameSiteNoneMode</code></span>
+<span class="codeline" id="line-120"><code>				default:</code></span>
+<span class="codeline" id="line-121"><code>					c.SameSite = SameSiteDefaultMode</code></span>
+<span class="codeline" id="line-122"><code>				}</code></span>
+<span class="codeline" id="line-123"><code>				continue</code></span>
+<span class="codeline" id="line-124"><code>			case "secure":</code></span>
+<span class="codeline" id="line-125"><code>				c.Secure = true</code></span>
+<span class="codeline" id="line-126"><code>				continue</code></span>
+<span class="codeline" id="line-127"><code>			case "httponly":</code></span>
+<span class="codeline" id="line-128"><code>				c.HttpOnly = true</code></span>
+<span class="codeline" id="line-129"><code>				continue</code></span>
+<span class="codeline" id="line-130"><code>			case "domain":</code></span>
+<span class="codeline" id="line-131"><code>				c.Domain = val</code></span>
+<span class="codeline" id="line-132"><code>				continue</code></span>
+<span class="codeline" id="line-133"><code>			case "max-age":</code></span>
+<span class="codeline" id="line-134"><code>				secs, err := strconv.Atoi(val)</code></span>
+<span class="codeline" id="line-135"><code>				if err != nil || secs != 0 &amp;&amp; val[0] == '0' {</code></span>
+<span class="codeline" id="line-136"><code>					break</code></span>
+<span class="codeline" id="line-137"><code>				}</code></span>
+<span class="codeline" id="line-138"><code>				if secs &lt;= 0 {</code></span>
+<span class="codeline" id="line-139"><code>					secs = -1</code></span>
+<span class="codeline" id="line-140"><code>				}</code></span>
+<span class="codeline" id="line-141"><code>				c.MaxAge = secs</code></span>
+<span class="codeline" id="line-142"><code>				continue</code></span>
+<span class="codeline" id="line-143"><code>			case "expires":</code></span>
+<span class="codeline" id="line-144"><code>				c.RawExpires = val</code></span>
+<span class="codeline" id="line-145"><code>				exptime, err := time.Parse(time.RFC1123, val)</code></span>
+<span class="codeline" id="line-146"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-147"><code>					exptime, err = time.Parse("Mon, 02-Jan-2006 15:04:05 MST", val)</code></span>
+<span class="codeline" id="line-148"><code>					if err != nil {</code></span>
+<span class="codeline" id="line-149"><code>						c.Expires = time.Time{}</code></span>
+<span class="codeline" id="line-150"><code>						break</code></span>
+<span class="codeline" id="line-151"><code>					}</code></span>
+<span class="codeline" id="line-152"><code>				}</code></span>
+<span class="codeline" id="line-153"><code>				c.Expires = exptime.UTC()</code></span>
+<span class="codeline" id="line-154"><code>				continue</code></span>
+<span class="codeline" id="line-155"><code>			case "path":</code></span>
+<span class="codeline" id="line-156"><code>				c.Path = val</code></span>
+<span class="codeline" id="line-157"><code>				continue</code></span>
+<span class="codeline" id="line-158"><code>			}</code></span>
+<span class="codeline" id="line-159"><code>			c.Unparsed = append(c.Unparsed, parts[i])</code></span>
+<span class="codeline" id="line-160"><code>		}</code></span>
+<span class="codeline" id="line-161"><code>		cookies = append(cookies, c)</code></span>
+<span class="codeline" id="line-162"><code>	}</code></span>
+<span class="codeline" id="line-163"><code>	return cookies</code></span>
+<span class="codeline" id="line-164"><code>}</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>// SetCookie adds a Set-Cookie header to the provided [ResponseWriter]'s headers.</code></span>
+<span class="codeline" id="line-167"><code>// The provided cookie must have a valid Name. Invalid cookies may be</code></span>
+<span class="codeline" id="line-168"><code>// silently dropped.</code></span>
+<span class="codeline" id="line-169"><code>func SetCookie(w ResponseWriter, cookie *Cookie) {</code></span>
+<span class="codeline" id="line-170"><code>	if v := cookie.String(); v != "" {</code></span>
+<span class="codeline" id="line-171"><code>		w.Header().Add("Set-Cookie", v)</code></span>
+<span class="codeline" id="line-172"><code>	}</code></span>
+<span class="codeline" id="line-173"><code>}</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>// String returns the serialization of the cookie for use in a [Cookie]</code></span>
+<span class="codeline" id="line-176"><code>// header (if only Name and Value are set) or a Set-Cookie response</code></span>
+<span class="codeline" id="line-177"><code>// header (if other fields are set).</code></span>
+<span class="codeline" id="line-178"><code>// If c is nil or c.Name is invalid, the empty string is returned.</code></span>
+<span class="codeline" id="line-179"><code>func (c *Cookie) String() string {</code></span>
+<span class="codeline" id="line-180"><code>	if c == nil || !isCookieNameValid(c.Name) {</code></span>
+<span class="codeline" id="line-181"><code>		return ""</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	// extraCookieLength derived from typical length of cookie attributes</code></span>
+<span class="codeline" id="line-184"><code>	// see RFC 6265 Sec 4.1.</code></span>
+<span class="codeline" id="line-185"><code>	const extraCookieLength = 110</code></span>
+<span class="codeline" id="line-186"><code>	var b strings.Builder</code></span>
+<span class="codeline" id="line-187"><code>	b.Grow(len(c.Name) + len(c.Value) + len(c.Domain) + len(c.Path) + extraCookieLength)</code></span>
+<span class="codeline" id="line-188"><code>	b.WriteString(c.Name)</code></span>
+<span class="codeline" id="line-189"><code>	b.WriteRune('=')</code></span>
+<span class="codeline" id="line-190"><code>	b.WriteString(sanitizeCookieValue(c.Value))</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>	if len(c.Path) &gt; 0 {</code></span>
+<span class="codeline" id="line-193"><code>		b.WriteString("; Path=")</code></span>
+<span class="codeline" id="line-194"><code>		b.WriteString(sanitizeCookiePath(c.Path))</code></span>
+<span class="codeline" id="line-195"><code>	}</code></span>
+<span class="codeline" id="line-196"><code>	if len(c.Domain) &gt; 0 {</code></span>
+<span class="codeline" id="line-197"><code>		if validCookieDomain(c.Domain) {</code></span>
+<span class="codeline" id="line-198"><code>			// A c.Domain containing illegal characters is not</code></span>
+<span class="codeline" id="line-199"><code>			// sanitized but simply dropped which turns the cookie</code></span>
+<span class="codeline" id="line-200"><code>			// into a host-only cookie. A leading dot is okay</code></span>
+<span class="codeline" id="line-201"><code>			// but won't be sent.</code></span>
+<span class="codeline" id="line-202"><code>			d := c.Domain</code></span>
+<span class="codeline" id="line-203"><code>			if d[0] == '.' {</code></span>
+<span class="codeline" id="line-204"><code>				d = d[1:]</code></span>
+<span class="codeline" id="line-205"><code>			}</code></span>
+<span class="codeline" id="line-206"><code>			b.WriteString("; Domain=")</code></span>
+<span class="codeline" id="line-207"><code>			b.WriteString(d)</code></span>
+<span class="codeline" id="line-208"><code>		} else {</code></span>
+<span class="codeline" id="line-209"><code>			log.Printf("net/http: invalid Cookie.Domain %q; dropping domain attribute", c.Domain)</code></span>
+<span class="codeline" id="line-210"><code>		}</code></span>
+<span class="codeline" id="line-211"><code>	}</code></span>
+<span class="codeline" id="line-212"><code>	var buf [len(TimeFormat)]byte</code></span>
+<span class="codeline" id="line-213"><code>	if validCookieExpires(c.Expires) {</code></span>
+<span class="codeline" id="line-214"><code>		b.WriteString("; Expires=")</code></span>
+<span class="codeline" id="line-215"><code>		b.Write(c.Expires.UTC().AppendFormat(buf[:0], TimeFormat))</code></span>
+<span class="codeline" id="line-216"><code>	}</code></span>
+<span class="codeline" id="line-217"><code>	if c.MaxAge &gt; 0 {</code></span>
+<span class="codeline" id="line-218"><code>		b.WriteString("; Max-Age=")</code></span>
+<span class="codeline" id="line-219"><code>		b.Write(strconv.AppendInt(buf[:0], int64(c.MaxAge), 10))</code></span>
+<span class="codeline" id="line-220"><code>	} else if c.MaxAge &lt; 0 {</code></span>
+<span class="codeline" id="line-221"><code>		b.WriteString("; Max-Age=0")</code></span>
+<span class="codeline" id="line-222"><code>	}</code></span>
+<span class="codeline" id="line-223"><code>	if c.HttpOnly {</code></span>
+<span class="codeline" id="line-224"><code>		b.WriteString("; HttpOnly")</code></span>
+<span class="codeline" id="line-225"><code>	}</code></span>
+<span class="codeline" id="line-226"><code>	if c.Secure {</code></span>
+<span class="codeline" id="line-227"><code>		b.WriteString("; Secure")</code></span>
+<span class="codeline" id="line-228"><code>	}</code></span>
+<span class="codeline" id="line-229"><code>	switch c.SameSite {</code></span>
+<span class="codeline" id="line-230"><code>	case SameSiteDefaultMode:</code></span>
+<span class="codeline" id="line-231"><code>		// Skip, default mode is obtained by not emitting the attribute.</code></span>
+<span class="codeline" id="line-232"><code>	case SameSiteNoneMode:</code></span>
+<span class="codeline" id="line-233"><code>		b.WriteString("; SameSite=None")</code></span>
+<span class="codeline" id="line-234"><code>	case SameSiteLaxMode:</code></span>
+<span class="codeline" id="line-235"><code>		b.WriteString("; SameSite=Lax")</code></span>
+<span class="codeline" id="line-236"><code>	case SameSiteStrictMode:</code></span>
+<span class="codeline" id="line-237"><code>		b.WriteString("; SameSite=Strict")</code></span>
+<span class="codeline" id="line-238"><code>	}</code></span>
+<span class="codeline" id="line-239"><code>	return b.String()</code></span>
+<span class="codeline" id="line-240"><code>}</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>// Valid reports whether the cookie is valid.</code></span>
+<span class="codeline" id="line-243"><code>func (c *Cookie) Valid() error {</code></span>
+<span class="codeline" id="line-244"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-245"><code>		return errors.New("http: nil Cookie")</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code>	if !isCookieNameValid(c.Name) {</code></span>
+<span class="codeline" id="line-248"><code>		return errors.New("http: invalid Cookie.Name")</code></span>
+<span class="codeline" id="line-249"><code>	}</code></span>
+<span class="codeline" id="line-250"><code>	if !c.Expires.IsZero() &amp;&amp; !validCookieExpires(c.Expires) {</code></span>
+<span class="codeline" id="line-251"><code>		return errors.New("http: invalid Cookie.Expires")</code></span>
+<span class="codeline" id="line-252"><code>	}</code></span>
+<span class="codeline" id="line-253"><code>	for i := 0; i &lt; len(c.Value); i++ {</code></span>
+<span class="codeline" id="line-254"><code>		if !validCookieValueByte(c.Value[i]) {</code></span>
+<span class="codeline" id="line-255"><code>			return fmt.Errorf("http: invalid byte %q in Cookie.Value", c.Value[i])</code></span>
+<span class="codeline" id="line-256"><code>		}</code></span>
+<span class="codeline" id="line-257"><code>	}</code></span>
+<span class="codeline" id="line-258"><code>	if len(c.Path) &gt; 0 {</code></span>
+<span class="codeline" id="line-259"><code>		for i := 0; i &lt; len(c.Path); i++ {</code></span>
+<span class="codeline" id="line-260"><code>			if !validCookiePathByte(c.Path[i]) {</code></span>
+<span class="codeline" id="line-261"><code>				return fmt.Errorf("http: invalid byte %q in Cookie.Path", c.Path[i])</code></span>
+<span class="codeline" id="line-262"><code>			}</code></span>
+<span class="codeline" id="line-263"><code>		}</code></span>
+<span class="codeline" id="line-264"><code>	}</code></span>
+<span class="codeline" id="line-265"><code>	if len(c.Domain) &gt; 0 {</code></span>
+<span class="codeline" id="line-266"><code>		if !validCookieDomain(c.Domain) {</code></span>
+<span class="codeline" id="line-267"><code>			return errors.New("http: invalid Cookie.Domain")</code></span>
+<span class="codeline" id="line-268"><code>		}</code></span>
+<span class="codeline" id="line-269"><code>	}</code></span>
+<span class="codeline" id="line-270"><code>	return nil</code></span>
+<span class="codeline" id="line-271"><code>}</code></span>
+<span class="codeline" id="line-272"><code></code></span>
+<span class="codeline" id="line-273"><code>// readCookies parses all "Cookie" values from the header h and</code></span>
+<span class="codeline" id="line-274"><code>// returns the successfully parsed Cookies.</code></span>
+<span class="codeline" id="line-275"><code>//</code></span>
+<span class="codeline" id="line-276"><code>// if filter isn't empty, only cookies of that name are returned.</code></span>
+<span class="codeline" id="line-277"><code>func readCookies(h Header, filter string) []*Cookie {</code></span>
+<span class="codeline" id="line-278"><code>	lines := h["Cookie"]</code></span>
+<span class="codeline" id="line-279"><code>	if len(lines) == 0 {</code></span>
+<span class="codeline" id="line-280"><code>		return []*Cookie{}</code></span>
+<span class="codeline" id="line-281"><code>	}</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>	cookies := make([]*Cookie, 0, len(lines)+strings.Count(lines[0], ";"))</code></span>
+<span class="codeline" id="line-284"><code>	for _, line := range lines {</code></span>
+<span class="codeline" id="line-285"><code>		line = textproto.TrimString(line)</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>		var part string</code></span>
+<span class="codeline" id="line-288"><code>		for len(line) &gt; 0 { // continue since we have rest</code></span>
+<span class="codeline" id="line-289"><code>			part, line, _ = strings.Cut(line, ";")</code></span>
+<span class="codeline" id="line-290"><code>			part = textproto.TrimString(part)</code></span>
+<span class="codeline" id="line-291"><code>			if part == "" {</code></span>
+<span class="codeline" id="line-292"><code>				continue</code></span>
+<span class="codeline" id="line-293"><code>			}</code></span>
+<span class="codeline" id="line-294"><code>			name, val, _ := strings.Cut(part, "=")</code></span>
+<span class="codeline" id="line-295"><code>			name = textproto.TrimString(name)</code></span>
+<span class="codeline" id="line-296"><code>			if !isCookieNameValid(name) {</code></span>
+<span class="codeline" id="line-297"><code>				continue</code></span>
+<span class="codeline" id="line-298"><code>			}</code></span>
+<span class="codeline" id="line-299"><code>			if filter != "" &amp;&amp; filter != name {</code></span>
+<span class="codeline" id="line-300"><code>				continue</code></span>
+<span class="codeline" id="line-301"><code>			}</code></span>
+<span class="codeline" id="line-302"><code>			val, ok := parseCookieValue(val, true)</code></span>
+<span class="codeline" id="line-303"><code>			if !ok {</code></span>
+<span class="codeline" id="line-304"><code>				continue</code></span>
+<span class="codeline" id="line-305"><code>			}</code></span>
+<span class="codeline" id="line-306"><code>			cookies = append(cookies, &amp;Cookie{Name: name, Value: val})</code></span>
+<span class="codeline" id="line-307"><code>		}</code></span>
+<span class="codeline" id="line-308"><code>	}</code></span>
+<span class="codeline" id="line-309"><code>	return cookies</code></span>
+<span class="codeline" id="line-310"><code>}</code></span>
+<span class="codeline" id="line-311"><code></code></span>
+<span class="codeline" id="line-312"><code>// validCookieDomain reports whether v is a valid cookie domain-value.</code></span>
+<span class="codeline" id="line-313"><code>func validCookieDomain(v string) bool {</code></span>
+<span class="codeline" id="line-314"><code>	if isCookieDomainName(v) {</code></span>
+<span class="codeline" id="line-315"><code>		return true</code></span>
+<span class="codeline" id="line-316"><code>	}</code></span>
+<span class="codeline" id="line-317"><code>	if net.ParseIP(v) != nil &amp;&amp; !strings.Contains(v, ":") {</code></span>
+<span class="codeline" id="line-318"><code>		return true</code></span>
+<span class="codeline" id="line-319"><code>	}</code></span>
+<span class="codeline" id="line-320"><code>	return false</code></span>
+<span class="codeline" id="line-321"><code>}</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>// validCookieExpires reports whether v is a valid cookie expires-value.</code></span>
+<span class="codeline" id="line-324"><code>func validCookieExpires(t time.Time) bool {</code></span>
+<span class="codeline" id="line-325"><code>	// IETF RFC 6265 Section 5.1.1.5, the year must not be less than 1601</code></span>
+<span class="codeline" id="line-326"><code>	return t.Year() &gt;= 1601</code></span>
+<span class="codeline" id="line-327"><code>}</code></span>
+<span class="codeline" id="line-328"><code></code></span>
+<span class="codeline" id="line-329"><code>// isCookieDomainName reports whether s is a valid domain name or a valid</code></span>
+<span class="codeline" id="line-330"><code>// domain name with a leading dot '.'.  It is almost a direct copy of</code></span>
+<span class="codeline" id="line-331"><code>// package net's isDomainName.</code></span>
+<span class="codeline" id="line-332"><code>func isCookieDomainName(s string) bool {</code></span>
+<span class="codeline" id="line-333"><code>	if len(s) == 0 {</code></span>
+<span class="codeline" id="line-334"><code>		return false</code></span>
+<span class="codeline" id="line-335"><code>	}</code></span>
+<span class="codeline" id="line-336"><code>	if len(s) &gt; 255 {</code></span>
+<span class="codeline" id="line-337"><code>		return false</code></span>
+<span class="codeline" id="line-338"><code>	}</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>	if s[0] == '.' {</code></span>
+<span class="codeline" id="line-341"><code>		// A cookie a domain attribute may start with a leading dot.</code></span>
+<span class="codeline" id="line-342"><code>		s = s[1:]</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code>	last := byte('.')</code></span>
+<span class="codeline" id="line-345"><code>	ok := false // Ok once we've seen a letter.</code></span>
+<span class="codeline" id="line-346"><code>	partlen := 0</code></span>
+<span class="codeline" id="line-347"><code>	for i := 0; i &lt; len(s); i++ {</code></span>
+<span class="codeline" id="line-348"><code>		c := s[i]</code></span>
+<span class="codeline" id="line-349"><code>		switch {</code></span>
+<span class="codeline" id="line-350"><code>		default:</code></span>
+<span class="codeline" id="line-351"><code>			return false</code></span>
+<span class="codeline" id="line-352"><code>		case 'a' &lt;= c &amp;&amp; c &lt;= 'z' || 'A' &lt;= c &amp;&amp; c &lt;= 'Z':</code></span>
+<span class="codeline" id="line-353"><code>			// No '_' allowed here (in contrast to package net).</code></span>
+<span class="codeline" id="line-354"><code>			ok = true</code></span>
+<span class="codeline" id="line-355"><code>			partlen++</code></span>
+<span class="codeline" id="line-356"><code>		case '0' &lt;= c &amp;&amp; c &lt;= '9':</code></span>
+<span class="codeline" id="line-357"><code>			// fine</code></span>
+<span class="codeline" id="line-358"><code>			partlen++</code></span>
+<span class="codeline" id="line-359"><code>		case c == '-':</code></span>
+<span class="codeline" id="line-360"><code>			// Byte before dash cannot be dot.</code></span>
+<span class="codeline" id="line-361"><code>			if last == '.' {</code></span>
+<span class="codeline" id="line-362"><code>				return false</code></span>
+<span class="codeline" id="line-363"><code>			}</code></span>
+<span class="codeline" id="line-364"><code>			partlen++</code></span>
+<span class="codeline" id="line-365"><code>		case c == '.':</code></span>
+<span class="codeline" id="line-366"><code>			// Byte before dot cannot be dot, dash.</code></span>
+<span class="codeline" id="line-367"><code>			if last == '.' || last == '-' {</code></span>
+<span class="codeline" id="line-368"><code>				return false</code></span>
+<span class="codeline" id="line-369"><code>			}</code></span>
+<span class="codeline" id="line-370"><code>			if partlen &gt; 63 || partlen == 0 {</code></span>
+<span class="codeline" id="line-371"><code>				return false</code></span>
+<span class="codeline" id="line-372"><code>			}</code></span>
+<span class="codeline" id="line-373"><code>			partlen = 0</code></span>
+<span class="codeline" id="line-374"><code>		}</code></span>
+<span class="codeline" id="line-375"><code>		last = c</code></span>
+<span class="codeline" id="line-376"><code>	}</code></span>
+<span class="codeline" id="line-377"><code>	if last == '-' || partlen &gt; 63 {</code></span>
+<span class="codeline" id="line-378"><code>		return false</code></span>
+<span class="codeline" id="line-379"><code>	}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>	return ok</code></span>
+<span class="codeline" id="line-382"><code>}</code></span>
+<span class="codeline" id="line-383"><code></code></span>
+<span class="codeline" id="line-384"><code>var cookieNameSanitizer = strings.NewReplacer("\n", "-", "\r", "-")</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>func sanitizeCookieName(n string) string {</code></span>
+<span class="codeline" id="line-387"><code>	return cookieNameSanitizer.Replace(n)</code></span>
+<span class="codeline" id="line-388"><code>}</code></span>
+<span class="codeline" id="line-389"><code></code></span>
+<span class="codeline" id="line-390"><code>// sanitizeCookieValue produces a suitable cookie-value from v.</code></span>
+<span class="codeline" id="line-391"><code>// https://tools.ietf.org/html/rfc6265#section-4.1.1</code></span>
+<span class="codeline" id="line-392"><code>//</code></span>
+<span class="codeline" id="line-393"><code>//	cookie-value      = *cookie-octet / ( DQUOTE *cookie-octet DQUOTE )</code></span>
+<span class="codeline" id="line-394"><code>//	cookie-octet      = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E</code></span>
+<span class="codeline" id="line-395"><code>//	          ; US-ASCII characters excluding CTLs,</code></span>
+<span class="codeline" id="line-396"><code>//	          ; whitespace DQUOTE, comma, semicolon,</code></span>
+<span class="codeline" id="line-397"><code>//	          ; and backslash</code></span>
+<span class="codeline" id="line-398"><code>//</code></span>
+<span class="codeline" id="line-399"><code>// We loosen this as spaces and commas are common in cookie values</code></span>
+<span class="codeline" id="line-400"><code>// but we produce a quoted cookie-value if and only if v contains</code></span>
+<span class="codeline" id="line-401"><code>// commas or spaces.</code></span>
+<span class="codeline" id="line-402"><code>// See https://golang.org/issue/7243 for the discussion.</code></span>
+<span class="codeline" id="line-403"><code>func sanitizeCookieValue(v string) string {</code></span>
+<span class="codeline" id="line-404"><code>	v = sanitizeOrWarn("Cookie.Value", validCookieValueByte, v)</code></span>
+<span class="codeline" id="line-405"><code>	if len(v) == 0 {</code></span>
+<span class="codeline" id="line-406"><code>		return v</code></span>
+<span class="codeline" id="line-407"><code>	}</code></span>
+<span class="codeline" id="line-408"><code>	if strings.ContainsAny(v, " ,") {</code></span>
+<span class="codeline" id="line-409"><code>		return `"` + v + `"`</code></span>
+<span class="codeline" id="line-410"><code>	}</code></span>
+<span class="codeline" id="line-411"><code>	return v</code></span>
+<span class="codeline" id="line-412"><code>}</code></span>
+<span class="codeline" id="line-413"><code></code></span>
+<span class="codeline" id="line-414"><code>func validCookieValueByte(b byte) bool {</code></span>
+<span class="codeline" id="line-415"><code>	return 0x20 &lt;= b &amp;&amp; b &lt; 0x7f &amp;&amp; b != '"' &amp;&amp; b != ';' &amp;&amp; b != '\\'</code></span>
+<span class="codeline" id="line-416"><code>}</code></span>
+<span class="codeline" id="line-417"><code></code></span>
+<span class="codeline" id="line-418"><code>// path-av           = "Path=" path-value</code></span>
+<span class="codeline" id="line-419"><code>// path-value        = &lt;any CHAR except CTLs or ";"&gt;</code></span>
+<span class="codeline" id="line-420"><code>func sanitizeCookiePath(v string) string {</code></span>
+<span class="codeline" id="line-421"><code>	return sanitizeOrWarn("Cookie.Path", validCookiePathByte, v)</code></span>
+<span class="codeline" id="line-422"><code>}</code></span>
+<span class="codeline" id="line-423"><code></code></span>
+<span class="codeline" id="line-424"><code>func validCookiePathByte(b byte) bool {</code></span>
+<span class="codeline" id="line-425"><code>	return 0x20 &lt;= b &amp;&amp; b &lt; 0x7f &amp;&amp; b != ';'</code></span>
+<span class="codeline" id="line-426"><code>}</code></span>
+<span class="codeline" id="line-427"><code></code></span>
+<span class="codeline" id="line-428"><code>func sanitizeOrWarn(fieldName string, valid func(byte) bool, v string) string {</code></span>
+<span class="codeline" id="line-429"><code>	ok := true</code></span>
+<span class="codeline" id="line-430"><code>	for i := 0; i &lt; len(v); i++ {</code></span>
+<span class="codeline" id="line-431"><code>		if valid(v[i]) {</code></span>
+<span class="codeline" id="line-432"><code>			continue</code></span>
+<span class="codeline" id="line-433"><code>		}</code></span>
+<span class="codeline" id="line-434"><code>		log.Printf("net/http: invalid byte %q in %s; dropping invalid bytes", v[i], fieldName)</code></span>
+<span class="codeline" id="line-435"><code>		ok = false</code></span>
+<span class="codeline" id="line-436"><code>		break</code></span>
+<span class="codeline" id="line-437"><code>	}</code></span>
+<span class="codeline" id="line-438"><code>	if ok {</code></span>
+<span class="codeline" id="line-439"><code>		return v</code></span>
+<span class="codeline" id="line-440"><code>	}</code></span>
+<span class="codeline" id="line-441"><code>	buf := make([]byte, 0, len(v))</code></span>
+<span class="codeline" id="line-442"><code>	for i := 0; i &lt; len(v); i++ {</code></span>
+<span class="codeline" id="line-443"><code>		if b := v[i]; valid(b) {</code></span>
+<span class="codeline" id="line-444"><code>			buf = append(buf, b)</code></span>
+<span class="codeline" id="line-445"><code>		}</code></span>
+<span class="codeline" id="line-446"><code>	}</code></span>
+<span class="codeline" id="line-447"><code>	return string(buf)</code></span>
+<span class="codeline" id="line-448"><code>}</code></span>
+<span class="codeline" id="line-449"><code></code></span>
+<span class="codeline" id="line-450"><code>func parseCookieValue(raw string, allowDoubleQuote bool) (string, bool) {</code></span>
+<span class="codeline" id="line-451"><code>	// Strip the quotes, if present.</code></span>
+<span class="codeline" id="line-452"><code>	if allowDoubleQuote &amp;&amp; len(raw) &gt; 1 &amp;&amp; raw[0] == '"' &amp;&amp; raw[len(raw)-1] == '"' {</code></span>
+<span class="codeline" id="line-453"><code>		raw = raw[1 : len(raw)-1]</code></span>
+<span class="codeline" id="line-454"><code>	}</code></span>
+<span class="codeline" id="line-455"><code>	for i := 0; i &lt; len(raw); i++ {</code></span>
+<span class="codeline" id="line-456"><code>		if !validCookieValueByte(raw[i]) {</code></span>
+<span class="codeline" id="line-457"><code>			return "", false</code></span>
+<span class="codeline" id="line-458"><code>		}</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	return raw, true</code></span>
+<span class="codeline" id="line-461"><code>}</code></span>
+<span class="codeline" id="line-462"><code></code></span>
+<span class="codeline" id="line-463"><code>func isCookieNameValid(raw string) bool {</code></span>
+<span class="codeline" id="line-464"><code>	if raw == "" {</code></span>
+<span class="codeline" id="line-465"><code>		return false</code></span>
+<span class="codeline" id="line-466"><code>	}</code></span>
+<span class="codeline" id="line-467"><code>	return strings.IndexFunc(raw, isNotToken) &lt; 0</code></span>
+<span class="codeline" id="line-468"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

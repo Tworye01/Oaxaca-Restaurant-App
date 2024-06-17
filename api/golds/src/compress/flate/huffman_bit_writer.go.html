@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: huffman_bit_writer.go in package compress/flate</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	huffman_bit_writer.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/compress/flate.html">compress/flate</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package flate</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"io"</code></span>
+<span class="codeline" id="line-9"><code>)</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>const (</code></span>
+<span class="codeline" id="line-12"><code>	// The largest offset code.</code></span>
+<span class="codeline" id="line-13"><code>	offsetCodeCount = 30</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>	// The special code used to mark the end of a block.</code></span>
+<span class="codeline" id="line-16"><code>	endBlockMarker = 256</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>	// The first length code.</code></span>
+<span class="codeline" id="line-19"><code>	lengthCodesStart = 257</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>	// The number of codegen codes.</code></span>
+<span class="codeline" id="line-22"><code>	codegenCodeCount = 19</code></span>
+<span class="codeline" id="line-23"><code>	badCode          = 255</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>	// bufferFlushSize indicates the buffer size</code></span>
+<span class="codeline" id="line-26"><code>	// after which bytes are flushed to the writer.</code></span>
+<span class="codeline" id="line-27"><code>	// Should preferably be a multiple of 6, since</code></span>
+<span class="codeline" id="line-28"><code>	// we accumulate 6 bytes between writes to the buffer.</code></span>
+<span class="codeline" id="line-29"><code>	bufferFlushSize = 240</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>	// bufferSize is the actual output byte buffer size.</code></span>
+<span class="codeline" id="line-32"><code>	// It must have additional headroom for a flush</code></span>
+<span class="codeline" id="line-33"><code>	// which can contain up to 8 bytes.</code></span>
+<span class="codeline" id="line-34"><code>	bufferSize = bufferFlushSize + 8</code></span>
+<span class="codeline" id="line-35"><code>)</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// The number of extra bits needed by length code X - LENGTH_CODES_START.</code></span>
+<span class="codeline" id="line-38"><code>var lengthExtraBits = []int8{</code></span>
+<span class="codeline" id="line-39"><code>	/* 257 */ 0, 0, 0,</code></span>
+<span class="codeline" id="line-40"><code>	/* 260 */ 0, 0, 0, 0, 0, 1, 1, 1, 1, 2,</code></span>
+<span class="codeline" id="line-41"><code>	/* 270 */ 2, 2, 2, 3, 3, 3, 3, 4, 4, 4,</code></span>
+<span class="codeline" id="line-42"><code>	/* 280 */ 4, 5, 5, 5, 5, 0,</code></span>
+<span class="codeline" id="line-43"><code>}</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>// The length indicated by length code X - LENGTH_CODES_START.</code></span>
+<span class="codeline" id="line-46"><code>var lengthBase = []uint32{</code></span>
+<span class="codeline" id="line-47"><code>	0, 1, 2, 3, 4, 5, 6, 7, 8, 10,</code></span>
+<span class="codeline" id="line-48"><code>	12, 14, 16, 20, 24, 28, 32, 40, 48, 56,</code></span>
+<span class="codeline" id="line-49"><code>	64, 80, 96, 112, 128, 160, 192, 224, 255,</code></span>
+<span class="codeline" id="line-50"><code>}</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>// offset code word extra bits.</code></span>
+<span class="codeline" id="line-53"><code>var offsetExtraBits = []int8{</code></span>
+<span class="codeline" id="line-54"><code>	0, 0, 0, 0, 1, 1, 2, 2, 3, 3,</code></span>
+<span class="codeline" id="line-55"><code>	4, 4, 5, 5, 6, 6, 7, 7, 8, 8,</code></span>
+<span class="codeline" id="line-56"><code>	9, 9, 10, 10, 11, 11, 12, 12, 13, 13,</code></span>
+<span class="codeline" id="line-57"><code>}</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>var offsetBase = []uint32{</code></span>
+<span class="codeline" id="line-60"><code>	0x000000, 0x000001, 0x000002, 0x000003, 0x000004,</code></span>
+<span class="codeline" id="line-61"><code>	0x000006, 0x000008, 0x00000c, 0x000010, 0x000018,</code></span>
+<span class="codeline" id="line-62"><code>	0x000020, 0x000030, 0x000040, 0x000060, 0x000080,</code></span>
+<span class="codeline" id="line-63"><code>	0x0000c0, 0x000100, 0x000180, 0x000200, 0x000300,</code></span>
+<span class="codeline" id="line-64"><code>	0x000400, 0x000600, 0x000800, 0x000c00, 0x001000,</code></span>
+<span class="codeline" id="line-65"><code>	0x001800, 0x002000, 0x003000, 0x004000, 0x006000,</code></span>
+<span class="codeline" id="line-66"><code>}</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>// The odd order in which the codegen code sizes are written.</code></span>
+<span class="codeline" id="line-69"><code>var codegenOrder = []uint32{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>type huffmanBitWriter struct {</code></span>
+<span class="codeline" id="line-72"><code>	// writer is the underlying writer.</code></span>
+<span class="codeline" id="line-73"><code>	// Do not use it directly; use the write method, which ensures</code></span>
+<span class="codeline" id="line-74"><code>	// that Write errors are sticky.</code></span>
+<span class="codeline" id="line-75"><code>	writer io.Writer</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>	// Data waiting to be written is bytes[0:nbytes]</code></span>
+<span class="codeline" id="line-78"><code>	// and then the low nbits of bits.  Data is always written</code></span>
+<span class="codeline" id="line-79"><code>	// sequentially into the bytes array.</code></span>
+<span class="codeline" id="line-80"><code>	bits            uint64</code></span>
+<span class="codeline" id="line-81"><code>	nbits           uint</code></span>
+<span class="codeline" id="line-82"><code>	bytes           [bufferSize]byte</code></span>
+<span class="codeline" id="line-83"><code>	codegenFreq     [codegenCodeCount]int32</code></span>
+<span class="codeline" id="line-84"><code>	nbytes          int</code></span>
+<span class="codeline" id="line-85"><code>	literalFreq     []int32</code></span>
+<span class="codeline" id="line-86"><code>	offsetFreq      []int32</code></span>
+<span class="codeline" id="line-87"><code>	codegen         []uint8</code></span>
+<span class="codeline" id="line-88"><code>	literalEncoding *huffmanEncoder</code></span>
+<span class="codeline" id="line-89"><code>	offsetEncoding  *huffmanEncoder</code></span>
+<span class="codeline" id="line-90"><code>	codegenEncoding *huffmanEncoder</code></span>
+<span class="codeline" id="line-91"><code>	err             error</code></span>
+<span class="codeline" id="line-92"><code>}</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>func newHuffmanBitWriter(w io.Writer) *huffmanBitWriter {</code></span>
+<span class="codeline" id="line-95"><code>	return &amp;huffmanBitWriter{</code></span>
+<span class="codeline" id="line-96"><code>		writer:          w,</code></span>
+<span class="codeline" id="line-97"><code>		literalFreq:     make([]int32, maxNumLit),</code></span>
+<span class="codeline" id="line-98"><code>		offsetFreq:      make([]int32, offsetCodeCount),</code></span>
+<span class="codeline" id="line-99"><code>		codegen:         make([]uint8, maxNumLit+offsetCodeCount+1),</code></span>
+<span class="codeline" id="line-100"><code>		literalEncoding: newHuffmanEncoder(maxNumLit),</code></span>
+<span class="codeline" id="line-101"><code>		codegenEncoding: newHuffmanEncoder(codegenCodeCount),</code></span>
+<span class="codeline" id="line-102"><code>		offsetEncoding:  newHuffmanEncoder(offsetCodeCount),</code></span>
+<span class="codeline" id="line-103"><code>	}</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>func (w *huffmanBitWriter) reset(writer io.Writer) {</code></span>
+<span class="codeline" id="line-107"><code>	w.writer = writer</code></span>
+<span class="codeline" id="line-108"><code>	w.bits, w.nbits, w.nbytes, w.err = 0, 0, 0, nil</code></span>
+<span class="codeline" id="line-109"><code>}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>func (w *huffmanBitWriter) flush() {</code></span>
+<span class="codeline" id="line-112"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-113"><code>		w.nbits = 0</code></span>
+<span class="codeline" id="line-114"><code>		return</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	n := w.nbytes</code></span>
+<span class="codeline" id="line-117"><code>	for w.nbits != 0 {</code></span>
+<span class="codeline" id="line-118"><code>		w.bytes[n] = byte(w.bits)</code></span>
+<span class="codeline" id="line-119"><code>		w.bits &gt;&gt;= 8</code></span>
+<span class="codeline" id="line-120"><code>		if w.nbits &gt; 8 { // Avoid underflow</code></span>
+<span class="codeline" id="line-121"><code>			w.nbits -= 8</code></span>
+<span class="codeline" id="line-122"><code>		} else {</code></span>
+<span class="codeline" id="line-123"><code>			w.nbits = 0</code></span>
+<span class="codeline" id="line-124"><code>		}</code></span>
+<span class="codeline" id="line-125"><code>		n++</code></span>
+<span class="codeline" id="line-126"><code>	}</code></span>
+<span class="codeline" id="line-127"><code>	w.bits = 0</code></span>
+<span class="codeline" id="line-128"><code>	w.write(w.bytes[:n])</code></span>
+<span class="codeline" id="line-129"><code>	w.nbytes = 0</code></span>
+<span class="codeline" id="line-130"><code>}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>func (w *huffmanBitWriter) write(b []byte) {</code></span>
+<span class="codeline" id="line-133"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-134"><code>		return</code></span>
+<span class="codeline" id="line-135"><code>	}</code></span>
+<span class="codeline" id="line-136"><code>	_, w.err = w.writer.Write(b)</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>func (w *huffmanBitWriter) writeBits(b int32, nb uint) {</code></span>
+<span class="codeline" id="line-140"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-141"><code>		return</code></span>
+<span class="codeline" id="line-142"><code>	}</code></span>
+<span class="codeline" id="line-143"><code>	w.bits |= uint64(b) &lt;&lt; w.nbits</code></span>
+<span class="codeline" id="line-144"><code>	w.nbits += nb</code></span>
+<span class="codeline" id="line-145"><code>	if w.nbits &gt;= 48 {</code></span>
+<span class="codeline" id="line-146"><code>		bits := w.bits</code></span>
+<span class="codeline" id="line-147"><code>		w.bits &gt;&gt;= 48</code></span>
+<span class="codeline" id="line-148"><code>		w.nbits -= 48</code></span>
+<span class="codeline" id="line-149"><code>		n := w.nbytes</code></span>
+<span class="codeline" id="line-150"><code>		bytes := w.bytes[n : n+6]</code></span>
+<span class="codeline" id="line-151"><code>		bytes[0] = byte(bits)</code></span>
+<span class="codeline" id="line-152"><code>		bytes[1] = byte(bits &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-153"><code>		bytes[2] = byte(bits &gt;&gt; 16)</code></span>
+<span class="codeline" id="line-154"><code>		bytes[3] = byte(bits &gt;&gt; 24)</code></span>
+<span class="codeline" id="line-155"><code>		bytes[4] = byte(bits &gt;&gt; 32)</code></span>
+<span class="codeline" id="line-156"><code>		bytes[5] = byte(bits &gt;&gt; 40)</code></span>
+<span class="codeline" id="line-157"><code>		n += 6</code></span>
+<span class="codeline" id="line-158"><code>		if n &gt;= bufferFlushSize {</code></span>
+<span class="codeline" id="line-159"><code>			w.write(w.bytes[:n])</code></span>
+<span class="codeline" id="line-160"><code>			n = 0</code></span>
+<span class="codeline" id="line-161"><code>		}</code></span>
+<span class="codeline" id="line-162"><code>		w.nbytes = n</code></span>
+<span class="codeline" id="line-163"><code>	}</code></span>
+<span class="codeline" id="line-164"><code>}</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>func (w *huffmanBitWriter) writeBytes(bytes []byte) {</code></span>
+<span class="codeline" id="line-167"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-168"><code>		return</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code>	n := w.nbytes</code></span>
+<span class="codeline" id="line-171"><code>	if w.nbits&amp;7 != 0 {</code></span>
+<span class="codeline" id="line-172"><code>		w.err = InternalError("writeBytes with unfinished bits")</code></span>
+<span class="codeline" id="line-173"><code>		return</code></span>
+<span class="codeline" id="line-174"><code>	}</code></span>
+<span class="codeline" id="line-175"><code>	for w.nbits != 0 {</code></span>
+<span class="codeline" id="line-176"><code>		w.bytes[n] = byte(w.bits)</code></span>
+<span class="codeline" id="line-177"><code>		w.bits &gt;&gt;= 8</code></span>
+<span class="codeline" id="line-178"><code>		w.nbits -= 8</code></span>
+<span class="codeline" id="line-179"><code>		n++</code></span>
+<span class="codeline" id="line-180"><code>	}</code></span>
+<span class="codeline" id="line-181"><code>	if n != 0 {</code></span>
+<span class="codeline" id="line-182"><code>		w.write(w.bytes[:n])</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code>	w.nbytes = 0</code></span>
+<span class="codeline" id="line-185"><code>	w.write(bytes)</code></span>
+<span class="codeline" id="line-186"><code>}</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>// RFC 1951 3.2.7 specifies a special run-length encoding for specifying</code></span>
+<span class="codeline" id="line-189"><code>// the literal and offset lengths arrays (which are concatenated into a single</code></span>
+<span class="codeline" id="line-190"><code>// array).  This method generates that run-length encoding.</code></span>
+<span class="codeline" id="line-191"><code>//</code></span>
+<span class="codeline" id="line-192"><code>// The result is written into the codegen array, and the frequencies</code></span>
+<span class="codeline" id="line-193"><code>// of each code is written into the codegenFreq array.</code></span>
+<span class="codeline" id="line-194"><code>// Codes 0-15 are single byte codes. Codes 16-18 are followed by additional</code></span>
+<span class="codeline" id="line-195"><code>// information. Code badCode is an end marker</code></span>
+<span class="codeline" id="line-196"><code>//</code></span>
+<span class="codeline" id="line-197"><code>//	numLiterals      The number of literals in literalEncoding</code></span>
+<span class="codeline" id="line-198"><code>//	numOffsets       The number of offsets in offsetEncoding</code></span>
+<span class="codeline" id="line-199"><code>//	litenc, offenc   The literal and offset encoder to use</code></span>
+<span class="codeline" id="line-200"><code>func (w *huffmanBitWriter) generateCodegen(numLiterals int, numOffsets int, litEnc, offEnc *huffmanEncoder) {</code></span>
+<span class="codeline" id="line-201"><code>	for i := range w.codegenFreq {</code></span>
+<span class="codeline" id="line-202"><code>		w.codegenFreq[i] = 0</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code>	// Note that we are using codegen both as a temporary variable for holding</code></span>
+<span class="codeline" id="line-205"><code>	// a copy of the frequencies, and as the place where we put the result.</code></span>
+<span class="codeline" id="line-206"><code>	// This is fine because the output is always shorter than the input used</code></span>
+<span class="codeline" id="line-207"><code>	// so far.</code></span>
+<span class="codeline" id="line-208"><code>	codegen := w.codegen // cache</code></span>
+<span class="codeline" id="line-209"><code>	// Copy the concatenated code sizes to codegen. Put a marker at the end.</code></span>
+<span class="codeline" id="line-210"><code>	cgnl := codegen[:numLiterals]</code></span>
+<span class="codeline" id="line-211"><code>	for i := range cgnl {</code></span>
+<span class="codeline" id="line-212"><code>		cgnl[i] = uint8(litEnc.codes[i].len)</code></span>
+<span class="codeline" id="line-213"><code>	}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>	cgnl = codegen[numLiterals : numLiterals+numOffsets]</code></span>
+<span class="codeline" id="line-216"><code>	for i := range cgnl {</code></span>
+<span class="codeline" id="line-217"><code>		cgnl[i] = uint8(offEnc.codes[i].len)</code></span>
+<span class="codeline" id="line-218"><code>	}</code></span>
+<span class="codeline" id="line-219"><code>	codegen[numLiterals+numOffsets] = badCode</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>	size := codegen[0]</code></span>
+<span class="codeline" id="line-222"><code>	count := 1</code></span>
+<span class="codeline" id="line-223"><code>	outIndex := 0</code></span>
+<span class="codeline" id="line-224"><code>	for inIndex := 1; size != badCode; inIndex++ {</code></span>
+<span class="codeline" id="line-225"><code>		// INVARIANT: We have seen "count" copies of size that have not yet</code></span>
+<span class="codeline" id="line-226"><code>		// had output generated for them.</code></span>
+<span class="codeline" id="line-227"><code>		nextSize := codegen[inIndex]</code></span>
+<span class="codeline" id="line-228"><code>		if nextSize == size {</code></span>
+<span class="codeline" id="line-229"><code>			count++</code></span>
+<span class="codeline" id="line-230"><code>			continue</code></span>
+<span class="codeline" id="line-231"><code>		}</code></span>
+<span class="codeline" id="line-232"><code>		// We need to generate codegen indicating "count" of size.</code></span>
+<span class="codeline" id="line-233"><code>		if size != 0 {</code></span>
+<span class="codeline" id="line-234"><code>			codegen[outIndex] = size</code></span>
+<span class="codeline" id="line-235"><code>			outIndex++</code></span>
+<span class="codeline" id="line-236"><code>			w.codegenFreq[size]++</code></span>
+<span class="codeline" id="line-237"><code>			count--</code></span>
+<span class="codeline" id="line-238"><code>			for count &gt;= 3 {</code></span>
+<span class="codeline" id="line-239"><code>				n := 6</code></span>
+<span class="codeline" id="line-240"><code>				if n &gt; count {</code></span>
+<span class="codeline" id="line-241"><code>					n = count</code></span>
+<span class="codeline" id="line-242"><code>				}</code></span>
+<span class="codeline" id="line-243"><code>				codegen[outIndex] = 16</code></span>
+<span class="codeline" id="line-244"><code>				outIndex++</code></span>
+<span class="codeline" id="line-245"><code>				codegen[outIndex] = uint8(n - 3)</code></span>
+<span class="codeline" id="line-246"><code>				outIndex++</code></span>
+<span class="codeline" id="line-247"><code>				w.codegenFreq[16]++</code></span>
+<span class="codeline" id="line-248"><code>				count -= n</code></span>
+<span class="codeline" id="line-249"><code>			}</code></span>
+<span class="codeline" id="line-250"><code>		} else {</code></span>
+<span class="codeline" id="line-251"><code>			for count &gt;= 11 {</code></span>
+<span class="codeline" id="line-252"><code>				n := 138</code></span>
+<span class="codeline" id="line-253"><code>				if n &gt; count {</code></span>
+<span class="codeline" id="line-254"><code>					n = count</code></span>
+<span class="codeline" id="line-255"><code>				}</code></span>
+<span class="codeline" id="line-256"><code>				codegen[outIndex] = 18</code></span>
+<span class="codeline" id="line-257"><code>				outIndex++</code></span>
+<span class="codeline" id="line-258"><code>				codegen[outIndex] = uint8(n - 11)</code></span>
+<span class="codeline" id="line-259"><code>				outIndex++</code></span>
+<span class="codeline" id="line-260"><code>				w.codegenFreq[18]++</code></span>
+<span class="codeline" id="line-261"><code>				count -= n</code></span>
+<span class="codeline" id="line-262"><code>			}</code></span>
+<span class="codeline" id="line-263"><code>			if count &gt;= 3 {</code></span>
+<span class="codeline" id="line-264"><code>				// count &gt;= 3 &amp;&amp; count &lt;= 10</code></span>
+<span class="codeline" id="line-265"><code>				codegen[outIndex] = 17</code></span>
+<span class="codeline" id="line-266"><code>				outIndex++</code></span>
+<span class="codeline" id="line-267"><code>				codegen[outIndex] = uint8(count - 3)</code></span>
+<span class="codeline" id="line-268"><code>				outIndex++</code></span>
+<span class="codeline" id="line-269"><code>				w.codegenFreq[17]++</code></span>
+<span class="codeline" id="line-270"><code>				count = 0</code></span>
+<span class="codeline" id="line-271"><code>			}</code></span>
+<span class="codeline" id="line-272"><code>		}</code></span>
+<span class="codeline" id="line-273"><code>		count--</code></span>
+<span class="codeline" id="line-274"><code>		for ; count &gt;= 0; count-- {</code></span>
+<span class="codeline" id="line-275"><code>			codegen[outIndex] = size</code></span>
+<span class="codeline" id="line-276"><code>			outIndex++</code></span>
+<span class="codeline" id="line-277"><code>			w.codegenFreq[size]++</code></span>
+<span class="codeline" id="line-278"><code>		}</code></span>
+<span class="codeline" id="line-279"><code>		// Set up invariant for next time through the loop.</code></span>
+<span class="codeline" id="line-280"><code>		size = nextSize</code></span>
+<span class="codeline" id="line-281"><code>		count = 1</code></span>
+<span class="codeline" id="line-282"><code>	}</code></span>
+<span class="codeline" id="line-283"><code>	// Marker indicating the end of the codegen.</code></span>
+<span class="codeline" id="line-284"><code>	codegen[outIndex] = badCode</code></span>
+<span class="codeline" id="line-285"><code>}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>// dynamicSize returns the size of dynamically encoded data in bits.</code></span>
+<span class="codeline" id="line-288"><code>func (w *huffmanBitWriter) dynamicSize(litEnc, offEnc *huffmanEncoder, extraBits int) (size, numCodegens int) {</code></span>
+<span class="codeline" id="line-289"><code>	numCodegens = len(w.codegenFreq)</code></span>
+<span class="codeline" id="line-290"><code>	for numCodegens &gt; 4 &amp;&amp; w.codegenFreq[codegenOrder[numCodegens-1]] == 0 {</code></span>
+<span class="codeline" id="line-291"><code>		numCodegens--</code></span>
+<span class="codeline" id="line-292"><code>	}</code></span>
+<span class="codeline" id="line-293"><code>	header := 3 + 5 + 5 + 4 + (3 * numCodegens) +</code></span>
+<span class="codeline" id="line-294"><code>		w.codegenEncoding.bitLength(w.codegenFreq[:]) +</code></span>
+<span class="codeline" id="line-295"><code>		int(w.codegenFreq[16])*2 +</code></span>
+<span class="codeline" id="line-296"><code>		int(w.codegenFreq[17])*3 +</code></span>
+<span class="codeline" id="line-297"><code>		int(w.codegenFreq[18])*7</code></span>
+<span class="codeline" id="line-298"><code>	size = header +</code></span>
+<span class="codeline" id="line-299"><code>		litEnc.bitLength(w.literalFreq) +</code></span>
+<span class="codeline" id="line-300"><code>		offEnc.bitLength(w.offsetFreq) +</code></span>
+<span class="codeline" id="line-301"><code>		extraBits</code></span>
+<span class="codeline" id="line-302"><code></code></span>
+<span class="codeline" id="line-303"><code>	return size, numCodegens</code></span>
+<span class="codeline" id="line-304"><code>}</code></span>
+<span class="codeline" id="line-305"><code></code></span>
+<span class="codeline" id="line-306"><code>// fixedSize returns the size of dynamically encoded data in bits.</code></span>
+<span class="codeline" id="line-307"><code>func (w *huffmanBitWriter) fixedSize(extraBits int) int {</code></span>
+<span class="codeline" id="line-308"><code>	return 3 +</code></span>
+<span class="codeline" id="line-309"><code>		fixedLiteralEncoding.bitLength(w.literalFreq) +</code></span>
+<span class="codeline" id="line-310"><code>		fixedOffsetEncoding.bitLength(w.offsetFreq) +</code></span>
+<span class="codeline" id="line-311"><code>		extraBits</code></span>
+<span class="codeline" id="line-312"><code>}</code></span>
+<span class="codeline" id="line-313"><code></code></span>
+<span class="codeline" id="line-314"><code>// storedSize calculates the stored size, including header.</code></span>
+<span class="codeline" id="line-315"><code>// The function returns the size in bits and whether the block</code></span>
+<span class="codeline" id="line-316"><code>// fits inside a single block.</code></span>
+<span class="codeline" id="line-317"><code>func (w *huffmanBitWriter) storedSize(in []byte) (int, bool) {</code></span>
+<span class="codeline" id="line-318"><code>	if in == nil {</code></span>
+<span class="codeline" id="line-319"><code>		return 0, false</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code>	if len(in) &lt;= maxStoreBlockSize {</code></span>
+<span class="codeline" id="line-322"><code>		return (len(in) + 5) * 8, true</code></span>
+<span class="codeline" id="line-323"><code>	}</code></span>
+<span class="codeline" id="line-324"><code>	return 0, false</code></span>
+<span class="codeline" id="line-325"><code>}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>func (w *huffmanBitWriter) writeCode(c hcode) {</code></span>
+<span class="codeline" id="line-328"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-329"><code>		return</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	w.bits |= uint64(c.code) &lt;&lt; w.nbits</code></span>
+<span class="codeline" id="line-332"><code>	w.nbits += uint(c.len)</code></span>
+<span class="codeline" id="line-333"><code>	if w.nbits &gt;= 48 {</code></span>
+<span class="codeline" id="line-334"><code>		bits := w.bits</code></span>
+<span class="codeline" id="line-335"><code>		w.bits &gt;&gt;= 48</code></span>
+<span class="codeline" id="line-336"><code>		w.nbits -= 48</code></span>
+<span class="codeline" id="line-337"><code>		n := w.nbytes</code></span>
+<span class="codeline" id="line-338"><code>		bytes := w.bytes[n : n+6]</code></span>
+<span class="codeline" id="line-339"><code>		bytes[0] = byte(bits)</code></span>
+<span class="codeline" id="line-340"><code>		bytes[1] = byte(bits &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-341"><code>		bytes[2] = byte(bits &gt;&gt; 16)</code></span>
+<span class="codeline" id="line-342"><code>		bytes[3] = byte(bits &gt;&gt; 24)</code></span>
+<span class="codeline" id="line-343"><code>		bytes[4] = byte(bits &gt;&gt; 32)</code></span>
+<span class="codeline" id="line-344"><code>		bytes[5] = byte(bits &gt;&gt; 40)</code></span>
+<span class="codeline" id="line-345"><code>		n += 6</code></span>
+<span class="codeline" id="line-346"><code>		if n &gt;= bufferFlushSize {</code></span>
+<span class="codeline" id="line-347"><code>			w.write(w.bytes[:n])</code></span>
+<span class="codeline" id="line-348"><code>			n = 0</code></span>
+<span class="codeline" id="line-349"><code>		}</code></span>
+<span class="codeline" id="line-350"><code>		w.nbytes = n</code></span>
+<span class="codeline" id="line-351"><code>	}</code></span>
+<span class="codeline" id="line-352"><code>}</code></span>
+<span class="codeline" id="line-353"><code></code></span>
+<span class="codeline" id="line-354"><code>// Write the header of a dynamic Huffman block to the output stream.</code></span>
+<span class="codeline" id="line-355"><code>//</code></span>
+<span class="codeline" id="line-356"><code>//	numLiterals  The number of literals specified in codegen</code></span>
+<span class="codeline" id="line-357"><code>//	numOffsets   The number of offsets specified in codegen</code></span>
+<span class="codeline" id="line-358"><code>//	numCodegens  The number of codegens used in codegen</code></span>
+<span class="codeline" id="line-359"><code>func (w *huffmanBitWriter) writeDynamicHeader(numLiterals int, numOffsets int, numCodegens int, isEof bool) {</code></span>
+<span class="codeline" id="line-360"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-361"><code>		return</code></span>
+<span class="codeline" id="line-362"><code>	}</code></span>
+<span class="codeline" id="line-363"><code>	var firstBits int32 = 4</code></span>
+<span class="codeline" id="line-364"><code>	if isEof {</code></span>
+<span class="codeline" id="line-365"><code>		firstBits = 5</code></span>
+<span class="codeline" id="line-366"><code>	}</code></span>
+<span class="codeline" id="line-367"><code>	w.writeBits(firstBits, 3)</code></span>
+<span class="codeline" id="line-368"><code>	w.writeBits(int32(numLiterals-257), 5)</code></span>
+<span class="codeline" id="line-369"><code>	w.writeBits(int32(numOffsets-1), 5)</code></span>
+<span class="codeline" id="line-370"><code>	w.writeBits(int32(numCodegens-4), 4)</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>	for i := 0; i &lt; numCodegens; i++ {</code></span>
+<span class="codeline" id="line-373"><code>		value := uint(w.codegenEncoding.codes[codegenOrder[i]].len)</code></span>
+<span class="codeline" id="line-374"><code>		w.writeBits(int32(value), 3)</code></span>
+<span class="codeline" id="line-375"><code>	}</code></span>
+<span class="codeline" id="line-376"><code></code></span>
+<span class="codeline" id="line-377"><code>	i := 0</code></span>
+<span class="codeline" id="line-378"><code>	for {</code></span>
+<span class="codeline" id="line-379"><code>		var codeWord int = int(w.codegen[i])</code></span>
+<span class="codeline" id="line-380"><code>		i++</code></span>
+<span class="codeline" id="line-381"><code>		if codeWord == badCode {</code></span>
+<span class="codeline" id="line-382"><code>			break</code></span>
+<span class="codeline" id="line-383"><code>		}</code></span>
+<span class="codeline" id="line-384"><code>		w.writeCode(w.codegenEncoding.codes[uint32(codeWord)])</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>		switch codeWord {</code></span>
+<span class="codeline" id="line-387"><code>		case 16:</code></span>
+<span class="codeline" id="line-388"><code>			w.writeBits(int32(w.codegen[i]), 2)</code></span>
+<span class="codeline" id="line-389"><code>			i++</code></span>
+<span class="codeline" id="line-390"><code>		case 17:</code></span>
+<span class="codeline" id="line-391"><code>			w.writeBits(int32(w.codegen[i]), 3)</code></span>
+<span class="codeline" id="line-392"><code>			i++</code></span>
+<span class="codeline" id="line-393"><code>		case 18:</code></span>
+<span class="codeline" id="line-394"><code>			w.writeBits(int32(w.codegen[i]), 7)</code></span>
+<span class="codeline" id="line-395"><code>			i++</code></span>
+<span class="codeline" id="line-396"><code>		}</code></span>
+<span class="codeline" id="line-397"><code>	}</code></span>
+<span class="codeline" id="line-398"><code>}</code></span>
+<span class="codeline" id="line-399"><code></code></span>
+<span class="codeline" id="line-400"><code>func (w *huffmanBitWriter) writeStoredHeader(length int, isEof bool) {</code></span>
+<span class="codeline" id="line-401"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-402"><code>		return</code></span>
+<span class="codeline" id="line-403"><code>	}</code></span>
+<span class="codeline" id="line-404"><code>	var flag int32</code></span>
+<span class="codeline" id="line-405"><code>	if isEof {</code></span>
+<span class="codeline" id="line-406"><code>		flag = 1</code></span>
+<span class="codeline" id="line-407"><code>	}</code></span>
+<span class="codeline" id="line-408"><code>	w.writeBits(flag, 3)</code></span>
+<span class="codeline" id="line-409"><code>	w.flush()</code></span>
+<span class="codeline" id="line-410"><code>	w.writeBits(int32(length), 16)</code></span>
+<span class="codeline" id="line-411"><code>	w.writeBits(int32(^uint16(length)), 16)</code></span>
+<span class="codeline" id="line-412"><code>}</code></span>
+<span class="codeline" id="line-413"><code></code></span>
+<span class="codeline" id="line-414"><code>func (w *huffmanBitWriter) writeFixedHeader(isEof bool) {</code></span>
+<span class="codeline" id="line-415"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-416"><code>		return</code></span>
+<span class="codeline" id="line-417"><code>	}</code></span>
+<span class="codeline" id="line-418"><code>	// Indicate that we are a fixed Huffman block</code></span>
+<span class="codeline" id="line-419"><code>	var value int32 = 2</code></span>
+<span class="codeline" id="line-420"><code>	if isEof {</code></span>
+<span class="codeline" id="line-421"><code>		value = 3</code></span>
+<span class="codeline" id="line-422"><code>	}</code></span>
+<span class="codeline" id="line-423"><code>	w.writeBits(value, 3)</code></span>
+<span class="codeline" id="line-424"><code>}</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>// writeBlock will write a block of tokens with the smallest encoding.</code></span>
+<span class="codeline" id="line-427"><code>// The original input can be supplied, and if the huffman encoded data</code></span>
+<span class="codeline" id="line-428"><code>// is larger than the original bytes, the data will be written as a</code></span>
+<span class="codeline" id="line-429"><code>// stored block.</code></span>
+<span class="codeline" id="line-430"><code>// If the input is nil, the tokens will always be Huffman encoded.</code></span>
+<span class="codeline" id="line-431"><code>func (w *huffmanBitWriter) writeBlock(tokens []token, eof bool, input []byte) {</code></span>
+<span class="codeline" id="line-432"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-433"><code>		return</code></span>
+<span class="codeline" id="line-434"><code>	}</code></span>
+<span class="codeline" id="line-435"><code></code></span>
+<span class="codeline" id="line-436"><code>	tokens = append(tokens, endBlockMarker)</code></span>
+<span class="codeline" id="line-437"><code>	numLiterals, numOffsets := w.indexTokens(tokens)</code></span>
+<span class="codeline" id="line-438"><code></code></span>
+<span class="codeline" id="line-439"><code>	var extraBits int</code></span>
+<span class="codeline" id="line-440"><code>	storedSize, storable := w.storedSize(input)</code></span>
+<span class="codeline" id="line-441"><code>	if storable {</code></span>
+<span class="codeline" id="line-442"><code>		// We only bother calculating the costs of the extra bits required by</code></span>
+<span class="codeline" id="line-443"><code>		// the length of offset fields (which will be the same for both fixed</code></span>
+<span class="codeline" id="line-444"><code>		// and dynamic encoding), if we need to compare those two encodings</code></span>
+<span class="codeline" id="line-445"><code>		// against stored encoding.</code></span>
+<span class="codeline" id="line-446"><code>		for lengthCode := lengthCodesStart + 8; lengthCode &lt; numLiterals; lengthCode++ {</code></span>
+<span class="codeline" id="line-447"><code>			// First eight length codes have extra size = 0.</code></span>
+<span class="codeline" id="line-448"><code>			extraBits += int(w.literalFreq[lengthCode]) * int(lengthExtraBits[lengthCode-lengthCodesStart])</code></span>
+<span class="codeline" id="line-449"><code>		}</code></span>
+<span class="codeline" id="line-450"><code>		for offsetCode := 4; offsetCode &lt; numOffsets; offsetCode++ {</code></span>
+<span class="codeline" id="line-451"><code>			// First four offset codes have extra size = 0.</code></span>
+<span class="codeline" id="line-452"><code>			extraBits += int(w.offsetFreq[offsetCode]) * int(offsetExtraBits[offsetCode])</code></span>
+<span class="codeline" id="line-453"><code>		}</code></span>
+<span class="codeline" id="line-454"><code>	}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>	// Figure out smallest code.</code></span>
+<span class="codeline" id="line-457"><code>	// Fixed Huffman baseline.</code></span>
+<span class="codeline" id="line-458"><code>	var literalEncoding = fixedLiteralEncoding</code></span>
+<span class="codeline" id="line-459"><code>	var offsetEncoding = fixedOffsetEncoding</code></span>
+<span class="codeline" id="line-460"><code>	var size = w.fixedSize(extraBits)</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>	// Dynamic Huffman?</code></span>
+<span class="codeline" id="line-463"><code>	var numCodegens int</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>	// Generate codegen and codegenFrequencies, which indicates how to encode</code></span>
+<span class="codeline" id="line-466"><code>	// the literalEncoding and the offsetEncoding.</code></span>
+<span class="codeline" id="line-467"><code>	w.generateCodegen(numLiterals, numOffsets, w.literalEncoding, w.offsetEncoding)</code></span>
+<span class="codeline" id="line-468"><code>	w.codegenEncoding.generate(w.codegenFreq[:], 7)</code></span>
+<span class="codeline" id="line-469"><code>	dynamicSize, numCodegens := w.dynamicSize(w.literalEncoding, w.offsetEncoding, extraBits)</code></span>
+<span class="codeline" id="line-470"><code></code></span>
+<span class="codeline" id="line-471"><code>	if dynamicSize &lt; size {</code></span>
+<span class="codeline" id="line-472"><code>		size = dynamicSize</code></span>
+<span class="codeline" id="line-473"><code>		literalEncoding = w.literalEncoding</code></span>
+<span class="codeline" id="line-474"><code>		offsetEncoding = w.offsetEncoding</code></span>
+<span class="codeline" id="line-475"><code>	}</code></span>
+<span class="codeline" id="line-476"><code></code></span>
+<span class="codeline" id="line-477"><code>	// Stored bytes?</code></span>
+<span class="codeline" id="line-478"><code>	if storable &amp;&amp; storedSize &lt; size {</code></span>
+<span class="codeline" id="line-479"><code>		w.writeStoredHeader(len(input), eof)</code></span>
+<span class="codeline" id="line-480"><code>		w.writeBytes(input)</code></span>
+<span class="codeline" id="line-481"><code>		return</code></span>
+<span class="codeline" id="line-482"><code>	}</code></span>
+<span class="codeline" id="line-483"><code></code></span>
+<span class="codeline" id="line-484"><code>	// Huffman.</code></span>
+<span class="codeline" id="line-485"><code>	if literalEncoding == fixedLiteralEncoding {</code></span>
+<span class="codeline" id="line-486"><code>		w.writeFixedHeader(eof)</code></span>
+<span class="codeline" id="line-487"><code>	} else {</code></span>
+<span class="codeline" id="line-488"><code>		w.writeDynamicHeader(numLiterals, numOffsets, numCodegens, eof)</code></span>
+<span class="codeline" id="line-489"><code>	}</code></span>
+<span class="codeline" id="line-490"><code></code></span>
+<span class="codeline" id="line-491"><code>	// Write the tokens.</code></span>
+<span class="codeline" id="line-492"><code>	w.writeTokens(tokens, literalEncoding.codes, offsetEncoding.codes)</code></span>
+<span class="codeline" id="line-493"><code>}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>// writeBlockDynamic encodes a block using a dynamic Huffman table.</code></span>
+<span class="codeline" id="line-496"><code>// This should be used if the symbols used have a disproportionate</code></span>
+<span class="codeline" id="line-497"><code>// histogram distribution.</code></span>
+<span class="codeline" id="line-498"><code>// If input is supplied and the compression savings are below 1/16th of the</code></span>
+<span class="codeline" id="line-499"><code>// input size the block is stored.</code></span>
+<span class="codeline" id="line-500"><code>func (w *huffmanBitWriter) writeBlockDynamic(tokens []token, eof bool, input []byte) {</code></span>
+<span class="codeline" id="line-501"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-502"><code>		return</code></span>
+<span class="codeline" id="line-503"><code>	}</code></span>
+<span class="codeline" id="line-504"><code></code></span>
+<span class="codeline" id="line-505"><code>	tokens = append(tokens, endBlockMarker)</code></span>
+<span class="codeline" id="line-506"><code>	numLiterals, numOffsets := w.indexTokens(tokens)</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>	// Generate codegen and codegenFrequencies, which indicates how to encode</code></span>
+<span class="codeline" id="line-509"><code>	// the literalEncoding and the offsetEncoding.</code></span>
+<span class="codeline" id="line-510"><code>	w.generateCodegen(numLiterals, numOffsets, w.literalEncoding, w.offsetEncoding)</code></span>
+<span class="codeline" id="line-511"><code>	w.codegenEncoding.generate(w.codegenFreq[:], 7)</code></span>
+<span class="codeline" id="line-512"><code>	size, numCodegens := w.dynamicSize(w.literalEncoding, w.offsetEncoding, 0)</code></span>
+<span class="codeline" id="line-513"><code></code></span>
+<span class="codeline" id="line-514"><code>	// Store bytes, if we don't get a reasonable improvement.</code></span>
+<span class="codeline" id="line-515"><code>	if ssize, storable := w.storedSize(input); storable &amp;&amp; ssize &lt; (size+size&gt;&gt;4) {</code></span>
+<span class="codeline" id="line-516"><code>		w.writeStoredHeader(len(input), eof)</code></span>
+<span class="codeline" id="line-517"><code>		w.writeBytes(input)</code></span>
+<span class="codeline" id="line-518"><code>		return</code></span>
+<span class="codeline" id="line-519"><code>	}</code></span>
+<span class="codeline" id="line-520"><code></code></span>
+<span class="codeline" id="line-521"><code>	// Write Huffman table.</code></span>
+<span class="codeline" id="line-522"><code>	w.writeDynamicHeader(numLiterals, numOffsets, numCodegens, eof)</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>	// Write the tokens.</code></span>
+<span class="codeline" id="line-525"><code>	w.writeTokens(tokens, w.literalEncoding.codes, w.offsetEncoding.codes)</code></span>
+<span class="codeline" id="line-526"><code>}</code></span>
+<span class="codeline" id="line-527"><code></code></span>
+<span class="codeline" id="line-528"><code>// indexTokens indexes a slice of tokens, and updates</code></span>
+<span class="codeline" id="line-529"><code>// literalFreq and offsetFreq, and generates literalEncoding</code></span>
+<span class="codeline" id="line-530"><code>// and offsetEncoding.</code></span>
+<span class="codeline" id="line-531"><code>// The number of literal and offset tokens is returned.</code></span>
+<span class="codeline" id="line-532"><code>func (w *huffmanBitWriter) indexTokens(tokens []token) (numLiterals, numOffsets int) {</code></span>
+<span class="codeline" id="line-533"><code>	for i := range w.literalFreq {</code></span>
+<span class="codeline" id="line-534"><code>		w.literalFreq[i] = 0</code></span>
+<span class="codeline" id="line-535"><code>	}</code></span>
+<span class="codeline" id="line-536"><code>	for i := range w.offsetFreq {</code></span>
+<span class="codeline" id="line-537"><code>		w.offsetFreq[i] = 0</code></span>
+<span class="codeline" id="line-538"><code>	}</code></span>
+<span class="codeline" id="line-539"><code></code></span>
+<span class="codeline" id="line-540"><code>	for _, t := range tokens {</code></span>
+<span class="codeline" id="line-541"><code>		if t &lt; matchType {</code></span>
+<span class="codeline" id="line-542"><code>			w.literalFreq[t.literal()]++</code></span>
+<span class="codeline" id="line-543"><code>			continue</code></span>
+<span class="codeline" id="line-544"><code>		}</code></span>
+<span class="codeline" id="line-545"><code>		length := t.length()</code></span>
+<span class="codeline" id="line-546"><code>		offset := t.offset()</code></span>
+<span class="codeline" id="line-547"><code>		w.literalFreq[lengthCodesStart+lengthCode(length)]++</code></span>
+<span class="codeline" id="line-548"><code>		w.offsetFreq[offsetCode(offset)]++</code></span>
+<span class="codeline" id="line-549"><code>	}</code></span>
+<span class="codeline" id="line-550"><code></code></span>
+<span class="codeline" id="line-551"><code>	// get the number of literals</code></span>
+<span class="codeline" id="line-552"><code>	numLiterals = len(w.literalFreq)</code></span>
+<span class="codeline" id="line-553"><code>	for w.literalFreq[numLiterals-1] == 0 {</code></span>
+<span class="codeline" id="line-554"><code>		numLiterals--</code></span>
+<span class="codeline" id="line-555"><code>	}</code></span>
+<span class="codeline" id="line-556"><code>	// get the number of offsets</code></span>
+<span class="codeline" id="line-557"><code>	numOffsets = len(w.offsetFreq)</code></span>
+<span class="codeline" id="line-558"><code>	for numOffsets &gt; 0 &amp;&amp; w.offsetFreq[numOffsets-1] == 0 {</code></span>
+<span class="codeline" id="line-559"><code>		numOffsets--</code></span>
+<span class="codeline" id="line-560"><code>	}</code></span>
+<span class="codeline" id="line-561"><code>	if numOffsets == 0 {</code></span>
+<span class="codeline" id="line-562"><code>		// We haven't found a single match. If we want to go with the dynamic encoding,</code></span>
+<span class="codeline" id="line-563"><code>		// we should count at least one offset to be sure that the offset huffman tree could be encoded.</code></span>
+<span class="codeline" id="line-564"><code>		w.offsetFreq[0] = 1</code></span>
+<span class="codeline" id="line-565"><code>		numOffsets = 1</code></span>
+<span class="codeline" id="line-566"><code>	}</code></span>
+<span class="codeline" id="line-567"><code>	w.literalEncoding.generate(w.literalFreq, 15)</code></span>
+<span class="codeline" id="line-568"><code>	w.offsetEncoding.generate(w.offsetFreq, 15)</code></span>
+<span class="codeline" id="line-569"><code>	return</code></span>
+<span class="codeline" id="line-570"><code>}</code></span>
+<span class="codeline" id="line-571"><code></code></span>
+<span class="codeline" id="line-572"><code>// writeTokens writes a slice of tokens to the output.</code></span>
+<span class="codeline" id="line-573"><code>// codes for literal and offset encoding must be supplied.</code></span>
+<span class="codeline" id="line-574"><code>func (w *huffmanBitWriter) writeTokens(tokens []token, leCodes, oeCodes []hcode) {</code></span>
+<span class="codeline" id="line-575"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-576"><code>		return</code></span>
+<span class="codeline" id="line-577"><code>	}</code></span>
+<span class="codeline" id="line-578"><code>	for _, t := range tokens {</code></span>
+<span class="codeline" id="line-579"><code>		if t &lt; matchType {</code></span>
+<span class="codeline" id="line-580"><code>			w.writeCode(leCodes[t.literal()])</code></span>
+<span class="codeline" id="line-581"><code>			continue</code></span>
+<span class="codeline" id="line-582"><code>		}</code></span>
+<span class="codeline" id="line-583"><code>		// Write the length</code></span>
+<span class="codeline" id="line-584"><code>		length := t.length()</code></span>
+<span class="codeline" id="line-585"><code>		lengthCode := lengthCode(length)</code></span>
+<span class="codeline" id="line-586"><code>		w.writeCode(leCodes[lengthCode+lengthCodesStart])</code></span>
+<span class="codeline" id="line-587"><code>		extraLengthBits := uint(lengthExtraBits[lengthCode])</code></span>
+<span class="codeline" id="line-588"><code>		if extraLengthBits &gt; 0 {</code></span>
+<span class="codeline" id="line-589"><code>			extraLength := int32(length - lengthBase[lengthCode])</code></span>
+<span class="codeline" id="line-590"><code>			w.writeBits(extraLength, extraLengthBits)</code></span>
+<span class="codeline" id="line-591"><code>		}</code></span>
+<span class="codeline" id="line-592"><code>		// Write the offset</code></span>
+<span class="codeline" id="line-593"><code>		offset := t.offset()</code></span>
+<span class="codeline" id="line-594"><code>		offsetCode := offsetCode(offset)</code></span>
+<span class="codeline" id="line-595"><code>		w.writeCode(oeCodes[offsetCode])</code></span>
+<span class="codeline" id="line-596"><code>		extraOffsetBits := uint(offsetExtraBits[offsetCode])</code></span>
+<span class="codeline" id="line-597"><code>		if extraOffsetBits &gt; 0 {</code></span>
+<span class="codeline" id="line-598"><code>			extraOffset := int32(offset - offsetBase[offsetCode])</code></span>
+<span class="codeline" id="line-599"><code>			w.writeBits(extraOffset, extraOffsetBits)</code></span>
+<span class="codeline" id="line-600"><code>		}</code></span>
+<span class="codeline" id="line-601"><code>	}</code></span>
+<span class="codeline" id="line-602"><code>}</code></span>
+<span class="codeline" id="line-603"><code></code></span>
+<span class="codeline" id="line-604"><code>// huffOffset is a static offset encoder used for huffman only encoding.</code></span>
+<span class="codeline" id="line-605"><code>// It can be reused since we will not be encoding offset values.</code></span>
+<span class="codeline" id="line-606"><code>var huffOffset *huffmanEncoder</code></span>
+<span class="codeline" id="line-607"><code></code></span>
+<span class="codeline" id="line-608"><code>func init() {</code></span>
+<span class="codeline" id="line-609"><code>	offsetFreq := make([]int32, offsetCodeCount)</code></span>
+<span class="codeline" id="line-610"><code>	offsetFreq[0] = 1</code></span>
+<span class="codeline" id="line-611"><code>	huffOffset = newHuffmanEncoder(offsetCodeCount)</code></span>
+<span class="codeline" id="line-612"><code>	huffOffset.generate(offsetFreq, 15)</code></span>
+<span class="codeline" id="line-613"><code>}</code></span>
+<span class="codeline" id="line-614"><code></code></span>
+<span class="codeline" id="line-615"><code>// writeBlockHuff encodes a block of bytes as either</code></span>
+<span class="codeline" id="line-616"><code>// Huffman encoded literals or uncompressed bytes if the</code></span>
+<span class="codeline" id="line-617"><code>// results only gains very little from compression.</code></span>
+<span class="codeline" id="line-618"><code>func (w *huffmanBitWriter) writeBlockHuff(eof bool, input []byte) {</code></span>
+<span class="codeline" id="line-619"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-620"><code>		return</code></span>
+<span class="codeline" id="line-621"><code>	}</code></span>
+<span class="codeline" id="line-622"><code></code></span>
+<span class="codeline" id="line-623"><code>	// Clear histogram</code></span>
+<span class="codeline" id="line-624"><code>	for i := range w.literalFreq {</code></span>
+<span class="codeline" id="line-625"><code>		w.literalFreq[i] = 0</code></span>
+<span class="codeline" id="line-626"><code>	}</code></span>
+<span class="codeline" id="line-627"><code></code></span>
+<span class="codeline" id="line-628"><code>	// Add everything as literals</code></span>
+<span class="codeline" id="line-629"><code>	histogram(input, w.literalFreq)</code></span>
+<span class="codeline" id="line-630"><code></code></span>
+<span class="codeline" id="line-631"><code>	w.literalFreq[endBlockMarker] = 1</code></span>
+<span class="codeline" id="line-632"><code></code></span>
+<span class="codeline" id="line-633"><code>	const numLiterals = endBlockMarker + 1</code></span>
+<span class="codeline" id="line-634"><code>	w.offsetFreq[0] = 1</code></span>
+<span class="codeline" id="line-635"><code>	const numOffsets = 1</code></span>
+<span class="codeline" id="line-636"><code></code></span>
+<span class="codeline" id="line-637"><code>	w.literalEncoding.generate(w.literalFreq, 15)</code></span>
+<span class="codeline" id="line-638"><code></code></span>
+<span class="codeline" id="line-639"><code>	// Figure out smallest code.</code></span>
+<span class="codeline" id="line-640"><code>	// Always use dynamic Huffman or Store</code></span>
+<span class="codeline" id="line-641"><code>	var numCodegens int</code></span>
+<span class="codeline" id="line-642"><code></code></span>
+<span class="codeline" id="line-643"><code>	// Generate codegen and codegenFrequencies, which indicates how to encode</code></span>
+<span class="codeline" id="line-644"><code>	// the literalEncoding and the offsetEncoding.</code></span>
+<span class="codeline" id="line-645"><code>	w.generateCodegen(numLiterals, numOffsets, w.literalEncoding, huffOffset)</code></span>
+<span class="codeline" id="line-646"><code>	w.codegenEncoding.generate(w.codegenFreq[:], 7)</code></span>
+<span class="codeline" id="line-647"><code>	size, numCodegens := w.dynamicSize(w.literalEncoding, huffOffset, 0)</code></span>
+<span class="codeline" id="line-648"><code></code></span>
+<span class="codeline" id="line-649"><code>	// Store bytes, if we don't get a reasonable improvement.</code></span>
+<span class="codeline" id="line-650"><code>	if ssize, storable := w.storedSize(input); storable &amp;&amp; ssize &lt; (size+size&gt;&gt;4) {</code></span>
+<span class="codeline" id="line-651"><code>		w.writeStoredHeader(len(input), eof)</code></span>
+<span class="codeline" id="line-652"><code>		w.writeBytes(input)</code></span>
+<span class="codeline" id="line-653"><code>		return</code></span>
+<span class="codeline" id="line-654"><code>	}</code></span>
+<span class="codeline" id="line-655"><code></code></span>
+<span class="codeline" id="line-656"><code>	// Huffman.</code></span>
+<span class="codeline" id="line-657"><code>	w.writeDynamicHeader(numLiterals, numOffsets, numCodegens, eof)</code></span>
+<span class="codeline" id="line-658"><code>	encoding := w.literalEncoding.codes[:257]</code></span>
+<span class="codeline" id="line-659"><code>	n := w.nbytes</code></span>
+<span class="codeline" id="line-660"><code>	for _, t := range input {</code></span>
+<span class="codeline" id="line-661"><code>		// Bitwriting inlined, ~30% speedup</code></span>
+<span class="codeline" id="line-662"><code>		c := encoding[t]</code></span>
+<span class="codeline" id="line-663"><code>		w.bits |= uint64(c.code) &lt;&lt; w.nbits</code></span>
+<span class="codeline" id="line-664"><code>		w.nbits += uint(c.len)</code></span>
+<span class="codeline" id="line-665"><code>		if w.nbits &lt; 48 {</code></span>
+<span class="codeline" id="line-666"><code>			continue</code></span>
+<span class="codeline" id="line-667"><code>		}</code></span>
+<span class="codeline" id="line-668"><code>		// Store 6 bytes</code></span>
+<span class="codeline" id="line-669"><code>		bits := w.bits</code></span>
+<span class="codeline" id="line-670"><code>		w.bits &gt;&gt;= 48</code></span>
+<span class="codeline" id="line-671"><code>		w.nbits -= 48</code></span>
+<span class="codeline" id="line-672"><code>		bytes := w.bytes[n : n+6]</code></span>
+<span class="codeline" id="line-673"><code>		bytes[0] = byte(bits)</code></span>
+<span class="codeline" id="line-674"><code>		bytes[1] = byte(bits &gt;&gt; 8)</code></span>
+<span class="codeline" id="line-675"><code>		bytes[2] = byte(bits &gt;&gt; 16)</code></span>
+<span class="codeline" id="line-676"><code>		bytes[3] = byte(bits &gt;&gt; 24)</code></span>
+<span class="codeline" id="line-677"><code>		bytes[4] = byte(bits &gt;&gt; 32)</code></span>
+<span class="codeline" id="line-678"><code>		bytes[5] = byte(bits &gt;&gt; 40)</code></span>
+<span class="codeline" id="line-679"><code>		n += 6</code></span>
+<span class="codeline" id="line-680"><code>		if n &lt; bufferFlushSize {</code></span>
+<span class="codeline" id="line-681"><code>			continue</code></span>
+<span class="codeline" id="line-682"><code>		}</code></span>
+<span class="codeline" id="line-683"><code>		w.write(w.bytes[:n])</code></span>
+<span class="codeline" id="line-684"><code>		if w.err != nil {</code></span>
+<span class="codeline" id="line-685"><code>			return // Return early in the event of write failures</code></span>
+<span class="codeline" id="line-686"><code>		}</code></span>
+<span class="codeline" id="line-687"><code>		n = 0</code></span>
+<span class="codeline" id="line-688"><code>	}</code></span>
+<span class="codeline" id="line-689"><code>	w.nbytes = n</code></span>
+<span class="codeline" id="line-690"><code>	w.writeCode(encoding[endBlockMarker])</code></span>
+<span class="codeline" id="line-691"><code>}</code></span>
+<span class="codeline" id="line-692"><code></code></span>
+<span class="codeline" id="line-693"><code>// histogram accumulates a histogram of b in h.</code></span>
+<span class="codeline" id="line-694"><code>//</code></span>
+<span class="codeline" id="line-695"><code>// len(h) must be &gt;= 256, and h's elements must be all zeroes.</code></span>
+<span class="codeline" id="line-696"><code>func histogram(b []byte, h []int32) {</code></span>
+<span class="codeline" id="line-697"><code>	h = h[:256]</code></span>
+<span class="codeline" id="line-698"><code>	for _, t := range b {</code></span>
+<span class="codeline" id="line-699"><code>		h[t]++</code></span>
+<span class="codeline" id="line-700"><code>	}</code></span>
+<span class="codeline" id="line-701"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

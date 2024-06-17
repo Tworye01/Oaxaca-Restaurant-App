@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: auth_scram.go in package github.com/jackc/pgx/v5/pgconn</title>
+<link href="../../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	auth_scram.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../../pkg/github.com/jackc/pgx/v5/pgconn.html">github.com/jackc/pgx/v5/pgconn</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// SCRAM-SHA-256 authentication</code></span>
+<span class="codeline" id="line-2"><code>//</code></span>
+<span class="codeline" id="line-3"><code>// Resources:</code></span>
+<span class="codeline" id="line-4"><code>//   https://tools.ietf.org/html/rfc5802</code></span>
+<span class="codeline" id="line-5"><code>//   https://tools.ietf.org/html/rfc8265</code></span>
+<span class="codeline" id="line-6"><code>//   https://www.postgresql.org/docs/current/sasl-authentication.html</code></span>
+<span class="codeline" id="line-7"><code>//</code></span>
+<span class="codeline" id="line-8"><code>// Inspiration drawn from other implementations:</code></span>
+<span class="codeline" id="line-9"><code>//   https://github.com/lib/pq/pull/608</code></span>
+<span class="codeline" id="line-10"><code>//   https://github.com/lib/pq/pull/788</code></span>
+<span class="codeline" id="line-11"><code>//   https://github.com/lib/pq/pull/833</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>package pgconn</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>import (</code></span>
+<span class="codeline" id="line-16"><code>	"bytes"</code></span>
+<span class="codeline" id="line-17"><code>	"crypto/hmac"</code></span>
+<span class="codeline" id="line-18"><code>	"crypto/rand"</code></span>
+<span class="codeline" id="line-19"><code>	"crypto/sha256"</code></span>
+<span class="codeline" id="line-20"><code>	"encoding/base64"</code></span>
+<span class="codeline" id="line-21"><code>	"errors"</code></span>
+<span class="codeline" id="line-22"><code>	"fmt"</code></span>
+<span class="codeline" id="line-23"><code>	"strconv"</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>	"github.com/jackc/pgx/v5/pgproto3"</code></span>
+<span class="codeline" id="line-26"><code>	"golang.org/x/crypto/pbkdf2"</code></span>
+<span class="codeline" id="line-27"><code>	"golang.org/x/text/secure/precis"</code></span>
+<span class="codeline" id="line-28"><code>)</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>const clientNonceLen = 18</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// Perform SCRAM authentication.</code></span>
+<span class="codeline" id="line-33"><code>func (c *PgConn) scramAuth(serverAuthMechanisms []string) error {</code></span>
+<span class="codeline" id="line-34"><code>	sc, err := newScramClient(serverAuthMechanisms, c.config.Password)</code></span>
+<span class="codeline" id="line-35"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-36"><code>		return err</code></span>
+<span class="codeline" id="line-37"><code>	}</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>	// Send client-first-message in a SASLInitialResponse</code></span>
+<span class="codeline" id="line-40"><code>	saslInitialResponse := &amp;pgproto3.SASLInitialResponse{</code></span>
+<span class="codeline" id="line-41"><code>		AuthMechanism: "SCRAM-SHA-256",</code></span>
+<span class="codeline" id="line-42"><code>		Data:          sc.clientFirstMessage(),</code></span>
+<span class="codeline" id="line-43"><code>	}</code></span>
+<span class="codeline" id="line-44"><code>	c.frontend.Send(saslInitialResponse)</code></span>
+<span class="codeline" id="line-45"><code>	err = c.flushWithPotentialWriteReadDeadlock()</code></span>
+<span class="codeline" id="line-46"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-47"><code>		return err</code></span>
+<span class="codeline" id="line-48"><code>	}</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>	// Receive server-first-message payload in an AuthenticationSASLContinue.</code></span>
+<span class="codeline" id="line-51"><code>	saslContinue, err := c.rxSASLContinue()</code></span>
+<span class="codeline" id="line-52"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-53"><code>		return err</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code>	err = sc.recvServerFirstMessage(saslContinue.Data)</code></span>
+<span class="codeline" id="line-56"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-57"><code>		return err</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// Send client-final-message in a SASLResponse</code></span>
+<span class="codeline" id="line-61"><code>	saslResponse := &amp;pgproto3.SASLResponse{</code></span>
+<span class="codeline" id="line-62"><code>		Data: []byte(sc.clientFinalMessage()),</code></span>
+<span class="codeline" id="line-63"><code>	}</code></span>
+<span class="codeline" id="line-64"><code>	c.frontend.Send(saslResponse)</code></span>
+<span class="codeline" id="line-65"><code>	err = c.flushWithPotentialWriteReadDeadlock()</code></span>
+<span class="codeline" id="line-66"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-67"><code>		return err</code></span>
+<span class="codeline" id="line-68"><code>	}</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>	// Receive server-final-message payload in an AuthenticationSASLFinal.</code></span>
+<span class="codeline" id="line-71"><code>	saslFinal, err := c.rxSASLFinal()</code></span>
+<span class="codeline" id="line-72"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-73"><code>		return err</code></span>
+<span class="codeline" id="line-74"><code>	}</code></span>
+<span class="codeline" id="line-75"><code>	return sc.recvServerFinalMessage(saslFinal.Data)</code></span>
+<span class="codeline" id="line-76"><code>}</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>func (c *PgConn) rxSASLContinue() (*pgproto3.AuthenticationSASLContinue, error) {</code></span>
+<span class="codeline" id="line-79"><code>	msg, err := c.receiveMessage()</code></span>
+<span class="codeline" id="line-80"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-81"><code>		return nil, err</code></span>
+<span class="codeline" id="line-82"><code>	}</code></span>
+<span class="codeline" id="line-83"><code>	switch m := msg.(type) {</code></span>
+<span class="codeline" id="line-84"><code>	case *pgproto3.AuthenticationSASLContinue:</code></span>
+<span class="codeline" id="line-85"><code>		return m, nil</code></span>
+<span class="codeline" id="line-86"><code>	case *pgproto3.ErrorResponse:</code></span>
+<span class="codeline" id="line-87"><code>		return nil, ErrorResponseToPgError(m)</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	return nil, fmt.Errorf("expected AuthenticationSASLContinue message but received unexpected message %T", msg)</code></span>
+<span class="codeline" id="line-91"><code>}</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>func (c *PgConn) rxSASLFinal() (*pgproto3.AuthenticationSASLFinal, error) {</code></span>
+<span class="codeline" id="line-94"><code>	msg, err := c.receiveMessage()</code></span>
+<span class="codeline" id="line-95"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-96"><code>		return nil, err</code></span>
+<span class="codeline" id="line-97"><code>	}</code></span>
+<span class="codeline" id="line-98"><code>	switch m := msg.(type) {</code></span>
+<span class="codeline" id="line-99"><code>	case *pgproto3.AuthenticationSASLFinal:</code></span>
+<span class="codeline" id="line-100"><code>		return m, nil</code></span>
+<span class="codeline" id="line-101"><code>	case *pgproto3.ErrorResponse:</code></span>
+<span class="codeline" id="line-102"><code>		return nil, ErrorResponseToPgError(m)</code></span>
+<span class="codeline" id="line-103"><code>	}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>	return nil, fmt.Errorf("expected AuthenticationSASLFinal message but received unexpected message %T", msg)</code></span>
+<span class="codeline" id="line-106"><code>}</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>type scramClient struct {</code></span>
+<span class="codeline" id="line-109"><code>	serverAuthMechanisms []string</code></span>
+<span class="codeline" id="line-110"><code>	password             []byte</code></span>
+<span class="codeline" id="line-111"><code>	clientNonce          []byte</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>	clientFirstMessageBare []byte</code></span>
+<span class="codeline" id="line-114"><code></code></span>
+<span class="codeline" id="line-115"><code>	serverFirstMessage   []byte</code></span>
+<span class="codeline" id="line-116"><code>	clientAndServerNonce []byte</code></span>
+<span class="codeline" id="line-117"><code>	salt                 []byte</code></span>
+<span class="codeline" id="line-118"><code>	iterations           int</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>	saltedPassword []byte</code></span>
+<span class="codeline" id="line-121"><code>	authMessage    []byte</code></span>
+<span class="codeline" id="line-122"><code>}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>func newScramClient(serverAuthMechanisms []string, password string) (*scramClient, error) {</code></span>
+<span class="codeline" id="line-125"><code>	sc := &amp;scramClient{</code></span>
+<span class="codeline" id="line-126"><code>		serverAuthMechanisms: serverAuthMechanisms,</code></span>
+<span class="codeline" id="line-127"><code>	}</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>	// Ensure server supports SCRAM-SHA-256</code></span>
+<span class="codeline" id="line-130"><code>	hasScramSHA256 := false</code></span>
+<span class="codeline" id="line-131"><code>	for _, mech := range sc.serverAuthMechanisms {</code></span>
+<span class="codeline" id="line-132"><code>		if mech == "SCRAM-SHA-256" {</code></span>
+<span class="codeline" id="line-133"><code>			hasScramSHA256 = true</code></span>
+<span class="codeline" id="line-134"><code>			break</code></span>
+<span class="codeline" id="line-135"><code>		}</code></span>
+<span class="codeline" id="line-136"><code>	}</code></span>
+<span class="codeline" id="line-137"><code>	if !hasScramSHA256 {</code></span>
+<span class="codeline" id="line-138"><code>		return nil, errors.New("server does not support SCRAM-SHA-256")</code></span>
+<span class="codeline" id="line-139"><code>	}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>	// precis.OpaqueString is equivalent to SASLprep for password.</code></span>
+<span class="codeline" id="line-142"><code>	var err error</code></span>
+<span class="codeline" id="line-143"><code>	sc.password, err = precis.OpaqueString.Bytes([]byte(password))</code></span>
+<span class="codeline" id="line-144"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-145"><code>		// PostgreSQL allows passwords invalid according to SCRAM / SASLprep.</code></span>
+<span class="codeline" id="line-146"><code>		sc.password = []byte(password)</code></span>
+<span class="codeline" id="line-147"><code>	}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>	buf := make([]byte, clientNonceLen)</code></span>
+<span class="codeline" id="line-150"><code>	_, err = rand.Read(buf)</code></span>
+<span class="codeline" id="line-151"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-152"><code>		return nil, err</code></span>
+<span class="codeline" id="line-153"><code>	}</code></span>
+<span class="codeline" id="line-154"><code>	sc.clientNonce = make([]byte, base64.RawStdEncoding.EncodedLen(len(buf)))</code></span>
+<span class="codeline" id="line-155"><code>	base64.RawStdEncoding.Encode(sc.clientNonce, buf)</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>	return sc, nil</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>func (sc *scramClient) clientFirstMessage() []byte {</code></span>
+<span class="codeline" id="line-161"><code>	sc.clientFirstMessageBare = []byte(fmt.Sprintf("n=,r=%s", sc.clientNonce))</code></span>
+<span class="codeline" id="line-162"><code>	return []byte(fmt.Sprintf("n,,%s", sc.clientFirstMessageBare))</code></span>
+<span class="codeline" id="line-163"><code>}</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>func (sc *scramClient) recvServerFirstMessage(serverFirstMessage []byte) error {</code></span>
+<span class="codeline" id="line-166"><code>	sc.serverFirstMessage = serverFirstMessage</code></span>
+<span class="codeline" id="line-167"><code>	buf := serverFirstMessage</code></span>
+<span class="codeline" id="line-168"><code>	if !bytes.HasPrefix(buf, []byte("r=")) {</code></span>
+<span class="codeline" id="line-169"><code>		return errors.New("invalid SCRAM server-first-message received from server: did not include r=")</code></span>
+<span class="codeline" id="line-170"><code>	}</code></span>
+<span class="codeline" id="line-171"><code>	buf = buf[2:]</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>	idx := bytes.IndexByte(buf, ',')</code></span>
+<span class="codeline" id="line-174"><code>	if idx == -1 {</code></span>
+<span class="codeline" id="line-175"><code>		return errors.New("invalid SCRAM server-first-message received from server: did not include s=")</code></span>
+<span class="codeline" id="line-176"><code>	}</code></span>
+<span class="codeline" id="line-177"><code>	sc.clientAndServerNonce = buf[:idx]</code></span>
+<span class="codeline" id="line-178"><code>	buf = buf[idx+1:]</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>	if !bytes.HasPrefix(buf, []byte("s=")) {</code></span>
+<span class="codeline" id="line-181"><code>		return errors.New("invalid SCRAM server-first-message received from server: did not include s=")</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	buf = buf[2:]</code></span>
+<span class="codeline" id="line-184"><code></code></span>
+<span class="codeline" id="line-185"><code>	idx = bytes.IndexByte(buf, ',')</code></span>
+<span class="codeline" id="line-186"><code>	if idx == -1 {</code></span>
+<span class="codeline" id="line-187"><code>		return errors.New("invalid SCRAM server-first-message received from server: did not include i=")</code></span>
+<span class="codeline" id="line-188"><code>	}</code></span>
+<span class="codeline" id="line-189"><code>	saltStr := buf[:idx]</code></span>
+<span class="codeline" id="line-190"><code>	buf = buf[idx+1:]</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>	if !bytes.HasPrefix(buf, []byte("i=")) {</code></span>
+<span class="codeline" id="line-193"><code>		return errors.New("invalid SCRAM server-first-message received from server: did not include i=")</code></span>
+<span class="codeline" id="line-194"><code>	}</code></span>
+<span class="codeline" id="line-195"><code>	buf = buf[2:]</code></span>
+<span class="codeline" id="line-196"><code>	iterationsStr := buf</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>	var err error</code></span>
+<span class="codeline" id="line-199"><code>	sc.salt, err = base64.StdEncoding.DecodeString(string(saltStr))</code></span>
+<span class="codeline" id="line-200"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-201"><code>		return fmt.Errorf("invalid SCRAM salt received from server: %w", err)</code></span>
+<span class="codeline" id="line-202"><code>	}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>	sc.iterations, err = strconv.Atoi(string(iterationsStr))</code></span>
+<span class="codeline" id="line-205"><code>	if err != nil || sc.iterations &lt;= 0 {</code></span>
+<span class="codeline" id="line-206"><code>		return fmt.Errorf("invalid SCRAM iteration count received from server: %w", err)</code></span>
+<span class="codeline" id="line-207"><code>	}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>	if !bytes.HasPrefix(sc.clientAndServerNonce, sc.clientNonce) {</code></span>
+<span class="codeline" id="line-210"><code>		return errors.New("invalid SCRAM nonce: did not start with client nonce")</code></span>
+<span class="codeline" id="line-211"><code>	}</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>	if len(sc.clientAndServerNonce) &lt;= len(sc.clientNonce) {</code></span>
+<span class="codeline" id="line-214"><code>		return errors.New("invalid SCRAM nonce: did not include server nonce")</code></span>
+<span class="codeline" id="line-215"><code>	}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>	return nil</code></span>
+<span class="codeline" id="line-218"><code>}</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>func (sc *scramClient) clientFinalMessage() string {</code></span>
+<span class="codeline" id="line-221"><code>	clientFinalMessageWithoutProof := []byte(fmt.Sprintf("c=biws,r=%s", sc.clientAndServerNonce))</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>	sc.saltedPassword = pbkdf2.Key([]byte(sc.password), sc.salt, sc.iterations, 32, sha256.New)</code></span>
+<span class="codeline" id="line-224"><code>	sc.authMessage = bytes.Join([][]byte{sc.clientFirstMessageBare, sc.serverFirstMessage, clientFinalMessageWithoutProof}, []byte(","))</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>	clientProof := computeClientProof(sc.saltedPassword, sc.authMessage)</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>	return fmt.Sprintf("%s,p=%s", clientFinalMessageWithoutProof, clientProof)</code></span>
+<span class="codeline" id="line-229"><code>}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>func (sc *scramClient) recvServerFinalMessage(serverFinalMessage []byte) error {</code></span>
+<span class="codeline" id="line-232"><code>	if !bytes.HasPrefix(serverFinalMessage, []byte("v=")) {</code></span>
+<span class="codeline" id="line-233"><code>		return errors.New("invalid SCRAM server-final-message received from server")</code></span>
+<span class="codeline" id="line-234"><code>	}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>	serverSignature := serverFinalMessage[2:]</code></span>
+<span class="codeline" id="line-237"><code></code></span>
+<span class="codeline" id="line-238"><code>	if !hmac.Equal(serverSignature, computeServerSignature(sc.saltedPassword, sc.authMessage)) {</code></span>
+<span class="codeline" id="line-239"><code>		return errors.New("invalid SCRAM ServerSignature received from server")</code></span>
+<span class="codeline" id="line-240"><code>	}</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>	return nil</code></span>
+<span class="codeline" id="line-243"><code>}</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>func computeHMAC(key, msg []byte) []byte {</code></span>
+<span class="codeline" id="line-246"><code>	mac := hmac.New(sha256.New, key)</code></span>
+<span class="codeline" id="line-247"><code>	mac.Write(msg)</code></span>
+<span class="codeline" id="line-248"><code>	return mac.Sum(nil)</code></span>
+<span class="codeline" id="line-249"><code>}</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>func computeClientProof(saltedPassword, authMessage []byte) []byte {</code></span>
+<span class="codeline" id="line-252"><code>	clientKey := computeHMAC(saltedPassword, []byte("Client Key"))</code></span>
+<span class="codeline" id="line-253"><code>	storedKey := sha256.Sum256(clientKey)</code></span>
+<span class="codeline" id="line-254"><code>	clientSignature := computeHMAC(storedKey[:], authMessage)</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>	clientProof := make([]byte, len(clientSignature))</code></span>
+<span class="codeline" id="line-257"><code>	for i := 0; i &lt; len(clientSignature); i++ {</code></span>
+<span class="codeline" id="line-258"><code>		clientProof[i] = clientKey[i] ^ clientSignature[i]</code></span>
+<span class="codeline" id="line-259"><code>	}</code></span>
+<span class="codeline" id="line-260"><code></code></span>
+<span class="codeline" id="line-261"><code>	buf := make([]byte, base64.StdEncoding.EncodedLen(len(clientProof)))</code></span>
+<span class="codeline" id="line-262"><code>	base64.StdEncoding.Encode(buf, clientProof)</code></span>
+<span class="codeline" id="line-263"><code>	return buf</code></span>
+<span class="codeline" id="line-264"><code>}</code></span>
+<span class="codeline" id="line-265"><code></code></span>
+<span class="codeline" id="line-266"><code>func computeServerSignature(saltedPassword []byte, authMessage []byte) []byte {</code></span>
+<span class="codeline" id="line-267"><code>	serverKey := computeHMAC(saltedPassword, []byte("Server Key"))</code></span>
+<span class="codeline" id="line-268"><code>	serverSignature := computeHMAC(serverKey, authMessage)</code></span>
+<span class="codeline" id="line-269"><code>	buf := make([]byte, base64.StdEncoding.EncodedLen(len(serverSignature)))</code></span>
+<span class="codeline" id="line-270"><code>	base64.StdEncoding.Encode(buf, serverSignature)</code></span>
+<span class="codeline" id="line-271"><code>	return buf</code></span>
+<span class="codeline" id="line-272"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

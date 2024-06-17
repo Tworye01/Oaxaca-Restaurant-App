@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: cgo.go in package golang.org/x/tools/go/internal/cgo</title>
+<link href="../../../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	cgo.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../../../pkg/golang.org/x/tools/go/internal/cgo.html">golang.org/x/tools/go/internal/cgo</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2013 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// Package cgo handles cgo preprocessing of files containing `import "C"`.</code></span>
+<span class="codeline" id="line-6"><code>//</code></span>
+<span class="codeline" id="line-7"><code>// DESIGN</code></span>
+<span class="codeline" id="line-8"><code>//</code></span>
+<span class="codeline" id="line-9"><code>// The approach taken is to run the cgo processor on the package's</code></span>
+<span class="codeline" id="line-10"><code>// CgoFiles and parse the output, faking the filenames of the</code></span>
+<span class="codeline" id="line-11"><code>// resulting ASTs so that the synthetic file containing the C types is</code></span>
+<span class="codeline" id="line-12"><code>// called "C" (e.g. "~/go/src/net/C") and the preprocessed files</code></span>
+<span class="codeline" id="line-13"><code>// have their original names (e.g. "~/go/src/net/cgo_unix.go"),</code></span>
+<span class="codeline" id="line-14"><code>// not the names of the actual temporary files.</code></span>
+<span class="codeline" id="line-15"><code>//</code></span>
+<span class="codeline" id="line-16"><code>// The advantage of this approach is its fidelity to 'go build'.  The</code></span>
+<span class="codeline" id="line-17"><code>// downside is that the token.Position.Offset for each AST node is</code></span>
+<span class="codeline" id="line-18"><code>// incorrect, being an offset within the temporary file.  Line numbers</code></span>
+<span class="codeline" id="line-19"><code>// should still be correct because of the //line comments.</code></span>
+<span class="codeline" id="line-20"><code>//</code></span>
+<span class="codeline" id="line-21"><code>// The logic of this file is mostly plundered from the 'go build'</code></span>
+<span class="codeline" id="line-22"><code>// tool, which also invokes the cgo preprocessor.</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>//</code></span>
+<span class="codeline" id="line-25"><code>// REJECTED ALTERNATIVE</code></span>
+<span class="codeline" id="line-26"><code>//</code></span>
+<span class="codeline" id="line-27"><code>// An alternative approach that we explored is to extend go/types'</code></span>
+<span class="codeline" id="line-28"><code>// Importer mechanism to provide the identity of the importing package</code></span>
+<span class="codeline" id="line-29"><code>// so that each time `import "C"` appears it resolves to a different</code></span>
+<span class="codeline" id="line-30"><code>// synthetic package containing just the objects needed in that case.</code></span>
+<span class="codeline" id="line-31"><code>// The loader would invoke cgo but parse only the cgo_types.go file</code></span>
+<span class="codeline" id="line-32"><code>// defining the package-level objects, discarding the other files</code></span>
+<span class="codeline" id="line-33"><code>// resulting from preprocessing.</code></span>
+<span class="codeline" id="line-34"><code>//</code></span>
+<span class="codeline" id="line-35"><code>// The benefit of this approach would have been that source-level</code></span>
+<span class="codeline" id="line-36"><code>// syntax information would correspond exactly to the original cgo</code></span>
+<span class="codeline" id="line-37"><code>// file, with no preprocessing involved, making source tools like</code></span>
+<span class="codeline" id="line-38"><code>// godoc, guru, and eg happy.  However, the approach was rejected</code></span>
+<span class="codeline" id="line-39"><code>// due to the additional complexity it would impose on go/types.  (It</code></span>
+<span class="codeline" id="line-40"><code>// made for a beautiful demo, though.)</code></span>
+<span class="codeline" id="line-41"><code>//</code></span>
+<span class="codeline" id="line-42"><code>// cgo files, despite their *.go extension, are not legal Go source</code></span>
+<span class="codeline" id="line-43"><code>// files per the specification since they may refer to unexported</code></span>
+<span class="codeline" id="line-44"><code>// members of package "C" such as C.int.  Also, a function such as</code></span>
+<span class="codeline" id="line-45"><code>// C.getpwent has in effect two types, one matching its C type and one</code></span>
+<span class="codeline" id="line-46"><code>// which additionally returns (errno C.int).  The cgo preprocessor</code></span>
+<span class="codeline" id="line-47"><code>// uses name mangling to distinguish these two functions in the</code></span>
+<span class="codeline" id="line-48"><code>// processed code, but go/types would need to duplicate this logic in</code></span>
+<span class="codeline" id="line-49"><code>// its handling of function calls, analogous to the treatment of map</code></span>
+<span class="codeline" id="line-50"><code>// lookups in which y=m[k] and y,ok=m[k] are both legal.</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>package cgo</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>import (</code></span>
+<span class="codeline" id="line-55"><code>	"fmt"</code></span>
+<span class="codeline" id="line-56"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-57"><code>	"go/build"</code></span>
+<span class="codeline" id="line-58"><code>	"go/parser"</code></span>
+<span class="codeline" id="line-59"><code>	"go/token"</code></span>
+<span class="codeline" id="line-60"><code>	"log"</code></span>
+<span class="codeline" id="line-61"><code>	"os"</code></span>
+<span class="codeline" id="line-62"><code>	"os/exec"</code></span>
+<span class="codeline" id="line-63"><code>	"path/filepath"</code></span>
+<span class="codeline" id="line-64"><code>	"regexp"</code></span>
+<span class="codeline" id="line-65"><code>	"strings"</code></span>
+<span class="codeline" id="line-66"><code>)</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>// ProcessFiles invokes the cgo preprocessor on bp.CgoFiles, parses</code></span>
+<span class="codeline" id="line-69"><code>// the output and returns the resulting ASTs.</code></span>
+<span class="codeline" id="line-70"><code>func ProcessFiles(bp *build.Package, fset *token.FileSet, DisplayPath func(path string) string, mode parser.Mode) ([]*ast.File, error) {</code></span>
+<span class="codeline" id="line-71"><code>	tmpdir, err := os.MkdirTemp("", strings.Replace(bp.ImportPath, "/", "_", -1)+"_C")</code></span>
+<span class="codeline" id="line-72"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-73"><code>		return nil, err</code></span>
+<span class="codeline" id="line-74"><code>	}</code></span>
+<span class="codeline" id="line-75"><code>	defer os.RemoveAll(tmpdir)</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>	pkgdir := bp.Dir</code></span>
+<span class="codeline" id="line-78"><code>	if DisplayPath != nil {</code></span>
+<span class="codeline" id="line-79"><code>		pkgdir = DisplayPath(pkgdir)</code></span>
+<span class="codeline" id="line-80"><code>	}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>	cgoFiles, cgoDisplayFiles, err := Run(bp, pkgdir, tmpdir, false)</code></span>
+<span class="codeline" id="line-83"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-84"><code>		return nil, err</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code>	var files []*ast.File</code></span>
+<span class="codeline" id="line-87"><code>	for i := range cgoFiles {</code></span>
+<span class="codeline" id="line-88"><code>		rd, err := os.Open(cgoFiles[i])</code></span>
+<span class="codeline" id="line-89"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-90"><code>			return nil, err</code></span>
+<span class="codeline" id="line-91"><code>		}</code></span>
+<span class="codeline" id="line-92"><code>		display := filepath.Join(bp.Dir, cgoDisplayFiles[i])</code></span>
+<span class="codeline" id="line-93"><code>		f, err := parser.ParseFile(fset, display, rd, mode)</code></span>
+<span class="codeline" id="line-94"><code>		rd.Close()</code></span>
+<span class="codeline" id="line-95"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-96"><code>			return nil, err</code></span>
+<span class="codeline" id="line-97"><code>		}</code></span>
+<span class="codeline" id="line-98"><code>		files = append(files, f)</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	return files, nil</code></span>
+<span class="codeline" id="line-101"><code>}</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>var cgoRe = regexp.MustCompile(`[/\\:]`)</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>// Run invokes the cgo preprocessor on bp.CgoFiles and returns two</code></span>
+<span class="codeline" id="line-106"><code>// lists of files: the resulting processed files (in temporary</code></span>
+<span class="codeline" id="line-107"><code>// directory tmpdir) and the corresponding names of the unprocessed files.</code></span>
+<span class="codeline" id="line-108"><code>//</code></span>
+<span class="codeline" id="line-109"><code>// Run is adapted from (*builder).cgo in</code></span>
+<span class="codeline" id="line-110"><code>// $GOROOT/src/cmd/go/build.go, but these features are unsupported:</code></span>
+<span class="codeline" id="line-111"><code>// Objective C, CGOPKGPATH, CGO_FLAGS.</code></span>
+<span class="codeline" id="line-112"><code>//</code></span>
+<span class="codeline" id="line-113"><code>// If useabs is set to true, absolute paths of the bp.CgoFiles will be passed in</code></span>
+<span class="codeline" id="line-114"><code>// to the cgo preprocessor. This in turn will set the // line comments</code></span>
+<span class="codeline" id="line-115"><code>// referring to those files to use absolute paths. This is needed for</code></span>
+<span class="codeline" id="line-116"><code>// go/packages using the legacy go list support so it is able to find</code></span>
+<span class="codeline" id="line-117"><code>// the original files.</code></span>
+<span class="codeline" id="line-118"><code>func Run(bp *build.Package, pkgdir, tmpdir string, useabs bool) (files, displayFiles []string, err error) {</code></span>
+<span class="codeline" id="line-119"><code>	cgoCPPFLAGS, _, _, _ := cflags(bp, true)</code></span>
+<span class="codeline" id="line-120"><code>	_, cgoexeCFLAGS, _, _ := cflags(bp, false)</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	if len(bp.CgoPkgConfig) &gt; 0 {</code></span>
+<span class="codeline" id="line-123"><code>		pcCFLAGS, err := pkgConfigFlags(bp)</code></span>
+<span class="codeline" id="line-124"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-125"><code>			return nil, nil, err</code></span>
+<span class="codeline" id="line-126"><code>		}</code></span>
+<span class="codeline" id="line-127"><code>		cgoCPPFLAGS = append(cgoCPPFLAGS, pcCFLAGS...)</code></span>
+<span class="codeline" id="line-128"><code>	}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>	// Allows including _cgo_export.h from .[ch] files in the package.</code></span>
+<span class="codeline" id="line-131"><code>	cgoCPPFLAGS = append(cgoCPPFLAGS, "-I", tmpdir)</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>	// _cgo_gotypes.go (displayed "C") contains the type definitions.</code></span>
+<span class="codeline" id="line-134"><code>	files = append(files, filepath.Join(tmpdir, "_cgo_gotypes.go"))</code></span>
+<span class="codeline" id="line-135"><code>	displayFiles = append(displayFiles, "C")</code></span>
+<span class="codeline" id="line-136"><code>	for _, fn := range bp.CgoFiles {</code></span>
+<span class="codeline" id="line-137"><code>		// "foo.cgo1.go" (displayed "foo.go") is the processed Go source.</code></span>
+<span class="codeline" id="line-138"><code>		f := cgoRe.ReplaceAllString(fn[:len(fn)-len("go")], "_")</code></span>
+<span class="codeline" id="line-139"><code>		files = append(files, filepath.Join(tmpdir, f+"cgo1.go"))</code></span>
+<span class="codeline" id="line-140"><code>		displayFiles = append(displayFiles, fn)</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>	var cgoflags []string</code></span>
+<span class="codeline" id="line-144"><code>	if bp.Goroot &amp;&amp; bp.ImportPath == "runtime/cgo" {</code></span>
+<span class="codeline" id="line-145"><code>		cgoflags = append(cgoflags, "-import_runtime_cgo=false")</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	if bp.Goroot &amp;&amp; bp.ImportPath == "runtime/race" || bp.ImportPath == "runtime/cgo" {</code></span>
+<span class="codeline" id="line-148"><code>		cgoflags = append(cgoflags, "-import_syscall=false")</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	var cgoFiles []string = bp.CgoFiles</code></span>
+<span class="codeline" id="line-152"><code>	if useabs {</code></span>
+<span class="codeline" id="line-153"><code>		cgoFiles = make([]string, len(bp.CgoFiles))</code></span>
+<span class="codeline" id="line-154"><code>		for i := range cgoFiles {</code></span>
+<span class="codeline" id="line-155"><code>			cgoFiles[i] = filepath.Join(pkgdir, bp.CgoFiles[i])</code></span>
+<span class="codeline" id="line-156"><code>		}</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>	args := stringList(</code></span>
+<span class="codeline" id="line-160"><code>		"go", "tool", "cgo", "-objdir", tmpdir, cgoflags, "--",</code></span>
+<span class="codeline" id="line-161"><code>		cgoCPPFLAGS, cgoexeCFLAGS, cgoFiles,</code></span>
+<span class="codeline" id="line-162"><code>	)</code></span>
+<span class="codeline" id="line-163"><code>	if false {</code></span>
+<span class="codeline" id="line-164"><code>		log.Printf("Running cgo for package %q: %s (dir=%s)", bp.ImportPath, args, pkgdir)</code></span>
+<span class="codeline" id="line-165"><code>	}</code></span>
+<span class="codeline" id="line-166"><code>	cmd := exec.Command(args[0], args[1:]...)</code></span>
+<span class="codeline" id="line-167"><code>	cmd.Dir = pkgdir</code></span>
+<span class="codeline" id="line-168"><code>	cmd.Env = append(os.Environ(), "PWD="+pkgdir)</code></span>
+<span class="codeline" id="line-169"><code>	cmd.Stdout = os.Stderr</code></span>
+<span class="codeline" id="line-170"><code>	cmd.Stderr = os.Stderr</code></span>
+<span class="codeline" id="line-171"><code>	if err := cmd.Run(); err != nil {</code></span>
+<span class="codeline" id="line-172"><code>		return nil, nil, fmt.Errorf("cgo failed: %s: %s", args, err)</code></span>
+<span class="codeline" id="line-173"><code>	}</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>	return files, displayFiles, nil</code></span>
+<span class="codeline" id="line-176"><code>}</code></span>
+<span class="codeline" id="line-177"><code></code></span>
+<span class="codeline" id="line-178"><code>// -- unmodified from 'go build' ---------------------------------------</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>// Return the flags to use when invoking the C or C++ compilers, or cgo.</code></span>
+<span class="codeline" id="line-181"><code>func cflags(p *build.Package, def bool) (cppflags, cflags, cxxflags, ldflags []string) {</code></span>
+<span class="codeline" id="line-182"><code>	var defaults string</code></span>
+<span class="codeline" id="line-183"><code>	if def {</code></span>
+<span class="codeline" id="line-184"><code>		defaults = "-g -O2"</code></span>
+<span class="codeline" id="line-185"><code>	}</code></span>
+<span class="codeline" id="line-186"><code></code></span>
+<span class="codeline" id="line-187"><code>	cppflags = stringList(envList("CGO_CPPFLAGS", ""), p.CgoCPPFLAGS)</code></span>
+<span class="codeline" id="line-188"><code>	cflags = stringList(envList("CGO_CFLAGS", defaults), p.CgoCFLAGS)</code></span>
+<span class="codeline" id="line-189"><code>	cxxflags = stringList(envList("CGO_CXXFLAGS", defaults), p.CgoCXXFLAGS)</code></span>
+<span class="codeline" id="line-190"><code>	ldflags = stringList(envList("CGO_LDFLAGS", defaults), p.CgoLDFLAGS)</code></span>
+<span class="codeline" id="line-191"><code>	return</code></span>
+<span class="codeline" id="line-192"><code>}</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>// envList returns the value of the given environment variable broken</code></span>
+<span class="codeline" id="line-195"><code>// into fields, using the default value when the variable is empty.</code></span>
+<span class="codeline" id="line-196"><code>func envList(key, def string) []string {</code></span>
+<span class="codeline" id="line-197"><code>	v := os.Getenv(key)</code></span>
+<span class="codeline" id="line-198"><code>	if v == "" {</code></span>
+<span class="codeline" id="line-199"><code>		v = def</code></span>
+<span class="codeline" id="line-200"><code>	}</code></span>
+<span class="codeline" id="line-201"><code>	return strings.Fields(v)</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>// stringList's arguments should be a sequence of string or []string values.</code></span>
+<span class="codeline" id="line-205"><code>// stringList flattens them into a single []string.</code></span>
+<span class="codeline" id="line-206"><code>func stringList(args ...interface{}) []string {</code></span>
+<span class="codeline" id="line-207"><code>	var x []string</code></span>
+<span class="codeline" id="line-208"><code>	for _, arg := range args {</code></span>
+<span class="codeline" id="line-209"><code>		switch arg := arg.(type) {</code></span>
+<span class="codeline" id="line-210"><code>		case []string:</code></span>
+<span class="codeline" id="line-211"><code>			x = append(x, arg...)</code></span>
+<span class="codeline" id="line-212"><code>		case string:</code></span>
+<span class="codeline" id="line-213"><code>			x = append(x, arg)</code></span>
+<span class="codeline" id="line-214"><code>		default:</code></span>
+<span class="codeline" id="line-215"><code>			panic("stringList: invalid argument")</code></span>
+<span class="codeline" id="line-216"><code>		}</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code>	return x</code></span>
+<span class="codeline" id="line-219"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: bracket.go in package golang.org/x/text/unicode/bidi</title>
+<link href="../../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	bracket.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../../pkg/golang.org/x/text/unicode/bidi.html">golang.org/x/text/unicode/bidi</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2015 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package bidi</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"container/list"</code></span>
+<span class="codeline" id="line-9"><code>	"fmt"</code></span>
+<span class="codeline" id="line-10"><code>	"sort"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// This file contains a port of the reference implementation of the</code></span>
+<span class="codeline" id="line-14"><code>// Bidi Parentheses Algorithm:</code></span>
+<span class="codeline" id="line-15"><code>// https://www.unicode.org/Public/PROGRAMS/BidiReferenceJava/BidiPBAReference.java</code></span>
+<span class="codeline" id="line-16"><code>//</code></span>
+<span class="codeline" id="line-17"><code>// The implementation in this file covers definitions BD14-BD16 and rule N0</code></span>
+<span class="codeline" id="line-18"><code>// of UAX#9.</code></span>
+<span class="codeline" id="line-19"><code>//</code></span>
+<span class="codeline" id="line-20"><code>// Some preprocessing is done for each rune before data is passed to this</code></span>
+<span class="codeline" id="line-21"><code>// algorithm:</code></span>
+<span class="codeline" id="line-22"><code>//  - opening and closing brackets are identified</code></span>
+<span class="codeline" id="line-23"><code>//  - a bracket pair type, like '(' and ')' is assigned a unique identifier that</code></span>
+<span class="codeline" id="line-24"><code>//    is identical for the opening and closing bracket. It is left to do these</code></span>
+<span class="codeline" id="line-25"><code>//    mappings.</code></span>
+<span class="codeline" id="line-26"><code>//  - The BPA algorithm requires that bracket characters that are canonical</code></span>
+<span class="codeline" id="line-27"><code>//    equivalents of each other be able to be substituted for each other.</code></span>
+<span class="codeline" id="line-28"><code>//    It is the responsibility of the caller to do this canonicalization.</code></span>
+<span class="codeline" id="line-29"><code>//</code></span>
+<span class="codeline" id="line-30"><code>// In implementing BD16, this implementation departs slightly from the "logical"</code></span>
+<span class="codeline" id="line-31"><code>// algorithm defined in UAX#9. In particular, the stack referenced there</code></span>
+<span class="codeline" id="line-32"><code>// supports operations that go beyond a "basic" stack. An equivalent</code></span>
+<span class="codeline" id="line-33"><code>// implementation based on a linked list is used here.</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>// Bidi_Paired_Bracket_Type</code></span>
+<span class="codeline" id="line-36"><code>// BD14. An opening paired bracket is a character whose</code></span>
+<span class="codeline" id="line-37"><code>// Bidi_Paired_Bracket_Type property value is Open.</code></span>
+<span class="codeline" id="line-38"><code>//</code></span>
+<span class="codeline" id="line-39"><code>// BD15. A closing paired bracket is a character whose</code></span>
+<span class="codeline" id="line-40"><code>// Bidi_Paired_Bracket_Type property value is Close.</code></span>
+<span class="codeline" id="line-41"><code>type bracketType byte</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>const (</code></span>
+<span class="codeline" id="line-44"><code>	bpNone bracketType = iota</code></span>
+<span class="codeline" id="line-45"><code>	bpOpen</code></span>
+<span class="codeline" id="line-46"><code>	bpClose</code></span>
+<span class="codeline" id="line-47"><code>)</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>// bracketPair holds a pair of index values for opening and closing bracket</code></span>
+<span class="codeline" id="line-50"><code>// location of a bracket pair.</code></span>
+<span class="codeline" id="line-51"><code>type bracketPair struct {</code></span>
+<span class="codeline" id="line-52"><code>	opener int</code></span>
+<span class="codeline" id="line-53"><code>	closer int</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>func (b *bracketPair) String() string {</code></span>
+<span class="codeline" id="line-57"><code>	return fmt.Sprintf("(%v, %v)", b.opener, b.closer)</code></span>
+<span class="codeline" id="line-58"><code>}</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>// bracketPairs is a slice of bracketPairs with a sort.Interface implementation.</code></span>
+<span class="codeline" id="line-61"><code>type bracketPairs []bracketPair</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>func (b bracketPairs) Len() int           { return len(b) }</code></span>
+<span class="codeline" id="line-64"><code>func (b bracketPairs) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }</code></span>
+<span class="codeline" id="line-65"><code>func (b bracketPairs) Less(i, j int) bool { return b[i].opener &lt; b[j].opener }</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// resolvePairedBrackets runs the paired bracket part of the UBA algorithm.</code></span>
+<span class="codeline" id="line-68"><code>//</code></span>
+<span class="codeline" id="line-69"><code>// For each rune, it takes the indexes into the original string, the class the</code></span>
+<span class="codeline" id="line-70"><code>// bracket type (in pairTypes) and the bracket identifier (pairValues). It also</code></span>
+<span class="codeline" id="line-71"><code>// takes the direction type for the start-of-sentence and the embedding level.</code></span>
+<span class="codeline" id="line-72"><code>//</code></span>
+<span class="codeline" id="line-73"><code>// The identifiers for bracket types are the rune of the canonicalized opening</code></span>
+<span class="codeline" id="line-74"><code>// bracket for brackets (open or close) or 0 for runes that are not brackets.</code></span>
+<span class="codeline" id="line-75"><code>func resolvePairedBrackets(s *isolatingRunSequence) {</code></span>
+<span class="codeline" id="line-76"><code>	p := bracketPairer{</code></span>
+<span class="codeline" id="line-77"><code>		sos:              s.sos,</code></span>
+<span class="codeline" id="line-78"><code>		openers:          list.New(),</code></span>
+<span class="codeline" id="line-79"><code>		codesIsolatedRun: s.types,</code></span>
+<span class="codeline" id="line-80"><code>		indexes:          s.indexes,</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code>	dirEmbed := L</code></span>
+<span class="codeline" id="line-83"><code>	if s.level&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-84"><code>		dirEmbed = R</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code>	p.locateBrackets(s.p.pairTypes, s.p.pairValues)</code></span>
+<span class="codeline" id="line-87"><code>	p.resolveBrackets(dirEmbed, s.p.initialTypes)</code></span>
+<span class="codeline" id="line-88"><code>}</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>type bracketPairer struct {</code></span>
+<span class="codeline" id="line-91"><code>	sos Class // direction corresponding to start of sequence</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>	// The following is a restatement of BD 16 using non-algorithmic language.</code></span>
+<span class="codeline" id="line-94"><code>	//</code></span>
+<span class="codeline" id="line-95"><code>	// A bracket pair is a pair of characters consisting of an opening</code></span>
+<span class="codeline" id="line-96"><code>	// paired bracket and a closing paired bracket such that the</code></span>
+<span class="codeline" id="line-97"><code>	// Bidi_Paired_Bracket property value of the former equals the latter,</code></span>
+<span class="codeline" id="line-98"><code>	// subject to the following constraints.</code></span>
+<span class="codeline" id="line-99"><code>	// - both characters of a pair occur in the same isolating run sequence</code></span>
+<span class="codeline" id="line-100"><code>	// - the closing character of a pair follows the opening character</code></span>
+<span class="codeline" id="line-101"><code>	// - any bracket character can belong at most to one pair, the earliest possible one</code></span>
+<span class="codeline" id="line-102"><code>	// - any bracket character not part of a pair is treated like an ordinary character</code></span>
+<span class="codeline" id="line-103"><code>	// - pairs may nest properly, but their spans may not overlap otherwise</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>	// Bracket characters with canonical decompositions are supposed to be</code></span>
+<span class="codeline" id="line-106"><code>	// treated as if they had been normalized, to allow normalized and non-</code></span>
+<span class="codeline" id="line-107"><code>	// normalized text to give the same result. In this implementation that step</code></span>
+<span class="codeline" id="line-108"><code>	// is pushed out to the caller. The caller has to ensure that the pairValue</code></span>
+<span class="codeline" id="line-109"><code>	// slices contain the rune of the opening bracket after normalization for</code></span>
+<span class="codeline" id="line-110"><code>	// any opening or closing bracket.</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	openers *list.List // list of positions for opening brackets</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>	// bracket pair positions sorted by location of opening bracket</code></span>
+<span class="codeline" id="line-115"><code>	pairPositions bracketPairs</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>	codesIsolatedRun []Class // directional bidi codes for an isolated run</code></span>
+<span class="codeline" id="line-118"><code>	indexes          []int   // array of index values into the original string</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>}</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>// matchOpener reports whether characters at given positions form a matching</code></span>
+<span class="codeline" id="line-123"><code>// bracket pair.</code></span>
+<span class="codeline" id="line-124"><code>func (p *bracketPairer) matchOpener(pairValues []rune, opener, closer int) bool {</code></span>
+<span class="codeline" id="line-125"><code>	return pairValues[p.indexes[opener]] == pairValues[p.indexes[closer]]</code></span>
+<span class="codeline" id="line-126"><code>}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>const maxPairingDepth = 63</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>// locateBrackets locates matching bracket pairs according to BD16.</code></span>
+<span class="codeline" id="line-131"><code>//</code></span>
+<span class="codeline" id="line-132"><code>// This implementation uses a linked list instead of a stack, because, while</code></span>
+<span class="codeline" id="line-133"><code>// elements are added at the front (like a push) they are not generally removed</code></span>
+<span class="codeline" id="line-134"><code>// in atomic 'pop' operations, reducing the benefit of the stack archetype.</code></span>
+<span class="codeline" id="line-135"><code>func (p *bracketPairer) locateBrackets(pairTypes []bracketType, pairValues []rune) {</code></span>
+<span class="codeline" id="line-136"><code>	// traverse the run</code></span>
+<span class="codeline" id="line-137"><code>	// do that explicitly (not in a for-each) so we can record position</code></span>
+<span class="codeline" id="line-138"><code>	for i, index := range p.indexes {</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>		// look at the bracket type for each character</code></span>
+<span class="codeline" id="line-141"><code>		if pairTypes[index] == bpNone || p.codesIsolatedRun[i] != ON {</code></span>
+<span class="codeline" id="line-142"><code>			// continue scanning</code></span>
+<span class="codeline" id="line-143"><code>			continue</code></span>
+<span class="codeline" id="line-144"><code>		}</code></span>
+<span class="codeline" id="line-145"><code>		switch pairTypes[index] {</code></span>
+<span class="codeline" id="line-146"><code>		case bpOpen:</code></span>
+<span class="codeline" id="line-147"><code>			// check if maximum pairing depth reached</code></span>
+<span class="codeline" id="line-148"><code>			if p.openers.Len() == maxPairingDepth {</code></span>
+<span class="codeline" id="line-149"><code>				p.openers.Init()</code></span>
+<span class="codeline" id="line-150"><code>				return</code></span>
+<span class="codeline" id="line-151"><code>			}</code></span>
+<span class="codeline" id="line-152"><code>			// remember opener location, most recent first</code></span>
+<span class="codeline" id="line-153"><code>			p.openers.PushFront(i)</code></span>
+<span class="codeline" id="line-154"><code></code></span>
+<span class="codeline" id="line-155"><code>		case bpClose:</code></span>
+<span class="codeline" id="line-156"><code>			// see if there is a match</code></span>
+<span class="codeline" id="line-157"><code>			count := 0</code></span>
+<span class="codeline" id="line-158"><code>			for elem := p.openers.Front(); elem != nil; elem = elem.Next() {</code></span>
+<span class="codeline" id="line-159"><code>				count++</code></span>
+<span class="codeline" id="line-160"><code>				opener := elem.Value.(int)</code></span>
+<span class="codeline" id="line-161"><code>				if p.matchOpener(pairValues, opener, i) {</code></span>
+<span class="codeline" id="line-162"><code>					// if the opener matches, add nested pair to the ordered list</code></span>
+<span class="codeline" id="line-163"><code>					p.pairPositions = append(p.pairPositions, bracketPair{opener, i})</code></span>
+<span class="codeline" id="line-164"><code>					// remove up to and including matched opener</code></span>
+<span class="codeline" id="line-165"><code>					for ; count &gt; 0; count-- {</code></span>
+<span class="codeline" id="line-166"><code>						p.openers.Remove(p.openers.Front())</code></span>
+<span class="codeline" id="line-167"><code>					}</code></span>
+<span class="codeline" id="line-168"><code>					break</code></span>
+<span class="codeline" id="line-169"><code>				}</code></span>
+<span class="codeline" id="line-170"><code>			}</code></span>
+<span class="codeline" id="line-171"><code>			sort.Sort(p.pairPositions)</code></span>
+<span class="codeline" id="line-172"><code>			// if we get here, the closing bracket matched no openers</code></span>
+<span class="codeline" id="line-173"><code>			// and gets ignored</code></span>
+<span class="codeline" id="line-174"><code>		}</code></span>
+<span class="codeline" id="line-175"><code>	}</code></span>
+<span class="codeline" id="line-176"><code>}</code></span>
+<span class="codeline" id="line-177"><code></code></span>
+<span class="codeline" id="line-178"><code>// Bracket pairs within an isolating run sequence are processed as units so</code></span>
+<span class="codeline" id="line-179"><code>// that both the opening and the closing paired bracket in a pair resolve to</code></span>
+<span class="codeline" id="line-180"><code>// the same direction.</code></span>
+<span class="codeline" id="line-181"><code>//</code></span>
+<span class="codeline" id="line-182"><code>// N0. Process bracket pairs in an isolating run sequence sequentially in</code></span>
+<span class="codeline" id="line-183"><code>// the logical order of the text positions of the opening paired brackets</code></span>
+<span class="codeline" id="line-184"><code>// using the logic given below. Within this scope, bidirectional types EN</code></span>
+<span class="codeline" id="line-185"><code>// and AN are treated as R.</code></span>
+<span class="codeline" id="line-186"><code>//</code></span>
+<span class="codeline" id="line-187"><code>// Identify the bracket pairs in the current isolating run sequence</code></span>
+<span class="codeline" id="line-188"><code>// according to BD16. For each bracket-pair element in the list of pairs of</code></span>
+<span class="codeline" id="line-189"><code>// text positions:</code></span>
+<span class="codeline" id="line-190"><code>//</code></span>
+<span class="codeline" id="line-191"><code>// a Inspect the bidirectional types of the characters enclosed within the</code></span>
+<span class="codeline" id="line-192"><code>// bracket pair.</code></span>
+<span class="codeline" id="line-193"><code>//</code></span>
+<span class="codeline" id="line-194"><code>// b If any strong type (either L or R) matching the embedding direction is</code></span>
+<span class="codeline" id="line-195"><code>// found, set the type for both brackets in the pair to match the embedding</code></span>
+<span class="codeline" id="line-196"><code>// direction.</code></span>
+<span class="codeline" id="line-197"><code>//</code></span>
+<span class="codeline" id="line-198"><code>// o [ e ] o -&gt; o e e e o</code></span>
+<span class="codeline" id="line-199"><code>//</code></span>
+<span class="codeline" id="line-200"><code>// o [ o e ] -&gt; o e o e e</code></span>
+<span class="codeline" id="line-201"><code>//</code></span>
+<span class="codeline" id="line-202"><code>// o [ NI e ] -&gt; o e NI e e</code></span>
+<span class="codeline" id="line-203"><code>//</code></span>
+<span class="codeline" id="line-204"><code>// c Otherwise, if a strong type (opposite the embedding direction) is</code></span>
+<span class="codeline" id="line-205"><code>// found, test for adjacent strong types as follows: 1 First, check</code></span>
+<span class="codeline" id="line-206"><code>// backwards before the opening paired bracket until the first strong type</code></span>
+<span class="codeline" id="line-207"><code>// (L, R, or sos) is found. If that first preceding strong type is opposite</code></span>
+<span class="codeline" id="line-208"><code>// the embedding direction, then set the type for both brackets in the pair</code></span>
+<span class="codeline" id="line-209"><code>// to that type. 2 Otherwise, set the type for both brackets in the pair to</code></span>
+<span class="codeline" id="line-210"><code>// the embedding direction.</code></span>
+<span class="codeline" id="line-211"><code>//</code></span>
+<span class="codeline" id="line-212"><code>// o [ o ] e -&gt; o o o o e</code></span>
+<span class="codeline" id="line-213"><code>//</code></span>
+<span class="codeline" id="line-214"><code>// o [ o NI ] o -&gt; o o o NI o o</code></span>
+<span class="codeline" id="line-215"><code>//</code></span>
+<span class="codeline" id="line-216"><code>// e [ o ] o -&gt; e e o e o</code></span>
+<span class="codeline" id="line-217"><code>//</code></span>
+<span class="codeline" id="line-218"><code>// e [ o ] e -&gt; e e o e e</code></span>
+<span class="codeline" id="line-219"><code>//</code></span>
+<span class="codeline" id="line-220"><code>// e ( o [ o ] NI ) e -&gt; e e o o o o NI e e</code></span>
+<span class="codeline" id="line-221"><code>//</code></span>
+<span class="codeline" id="line-222"><code>// d Otherwise, do not set the type for the current bracket pair. Note that</code></span>
+<span class="codeline" id="line-223"><code>// if the enclosed text contains no strong types the paired brackets will</code></span>
+<span class="codeline" id="line-224"><code>// both resolve to the same level when resolved individually using rules N1</code></span>
+<span class="codeline" id="line-225"><code>// and N2.</code></span>
+<span class="codeline" id="line-226"><code>//</code></span>
+<span class="codeline" id="line-227"><code>// e ( NI ) o -&gt; e ( NI ) o</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>// getStrongTypeN0 maps character's directional code to strong type as required</code></span>
+<span class="codeline" id="line-230"><code>// by rule N0.</code></span>
+<span class="codeline" id="line-231"><code>//</code></span>
+<span class="codeline" id="line-232"><code>// TODO: have separate type for "strong" directionality.</code></span>
+<span class="codeline" id="line-233"><code>func (p *bracketPairer) getStrongTypeN0(index int) Class {</code></span>
+<span class="codeline" id="line-234"><code>	switch p.codesIsolatedRun[index] {</code></span>
+<span class="codeline" id="line-235"><code>	// in the scope of N0, number types are treated as R</code></span>
+<span class="codeline" id="line-236"><code>	case EN, AN, AL, R:</code></span>
+<span class="codeline" id="line-237"><code>		return R</code></span>
+<span class="codeline" id="line-238"><code>	case L:</code></span>
+<span class="codeline" id="line-239"><code>		return L</code></span>
+<span class="codeline" id="line-240"><code>	default:</code></span>
+<span class="codeline" id="line-241"><code>		return ON</code></span>
+<span class="codeline" id="line-242"><code>	}</code></span>
+<span class="codeline" id="line-243"><code>}</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>// classifyPairContent reports the strong types contained inside a Bracket Pair,</code></span>
+<span class="codeline" id="line-246"><code>// assuming the given embedding direction.</code></span>
+<span class="codeline" id="line-247"><code>//</code></span>
+<span class="codeline" id="line-248"><code>// It returns ON if no strong type is found. If a single strong type is found,</code></span>
+<span class="codeline" id="line-249"><code>// it returns this type. Otherwise it returns the embedding direction.</code></span>
+<span class="codeline" id="line-250"><code>//</code></span>
+<span class="codeline" id="line-251"><code>// TODO: use separate type for "strong" directionality.</code></span>
+<span class="codeline" id="line-252"><code>func (p *bracketPairer) classifyPairContent(loc bracketPair, dirEmbed Class) Class {</code></span>
+<span class="codeline" id="line-253"><code>	dirOpposite := ON</code></span>
+<span class="codeline" id="line-254"><code>	for i := loc.opener + 1; i &lt; loc.closer; i++ {</code></span>
+<span class="codeline" id="line-255"><code>		dir := p.getStrongTypeN0(i)</code></span>
+<span class="codeline" id="line-256"><code>		if dir == ON {</code></span>
+<span class="codeline" id="line-257"><code>			continue</code></span>
+<span class="codeline" id="line-258"><code>		}</code></span>
+<span class="codeline" id="line-259"><code>		if dir == dirEmbed {</code></span>
+<span class="codeline" id="line-260"><code>			return dir // type matching embedding direction found</code></span>
+<span class="codeline" id="line-261"><code>		}</code></span>
+<span class="codeline" id="line-262"><code>		dirOpposite = dir</code></span>
+<span class="codeline" id="line-263"><code>	}</code></span>
+<span class="codeline" id="line-264"><code>	// return ON if no strong type found, or class opposite to dirEmbed</code></span>
+<span class="codeline" id="line-265"><code>	return dirOpposite</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// classBeforePair determines which strong types are present before a Bracket</code></span>
+<span class="codeline" id="line-269"><code>// Pair. Return R or L if strong type found, otherwise ON.</code></span>
+<span class="codeline" id="line-270"><code>func (p *bracketPairer) classBeforePair(loc bracketPair) Class {</code></span>
+<span class="codeline" id="line-271"><code>	for i := loc.opener - 1; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-272"><code>		if dir := p.getStrongTypeN0(i); dir != ON {</code></span>
+<span class="codeline" id="line-273"><code>			return dir</code></span>
+<span class="codeline" id="line-274"><code>		}</code></span>
+<span class="codeline" id="line-275"><code>	}</code></span>
+<span class="codeline" id="line-276"><code>	// no strong types found, return sos</code></span>
+<span class="codeline" id="line-277"><code>	return p.sos</code></span>
+<span class="codeline" id="line-278"><code>}</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>// assignBracketType implements rule N0 for a single bracket pair.</code></span>
+<span class="codeline" id="line-281"><code>func (p *bracketPairer) assignBracketType(loc bracketPair, dirEmbed Class, initialTypes []Class) {</code></span>
+<span class="codeline" id="line-282"><code>	// rule "N0, a", inspect contents of pair</code></span>
+<span class="codeline" id="line-283"><code>	dirPair := p.classifyPairContent(loc, dirEmbed)</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	// dirPair is now L, R, or N (no strong type found)</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>	// the following logical tests are performed out of order compared to</code></span>
+<span class="codeline" id="line-288"><code>	// the statement of the rules but yield the same results</code></span>
+<span class="codeline" id="line-289"><code>	if dirPair == ON {</code></span>
+<span class="codeline" id="line-290"><code>		return // case "d" - nothing to do</code></span>
+<span class="codeline" id="line-291"><code>	}</code></span>
+<span class="codeline" id="line-292"><code></code></span>
+<span class="codeline" id="line-293"><code>	if dirPair != dirEmbed {</code></span>
+<span class="codeline" id="line-294"><code>		// case "c": strong type found, opposite - check before (c.1)</code></span>
+<span class="codeline" id="line-295"><code>		dirPair = p.classBeforePair(loc)</code></span>
+<span class="codeline" id="line-296"><code>		if dirPair == dirEmbed || dirPair == ON {</code></span>
+<span class="codeline" id="line-297"><code>			// no strong opposite type found before - use embedding (c.2)</code></span>
+<span class="codeline" id="line-298"><code>			dirPair = dirEmbed</code></span>
+<span class="codeline" id="line-299"><code>		}</code></span>
+<span class="codeline" id="line-300"><code>	}</code></span>
+<span class="codeline" id="line-301"><code>	// else: case "b", strong type found matching embedding,</code></span>
+<span class="codeline" id="line-302"><code>	// no explicit action needed, as dirPair is already set to embedding</code></span>
+<span class="codeline" id="line-303"><code>	// direction</code></span>
+<span class="codeline" id="line-304"><code></code></span>
+<span class="codeline" id="line-305"><code>	// set the bracket types to the type found</code></span>
+<span class="codeline" id="line-306"><code>	p.setBracketsToType(loc, dirPair, initialTypes)</code></span>
+<span class="codeline" id="line-307"><code>}</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>func (p *bracketPairer) setBracketsToType(loc bracketPair, dirPair Class, initialTypes []Class) {</code></span>
+<span class="codeline" id="line-310"><code>	p.codesIsolatedRun[loc.opener] = dirPair</code></span>
+<span class="codeline" id="line-311"><code>	p.codesIsolatedRun[loc.closer] = dirPair</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>	for i := loc.opener + 1; i &lt; loc.closer; i++ {</code></span>
+<span class="codeline" id="line-314"><code>		index := p.indexes[i]</code></span>
+<span class="codeline" id="line-315"><code>		if initialTypes[index] != NSM {</code></span>
+<span class="codeline" id="line-316"><code>			break</code></span>
+<span class="codeline" id="line-317"><code>		}</code></span>
+<span class="codeline" id="line-318"><code>		p.codesIsolatedRun[i] = dirPair</code></span>
+<span class="codeline" id="line-319"><code>	}</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>	for i := loc.closer + 1; i &lt; len(p.indexes); i++ {</code></span>
+<span class="codeline" id="line-322"><code>		index := p.indexes[i]</code></span>
+<span class="codeline" id="line-323"><code>		if initialTypes[index] != NSM {</code></span>
+<span class="codeline" id="line-324"><code>			break</code></span>
+<span class="codeline" id="line-325"><code>		}</code></span>
+<span class="codeline" id="line-326"><code>		p.codesIsolatedRun[i] = dirPair</code></span>
+<span class="codeline" id="line-327"><code>	}</code></span>
+<span class="codeline" id="line-328"><code>}</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>// resolveBrackets implements rule N0 for a list of pairs.</code></span>
+<span class="codeline" id="line-331"><code>func (p *bracketPairer) resolveBrackets(dirEmbed Class, initialTypes []Class) {</code></span>
+<span class="codeline" id="line-332"><code>	for _, loc := range p.pairPositions {</code></span>
+<span class="codeline" id="line-333"><code>		p.assignBracketType(loc, dirEmbed, initialTypes)</code></span>
+<span class="codeline" id="line-334"><code>	}</code></span>
+<span class="codeline" id="line-335"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

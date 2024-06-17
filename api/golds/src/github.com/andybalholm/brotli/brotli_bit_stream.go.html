@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: brotli_bit_stream.go in package github.com/andybalholm/brotli</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	brotli_bit_stream.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/andybalholm/brotli.html">github.com/andybalholm/brotli</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package brotli</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"math"</code></span>
+<span class="codeline" id="line-5"><code>	"sync"</code></span>
+<span class="codeline" id="line-6"><code>)</code></span>
+<span class="codeline" id="line-7"><code></code></span>
+<span class="codeline" id="line-8"><code>const maxHuffmanTreeSize = (2*numCommandSymbols + 1)</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>/*</code></span>
+<span class="codeline" id="line-11"><code>The maximum size of Huffman dictionary for distances assuming that</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>	NPOSTFIX = 0 and NDIRECT = 0.</code></span>
+<span class="codeline" id="line-14"><code>*/</code></span>
+<span class="codeline" id="line-15"><code>const maxSimpleDistanceAlphabetSize = 140</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>/*</code></span>
+<span class="codeline" id="line-18"><code>Represents the range of values belonging to a prefix code:</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>	[offset, offset + 2^nbits)</code></span>
+<span class="codeline" id="line-21"><code>*/</code></span>
+<span class="codeline" id="line-22"><code>type prefixCodeRange struct {</code></span>
+<span class="codeline" id="line-23"><code>	offset uint32</code></span>
+<span class="codeline" id="line-24"><code>	nbits  uint32</code></span>
+<span class="codeline" id="line-25"><code>}</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>var kBlockLengthPrefixCode = [numBlockLenSymbols]prefixCodeRange{</code></span>
+<span class="codeline" id="line-28"><code>	prefixCodeRange{1, 2},</code></span>
+<span class="codeline" id="line-29"><code>	prefixCodeRange{5, 2},</code></span>
+<span class="codeline" id="line-30"><code>	prefixCodeRange{9, 2},</code></span>
+<span class="codeline" id="line-31"><code>	prefixCodeRange{13, 2},</code></span>
+<span class="codeline" id="line-32"><code>	prefixCodeRange{17, 3},</code></span>
+<span class="codeline" id="line-33"><code>	prefixCodeRange{25, 3},</code></span>
+<span class="codeline" id="line-34"><code>	prefixCodeRange{33, 3},</code></span>
+<span class="codeline" id="line-35"><code>	prefixCodeRange{41, 3},</code></span>
+<span class="codeline" id="line-36"><code>	prefixCodeRange{49, 4},</code></span>
+<span class="codeline" id="line-37"><code>	prefixCodeRange{65, 4},</code></span>
+<span class="codeline" id="line-38"><code>	prefixCodeRange{81, 4},</code></span>
+<span class="codeline" id="line-39"><code>	prefixCodeRange{97, 4},</code></span>
+<span class="codeline" id="line-40"><code>	prefixCodeRange{113, 5},</code></span>
+<span class="codeline" id="line-41"><code>	prefixCodeRange{145, 5},</code></span>
+<span class="codeline" id="line-42"><code>	prefixCodeRange{177, 5},</code></span>
+<span class="codeline" id="line-43"><code>	prefixCodeRange{209, 5},</code></span>
+<span class="codeline" id="line-44"><code>	prefixCodeRange{241, 6},</code></span>
+<span class="codeline" id="line-45"><code>	prefixCodeRange{305, 6},</code></span>
+<span class="codeline" id="line-46"><code>	prefixCodeRange{369, 7},</code></span>
+<span class="codeline" id="line-47"><code>	prefixCodeRange{497, 8},</code></span>
+<span class="codeline" id="line-48"><code>	prefixCodeRange{753, 9},</code></span>
+<span class="codeline" id="line-49"><code>	prefixCodeRange{1265, 10},</code></span>
+<span class="codeline" id="line-50"><code>	prefixCodeRange{2289, 11},</code></span>
+<span class="codeline" id="line-51"><code>	prefixCodeRange{4337, 12},</code></span>
+<span class="codeline" id="line-52"><code>	prefixCodeRange{8433, 13},</code></span>
+<span class="codeline" id="line-53"><code>	prefixCodeRange{16625, 24},</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>func blockLengthPrefixCode(len uint32) uint32 {</code></span>
+<span class="codeline" id="line-57"><code>	var code uint32</code></span>
+<span class="codeline" id="line-58"><code>	if len &gt;= 177 {</code></span>
+<span class="codeline" id="line-59"><code>		if len &gt;= 753 {</code></span>
+<span class="codeline" id="line-60"><code>			code = 20</code></span>
+<span class="codeline" id="line-61"><code>		} else {</code></span>
+<span class="codeline" id="line-62"><code>			code = 14</code></span>
+<span class="codeline" id="line-63"><code>		}</code></span>
+<span class="codeline" id="line-64"><code>	} else if len &gt;= 41 {</code></span>
+<span class="codeline" id="line-65"><code>		code = 7</code></span>
+<span class="codeline" id="line-66"><code>	} else {</code></span>
+<span class="codeline" id="line-67"><code>		code = 0</code></span>
+<span class="codeline" id="line-68"><code>	}</code></span>
+<span class="codeline" id="line-69"><code>	for code &lt; (numBlockLenSymbols-1) &amp;&amp; len &gt;= kBlockLengthPrefixCode[code+1].offset {</code></span>
+<span class="codeline" id="line-70"><code>		code++</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code>	return code</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>func getBlockLengthPrefixCode(len uint32, code *uint, n_extra *uint32, extra *uint32) {</code></span>
+<span class="codeline" id="line-76"><code>	*code = uint(blockLengthPrefixCode(uint32(len)))</code></span>
+<span class="codeline" id="line-77"><code>	*n_extra = kBlockLengthPrefixCode[*code].nbits</code></span>
+<span class="codeline" id="line-78"><code>	*extra = len - kBlockLengthPrefixCode[*code].offset</code></span>
+<span class="codeline" id="line-79"><code>}</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>type blockTypeCodeCalculator struct {</code></span>
+<span class="codeline" id="line-82"><code>	last_type        uint</code></span>
+<span class="codeline" id="line-83"><code>	second_last_type uint</code></span>
+<span class="codeline" id="line-84"><code>}</code></span>
+<span class="codeline" id="line-85"><code></code></span>
+<span class="codeline" id="line-86"><code>func initBlockTypeCodeCalculator(self *blockTypeCodeCalculator) {</code></span>
+<span class="codeline" id="line-87"><code>	self.last_type = 1</code></span>
+<span class="codeline" id="line-88"><code>	self.second_last_type = 0</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>func nextBlockTypeCode(calculator *blockTypeCodeCalculator, type_ byte) uint {</code></span>
+<span class="codeline" id="line-92"><code>	var type_code uint</code></span>
+<span class="codeline" id="line-93"><code>	if uint(type_) == calculator.last_type+1 {</code></span>
+<span class="codeline" id="line-94"><code>		type_code = 1</code></span>
+<span class="codeline" id="line-95"><code>	} else if uint(type_) == calculator.second_last_type {</code></span>
+<span class="codeline" id="line-96"><code>		type_code = 0</code></span>
+<span class="codeline" id="line-97"><code>	} else {</code></span>
+<span class="codeline" id="line-98"><code>		type_code = uint(type_) + 2</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	calculator.second_last_type = calculator.last_type</code></span>
+<span class="codeline" id="line-101"><code>	calculator.last_type = uint(type_)</code></span>
+<span class="codeline" id="line-102"><code>	return type_code</code></span>
+<span class="codeline" id="line-103"><code>}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>/*</code></span>
+<span class="codeline" id="line-106"><code>|nibblesbits| represents the 2 bits to encode MNIBBLES (0-3)</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	REQUIRES: length &gt; 0</code></span>
+<span class="codeline" id="line-109"><code>	REQUIRES: length &lt;= (1 &lt;&lt; 24)</code></span>
+<span class="codeline" id="line-110"><code>*/</code></span>
+<span class="codeline" id="line-111"><code>func encodeMlen(length uint, bits *uint64, numbits *uint, nibblesbits *uint64) {</code></span>
+<span class="codeline" id="line-112"><code>	var lg uint</code></span>
+<span class="codeline" id="line-113"><code>	if length == 1 {</code></span>
+<span class="codeline" id="line-114"><code>		lg = 1</code></span>
+<span class="codeline" id="line-115"><code>	} else {</code></span>
+<span class="codeline" id="line-116"><code>		lg = uint(log2FloorNonZero(uint(uint32(length-1)))) + 1</code></span>
+<span class="codeline" id="line-117"><code>	}</code></span>
+<span class="codeline" id="line-118"><code>	var tmp uint</code></span>
+<span class="codeline" id="line-119"><code>	if lg &lt; 16 {</code></span>
+<span class="codeline" id="line-120"><code>		tmp = 16</code></span>
+<span class="codeline" id="line-121"><code>	} else {</code></span>
+<span class="codeline" id="line-122"><code>		tmp = (lg + 3)</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	var mnibbles uint = tmp / 4</code></span>
+<span class="codeline" id="line-125"><code>	assert(length &gt; 0)</code></span>
+<span class="codeline" id="line-126"><code>	assert(length &lt;= 1&lt;&lt;24)</code></span>
+<span class="codeline" id="line-127"><code>	assert(lg &lt;= 24)</code></span>
+<span class="codeline" id="line-128"><code>	*nibblesbits = uint64(mnibbles) - 4</code></span>
+<span class="codeline" id="line-129"><code>	*numbits = mnibbles * 4</code></span>
+<span class="codeline" id="line-130"><code>	*bits = uint64(length) - 1</code></span>
+<span class="codeline" id="line-131"><code>}</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>func storeCommandExtra(cmd *command, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-134"><code>	var copylen_code uint32 = commandCopyLenCode(cmd)</code></span>
+<span class="codeline" id="line-135"><code>	var inscode uint16 = getInsertLengthCode(uint(cmd.insert_len_))</code></span>
+<span class="codeline" id="line-136"><code>	var copycode uint16 = getCopyLengthCode(uint(copylen_code))</code></span>
+<span class="codeline" id="line-137"><code>	var insnumextra uint32 = getInsertExtra(inscode)</code></span>
+<span class="codeline" id="line-138"><code>	var insextraval uint64 = uint64(cmd.insert_len_) - uint64(getInsertBase(inscode))</code></span>
+<span class="codeline" id="line-139"><code>	var copyextraval uint64 = uint64(copylen_code) - uint64(getCopyBase(copycode))</code></span>
+<span class="codeline" id="line-140"><code>	var bits uint64 = copyextraval&lt;&lt;insnumextra | insextraval</code></span>
+<span class="codeline" id="line-141"><code>	writeBits(uint(insnumextra+getCopyExtra(copycode)), bits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>/*</code></span>
+<span class="codeline" id="line-145"><code>Data structure that stores almost everything that is needed to encode each</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>	block switch command.</code></span>
+<span class="codeline" id="line-148"><code>*/</code></span>
+<span class="codeline" id="line-149"><code>type blockSplitCode struct {</code></span>
+<span class="codeline" id="line-150"><code>	type_code_calculator blockTypeCodeCalculator</code></span>
+<span class="codeline" id="line-151"><code>	type_depths          [maxBlockTypeSymbols]byte</code></span>
+<span class="codeline" id="line-152"><code>	type_bits            [maxBlockTypeSymbols]uint16</code></span>
+<span class="codeline" id="line-153"><code>	length_depths        [numBlockLenSymbols]byte</code></span>
+<span class="codeline" id="line-154"><code>	length_bits          [numBlockLenSymbols]uint16</code></span>
+<span class="codeline" id="line-155"><code>}</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>/* Stores a number between 0 and 255. */</code></span>
+<span class="codeline" id="line-158"><code>func storeVarLenUint8(n uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-159"><code>	if n == 0 {</code></span>
+<span class="codeline" id="line-160"><code>		writeBits(1, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-161"><code>	} else {</code></span>
+<span class="codeline" id="line-162"><code>		var nbits uint = uint(log2FloorNonZero(n))</code></span>
+<span class="codeline" id="line-163"><code>		writeBits(1, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-164"><code>		writeBits(3, uint64(nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-165"><code>		writeBits(nbits, uint64(n)-(uint64(uint(1))&lt;&lt;nbits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>/*</code></span>
+<span class="codeline" id="line-170"><code>Stores the compressed meta-block header.</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>	REQUIRES: length &gt; 0</code></span>
+<span class="codeline" id="line-173"><code>	REQUIRES: length &lt;= (1 &lt;&lt; 24)</code></span>
+<span class="codeline" id="line-174"><code>*/</code></span>
+<span class="codeline" id="line-175"><code>func storeCompressedMetaBlockHeader(is_final_block bool, length uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-176"><code>	var lenbits uint64</code></span>
+<span class="codeline" id="line-177"><code>	var nlenbits uint</code></span>
+<span class="codeline" id="line-178"><code>	var nibblesbits uint64</code></span>
+<span class="codeline" id="line-179"><code>	var is_final uint64</code></span>
+<span class="codeline" id="line-180"><code>	if is_final_block {</code></span>
+<span class="codeline" id="line-181"><code>		is_final = 1</code></span>
+<span class="codeline" id="line-182"><code>	} else {</code></span>
+<span class="codeline" id="line-183"><code>		is_final = 0</code></span>
+<span class="codeline" id="line-184"><code>	}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>	/* Write ISLAST bit. */</code></span>
+<span class="codeline" id="line-187"><code>	writeBits(1, is_final, storage_ix, storage)</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>	/* Write ISEMPTY bit. */</code></span>
+<span class="codeline" id="line-190"><code>	if is_final_block {</code></span>
+<span class="codeline" id="line-191"><code>		writeBits(1, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-192"><code>	}</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>	encodeMlen(length, &amp;lenbits, &amp;nlenbits, &amp;nibblesbits)</code></span>
+<span class="codeline" id="line-195"><code>	writeBits(2, nibblesbits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-196"><code>	writeBits(nlenbits, lenbits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>	if !is_final_block {</code></span>
+<span class="codeline" id="line-199"><code>		/* Write ISUNCOMPRESSED bit. */</code></span>
+<span class="codeline" id="line-200"><code>		writeBits(1, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>/*</code></span>
+<span class="codeline" id="line-205"><code>Stores the uncompressed meta-block header.</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>	REQUIRES: length &gt; 0</code></span>
+<span class="codeline" id="line-208"><code>	REQUIRES: length &lt;= (1 &lt;&lt; 24)</code></span>
+<span class="codeline" id="line-209"><code>*/</code></span>
+<span class="codeline" id="line-210"><code>func storeUncompressedMetaBlockHeader(length uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-211"><code>	var lenbits uint64</code></span>
+<span class="codeline" id="line-212"><code>	var nlenbits uint</code></span>
+<span class="codeline" id="line-213"><code>	var nibblesbits uint64</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>	/* Write ISLAST bit.</code></span>
+<span class="codeline" id="line-216"><code>	   Uncompressed block cannot be the last one, so set to 0. */</code></span>
+<span class="codeline" id="line-217"><code>	writeBits(1, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>	encodeMlen(length, &amp;lenbits, &amp;nlenbits, &amp;nibblesbits)</code></span>
+<span class="codeline" id="line-220"><code>	writeBits(2, nibblesbits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-221"><code>	writeBits(nlenbits, lenbits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>	/* Write ISUNCOMPRESSED bit. */</code></span>
+<span class="codeline" id="line-224"><code>	writeBits(1, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-225"><code>}</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>var storeHuffmanTreeOfHuffmanTreeToBitMask_kStorageOrder = [codeLengthCodes]byte{1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>var storeHuffmanTreeOfHuffmanTreeToBitMask_kHuffmanBitLengthHuffmanCodeSymbols = [6]byte{0, 7, 3, 2, 1, 15}</code></span>
+<span class="codeline" id="line-230"><code>var storeHuffmanTreeOfHuffmanTreeToBitMask_kHuffmanBitLengthHuffmanCodeBitLengths = [6]byte{2, 4, 3, 2, 2, 4}</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>func storeHuffmanTreeOfHuffmanTreeToBitMask(num_codes int, code_length_bitdepth []byte, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-233"><code>	var skip_some uint = 0</code></span>
+<span class="codeline" id="line-234"><code>	var codes_to_store uint = codeLengthCodes</code></span>
+<span class="codeline" id="line-235"><code>	/* The bit lengths of the Huffman code over the code length alphabet</code></span>
+<span class="codeline" id="line-236"><code>	   are compressed with the following static Huffman code:</code></span>
+<span class="codeline" id="line-237"><code>	     Symbol   Code</code></span>
+<span class="codeline" id="line-238"><code>	     ------   ----</code></span>
+<span class="codeline" id="line-239"><code>	     0          00</code></span>
+<span class="codeline" id="line-240"><code>	     1        1110</code></span>
+<span class="codeline" id="line-241"><code>	     2         110</code></span>
+<span class="codeline" id="line-242"><code>	     3          01</code></span>
+<span class="codeline" id="line-243"><code>	     4          10</code></span>
+<span class="codeline" id="line-244"><code>	     5        1111 */</code></span>
+<span class="codeline" id="line-245"><code></code></span>
+<span class="codeline" id="line-246"><code>	/* Throw away trailing zeros: */</code></span>
+<span class="codeline" id="line-247"><code>	if num_codes &gt; 1 {</code></span>
+<span class="codeline" id="line-248"><code>		for ; codes_to_store &gt; 0; codes_to_store-- {</code></span>
+<span class="codeline" id="line-249"><code>			if code_length_bitdepth[storeHuffmanTreeOfHuffmanTreeToBitMask_kStorageOrder[codes_to_store-1]] != 0 {</code></span>
+<span class="codeline" id="line-250"><code>				break</code></span>
+<span class="codeline" id="line-251"><code>			}</code></span>
+<span class="codeline" id="line-252"><code>		}</code></span>
+<span class="codeline" id="line-253"><code>	}</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>	if code_length_bitdepth[storeHuffmanTreeOfHuffmanTreeToBitMask_kStorageOrder[0]] == 0 &amp;&amp; code_length_bitdepth[storeHuffmanTreeOfHuffmanTreeToBitMask_kStorageOrder[1]] == 0 {</code></span>
+<span class="codeline" id="line-256"><code>		skip_some = 2 /* skips two. */</code></span>
+<span class="codeline" id="line-257"><code>		if code_length_bitdepth[storeHuffmanTreeOfHuffmanTreeToBitMask_kStorageOrder[2]] == 0 {</code></span>
+<span class="codeline" id="line-258"><code>			skip_some = 3 /* skips three. */</code></span>
+<span class="codeline" id="line-259"><code>		}</code></span>
+<span class="codeline" id="line-260"><code>	}</code></span>
+<span class="codeline" id="line-261"><code></code></span>
+<span class="codeline" id="line-262"><code>	writeBits(2, uint64(skip_some), storage_ix, storage)</code></span>
+<span class="codeline" id="line-263"><code>	{</code></span>
+<span class="codeline" id="line-264"><code>		var i uint</code></span>
+<span class="codeline" id="line-265"><code>		for i = skip_some; i &lt; codes_to_store; i++ {</code></span>
+<span class="codeline" id="line-266"><code>			var l uint = uint(code_length_bitdepth[storeHuffmanTreeOfHuffmanTreeToBitMask_kStorageOrder[i]])</code></span>
+<span class="codeline" id="line-267"><code>			writeBits(uint(storeHuffmanTreeOfHuffmanTreeToBitMask_kHuffmanBitLengthHuffmanCodeBitLengths[l]), uint64(storeHuffmanTreeOfHuffmanTreeToBitMask_kHuffmanBitLengthHuffmanCodeSymbols[l]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-268"><code>		}</code></span>
+<span class="codeline" id="line-269"><code>	}</code></span>
+<span class="codeline" id="line-270"><code>}</code></span>
+<span class="codeline" id="line-271"><code></code></span>
+<span class="codeline" id="line-272"><code>func storeHuffmanTreeToBitMask(huffman_tree_size uint, huffman_tree []byte, huffman_tree_extra_bits []byte, code_length_bitdepth []byte, code_length_bitdepth_symbols []uint16, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-273"><code>	var i uint</code></span>
+<span class="codeline" id="line-274"><code>	for i = 0; i &lt; huffman_tree_size; i++ {</code></span>
+<span class="codeline" id="line-275"><code>		var ix uint = uint(huffman_tree[i])</code></span>
+<span class="codeline" id="line-276"><code>		writeBits(uint(code_length_bitdepth[ix]), uint64(code_length_bitdepth_symbols[ix]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-277"><code></code></span>
+<span class="codeline" id="line-278"><code>		/* Extra bits */</code></span>
+<span class="codeline" id="line-279"><code>		switch ix {</code></span>
+<span class="codeline" id="line-280"><code>		case repeatPreviousCodeLength:</code></span>
+<span class="codeline" id="line-281"><code>			writeBits(2, uint64(huffman_tree_extra_bits[i]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>		case repeatZeroCodeLength:</code></span>
+<span class="codeline" id="line-284"><code>			writeBits(3, uint64(huffman_tree_extra_bits[i]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-285"><code>		}</code></span>
+<span class="codeline" id="line-286"><code>	}</code></span>
+<span class="codeline" id="line-287"><code>}</code></span>
+<span class="codeline" id="line-288"><code></code></span>
+<span class="codeline" id="line-289"><code>func storeSimpleHuffmanTree(depths []byte, symbols []uint, num_symbols uint, max_bits uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-290"><code>	/* value of 1 indicates a simple Huffman code */</code></span>
+<span class="codeline" id="line-291"><code>	writeBits(2, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-292"><code></code></span>
+<span class="codeline" id="line-293"><code>	writeBits(2, uint64(num_symbols)-1, storage_ix, storage) /* NSYM - 1 */</code></span>
+<span class="codeline" id="line-294"><code>	{</code></span>
+<span class="codeline" id="line-295"><code>		/* Sort */</code></span>
+<span class="codeline" id="line-296"><code>		var i uint</code></span>
+<span class="codeline" id="line-297"><code>		for i = 0; i &lt; num_symbols; i++ {</code></span>
+<span class="codeline" id="line-298"><code>			var j uint</code></span>
+<span class="codeline" id="line-299"><code>			for j = i + 1; j &lt; num_symbols; j++ {</code></span>
+<span class="codeline" id="line-300"><code>				if depths[symbols[j]] &lt; depths[symbols[i]] {</code></span>
+<span class="codeline" id="line-301"><code>					var tmp uint = symbols[j]</code></span>
+<span class="codeline" id="line-302"><code>					symbols[j] = symbols[i]</code></span>
+<span class="codeline" id="line-303"><code>					symbols[i] = tmp</code></span>
+<span class="codeline" id="line-304"><code>				}</code></span>
+<span class="codeline" id="line-305"><code>			}</code></span>
+<span class="codeline" id="line-306"><code>		}</code></span>
+<span class="codeline" id="line-307"><code>	}</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>	if num_symbols == 2 {</code></span>
+<span class="codeline" id="line-310"><code>		writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-311"><code>		writeBits(max_bits, uint64(symbols[1]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-312"><code>	} else if num_symbols == 3 {</code></span>
+<span class="codeline" id="line-313"><code>		writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-314"><code>		writeBits(max_bits, uint64(symbols[1]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-315"><code>		writeBits(max_bits, uint64(symbols[2]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-316"><code>	} else {</code></span>
+<span class="codeline" id="line-317"><code>		writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-318"><code>		writeBits(max_bits, uint64(symbols[1]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-319"><code>		writeBits(max_bits, uint64(symbols[2]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-320"><code>		writeBits(max_bits, uint64(symbols[3]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>		/* tree-select */</code></span>
+<span class="codeline" id="line-323"><code>		var tmp int</code></span>
+<span class="codeline" id="line-324"><code>		if depths[symbols[0]] == 1 {</code></span>
+<span class="codeline" id="line-325"><code>			tmp = 1</code></span>
+<span class="codeline" id="line-326"><code>		} else {</code></span>
+<span class="codeline" id="line-327"><code>			tmp = 0</code></span>
+<span class="codeline" id="line-328"><code>		}</code></span>
+<span class="codeline" id="line-329"><code>		writeBits(1, uint64(tmp), storage_ix, storage)</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>/*</code></span>
+<span class="codeline" id="line-334"><code>num = alphabet size</code></span>
+<span class="codeline" id="line-335"><code></code></span>
+<span class="codeline" id="line-336"><code>	depths = symbol depths</code></span>
+<span class="codeline" id="line-337"><code>*/</code></span>
+<span class="codeline" id="line-338"><code>func storeHuffmanTree(depths []byte, num uint, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-339"><code>	var huffman_tree [numCommandSymbols]byte</code></span>
+<span class="codeline" id="line-340"><code>	var huffman_tree_extra_bits [numCommandSymbols]byte</code></span>
+<span class="codeline" id="line-341"><code>	var huffman_tree_size uint = 0</code></span>
+<span class="codeline" id="line-342"><code>	var code_length_bitdepth = [codeLengthCodes]byte{0}</code></span>
+<span class="codeline" id="line-343"><code>	var code_length_bitdepth_symbols [codeLengthCodes]uint16</code></span>
+<span class="codeline" id="line-344"><code>	var huffman_tree_histogram = [codeLengthCodes]uint32{0}</code></span>
+<span class="codeline" id="line-345"><code>	var i uint</code></span>
+<span class="codeline" id="line-346"><code>	var num_codes int = 0</code></span>
+<span class="codeline" id="line-347"><code>	/* Write the Huffman tree into the brotli-representation.</code></span>
+<span class="codeline" id="line-348"><code>	   The command alphabet is the largest, so this allocation will fit all</code></span>
+<span class="codeline" id="line-349"><code>	   alphabets. */</code></span>
+<span class="codeline" id="line-350"><code></code></span>
+<span class="codeline" id="line-351"><code>	var code uint = 0</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>	assert(num &lt;= numCommandSymbols)</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>	writeHuffmanTree(depths, num, &amp;huffman_tree_size, huffman_tree[:], huffman_tree_extra_bits[:])</code></span>
+<span class="codeline" id="line-356"><code></code></span>
+<span class="codeline" id="line-357"><code>	/* Calculate the statistics of the Huffman tree in brotli-representation. */</code></span>
+<span class="codeline" id="line-358"><code>	for i = 0; i &lt; huffman_tree_size; i++ {</code></span>
+<span class="codeline" id="line-359"><code>		huffman_tree_histogram[huffman_tree[i]]++</code></span>
+<span class="codeline" id="line-360"><code>	}</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>	for i = 0; i &lt; codeLengthCodes; i++ {</code></span>
+<span class="codeline" id="line-363"><code>		if huffman_tree_histogram[i] != 0 {</code></span>
+<span class="codeline" id="line-364"><code>			if num_codes == 0 {</code></span>
+<span class="codeline" id="line-365"><code>				code = i</code></span>
+<span class="codeline" id="line-366"><code>				num_codes = 1</code></span>
+<span class="codeline" id="line-367"><code>			} else if num_codes == 1 {</code></span>
+<span class="codeline" id="line-368"><code>				num_codes = 2</code></span>
+<span class="codeline" id="line-369"><code>				break</code></span>
+<span class="codeline" id="line-370"><code>			}</code></span>
+<span class="codeline" id="line-371"><code>		}</code></span>
+<span class="codeline" id="line-372"><code>	}</code></span>
+<span class="codeline" id="line-373"><code></code></span>
+<span class="codeline" id="line-374"><code>	/* Calculate another Huffman tree to use for compressing both the</code></span>
+<span class="codeline" id="line-375"><code>	   earlier Huffman tree with. */</code></span>
+<span class="codeline" id="line-376"><code>	createHuffmanTree(huffman_tree_histogram[:], codeLengthCodes, 5, tree, code_length_bitdepth[:])</code></span>
+<span class="codeline" id="line-377"><code></code></span>
+<span class="codeline" id="line-378"><code>	convertBitDepthsToSymbols(code_length_bitdepth[:], codeLengthCodes, code_length_bitdepth_symbols[:])</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>	/* Now, we have all the data, let's start storing it */</code></span>
+<span class="codeline" id="line-381"><code>	storeHuffmanTreeOfHuffmanTreeToBitMask(num_codes, code_length_bitdepth[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-382"><code></code></span>
+<span class="codeline" id="line-383"><code>	if num_codes == 1 {</code></span>
+<span class="codeline" id="line-384"><code>		code_length_bitdepth[code] = 0</code></span>
+<span class="codeline" id="line-385"><code>	}</code></span>
+<span class="codeline" id="line-386"><code></code></span>
+<span class="codeline" id="line-387"><code>	/* Store the real Huffman tree now. */</code></span>
+<span class="codeline" id="line-388"><code>	storeHuffmanTreeToBitMask(huffman_tree_size, huffman_tree[:], huffman_tree_extra_bits[:], code_length_bitdepth[:], code_length_bitdepth_symbols[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>/*</code></span>
+<span class="codeline" id="line-392"><code>Builds a Huffman tree from histogram[0:length] into depth[0:length] and</code></span>
+<span class="codeline" id="line-393"><code></code></span>
+<span class="codeline" id="line-394"><code>	bits[0:length] and stores the encoded tree to the bit stream.</code></span>
+<span class="codeline" id="line-395"><code>*/</code></span>
+<span class="codeline" id="line-396"><code>func buildAndStoreHuffmanTree(histogram []uint32, histogram_length uint, alphabet_size uint, tree []huffmanTree, depth []byte, bits []uint16, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-397"><code>	var count uint = 0</code></span>
+<span class="codeline" id="line-398"><code>	var s4 = [4]uint{0}</code></span>
+<span class="codeline" id="line-399"><code>	var i uint</code></span>
+<span class="codeline" id="line-400"><code>	var max_bits uint = 0</code></span>
+<span class="codeline" id="line-401"><code>	for i = 0; i &lt; histogram_length; i++ {</code></span>
+<span class="codeline" id="line-402"><code>		if histogram[i] != 0 {</code></span>
+<span class="codeline" id="line-403"><code>			if count &lt; 4 {</code></span>
+<span class="codeline" id="line-404"><code>				s4[count] = i</code></span>
+<span class="codeline" id="line-405"><code>			} else if count &gt; 4 {</code></span>
+<span class="codeline" id="line-406"><code>				break</code></span>
+<span class="codeline" id="line-407"><code>			}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>			count++</code></span>
+<span class="codeline" id="line-410"><code>		}</code></span>
+<span class="codeline" id="line-411"><code>	}</code></span>
+<span class="codeline" id="line-412"><code>	{</code></span>
+<span class="codeline" id="line-413"><code>		var max_bits_counter uint = alphabet_size - 1</code></span>
+<span class="codeline" id="line-414"><code>		for max_bits_counter != 0 {</code></span>
+<span class="codeline" id="line-415"><code>			max_bits_counter &gt;&gt;= 1</code></span>
+<span class="codeline" id="line-416"><code>			max_bits++</code></span>
+<span class="codeline" id="line-417"><code>		}</code></span>
+<span class="codeline" id="line-418"><code>	}</code></span>
+<span class="codeline" id="line-419"><code></code></span>
+<span class="codeline" id="line-420"><code>	if count &lt;= 1 {</code></span>
+<span class="codeline" id="line-421"><code>		writeBits(4, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-422"><code>		writeBits(max_bits, uint64(s4[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-423"><code>		depth[s4[0]] = 0</code></span>
+<span class="codeline" id="line-424"><code>		bits[s4[0]] = 0</code></span>
+<span class="codeline" id="line-425"><code>		return</code></span>
+<span class="codeline" id="line-426"><code>	}</code></span>
+<span class="codeline" id="line-427"><code></code></span>
+<span class="codeline" id="line-428"><code>	for i := 0; i &lt; int(histogram_length); i++ {</code></span>
+<span class="codeline" id="line-429"><code>		depth[i] = 0</code></span>
+<span class="codeline" id="line-430"><code>	}</code></span>
+<span class="codeline" id="line-431"><code>	createHuffmanTree(histogram, histogram_length, 15, tree, depth)</code></span>
+<span class="codeline" id="line-432"><code>	convertBitDepthsToSymbols(depth, histogram_length, bits)</code></span>
+<span class="codeline" id="line-433"><code></code></span>
+<span class="codeline" id="line-434"><code>	if count &lt;= 4 {</code></span>
+<span class="codeline" id="line-435"><code>		storeSimpleHuffmanTree(depth, s4[:], count, max_bits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-436"><code>	} else {</code></span>
+<span class="codeline" id="line-437"><code>		storeHuffmanTree(depth, histogram_length, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-438"><code>	}</code></span>
+<span class="codeline" id="line-439"><code>}</code></span>
+<span class="codeline" id="line-440"><code></code></span>
+<span class="codeline" id="line-441"><code>func sortHuffmanTree1(v0 huffmanTree, v1 huffmanTree) bool {</code></span>
+<span class="codeline" id="line-442"><code>	return v0.total_count_ &lt; v1.total_count_</code></span>
+<span class="codeline" id="line-443"><code>}</code></span>
+<span class="codeline" id="line-444"><code></code></span>
+<span class="codeline" id="line-445"><code>var huffmanTreePool sync.Pool</code></span>
+<span class="codeline" id="line-446"><code></code></span>
+<span class="codeline" id="line-447"><code>func buildAndStoreHuffmanTreeFast(histogram []uint32, histogram_total uint, max_bits uint, depth []byte, bits []uint16, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-448"><code>	var count uint = 0</code></span>
+<span class="codeline" id="line-449"><code>	var symbols = [4]uint{0}</code></span>
+<span class="codeline" id="line-450"><code>	var length uint = 0</code></span>
+<span class="codeline" id="line-451"><code>	var total uint = histogram_total</code></span>
+<span class="codeline" id="line-452"><code>	for total != 0 {</code></span>
+<span class="codeline" id="line-453"><code>		if histogram[length] != 0 {</code></span>
+<span class="codeline" id="line-454"><code>			if count &lt; 4 {</code></span>
+<span class="codeline" id="line-455"><code>				symbols[count] = length</code></span>
+<span class="codeline" id="line-456"><code>			}</code></span>
+<span class="codeline" id="line-457"><code></code></span>
+<span class="codeline" id="line-458"><code>			count++</code></span>
+<span class="codeline" id="line-459"><code>			total -= uint(histogram[length])</code></span>
+<span class="codeline" id="line-460"><code>		}</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>		length++</code></span>
+<span class="codeline" id="line-463"><code>	}</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>	if count &lt;= 1 {</code></span>
+<span class="codeline" id="line-466"><code>		writeBits(4, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-467"><code>		writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-468"><code>		depth[symbols[0]] = 0</code></span>
+<span class="codeline" id="line-469"><code>		bits[symbols[0]] = 0</code></span>
+<span class="codeline" id="line-470"><code>		return</code></span>
+<span class="codeline" id="line-471"><code>	}</code></span>
+<span class="codeline" id="line-472"><code></code></span>
+<span class="codeline" id="line-473"><code>	for i := 0; i &lt; int(length); i++ {</code></span>
+<span class="codeline" id="line-474"><code>		depth[i] = 0</code></span>
+<span class="codeline" id="line-475"><code>	}</code></span>
+<span class="codeline" id="line-476"><code>	{</code></span>
+<span class="codeline" id="line-477"><code>		var max_tree_size uint = 2*length + 1</code></span>
+<span class="codeline" id="line-478"><code>		tree, _ := huffmanTreePool.Get().(*[]huffmanTree)</code></span>
+<span class="codeline" id="line-479"><code>		if tree == nil || cap(*tree) &lt; int(max_tree_size) {</code></span>
+<span class="codeline" id="line-480"><code>			tmp := make([]huffmanTree, max_tree_size)</code></span>
+<span class="codeline" id="line-481"><code>			tree = &amp;tmp</code></span>
+<span class="codeline" id="line-482"><code>		} else {</code></span>
+<span class="codeline" id="line-483"><code>			*tree = (*tree)[:max_tree_size]</code></span>
+<span class="codeline" id="line-484"><code>		}</code></span>
+<span class="codeline" id="line-485"><code>		var count_limit uint32</code></span>
+<span class="codeline" id="line-486"><code>		for count_limit = 1; ; count_limit *= 2 {</code></span>
+<span class="codeline" id="line-487"><code>			var node int = 0</code></span>
+<span class="codeline" id="line-488"><code>			var l uint</code></span>
+<span class="codeline" id="line-489"><code>			for l = length; l != 0; {</code></span>
+<span class="codeline" id="line-490"><code>				l--</code></span>
+<span class="codeline" id="line-491"><code>				if histogram[l] != 0 {</code></span>
+<span class="codeline" id="line-492"><code>					if histogram[l] &gt;= count_limit {</code></span>
+<span class="codeline" id="line-493"><code>						initHuffmanTree(&amp;(*tree)[node:][0], histogram[l], -1, int16(l))</code></span>
+<span class="codeline" id="line-494"><code>					} else {</code></span>
+<span class="codeline" id="line-495"><code>						initHuffmanTree(&amp;(*tree)[node:][0], count_limit, -1, int16(l))</code></span>
+<span class="codeline" id="line-496"><code>					}</code></span>
+<span class="codeline" id="line-497"><code></code></span>
+<span class="codeline" id="line-498"><code>					node++</code></span>
+<span class="codeline" id="line-499"><code>				}</code></span>
+<span class="codeline" id="line-500"><code>			}</code></span>
+<span class="codeline" id="line-501"><code>			{</code></span>
+<span class="codeline" id="line-502"><code>				var n int = node</code></span>
+<span class="codeline" id="line-503"><code>				/* Points to the next leaf node. */ /* Points to the next non-leaf node. */</code></span>
+<span class="codeline" id="line-504"><code>				var sentinel huffmanTree</code></span>
+<span class="codeline" id="line-505"><code>				var i int = 0</code></span>
+<span class="codeline" id="line-506"><code>				var j int = n + 1</code></span>
+<span class="codeline" id="line-507"><code>				var k int</code></span>
+<span class="codeline" id="line-508"><code></code></span>
+<span class="codeline" id="line-509"><code>				sortHuffmanTreeItems(*tree, uint(n), huffmanTreeComparator(sortHuffmanTree1))</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>				/* The nodes are:</code></span>
+<span class="codeline" id="line-512"><code>				   [0, n): the sorted leaf nodes that we start with.</code></span>
+<span class="codeline" id="line-513"><code>				   [n]: we add a sentinel here.</code></span>
+<span class="codeline" id="line-514"><code>				   [n + 1, 2n): new parent nodes are added here, starting from</code></span>
+<span class="codeline" id="line-515"><code>				                (n+1). These are naturally in ascending order.</code></span>
+<span class="codeline" id="line-516"><code>				   [2n]: we add a sentinel at the end as well.</code></span>
+<span class="codeline" id="line-517"><code>				   There will be (2n+1) elements at the end. */</code></span>
+<span class="codeline" id="line-518"><code>				initHuffmanTree(&amp;sentinel, math.MaxUint32, -1, -1)</code></span>
+<span class="codeline" id="line-519"><code></code></span>
+<span class="codeline" id="line-520"><code>				(*tree)[node] = sentinel</code></span>
+<span class="codeline" id="line-521"><code>				node++</code></span>
+<span class="codeline" id="line-522"><code>				(*tree)[node] = sentinel</code></span>
+<span class="codeline" id="line-523"><code>				node++</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>				for k = n - 1; k &gt; 0; k-- {</code></span>
+<span class="codeline" id="line-526"><code>					var left int</code></span>
+<span class="codeline" id="line-527"><code>					var right int</code></span>
+<span class="codeline" id="line-528"><code>					if (*tree)[i].total_count_ &lt;= (*tree)[j].total_count_ {</code></span>
+<span class="codeline" id="line-529"><code>						left = i</code></span>
+<span class="codeline" id="line-530"><code>						i++</code></span>
+<span class="codeline" id="line-531"><code>					} else {</code></span>
+<span class="codeline" id="line-532"><code>						left = j</code></span>
+<span class="codeline" id="line-533"><code>						j++</code></span>
+<span class="codeline" id="line-534"><code>					}</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>					if (*tree)[i].total_count_ &lt;= (*tree)[j].total_count_ {</code></span>
+<span class="codeline" id="line-537"><code>						right = i</code></span>
+<span class="codeline" id="line-538"><code>						i++</code></span>
+<span class="codeline" id="line-539"><code>					} else {</code></span>
+<span class="codeline" id="line-540"><code>						right = j</code></span>
+<span class="codeline" id="line-541"><code>						j++</code></span>
+<span class="codeline" id="line-542"><code>					}</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>					/* The sentinel node becomes the parent node. */</code></span>
+<span class="codeline" id="line-545"><code>					(*tree)[node-1].total_count_ = (*tree)[left].total_count_ + (*tree)[right].total_count_</code></span>
+<span class="codeline" id="line-546"><code></code></span>
+<span class="codeline" id="line-547"><code>					(*tree)[node-1].index_left_ = int16(left)</code></span>
+<span class="codeline" id="line-548"><code>					(*tree)[node-1].index_right_or_value_ = int16(right)</code></span>
+<span class="codeline" id="line-549"><code></code></span>
+<span class="codeline" id="line-550"><code>					/* Add back the last sentinel node. */</code></span>
+<span class="codeline" id="line-551"><code>					(*tree)[node] = sentinel</code></span>
+<span class="codeline" id="line-552"><code>					node++</code></span>
+<span class="codeline" id="line-553"><code>				}</code></span>
+<span class="codeline" id="line-554"><code></code></span>
+<span class="codeline" id="line-555"><code>				if setDepth(2*n-1, *tree, depth, 14) {</code></span>
+<span class="codeline" id="line-556"><code>					/* We need to pack the Huffman tree in 14 bits. If this was not</code></span>
+<span class="codeline" id="line-557"><code>					   successful, add fake entities to the lowest values and retry. */</code></span>
+<span class="codeline" id="line-558"><code>					break</code></span>
+<span class="codeline" id="line-559"><code>				}</code></span>
+<span class="codeline" id="line-560"><code>			}</code></span>
+<span class="codeline" id="line-561"><code>		}</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>		huffmanTreePool.Put(tree)</code></span>
+<span class="codeline" id="line-564"><code>	}</code></span>
+<span class="codeline" id="line-565"><code></code></span>
+<span class="codeline" id="line-566"><code>	convertBitDepthsToSymbols(depth, length, bits)</code></span>
+<span class="codeline" id="line-567"><code>	if count &lt;= 4 {</code></span>
+<span class="codeline" id="line-568"><code>		var i uint</code></span>
+<span class="codeline" id="line-569"><code></code></span>
+<span class="codeline" id="line-570"><code>		/* value of 1 indicates a simple Huffman code */</code></span>
+<span class="codeline" id="line-571"><code>		writeBits(2, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-572"><code></code></span>
+<span class="codeline" id="line-573"><code>		writeBits(2, uint64(count)-1, storage_ix, storage) /* NSYM - 1 */</code></span>
+<span class="codeline" id="line-574"><code></code></span>
+<span class="codeline" id="line-575"><code>		/* Sort */</code></span>
+<span class="codeline" id="line-576"><code>		for i = 0; i &lt; count; i++ {</code></span>
+<span class="codeline" id="line-577"><code>			var j uint</code></span>
+<span class="codeline" id="line-578"><code>			for j = i + 1; j &lt; count; j++ {</code></span>
+<span class="codeline" id="line-579"><code>				if depth[symbols[j]] &lt; depth[symbols[i]] {</code></span>
+<span class="codeline" id="line-580"><code>					var tmp uint = symbols[j]</code></span>
+<span class="codeline" id="line-581"><code>					symbols[j] = symbols[i]</code></span>
+<span class="codeline" id="line-582"><code>					symbols[i] = tmp</code></span>
+<span class="codeline" id="line-583"><code>				}</code></span>
+<span class="codeline" id="line-584"><code>			}</code></span>
+<span class="codeline" id="line-585"><code>		}</code></span>
+<span class="codeline" id="line-586"><code></code></span>
+<span class="codeline" id="line-587"><code>		if count == 2 {</code></span>
+<span class="codeline" id="line-588"><code>			writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-589"><code>			writeBits(max_bits, uint64(symbols[1]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-590"><code>		} else if count == 3 {</code></span>
+<span class="codeline" id="line-591"><code>			writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-592"><code>			writeBits(max_bits, uint64(symbols[1]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-593"><code>			writeBits(max_bits, uint64(symbols[2]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-594"><code>		} else {</code></span>
+<span class="codeline" id="line-595"><code>			writeBits(max_bits, uint64(symbols[0]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-596"><code>			writeBits(max_bits, uint64(symbols[1]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-597"><code>			writeBits(max_bits, uint64(symbols[2]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-598"><code>			writeBits(max_bits, uint64(symbols[3]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-599"><code></code></span>
+<span class="codeline" id="line-600"><code>			/* tree-select */</code></span>
+<span class="codeline" id="line-601"><code>			var tmp int</code></span>
+<span class="codeline" id="line-602"><code>			if depth[symbols[0]] == 1 {</code></span>
+<span class="codeline" id="line-603"><code>				tmp = 1</code></span>
+<span class="codeline" id="line-604"><code>			} else {</code></span>
+<span class="codeline" id="line-605"><code>				tmp = 0</code></span>
+<span class="codeline" id="line-606"><code>			}</code></span>
+<span class="codeline" id="line-607"><code>			writeBits(1, uint64(tmp), storage_ix, storage)</code></span>
+<span class="codeline" id="line-608"><code>		}</code></span>
+<span class="codeline" id="line-609"><code>	} else {</code></span>
+<span class="codeline" id="line-610"><code>		var previous_value byte = 8</code></span>
+<span class="codeline" id="line-611"><code>		var i uint</code></span>
+<span class="codeline" id="line-612"><code></code></span>
+<span class="codeline" id="line-613"><code>		/* Complex Huffman Tree */</code></span>
+<span class="codeline" id="line-614"><code>		storeStaticCodeLengthCode(storage_ix, storage)</code></span>
+<span class="codeline" id="line-615"><code></code></span>
+<span class="codeline" id="line-616"><code>		/* Actual RLE coding. */</code></span>
+<span class="codeline" id="line-617"><code>		for i = 0; i &lt; length; {</code></span>
+<span class="codeline" id="line-618"><code>			var value byte = depth[i]</code></span>
+<span class="codeline" id="line-619"><code>			var reps uint = 1</code></span>
+<span class="codeline" id="line-620"><code>			var k uint</code></span>
+<span class="codeline" id="line-621"><code>			for k = i + 1; k &lt; length &amp;&amp; depth[k] == value; k++ {</code></span>
+<span class="codeline" id="line-622"><code>				reps++</code></span>
+<span class="codeline" id="line-623"><code>			}</code></span>
+<span class="codeline" id="line-624"><code></code></span>
+<span class="codeline" id="line-625"><code>			i += reps</code></span>
+<span class="codeline" id="line-626"><code>			if value == 0 {</code></span>
+<span class="codeline" id="line-627"><code>				writeBits(uint(kZeroRepsDepth[reps]), kZeroRepsBits[reps], storage_ix, storage)</code></span>
+<span class="codeline" id="line-628"><code>			} else {</code></span>
+<span class="codeline" id="line-629"><code>				if previous_value != value {</code></span>
+<span class="codeline" id="line-630"><code>					writeBits(uint(kCodeLengthDepth[value]), uint64(kCodeLengthBits[value]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-631"><code>					reps--</code></span>
+<span class="codeline" id="line-632"><code>				}</code></span>
+<span class="codeline" id="line-633"><code></code></span>
+<span class="codeline" id="line-634"><code>				if reps &lt; 3 {</code></span>
+<span class="codeline" id="line-635"><code>					for reps != 0 {</code></span>
+<span class="codeline" id="line-636"><code>						reps--</code></span>
+<span class="codeline" id="line-637"><code>						writeBits(uint(kCodeLengthDepth[value]), uint64(kCodeLengthBits[value]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-638"><code>					}</code></span>
+<span class="codeline" id="line-639"><code>				} else {</code></span>
+<span class="codeline" id="line-640"><code>					reps -= 3</code></span>
+<span class="codeline" id="line-641"><code>					writeBits(uint(kNonZeroRepsDepth[reps]), kNonZeroRepsBits[reps], storage_ix, storage)</code></span>
+<span class="codeline" id="line-642"><code>				}</code></span>
+<span class="codeline" id="line-643"><code></code></span>
+<span class="codeline" id="line-644"><code>				previous_value = value</code></span>
+<span class="codeline" id="line-645"><code>			}</code></span>
+<span class="codeline" id="line-646"><code>		}</code></span>
+<span class="codeline" id="line-647"><code>	}</code></span>
+<span class="codeline" id="line-648"><code>}</code></span>
+<span class="codeline" id="line-649"><code></code></span>
+<span class="codeline" id="line-650"><code>func buildAndStoreHuffmanTreeFastBW(histogram []uint32, histogram_total uint, max_bits uint, depth []byte, bits []uint16, bw *bitWriter) {</code></span>
+<span class="codeline" id="line-651"><code>	var count uint = 0</code></span>
+<span class="codeline" id="line-652"><code>	var symbols = [4]uint{0}</code></span>
+<span class="codeline" id="line-653"><code>	var length uint = 0</code></span>
+<span class="codeline" id="line-654"><code>	var total uint = histogram_total</code></span>
+<span class="codeline" id="line-655"><code>	for total != 0 {</code></span>
+<span class="codeline" id="line-656"><code>		if histogram[length] != 0 {</code></span>
+<span class="codeline" id="line-657"><code>			if count &lt; 4 {</code></span>
+<span class="codeline" id="line-658"><code>				symbols[count] = length</code></span>
+<span class="codeline" id="line-659"><code>			}</code></span>
+<span class="codeline" id="line-660"><code></code></span>
+<span class="codeline" id="line-661"><code>			count++</code></span>
+<span class="codeline" id="line-662"><code>			total -= uint(histogram[length])</code></span>
+<span class="codeline" id="line-663"><code>		}</code></span>
+<span class="codeline" id="line-664"><code></code></span>
+<span class="codeline" id="line-665"><code>		length++</code></span>
+<span class="codeline" id="line-666"><code>	}</code></span>
+<span class="codeline" id="line-667"><code></code></span>
+<span class="codeline" id="line-668"><code>	if count &lt;= 1 {</code></span>
+<span class="codeline" id="line-669"><code>		bw.writeBits(4, 1)</code></span>
+<span class="codeline" id="line-670"><code>		bw.writeBits(max_bits, uint64(symbols[0]))</code></span>
+<span class="codeline" id="line-671"><code>		depth[symbols[0]] = 0</code></span>
+<span class="codeline" id="line-672"><code>		bits[symbols[0]] = 0</code></span>
+<span class="codeline" id="line-673"><code>		return</code></span>
+<span class="codeline" id="line-674"><code>	}</code></span>
+<span class="codeline" id="line-675"><code></code></span>
+<span class="codeline" id="line-676"><code>	for i := 0; i &lt; int(length); i++ {</code></span>
+<span class="codeline" id="line-677"><code>		depth[i] = 0</code></span>
+<span class="codeline" id="line-678"><code>	}</code></span>
+<span class="codeline" id="line-679"><code>	{</code></span>
+<span class="codeline" id="line-680"><code>		var max_tree_size uint = 2*length + 1</code></span>
+<span class="codeline" id="line-681"><code>		tree, _ := huffmanTreePool.Get().(*[]huffmanTree)</code></span>
+<span class="codeline" id="line-682"><code>		if tree == nil || cap(*tree) &lt; int(max_tree_size) {</code></span>
+<span class="codeline" id="line-683"><code>			tmp := make([]huffmanTree, max_tree_size)</code></span>
+<span class="codeline" id="line-684"><code>			tree = &amp;tmp</code></span>
+<span class="codeline" id="line-685"><code>		} else {</code></span>
+<span class="codeline" id="line-686"><code>			*tree = (*tree)[:max_tree_size]</code></span>
+<span class="codeline" id="line-687"><code>		}</code></span>
+<span class="codeline" id="line-688"><code>		var count_limit uint32</code></span>
+<span class="codeline" id="line-689"><code>		for count_limit = 1; ; count_limit *= 2 {</code></span>
+<span class="codeline" id="line-690"><code>			var node int = 0</code></span>
+<span class="codeline" id="line-691"><code>			var l uint</code></span>
+<span class="codeline" id="line-692"><code>			for l = length; l != 0; {</code></span>
+<span class="codeline" id="line-693"><code>				l--</code></span>
+<span class="codeline" id="line-694"><code>				if histogram[l] != 0 {</code></span>
+<span class="codeline" id="line-695"><code>					if histogram[l] &gt;= count_limit {</code></span>
+<span class="codeline" id="line-696"><code>						initHuffmanTree(&amp;(*tree)[node:][0], histogram[l], -1, int16(l))</code></span>
+<span class="codeline" id="line-697"><code>					} else {</code></span>
+<span class="codeline" id="line-698"><code>						initHuffmanTree(&amp;(*tree)[node:][0], count_limit, -1, int16(l))</code></span>
+<span class="codeline" id="line-699"><code>					}</code></span>
+<span class="codeline" id="line-700"><code></code></span>
+<span class="codeline" id="line-701"><code>					node++</code></span>
+<span class="codeline" id="line-702"><code>				}</code></span>
+<span class="codeline" id="line-703"><code>			}</code></span>
+<span class="codeline" id="line-704"><code>			{</code></span>
+<span class="codeline" id="line-705"><code>				var n int = node</code></span>
+<span class="codeline" id="line-706"><code>				/* Points to the next leaf node. */ /* Points to the next non-leaf node. */</code></span>
+<span class="codeline" id="line-707"><code>				var sentinel huffmanTree</code></span>
+<span class="codeline" id="line-708"><code>				var i int = 0</code></span>
+<span class="codeline" id="line-709"><code>				var j int = n + 1</code></span>
+<span class="codeline" id="line-710"><code>				var k int</code></span>
+<span class="codeline" id="line-711"><code></code></span>
+<span class="codeline" id="line-712"><code>				sortHuffmanTreeItems(*tree, uint(n), huffmanTreeComparator(sortHuffmanTree1))</code></span>
+<span class="codeline" id="line-713"><code></code></span>
+<span class="codeline" id="line-714"><code>				/* The nodes are:</code></span>
+<span class="codeline" id="line-715"><code>				   [0, n): the sorted leaf nodes that we start with.</code></span>
+<span class="codeline" id="line-716"><code>				   [n]: we add a sentinel here.</code></span>
+<span class="codeline" id="line-717"><code>				   [n + 1, 2n): new parent nodes are added here, starting from</code></span>
+<span class="codeline" id="line-718"><code>				                (n+1). These are naturally in ascending order.</code></span>
+<span class="codeline" id="line-719"><code>				   [2n]: we add a sentinel at the end as well.</code></span>
+<span class="codeline" id="line-720"><code>				   There will be (2n+1) elements at the end. */</code></span>
+<span class="codeline" id="line-721"><code>				initHuffmanTree(&amp;sentinel, math.MaxUint32, -1, -1)</code></span>
+<span class="codeline" id="line-722"><code></code></span>
+<span class="codeline" id="line-723"><code>				(*tree)[node] = sentinel</code></span>
+<span class="codeline" id="line-724"><code>				node++</code></span>
+<span class="codeline" id="line-725"><code>				(*tree)[node] = sentinel</code></span>
+<span class="codeline" id="line-726"><code>				node++</code></span>
+<span class="codeline" id="line-727"><code></code></span>
+<span class="codeline" id="line-728"><code>				for k = n - 1; k &gt; 0; k-- {</code></span>
+<span class="codeline" id="line-729"><code>					var left int</code></span>
+<span class="codeline" id="line-730"><code>					var right int</code></span>
+<span class="codeline" id="line-731"><code>					if (*tree)[i].total_count_ &lt;= (*tree)[j].total_count_ {</code></span>
+<span class="codeline" id="line-732"><code>						left = i</code></span>
+<span class="codeline" id="line-733"><code>						i++</code></span>
+<span class="codeline" id="line-734"><code>					} else {</code></span>
+<span class="codeline" id="line-735"><code>						left = j</code></span>
+<span class="codeline" id="line-736"><code>						j++</code></span>
+<span class="codeline" id="line-737"><code>					}</code></span>
+<span class="codeline" id="line-738"><code></code></span>
+<span class="codeline" id="line-739"><code>					if (*tree)[i].total_count_ &lt;= (*tree)[j].total_count_ {</code></span>
+<span class="codeline" id="line-740"><code>						right = i</code></span>
+<span class="codeline" id="line-741"><code>						i++</code></span>
+<span class="codeline" id="line-742"><code>					} else {</code></span>
+<span class="codeline" id="line-743"><code>						right = j</code></span>
+<span class="codeline" id="line-744"><code>						j++</code></span>
+<span class="codeline" id="line-745"><code>					}</code></span>
+<span class="codeline" id="line-746"><code></code></span>
+<span class="codeline" id="line-747"><code>					/* The sentinel node becomes the parent node. */</code></span>
+<span class="codeline" id="line-748"><code>					(*tree)[node-1].total_count_ = (*tree)[left].total_count_ + (*tree)[right].total_count_</code></span>
+<span class="codeline" id="line-749"><code></code></span>
+<span class="codeline" id="line-750"><code>					(*tree)[node-1].index_left_ = int16(left)</code></span>
+<span class="codeline" id="line-751"><code>					(*tree)[node-1].index_right_or_value_ = int16(right)</code></span>
+<span class="codeline" id="line-752"><code></code></span>
+<span class="codeline" id="line-753"><code>					/* Add back the last sentinel node. */</code></span>
+<span class="codeline" id="line-754"><code>					(*tree)[node] = sentinel</code></span>
+<span class="codeline" id="line-755"><code>					node++</code></span>
+<span class="codeline" id="line-756"><code>				}</code></span>
+<span class="codeline" id="line-757"><code></code></span>
+<span class="codeline" id="line-758"><code>				if setDepth(2*n-1, *tree, depth, 14) {</code></span>
+<span class="codeline" id="line-759"><code>					/* We need to pack the Huffman tree in 14 bits. If this was not</code></span>
+<span class="codeline" id="line-760"><code>					   successful, add fake entities to the lowest values and retry. */</code></span>
+<span class="codeline" id="line-761"><code>					break</code></span>
+<span class="codeline" id="line-762"><code>				}</code></span>
+<span class="codeline" id="line-763"><code>			}</code></span>
+<span class="codeline" id="line-764"><code>		}</code></span>
+<span class="codeline" id="line-765"><code></code></span>
+<span class="codeline" id="line-766"><code>		huffmanTreePool.Put(tree)</code></span>
+<span class="codeline" id="line-767"><code>	}</code></span>
+<span class="codeline" id="line-768"><code></code></span>
+<span class="codeline" id="line-769"><code>	convertBitDepthsToSymbols(depth, length, bits)</code></span>
+<span class="codeline" id="line-770"><code>	if count &lt;= 4 {</code></span>
+<span class="codeline" id="line-771"><code>		var i uint</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>		/* value of 1 indicates a simple Huffman code */</code></span>
+<span class="codeline" id="line-774"><code>		bw.writeBits(2, 1)</code></span>
+<span class="codeline" id="line-775"><code></code></span>
+<span class="codeline" id="line-776"><code>		bw.writeBits(2, uint64(count)-1) /* NSYM - 1 */</code></span>
+<span class="codeline" id="line-777"><code></code></span>
+<span class="codeline" id="line-778"><code>		/* Sort */</code></span>
+<span class="codeline" id="line-779"><code>		for i = 0; i &lt; count; i++ {</code></span>
+<span class="codeline" id="line-780"><code>			var j uint</code></span>
+<span class="codeline" id="line-781"><code>			for j = i + 1; j &lt; count; j++ {</code></span>
+<span class="codeline" id="line-782"><code>				if depth[symbols[j]] &lt; depth[symbols[i]] {</code></span>
+<span class="codeline" id="line-783"><code>					var tmp uint = symbols[j]</code></span>
+<span class="codeline" id="line-784"><code>					symbols[j] = symbols[i]</code></span>
+<span class="codeline" id="line-785"><code>					symbols[i] = tmp</code></span>
+<span class="codeline" id="line-786"><code>				}</code></span>
+<span class="codeline" id="line-787"><code>			}</code></span>
+<span class="codeline" id="line-788"><code>		}</code></span>
+<span class="codeline" id="line-789"><code></code></span>
+<span class="codeline" id="line-790"><code>		if count == 2 {</code></span>
+<span class="codeline" id="line-791"><code>			bw.writeBits(max_bits, uint64(symbols[0]))</code></span>
+<span class="codeline" id="line-792"><code>			bw.writeBits(max_bits, uint64(symbols[1]))</code></span>
+<span class="codeline" id="line-793"><code>		} else if count == 3 {</code></span>
+<span class="codeline" id="line-794"><code>			bw.writeBits(max_bits, uint64(symbols[0]))</code></span>
+<span class="codeline" id="line-795"><code>			bw.writeBits(max_bits, uint64(symbols[1]))</code></span>
+<span class="codeline" id="line-796"><code>			bw.writeBits(max_bits, uint64(symbols[2]))</code></span>
+<span class="codeline" id="line-797"><code>		} else {</code></span>
+<span class="codeline" id="line-798"><code>			bw.writeBits(max_bits, uint64(symbols[0]))</code></span>
+<span class="codeline" id="line-799"><code>			bw.writeBits(max_bits, uint64(symbols[1]))</code></span>
+<span class="codeline" id="line-800"><code>			bw.writeBits(max_bits, uint64(symbols[2]))</code></span>
+<span class="codeline" id="line-801"><code>			bw.writeBits(max_bits, uint64(symbols[3]))</code></span>
+<span class="codeline" id="line-802"><code></code></span>
+<span class="codeline" id="line-803"><code>			/* tree-select */</code></span>
+<span class="codeline" id="line-804"><code>			bw.writeSingleBit(depth[symbols[0]] == 1)</code></span>
+<span class="codeline" id="line-805"><code>		}</code></span>
+<span class="codeline" id="line-806"><code>	} else {</code></span>
+<span class="codeline" id="line-807"><code>		var previous_value byte = 8</code></span>
+<span class="codeline" id="line-808"><code>		var i uint</code></span>
+<span class="codeline" id="line-809"><code></code></span>
+<span class="codeline" id="line-810"><code>		/* Complex Huffman Tree */</code></span>
+<span class="codeline" id="line-811"><code>		storeStaticCodeLengthCodeBW(bw)</code></span>
+<span class="codeline" id="line-812"><code></code></span>
+<span class="codeline" id="line-813"><code>		/* Actual RLE coding. */</code></span>
+<span class="codeline" id="line-814"><code>		for i = 0; i &lt; length; {</code></span>
+<span class="codeline" id="line-815"><code>			var value byte = depth[i]</code></span>
+<span class="codeline" id="line-816"><code>			var reps uint = 1</code></span>
+<span class="codeline" id="line-817"><code>			var k uint</code></span>
+<span class="codeline" id="line-818"><code>			for k = i + 1; k &lt; length &amp;&amp; depth[k] == value; k++ {</code></span>
+<span class="codeline" id="line-819"><code>				reps++</code></span>
+<span class="codeline" id="line-820"><code>			}</code></span>
+<span class="codeline" id="line-821"><code></code></span>
+<span class="codeline" id="line-822"><code>			i += reps</code></span>
+<span class="codeline" id="line-823"><code>			if value == 0 {</code></span>
+<span class="codeline" id="line-824"><code>				bw.writeBits(uint(kZeroRepsDepth[reps]), kZeroRepsBits[reps])</code></span>
+<span class="codeline" id="line-825"><code>			} else {</code></span>
+<span class="codeline" id="line-826"><code>				if previous_value != value {</code></span>
+<span class="codeline" id="line-827"><code>					bw.writeBits(uint(kCodeLengthDepth[value]), uint64(kCodeLengthBits[value]))</code></span>
+<span class="codeline" id="line-828"><code>					reps--</code></span>
+<span class="codeline" id="line-829"><code>				}</code></span>
+<span class="codeline" id="line-830"><code></code></span>
+<span class="codeline" id="line-831"><code>				if reps &lt; 3 {</code></span>
+<span class="codeline" id="line-832"><code>					for reps != 0 {</code></span>
+<span class="codeline" id="line-833"><code>						reps--</code></span>
+<span class="codeline" id="line-834"><code>						bw.writeBits(uint(kCodeLengthDepth[value]), uint64(kCodeLengthBits[value]))</code></span>
+<span class="codeline" id="line-835"><code>					}</code></span>
+<span class="codeline" id="line-836"><code>				} else {</code></span>
+<span class="codeline" id="line-837"><code>					reps -= 3</code></span>
+<span class="codeline" id="line-838"><code>					bw.writeBits(uint(kNonZeroRepsDepth[reps]), kNonZeroRepsBits[reps])</code></span>
+<span class="codeline" id="line-839"><code>				}</code></span>
+<span class="codeline" id="line-840"><code></code></span>
+<span class="codeline" id="line-841"><code>				previous_value = value</code></span>
+<span class="codeline" id="line-842"><code>			}</code></span>
+<span class="codeline" id="line-843"><code>		}</code></span>
+<span class="codeline" id="line-844"><code>	}</code></span>
+<span class="codeline" id="line-845"><code>}</code></span>
+<span class="codeline" id="line-846"><code></code></span>
+<span class="codeline" id="line-847"><code>func indexOf(v []byte, v_size uint, value byte) uint {</code></span>
+<span class="codeline" id="line-848"><code>	var i uint = 0</code></span>
+<span class="codeline" id="line-849"><code>	for ; i &lt; v_size; i++ {</code></span>
+<span class="codeline" id="line-850"><code>		if v[i] == value {</code></span>
+<span class="codeline" id="line-851"><code>			return i</code></span>
+<span class="codeline" id="line-852"><code>		}</code></span>
+<span class="codeline" id="line-853"><code>	}</code></span>
+<span class="codeline" id="line-854"><code></code></span>
+<span class="codeline" id="line-855"><code>	return i</code></span>
+<span class="codeline" id="line-856"><code>}</code></span>
+<span class="codeline" id="line-857"><code></code></span>
+<span class="codeline" id="line-858"><code>func moveToFront(v []byte, index uint) {</code></span>
+<span class="codeline" id="line-859"><code>	var value byte = v[index]</code></span>
+<span class="codeline" id="line-860"><code>	var i uint</code></span>
+<span class="codeline" id="line-861"><code>	for i = index; i != 0; i-- {</code></span>
+<span class="codeline" id="line-862"><code>		v[i] = v[i-1]</code></span>
+<span class="codeline" id="line-863"><code>	}</code></span>
+<span class="codeline" id="line-864"><code></code></span>
+<span class="codeline" id="line-865"><code>	v[0] = value</code></span>
+<span class="codeline" id="line-866"><code>}</code></span>
+<span class="codeline" id="line-867"><code></code></span>
+<span class="codeline" id="line-868"><code>func moveToFrontTransform(v_in []uint32, v_size uint, v_out []uint32) {</code></span>
+<span class="codeline" id="line-869"><code>	var i uint</code></span>
+<span class="codeline" id="line-870"><code>	var mtf [256]byte</code></span>
+<span class="codeline" id="line-871"><code>	var max_value uint32</code></span>
+<span class="codeline" id="line-872"><code>	if v_size == 0 {</code></span>
+<span class="codeline" id="line-873"><code>		return</code></span>
+<span class="codeline" id="line-874"><code>	}</code></span>
+<span class="codeline" id="line-875"><code></code></span>
+<span class="codeline" id="line-876"><code>	max_value = v_in[0]</code></span>
+<span class="codeline" id="line-877"><code>	for i = 1; i &lt; v_size; i++ {</code></span>
+<span class="codeline" id="line-878"><code>		if v_in[i] &gt; max_value {</code></span>
+<span class="codeline" id="line-879"><code>			max_value = v_in[i]</code></span>
+<span class="codeline" id="line-880"><code>		}</code></span>
+<span class="codeline" id="line-881"><code>	}</code></span>
+<span class="codeline" id="line-882"><code></code></span>
+<span class="codeline" id="line-883"><code>	assert(max_value &lt; 256)</code></span>
+<span class="codeline" id="line-884"><code>	for i = 0; uint32(i) &lt;= max_value; i++ {</code></span>
+<span class="codeline" id="line-885"><code>		mtf[i] = byte(i)</code></span>
+<span class="codeline" id="line-886"><code>	}</code></span>
+<span class="codeline" id="line-887"><code>	{</code></span>
+<span class="codeline" id="line-888"><code>		var mtf_size uint = uint(max_value + 1)</code></span>
+<span class="codeline" id="line-889"><code>		for i = 0; i &lt; v_size; i++ {</code></span>
+<span class="codeline" id="line-890"><code>			var index uint = indexOf(mtf[:], mtf_size, byte(v_in[i]))</code></span>
+<span class="codeline" id="line-891"><code>			assert(index &lt; mtf_size)</code></span>
+<span class="codeline" id="line-892"><code>			v_out[i] = uint32(index)</code></span>
+<span class="codeline" id="line-893"><code>			moveToFront(mtf[:], index)</code></span>
+<span class="codeline" id="line-894"><code>		}</code></span>
+<span class="codeline" id="line-895"><code>	}</code></span>
+<span class="codeline" id="line-896"><code>}</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>/*</code></span>
+<span class="codeline" id="line-899"><code>Finds runs of zeros in v[0..in_size) and replaces them with a prefix code of</code></span>
+<span class="codeline" id="line-900"><code></code></span>
+<span class="codeline" id="line-901"><code>	the run length plus extra bits (lower 9 bits is the prefix code and the rest</code></span>
+<span class="codeline" id="line-902"><code>	are the extra bits). Non-zero values in v[] are shifted by</code></span>
+<span class="codeline" id="line-903"><code>	*max_length_prefix. Will not create prefix codes bigger than the initial</code></span>
+<span class="codeline" id="line-904"><code>	value of *max_run_length_prefix. The prefix code of run length L is simply</code></span>
+<span class="codeline" id="line-905"><code>	Log2Floor(L) and the number of extra bits is the same as the prefix code.</code></span>
+<span class="codeline" id="line-906"><code>*/</code></span>
+<span class="codeline" id="line-907"><code>func runLengthCodeZeros(in_size uint, v []uint32, out_size *uint, max_run_length_prefix *uint32) {</code></span>
+<span class="codeline" id="line-908"><code>	var max_reps uint32 = 0</code></span>
+<span class="codeline" id="line-909"><code>	var i uint</code></span>
+<span class="codeline" id="line-910"><code>	var max_prefix uint32</code></span>
+<span class="codeline" id="line-911"><code>	for i = 0; i &lt; in_size; {</code></span>
+<span class="codeline" id="line-912"><code>		var reps uint32 = 0</code></span>
+<span class="codeline" id="line-913"><code>		for ; i &lt; in_size &amp;&amp; v[i] != 0; i++ {</code></span>
+<span class="codeline" id="line-914"><code>		}</code></span>
+<span class="codeline" id="line-915"><code>		for ; i &lt; in_size &amp;&amp; v[i] == 0; i++ {</code></span>
+<span class="codeline" id="line-916"><code>			reps++</code></span>
+<span class="codeline" id="line-917"><code>		}</code></span>
+<span class="codeline" id="line-918"><code></code></span>
+<span class="codeline" id="line-919"><code>		max_reps = brotli_max_uint32_t(reps, max_reps)</code></span>
+<span class="codeline" id="line-920"><code>	}</code></span>
+<span class="codeline" id="line-921"><code></code></span>
+<span class="codeline" id="line-922"><code>	if max_reps &gt; 0 {</code></span>
+<span class="codeline" id="line-923"><code>		max_prefix = log2FloorNonZero(uint(max_reps))</code></span>
+<span class="codeline" id="line-924"><code>	} else {</code></span>
+<span class="codeline" id="line-925"><code>		max_prefix = 0</code></span>
+<span class="codeline" id="line-926"><code>	}</code></span>
+<span class="codeline" id="line-927"><code>	max_prefix = brotli_min_uint32_t(max_prefix, *max_run_length_prefix)</code></span>
+<span class="codeline" id="line-928"><code>	*max_run_length_prefix = max_prefix</code></span>
+<span class="codeline" id="line-929"><code>	*out_size = 0</code></span>
+<span class="codeline" id="line-930"><code>	for i = 0; i &lt; in_size; {</code></span>
+<span class="codeline" id="line-931"><code>		assert(*out_size &lt;= i)</code></span>
+<span class="codeline" id="line-932"><code>		if v[i] != 0 {</code></span>
+<span class="codeline" id="line-933"><code>			v[*out_size] = v[i] + *max_run_length_prefix</code></span>
+<span class="codeline" id="line-934"><code>			i++</code></span>
+<span class="codeline" id="line-935"><code>			(*out_size)++</code></span>
+<span class="codeline" id="line-936"><code>		} else {</code></span>
+<span class="codeline" id="line-937"><code>			var reps uint32 = 1</code></span>
+<span class="codeline" id="line-938"><code>			var k uint</code></span>
+<span class="codeline" id="line-939"><code>			for k = i + 1; k &lt; in_size &amp;&amp; v[k] == 0; k++ {</code></span>
+<span class="codeline" id="line-940"><code>				reps++</code></span>
+<span class="codeline" id="line-941"><code>			}</code></span>
+<span class="codeline" id="line-942"><code></code></span>
+<span class="codeline" id="line-943"><code>			i += uint(reps)</code></span>
+<span class="codeline" id="line-944"><code>			for reps != 0 {</code></span>
+<span class="codeline" id="line-945"><code>				if reps &lt; 2&lt;&lt;max_prefix {</code></span>
+<span class="codeline" id="line-946"><code>					var run_length_prefix uint32 = log2FloorNonZero(uint(reps))</code></span>
+<span class="codeline" id="line-947"><code>					var extra_bits uint32 = reps - (1 &lt;&lt; run_length_prefix)</code></span>
+<span class="codeline" id="line-948"><code>					v[*out_size] = run_length_prefix + (extra_bits &lt;&lt; 9)</code></span>
+<span class="codeline" id="line-949"><code>					(*out_size)++</code></span>
+<span class="codeline" id="line-950"><code>					break</code></span>
+<span class="codeline" id="line-951"><code>				} else {</code></span>
+<span class="codeline" id="line-952"><code>					var extra_bits uint32 = (1 &lt;&lt; max_prefix) - 1</code></span>
+<span class="codeline" id="line-953"><code>					v[*out_size] = max_prefix + (extra_bits &lt;&lt; 9)</code></span>
+<span class="codeline" id="line-954"><code>					reps -= (2 &lt;&lt; max_prefix) - 1</code></span>
+<span class="codeline" id="line-955"><code>					(*out_size)++</code></span>
+<span class="codeline" id="line-956"><code>				}</code></span>
+<span class="codeline" id="line-957"><code>			}</code></span>
+<span class="codeline" id="line-958"><code>		}</code></span>
+<span class="codeline" id="line-959"><code>	}</code></span>
+<span class="codeline" id="line-960"><code>}</code></span>
+<span class="codeline" id="line-961"><code></code></span>
+<span class="codeline" id="line-962"><code>const symbolBits = 9</code></span>
+<span class="codeline" id="line-963"><code></code></span>
+<span class="codeline" id="line-964"><code>var encodeContextMap_kSymbolMask uint32 = (1 &lt;&lt; symbolBits) - 1</code></span>
+<span class="codeline" id="line-965"><code></code></span>
+<span class="codeline" id="line-966"><code>func encodeContextMap(context_map []uint32, context_map_size uint, num_clusters uint, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-967"><code>	var i uint</code></span>
+<span class="codeline" id="line-968"><code>	var rle_symbols []uint32</code></span>
+<span class="codeline" id="line-969"><code>	var max_run_length_prefix uint32 = 6</code></span>
+<span class="codeline" id="line-970"><code>	var num_rle_symbols uint = 0</code></span>
+<span class="codeline" id="line-971"><code>	var histogram [maxContextMapSymbols]uint32</code></span>
+<span class="codeline" id="line-972"><code>	var depths [maxContextMapSymbols]byte</code></span>
+<span class="codeline" id="line-973"><code>	var bits [maxContextMapSymbols]uint16</code></span>
+<span class="codeline" id="line-974"><code></code></span>
+<span class="codeline" id="line-975"><code>	storeVarLenUint8(num_clusters-1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-976"><code></code></span>
+<span class="codeline" id="line-977"><code>	if num_clusters == 1 {</code></span>
+<span class="codeline" id="line-978"><code>		return</code></span>
+<span class="codeline" id="line-979"><code>	}</code></span>
+<span class="codeline" id="line-980"><code></code></span>
+<span class="codeline" id="line-981"><code>	rle_symbols = make([]uint32, context_map_size)</code></span>
+<span class="codeline" id="line-982"><code>	moveToFrontTransform(context_map, context_map_size, rle_symbols)</code></span>
+<span class="codeline" id="line-983"><code>	runLengthCodeZeros(context_map_size, rle_symbols, &amp;num_rle_symbols, &amp;max_run_length_prefix)</code></span>
+<span class="codeline" id="line-984"><code>	histogram = [maxContextMapSymbols]uint32{}</code></span>
+<span class="codeline" id="line-985"><code>	for i = 0; i &lt; num_rle_symbols; i++ {</code></span>
+<span class="codeline" id="line-986"><code>		histogram[rle_symbols[i]&amp;encodeContextMap_kSymbolMask]++</code></span>
+<span class="codeline" id="line-987"><code>	}</code></span>
+<span class="codeline" id="line-988"><code>	{</code></span>
+<span class="codeline" id="line-989"><code>		var use_rle bool = (max_run_length_prefix &gt; 0)</code></span>
+<span class="codeline" id="line-990"><code>		writeSingleBit(use_rle, storage_ix, storage)</code></span>
+<span class="codeline" id="line-991"><code>		if use_rle {</code></span>
+<span class="codeline" id="line-992"><code>			writeBits(4, uint64(max_run_length_prefix)-1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-993"><code>		}</code></span>
+<span class="codeline" id="line-994"><code>	}</code></span>
+<span class="codeline" id="line-995"><code></code></span>
+<span class="codeline" id="line-996"><code>	buildAndStoreHuffmanTree(histogram[:], uint(uint32(num_clusters)+max_run_length_prefix), uint(uint32(num_clusters)+max_run_length_prefix), tree, depths[:], bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-997"><code>	for i = 0; i &lt; num_rle_symbols; i++ {</code></span>
+<span class="codeline" id="line-998"><code>		var rle_symbol uint32 = rle_symbols[i] &amp; encodeContextMap_kSymbolMask</code></span>
+<span class="codeline" id="line-999"><code>		var extra_bits_val uint32 = rle_symbols[i] &gt;&gt; symbolBits</code></span>
+<span class="codeline" id="line-1000"><code>		writeBits(uint(depths[rle_symbol]), uint64(bits[rle_symbol]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1001"><code>		if rle_symbol &gt; 0 &amp;&amp; rle_symbol &lt;= max_run_length_prefix {</code></span>
+<span class="codeline" id="line-1002"><code>			writeBits(uint(rle_symbol), uint64(extra_bits_val), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1003"><code>		}</code></span>
+<span class="codeline" id="line-1004"><code>	}</code></span>
+<span class="codeline" id="line-1005"><code></code></span>
+<span class="codeline" id="line-1006"><code>	writeBits(1, 1, storage_ix, storage) /* use move-to-front */</code></span>
+<span class="codeline" id="line-1007"><code>	rle_symbols = nil</code></span>
+<span class="codeline" id="line-1008"><code>}</code></span>
+<span class="codeline" id="line-1009"><code></code></span>
+<span class="codeline" id="line-1010"><code>/* Stores the block switch command with index block_ix to the bit stream. */</code></span>
+<span class="codeline" id="line-1011"><code>func storeBlockSwitch(code *blockSplitCode, block_len uint32, block_type byte, is_first_block bool, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1012"><code>	var typecode uint = nextBlockTypeCode(&amp;code.type_code_calculator, block_type)</code></span>
+<span class="codeline" id="line-1013"><code>	var lencode uint</code></span>
+<span class="codeline" id="line-1014"><code>	var len_nextra uint32</code></span>
+<span class="codeline" id="line-1015"><code>	var len_extra uint32</code></span>
+<span class="codeline" id="line-1016"><code>	if !is_first_block {</code></span>
+<span class="codeline" id="line-1017"><code>		writeBits(uint(code.type_depths[typecode]), uint64(code.type_bits[typecode]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1018"><code>	}</code></span>
+<span class="codeline" id="line-1019"><code></code></span>
+<span class="codeline" id="line-1020"><code>	getBlockLengthPrefixCode(block_len, &amp;lencode, &amp;len_nextra, &amp;len_extra)</code></span>
+<span class="codeline" id="line-1021"><code></code></span>
+<span class="codeline" id="line-1022"><code>	writeBits(uint(code.length_depths[lencode]), uint64(code.length_bits[lencode]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1023"><code>	writeBits(uint(len_nextra), uint64(len_extra), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1024"><code>}</code></span>
+<span class="codeline" id="line-1025"><code></code></span>
+<span class="codeline" id="line-1026"><code>/*</code></span>
+<span class="codeline" id="line-1027"><code>Builds a BlockSplitCode data structure from the block split given by the</code></span>
+<span class="codeline" id="line-1028"><code></code></span>
+<span class="codeline" id="line-1029"><code>	vector of block types and block lengths and stores it to the bit stream.</code></span>
+<span class="codeline" id="line-1030"><code>*/</code></span>
+<span class="codeline" id="line-1031"><code>func buildAndStoreBlockSplitCode(types []byte, lengths []uint32, num_blocks uint, num_types uint, tree []huffmanTree, code *blockSplitCode, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1032"><code>	var type_histo [maxBlockTypeSymbols]uint32</code></span>
+<span class="codeline" id="line-1033"><code>	var length_histo [numBlockLenSymbols]uint32</code></span>
+<span class="codeline" id="line-1034"><code>	var i uint</code></span>
+<span class="codeline" id="line-1035"><code>	var type_code_calculator blockTypeCodeCalculator</code></span>
+<span class="codeline" id="line-1036"><code>	for i := 0; i &lt; int(num_types+2); i++ {</code></span>
+<span class="codeline" id="line-1037"><code>		type_histo[i] = 0</code></span>
+<span class="codeline" id="line-1038"><code>	}</code></span>
+<span class="codeline" id="line-1039"><code>	length_histo = [numBlockLenSymbols]uint32{}</code></span>
+<span class="codeline" id="line-1040"><code>	initBlockTypeCodeCalculator(&amp;type_code_calculator)</code></span>
+<span class="codeline" id="line-1041"><code>	for i = 0; i &lt; num_blocks; i++ {</code></span>
+<span class="codeline" id="line-1042"><code>		var type_code uint = nextBlockTypeCode(&amp;type_code_calculator, types[i])</code></span>
+<span class="codeline" id="line-1043"><code>		if i != 0 {</code></span>
+<span class="codeline" id="line-1044"><code>			type_histo[type_code]++</code></span>
+<span class="codeline" id="line-1045"><code>		}</code></span>
+<span class="codeline" id="line-1046"><code>		length_histo[blockLengthPrefixCode(lengths[i])]++</code></span>
+<span class="codeline" id="line-1047"><code>	}</code></span>
+<span class="codeline" id="line-1048"><code></code></span>
+<span class="codeline" id="line-1049"><code>	storeVarLenUint8(num_types-1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1050"><code>	if num_types &gt; 1 { /* TODO: else? could StoreBlockSwitch occur? */</code></span>
+<span class="codeline" id="line-1051"><code>		buildAndStoreHuffmanTree(type_histo[0:], num_types+2, num_types+2, tree, code.type_depths[0:], code.type_bits[0:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1052"><code>		buildAndStoreHuffmanTree(length_histo[0:], numBlockLenSymbols, numBlockLenSymbols, tree, code.length_depths[0:], code.length_bits[0:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1053"><code>		storeBlockSwitch(code, lengths[0], types[0], true, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1054"><code>	}</code></span>
+<span class="codeline" id="line-1055"><code>}</code></span>
+<span class="codeline" id="line-1056"><code></code></span>
+<span class="codeline" id="line-1057"><code>/* Stores a context map where the histogram type is always the block type. */</code></span>
+<span class="codeline" id="line-1058"><code>func storeTrivialContextMap(num_types uint, context_bits uint, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1059"><code>	storeVarLenUint8(num_types-1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1060"><code>	if num_types &gt; 1 {</code></span>
+<span class="codeline" id="line-1061"><code>		var repeat_code uint = context_bits - 1</code></span>
+<span class="codeline" id="line-1062"><code>		var repeat_bits uint = (1 &lt;&lt; repeat_code) - 1</code></span>
+<span class="codeline" id="line-1063"><code>		var alphabet_size uint = num_types + repeat_code</code></span>
+<span class="codeline" id="line-1064"><code>		var histogram [maxContextMapSymbols]uint32</code></span>
+<span class="codeline" id="line-1065"><code>		var depths [maxContextMapSymbols]byte</code></span>
+<span class="codeline" id="line-1066"><code>		var bits [maxContextMapSymbols]uint16</code></span>
+<span class="codeline" id="line-1067"><code>		var i uint</code></span>
+<span class="codeline" id="line-1068"><code>		for i := 0; i &lt; int(alphabet_size); i++ {</code></span>
+<span class="codeline" id="line-1069"><code>			histogram[i] = 0</code></span>
+<span class="codeline" id="line-1070"><code>		}</code></span>
+<span class="codeline" id="line-1071"><code></code></span>
+<span class="codeline" id="line-1072"><code>		/* Write RLEMAX. */</code></span>
+<span class="codeline" id="line-1073"><code>		writeBits(1, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1074"><code></code></span>
+<span class="codeline" id="line-1075"><code>		writeBits(4, uint64(repeat_code)-1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1076"><code>		histogram[repeat_code] = uint32(num_types)</code></span>
+<span class="codeline" id="line-1077"><code>		histogram[0] = 1</code></span>
+<span class="codeline" id="line-1078"><code>		for i = context_bits; i &lt; alphabet_size; i++ {</code></span>
+<span class="codeline" id="line-1079"><code>			histogram[i] = 1</code></span>
+<span class="codeline" id="line-1080"><code>		}</code></span>
+<span class="codeline" id="line-1081"><code></code></span>
+<span class="codeline" id="line-1082"><code>		buildAndStoreHuffmanTree(histogram[:], alphabet_size, alphabet_size, tree, depths[:], bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1083"><code>		for i = 0; i &lt; num_types; i++ {</code></span>
+<span class="codeline" id="line-1084"><code>			var tmp uint</code></span>
+<span class="codeline" id="line-1085"><code>			if i == 0 {</code></span>
+<span class="codeline" id="line-1086"><code>				tmp = 0</code></span>
+<span class="codeline" id="line-1087"><code>			} else {</code></span>
+<span class="codeline" id="line-1088"><code>				tmp = i + context_bits - 1</code></span>
+<span class="codeline" id="line-1089"><code>			}</code></span>
+<span class="codeline" id="line-1090"><code>			var code uint = tmp</code></span>
+<span class="codeline" id="line-1091"><code>			writeBits(uint(depths[code]), uint64(bits[code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1092"><code>			writeBits(uint(depths[repeat_code]), uint64(bits[repeat_code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1093"><code>			writeBits(repeat_code, uint64(repeat_bits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1094"><code>		}</code></span>
+<span class="codeline" id="line-1095"><code></code></span>
+<span class="codeline" id="line-1096"><code>		/* Write IMTF (inverse-move-to-front) bit. */</code></span>
+<span class="codeline" id="line-1097"><code>		writeBits(1, 1, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1098"><code>	}</code></span>
+<span class="codeline" id="line-1099"><code>}</code></span>
+<span class="codeline" id="line-1100"><code></code></span>
+<span class="codeline" id="line-1101"><code>/* Manages the encoding of one block category (literal, command or distance). */</code></span>
+<span class="codeline" id="line-1102"><code>type blockEncoder struct {</code></span>
+<span class="codeline" id="line-1103"><code>	histogram_length_ uint</code></span>
+<span class="codeline" id="line-1104"><code>	num_block_types_  uint</code></span>
+<span class="codeline" id="line-1105"><code>	block_types_      []byte</code></span>
+<span class="codeline" id="line-1106"><code>	block_lengths_    []uint32</code></span>
+<span class="codeline" id="line-1107"><code>	num_blocks_       uint</code></span>
+<span class="codeline" id="line-1108"><code>	block_split_code_ blockSplitCode</code></span>
+<span class="codeline" id="line-1109"><code>	block_ix_         uint</code></span>
+<span class="codeline" id="line-1110"><code>	block_len_        uint</code></span>
+<span class="codeline" id="line-1111"><code>	entropy_ix_       uint</code></span>
+<span class="codeline" id="line-1112"><code>	depths_           []byte</code></span>
+<span class="codeline" id="line-1113"><code>	bits_             []uint16</code></span>
+<span class="codeline" id="line-1114"><code>}</code></span>
+<span class="codeline" id="line-1115"><code></code></span>
+<span class="codeline" id="line-1116"><code>var blockEncoderPool sync.Pool</code></span>
+<span class="codeline" id="line-1117"><code></code></span>
+<span class="codeline" id="line-1118"><code>func getBlockEncoder(histogram_length uint, num_block_types uint, block_types []byte, block_lengths []uint32, num_blocks uint) *blockEncoder {</code></span>
+<span class="codeline" id="line-1119"><code>	self, _ := blockEncoderPool.Get().(*blockEncoder)</code></span>
+<span class="codeline" id="line-1120"><code></code></span>
+<span class="codeline" id="line-1121"><code>	if self != nil {</code></span>
+<span class="codeline" id="line-1122"><code>		self.block_ix_ = 0</code></span>
+<span class="codeline" id="line-1123"><code>		self.entropy_ix_ = 0</code></span>
+<span class="codeline" id="line-1124"><code>		self.depths_ = self.depths_[:0]</code></span>
+<span class="codeline" id="line-1125"><code>		self.bits_ = self.bits_[:0]</code></span>
+<span class="codeline" id="line-1126"><code>	} else {</code></span>
+<span class="codeline" id="line-1127"><code>		self = &amp;blockEncoder{}</code></span>
+<span class="codeline" id="line-1128"><code>	}</code></span>
+<span class="codeline" id="line-1129"><code></code></span>
+<span class="codeline" id="line-1130"><code>	self.histogram_length_ = histogram_length</code></span>
+<span class="codeline" id="line-1131"><code>	self.num_block_types_ = num_block_types</code></span>
+<span class="codeline" id="line-1132"><code>	self.block_types_ = block_types</code></span>
+<span class="codeline" id="line-1133"><code>	self.block_lengths_ = block_lengths</code></span>
+<span class="codeline" id="line-1134"><code>	self.num_blocks_ = num_blocks</code></span>
+<span class="codeline" id="line-1135"><code>	initBlockTypeCodeCalculator(&amp;self.block_split_code_.type_code_calculator)</code></span>
+<span class="codeline" id="line-1136"><code>	if num_blocks == 0 {</code></span>
+<span class="codeline" id="line-1137"><code>		self.block_len_ = 0</code></span>
+<span class="codeline" id="line-1138"><code>	} else {</code></span>
+<span class="codeline" id="line-1139"><code>		self.block_len_ = uint(block_lengths[0])</code></span>
+<span class="codeline" id="line-1140"><code>	}</code></span>
+<span class="codeline" id="line-1141"><code></code></span>
+<span class="codeline" id="line-1142"><code>	return self</code></span>
+<span class="codeline" id="line-1143"><code>}</code></span>
+<span class="codeline" id="line-1144"><code></code></span>
+<span class="codeline" id="line-1145"><code>func cleanupBlockEncoder(self *blockEncoder) {</code></span>
+<span class="codeline" id="line-1146"><code>	blockEncoderPool.Put(self)</code></span>
+<span class="codeline" id="line-1147"><code>}</code></span>
+<span class="codeline" id="line-1148"><code></code></span>
+<span class="codeline" id="line-1149"><code>/*</code></span>
+<span class="codeline" id="line-1150"><code>Creates entropy codes of block lengths and block types and stores them</code></span>
+<span class="codeline" id="line-1151"><code></code></span>
+<span class="codeline" id="line-1152"><code>	to the bit stream.</code></span>
+<span class="codeline" id="line-1153"><code>*/</code></span>
+<span class="codeline" id="line-1154"><code>func buildAndStoreBlockSwitchEntropyCodes(self *blockEncoder, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1155"><code>	buildAndStoreBlockSplitCode(self.block_types_, self.block_lengths_, self.num_blocks_, self.num_block_types_, tree, &amp;self.block_split_code_, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1156"><code>}</code></span>
+<span class="codeline" id="line-1157"><code></code></span>
+<span class="codeline" id="line-1158"><code>/*</code></span>
+<span class="codeline" id="line-1159"><code>Stores the next symbol with the entropy code of the current block type.</code></span>
+<span class="codeline" id="line-1160"><code></code></span>
+<span class="codeline" id="line-1161"><code>	Updates the block type and block length at block boundaries.</code></span>
+<span class="codeline" id="line-1162"><code>*/</code></span>
+<span class="codeline" id="line-1163"><code>func storeSymbol(self *blockEncoder, symbol uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1164"><code>	if self.block_len_ == 0 {</code></span>
+<span class="codeline" id="line-1165"><code>		self.block_ix_++</code></span>
+<span class="codeline" id="line-1166"><code>		var block_ix uint = self.block_ix_</code></span>
+<span class="codeline" id="line-1167"><code>		var block_len uint32 = self.block_lengths_[block_ix]</code></span>
+<span class="codeline" id="line-1168"><code>		var block_type byte = self.block_types_[block_ix]</code></span>
+<span class="codeline" id="line-1169"><code>		self.block_len_ = uint(block_len)</code></span>
+<span class="codeline" id="line-1170"><code>		self.entropy_ix_ = uint(block_type) * self.histogram_length_</code></span>
+<span class="codeline" id="line-1171"><code>		storeBlockSwitch(&amp;self.block_split_code_, block_len, block_type, false, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1172"><code>	}</code></span>
+<span class="codeline" id="line-1173"><code></code></span>
+<span class="codeline" id="line-1174"><code>	self.block_len_--</code></span>
+<span class="codeline" id="line-1175"><code>	{</code></span>
+<span class="codeline" id="line-1176"><code>		var ix uint = self.entropy_ix_ + symbol</code></span>
+<span class="codeline" id="line-1177"><code>		writeBits(uint(self.depths_[ix]), uint64(self.bits_[ix]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1178"><code>	}</code></span>
+<span class="codeline" id="line-1179"><code>}</code></span>
+<span class="codeline" id="line-1180"><code></code></span>
+<span class="codeline" id="line-1181"><code>/*</code></span>
+<span class="codeline" id="line-1182"><code>Stores the next symbol with the entropy code of the current block type and</code></span>
+<span class="codeline" id="line-1183"><code></code></span>
+<span class="codeline" id="line-1184"><code>	context value.</code></span>
+<span class="codeline" id="line-1185"><code>	Updates the block type and block length at block boundaries.</code></span>
+<span class="codeline" id="line-1186"><code>*/</code></span>
+<span class="codeline" id="line-1187"><code>func storeSymbolWithContext(self *blockEncoder, symbol uint, context uint, context_map []uint32, storage_ix *uint, storage []byte, context_bits uint) {</code></span>
+<span class="codeline" id="line-1188"><code>	if self.block_len_ == 0 {</code></span>
+<span class="codeline" id="line-1189"><code>		self.block_ix_++</code></span>
+<span class="codeline" id="line-1190"><code>		var block_ix uint = self.block_ix_</code></span>
+<span class="codeline" id="line-1191"><code>		var block_len uint32 = self.block_lengths_[block_ix]</code></span>
+<span class="codeline" id="line-1192"><code>		var block_type byte = self.block_types_[block_ix]</code></span>
+<span class="codeline" id="line-1193"><code>		self.block_len_ = uint(block_len)</code></span>
+<span class="codeline" id="line-1194"><code>		self.entropy_ix_ = uint(block_type) &lt;&lt; context_bits</code></span>
+<span class="codeline" id="line-1195"><code>		storeBlockSwitch(&amp;self.block_split_code_, block_len, block_type, false, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1196"><code>	}</code></span>
+<span class="codeline" id="line-1197"><code></code></span>
+<span class="codeline" id="line-1198"><code>	self.block_len_--</code></span>
+<span class="codeline" id="line-1199"><code>	{</code></span>
+<span class="codeline" id="line-1200"><code>		var histo_ix uint = uint(context_map[self.entropy_ix_+context])</code></span>
+<span class="codeline" id="line-1201"><code>		var ix uint = histo_ix*self.histogram_length_ + symbol</code></span>
+<span class="codeline" id="line-1202"><code>		writeBits(uint(self.depths_[ix]), uint64(self.bits_[ix]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1203"><code>	}</code></span>
+<span class="codeline" id="line-1204"><code>}</code></span>
+<span class="codeline" id="line-1205"><code></code></span>
+<span class="codeline" id="line-1206"><code>func buildAndStoreEntropyCodesLiteral(self *blockEncoder, histograms []histogramLiteral, histograms_size uint, alphabet_size uint, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1207"><code>	var table_size uint = histograms_size * self.histogram_length_</code></span>
+<span class="codeline" id="line-1208"><code>	if cap(self.depths_) &lt; int(table_size) {</code></span>
+<span class="codeline" id="line-1209"><code>		self.depths_ = make([]byte, table_size)</code></span>
+<span class="codeline" id="line-1210"><code>	} else {</code></span>
+<span class="codeline" id="line-1211"><code>		self.depths_ = self.depths_[:table_size]</code></span>
+<span class="codeline" id="line-1212"><code>	}</code></span>
+<span class="codeline" id="line-1213"><code>	if cap(self.bits_) &lt; int(table_size) {</code></span>
+<span class="codeline" id="line-1214"><code>		self.bits_ = make([]uint16, table_size)</code></span>
+<span class="codeline" id="line-1215"><code>	} else {</code></span>
+<span class="codeline" id="line-1216"><code>		self.bits_ = self.bits_[:table_size]</code></span>
+<span class="codeline" id="line-1217"><code>	}</code></span>
+<span class="codeline" id="line-1218"><code>	{</code></span>
+<span class="codeline" id="line-1219"><code>		var i uint</code></span>
+<span class="codeline" id="line-1220"><code>		for i = 0; i &lt; histograms_size; i++ {</code></span>
+<span class="codeline" id="line-1221"><code>			var ix uint = i * self.histogram_length_</code></span>
+<span class="codeline" id="line-1222"><code>			buildAndStoreHuffmanTree(histograms[i].data_[0:], self.histogram_length_, alphabet_size, tree, self.depths_[ix:], self.bits_[ix:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1223"><code>		}</code></span>
+<span class="codeline" id="line-1224"><code>	}</code></span>
+<span class="codeline" id="line-1225"><code>}</code></span>
+<span class="codeline" id="line-1226"><code></code></span>
+<span class="codeline" id="line-1227"><code>func buildAndStoreEntropyCodesCommand(self *blockEncoder, histograms []histogramCommand, histograms_size uint, alphabet_size uint, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1228"><code>	var table_size uint = histograms_size * self.histogram_length_</code></span>
+<span class="codeline" id="line-1229"><code>	if cap(self.depths_) &lt; int(table_size) {</code></span>
+<span class="codeline" id="line-1230"><code>		self.depths_ = make([]byte, table_size)</code></span>
+<span class="codeline" id="line-1231"><code>	} else {</code></span>
+<span class="codeline" id="line-1232"><code>		self.depths_ = self.depths_[:table_size]</code></span>
+<span class="codeline" id="line-1233"><code>	}</code></span>
+<span class="codeline" id="line-1234"><code>	if cap(self.bits_) &lt; int(table_size) {</code></span>
+<span class="codeline" id="line-1235"><code>		self.bits_ = make([]uint16, table_size)</code></span>
+<span class="codeline" id="line-1236"><code>	} else {</code></span>
+<span class="codeline" id="line-1237"><code>		self.bits_ = self.bits_[:table_size]</code></span>
+<span class="codeline" id="line-1238"><code>	}</code></span>
+<span class="codeline" id="line-1239"><code>	{</code></span>
+<span class="codeline" id="line-1240"><code>		var i uint</code></span>
+<span class="codeline" id="line-1241"><code>		for i = 0; i &lt; histograms_size; i++ {</code></span>
+<span class="codeline" id="line-1242"><code>			var ix uint = i * self.histogram_length_</code></span>
+<span class="codeline" id="line-1243"><code>			buildAndStoreHuffmanTree(histograms[i].data_[0:], self.histogram_length_, alphabet_size, tree, self.depths_[ix:], self.bits_[ix:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1244"><code>		}</code></span>
+<span class="codeline" id="line-1245"><code>	}</code></span>
+<span class="codeline" id="line-1246"><code>}</code></span>
+<span class="codeline" id="line-1247"><code></code></span>
+<span class="codeline" id="line-1248"><code>func buildAndStoreEntropyCodesDistance(self *blockEncoder, histograms []histogramDistance, histograms_size uint, alphabet_size uint, tree []huffmanTree, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1249"><code>	var table_size uint = histograms_size * self.histogram_length_</code></span>
+<span class="codeline" id="line-1250"><code>	if cap(self.depths_) &lt; int(table_size) {</code></span>
+<span class="codeline" id="line-1251"><code>		self.depths_ = make([]byte, table_size)</code></span>
+<span class="codeline" id="line-1252"><code>	} else {</code></span>
+<span class="codeline" id="line-1253"><code>		self.depths_ = self.depths_[:table_size]</code></span>
+<span class="codeline" id="line-1254"><code>	}</code></span>
+<span class="codeline" id="line-1255"><code>	if cap(self.bits_) &lt; int(table_size) {</code></span>
+<span class="codeline" id="line-1256"><code>		self.bits_ = make([]uint16, table_size)</code></span>
+<span class="codeline" id="line-1257"><code>	} else {</code></span>
+<span class="codeline" id="line-1258"><code>		self.bits_ = self.bits_[:table_size]</code></span>
+<span class="codeline" id="line-1259"><code>	}</code></span>
+<span class="codeline" id="line-1260"><code>	{</code></span>
+<span class="codeline" id="line-1261"><code>		var i uint</code></span>
+<span class="codeline" id="line-1262"><code>		for i = 0; i &lt; histograms_size; i++ {</code></span>
+<span class="codeline" id="line-1263"><code>			var ix uint = i * self.histogram_length_</code></span>
+<span class="codeline" id="line-1264"><code>			buildAndStoreHuffmanTree(histograms[i].data_[0:], self.histogram_length_, alphabet_size, tree, self.depths_[ix:], self.bits_[ix:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1265"><code>		}</code></span>
+<span class="codeline" id="line-1266"><code>	}</code></span>
+<span class="codeline" id="line-1267"><code>}</code></span>
+<span class="codeline" id="line-1268"><code></code></span>
+<span class="codeline" id="line-1269"><code>func jumpToByteBoundary(storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1270"><code>	*storage_ix = (*storage_ix + 7) &amp;^ 7</code></span>
+<span class="codeline" id="line-1271"><code>	storage[*storage_ix&gt;&gt;3] = 0</code></span>
+<span class="codeline" id="line-1272"><code>}</code></span>
+<span class="codeline" id="line-1273"><code></code></span>
+<span class="codeline" id="line-1274"><code>func storeMetaBlock(input []byte, start_pos uint, length uint, mask uint, prev_byte byte, prev_byte2 byte, is_last bool, params *encoderParams, literal_context_mode int, commands []command, mb *metaBlockSplit, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1275"><code>	var pos uint = start_pos</code></span>
+<span class="codeline" id="line-1276"><code>	var i uint</code></span>
+<span class="codeline" id="line-1277"><code>	var num_distance_symbols uint32 = params.dist.alphabet_size</code></span>
+<span class="codeline" id="line-1278"><code>	var num_effective_distance_symbols uint32 = num_distance_symbols</code></span>
+<span class="codeline" id="line-1279"><code>	var tree []huffmanTree</code></span>
+<span class="codeline" id="line-1280"><code>	var literal_context_lut contextLUT = getContextLUT(literal_context_mode)</code></span>
+<span class="codeline" id="line-1281"><code>	var dist *distanceParams = &amp;params.dist</code></span>
+<span class="codeline" id="line-1282"><code>	if params.large_window &amp;&amp; num_effective_distance_symbols &gt; numHistogramDistanceSymbols {</code></span>
+<span class="codeline" id="line-1283"><code>		num_effective_distance_symbols = numHistogramDistanceSymbols</code></span>
+<span class="codeline" id="line-1284"><code>	}</code></span>
+<span class="codeline" id="line-1285"><code></code></span>
+<span class="codeline" id="line-1286"><code>	storeCompressedMetaBlockHeader(is_last, length, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1287"><code></code></span>
+<span class="codeline" id="line-1288"><code>	tree = make([]huffmanTree, maxHuffmanTreeSize)</code></span>
+<span class="codeline" id="line-1289"><code>	literal_enc := getBlockEncoder(numLiteralSymbols, mb.literal_split.num_types, mb.literal_split.types, mb.literal_split.lengths, mb.literal_split.num_blocks)</code></span>
+<span class="codeline" id="line-1290"><code>	command_enc := getBlockEncoder(numCommandSymbols, mb.command_split.num_types, mb.command_split.types, mb.command_split.lengths, mb.command_split.num_blocks)</code></span>
+<span class="codeline" id="line-1291"><code>	distance_enc := getBlockEncoder(uint(num_effective_distance_symbols), mb.distance_split.num_types, mb.distance_split.types, mb.distance_split.lengths, mb.distance_split.num_blocks)</code></span>
+<span class="codeline" id="line-1292"><code></code></span>
+<span class="codeline" id="line-1293"><code>	buildAndStoreBlockSwitchEntropyCodes(literal_enc, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1294"><code>	buildAndStoreBlockSwitchEntropyCodes(command_enc, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1295"><code>	buildAndStoreBlockSwitchEntropyCodes(distance_enc, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1296"><code></code></span>
+<span class="codeline" id="line-1297"><code>	writeBits(2, uint64(dist.distance_postfix_bits), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1298"><code>	writeBits(4, uint64(dist.num_direct_distance_codes)&gt;&gt;dist.distance_postfix_bits, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1299"><code>	for i = 0; i &lt; mb.literal_split.num_types; i++ {</code></span>
+<span class="codeline" id="line-1300"><code>		writeBits(2, uint64(literal_context_mode), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1301"><code>	}</code></span>
+<span class="codeline" id="line-1302"><code></code></span>
+<span class="codeline" id="line-1303"><code>	if mb.literal_context_map_size == 0 {</code></span>
+<span class="codeline" id="line-1304"><code>		storeTrivialContextMap(mb.literal_histograms_size, literalContextBits, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1305"><code>	} else {</code></span>
+<span class="codeline" id="line-1306"><code>		encodeContextMap(mb.literal_context_map, mb.literal_context_map_size, mb.literal_histograms_size, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1307"><code>	}</code></span>
+<span class="codeline" id="line-1308"><code></code></span>
+<span class="codeline" id="line-1309"><code>	if mb.distance_context_map_size == 0 {</code></span>
+<span class="codeline" id="line-1310"><code>		storeTrivialContextMap(mb.distance_histograms_size, distanceContextBits, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1311"><code>	} else {</code></span>
+<span class="codeline" id="line-1312"><code>		encodeContextMap(mb.distance_context_map, mb.distance_context_map_size, mb.distance_histograms_size, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1313"><code>	}</code></span>
+<span class="codeline" id="line-1314"><code></code></span>
+<span class="codeline" id="line-1315"><code>	buildAndStoreEntropyCodesLiteral(literal_enc, mb.literal_histograms, mb.literal_histograms_size, numLiteralSymbols, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1316"><code>	buildAndStoreEntropyCodesCommand(command_enc, mb.command_histograms, mb.command_histograms_size, numCommandSymbols, tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1317"><code>	buildAndStoreEntropyCodesDistance(distance_enc, mb.distance_histograms, mb.distance_histograms_size, uint(num_distance_symbols), tree, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1318"><code>	tree = nil</code></span>
+<span class="codeline" id="line-1319"><code></code></span>
+<span class="codeline" id="line-1320"><code>	for _, cmd := range commands {</code></span>
+<span class="codeline" id="line-1321"><code>		var cmd_code uint = uint(cmd.cmd_prefix_)</code></span>
+<span class="codeline" id="line-1322"><code>		storeSymbol(command_enc, cmd_code, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1323"><code>		storeCommandExtra(&amp;cmd, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1324"><code>		if mb.literal_context_map_size == 0 {</code></span>
+<span class="codeline" id="line-1325"><code>			var j uint</code></span>
+<span class="codeline" id="line-1326"><code>			for j = uint(cmd.insert_len_); j != 0; j-- {</code></span>
+<span class="codeline" id="line-1327"><code>				storeSymbol(literal_enc, uint(input[pos&amp;mask]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1328"><code>				pos++</code></span>
+<span class="codeline" id="line-1329"><code>			}</code></span>
+<span class="codeline" id="line-1330"><code>		} else {</code></span>
+<span class="codeline" id="line-1331"><code>			var j uint</code></span>
+<span class="codeline" id="line-1332"><code>			for j = uint(cmd.insert_len_); j != 0; j-- {</code></span>
+<span class="codeline" id="line-1333"><code>				var context uint = uint(getContext(prev_byte, prev_byte2, literal_context_lut))</code></span>
+<span class="codeline" id="line-1334"><code>				var literal byte = input[pos&amp;mask]</code></span>
+<span class="codeline" id="line-1335"><code>				storeSymbolWithContext(literal_enc, uint(literal), context, mb.literal_context_map, storage_ix, storage, literalContextBits)</code></span>
+<span class="codeline" id="line-1336"><code>				prev_byte2 = prev_byte</code></span>
+<span class="codeline" id="line-1337"><code>				prev_byte = literal</code></span>
+<span class="codeline" id="line-1338"><code>				pos++</code></span>
+<span class="codeline" id="line-1339"><code>			}</code></span>
+<span class="codeline" id="line-1340"><code>		}</code></span>
+<span class="codeline" id="line-1341"><code></code></span>
+<span class="codeline" id="line-1342"><code>		pos += uint(commandCopyLen(&amp;cmd))</code></span>
+<span class="codeline" id="line-1343"><code>		if commandCopyLen(&amp;cmd) != 0 {</code></span>
+<span class="codeline" id="line-1344"><code>			prev_byte2 = input[(pos-2)&amp;mask]</code></span>
+<span class="codeline" id="line-1345"><code>			prev_byte = input[(pos-1)&amp;mask]</code></span>
+<span class="codeline" id="line-1346"><code>			if cmd.cmd_prefix_ &gt;= 128 {</code></span>
+<span class="codeline" id="line-1347"><code>				var dist_code uint = uint(cmd.dist_prefix_) &amp; 0x3FF</code></span>
+<span class="codeline" id="line-1348"><code>				var distnumextra uint32 = uint32(cmd.dist_prefix_) &gt;&gt; 10</code></span>
+<span class="codeline" id="line-1349"><code>				var distextra uint64 = uint64(cmd.dist_extra_)</code></span>
+<span class="codeline" id="line-1350"><code>				if mb.distance_context_map_size == 0 {</code></span>
+<span class="codeline" id="line-1351"><code>					storeSymbol(distance_enc, dist_code, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1352"><code>				} else {</code></span>
+<span class="codeline" id="line-1353"><code>					var context uint = uint(commandDistanceContext(&amp;cmd))</code></span>
+<span class="codeline" id="line-1354"><code>					storeSymbolWithContext(distance_enc, dist_code, context, mb.distance_context_map, storage_ix, storage, distanceContextBits)</code></span>
+<span class="codeline" id="line-1355"><code>				}</code></span>
+<span class="codeline" id="line-1356"><code></code></span>
+<span class="codeline" id="line-1357"><code>				writeBits(uint(distnumextra), distextra, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1358"><code>			}</code></span>
+<span class="codeline" id="line-1359"><code>		}</code></span>
+<span class="codeline" id="line-1360"><code>	}</code></span>
+<span class="codeline" id="line-1361"><code></code></span>
+<span class="codeline" id="line-1362"><code>	cleanupBlockEncoder(distance_enc)</code></span>
+<span class="codeline" id="line-1363"><code>	cleanupBlockEncoder(command_enc)</code></span>
+<span class="codeline" id="line-1364"><code>	cleanupBlockEncoder(literal_enc)</code></span>
+<span class="codeline" id="line-1365"><code>	if is_last {</code></span>
+<span class="codeline" id="line-1366"><code>		jumpToByteBoundary(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1367"><code>	}</code></span>
+<span class="codeline" id="line-1368"><code>}</code></span>
+<span class="codeline" id="line-1369"><code></code></span>
+<span class="codeline" id="line-1370"><code>func buildHistograms(input []byte, start_pos uint, mask uint, commands []command, lit_histo *histogramLiteral, cmd_histo *histogramCommand, dist_histo *histogramDistance) {</code></span>
+<span class="codeline" id="line-1371"><code>	var pos uint = start_pos</code></span>
+<span class="codeline" id="line-1372"><code>	for _, cmd := range commands {</code></span>
+<span class="codeline" id="line-1373"><code>		var j uint</code></span>
+<span class="codeline" id="line-1374"><code>		histogramAddCommand(cmd_histo, uint(cmd.cmd_prefix_))</code></span>
+<span class="codeline" id="line-1375"><code>		for j = uint(cmd.insert_len_); j != 0; j-- {</code></span>
+<span class="codeline" id="line-1376"><code>			histogramAddLiteral(lit_histo, uint(input[pos&amp;mask]))</code></span>
+<span class="codeline" id="line-1377"><code>			pos++</code></span>
+<span class="codeline" id="line-1378"><code>		}</code></span>
+<span class="codeline" id="line-1379"><code></code></span>
+<span class="codeline" id="line-1380"><code>		pos += uint(commandCopyLen(&amp;cmd))</code></span>
+<span class="codeline" id="line-1381"><code>		if commandCopyLen(&amp;cmd) != 0 &amp;&amp; cmd.cmd_prefix_ &gt;= 128 {</code></span>
+<span class="codeline" id="line-1382"><code>			histogramAddDistance(dist_histo, uint(cmd.dist_prefix_)&amp;0x3FF)</code></span>
+<span class="codeline" id="line-1383"><code>		}</code></span>
+<span class="codeline" id="line-1384"><code>	}</code></span>
+<span class="codeline" id="line-1385"><code>}</code></span>
+<span class="codeline" id="line-1386"><code></code></span>
+<span class="codeline" id="line-1387"><code>func storeDataWithHuffmanCodes(input []byte, start_pos uint, mask uint, commands []command, lit_depth []byte, lit_bits []uint16, cmd_depth []byte, cmd_bits []uint16, dist_depth []byte, dist_bits []uint16, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1388"><code>	var pos uint = start_pos</code></span>
+<span class="codeline" id="line-1389"><code>	for _, cmd := range commands {</code></span>
+<span class="codeline" id="line-1390"><code>		var cmd_code uint = uint(cmd.cmd_prefix_)</code></span>
+<span class="codeline" id="line-1391"><code>		var j uint</code></span>
+<span class="codeline" id="line-1392"><code>		writeBits(uint(cmd_depth[cmd_code]), uint64(cmd_bits[cmd_code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1393"><code>		storeCommandExtra(&amp;cmd, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1394"><code>		for j = uint(cmd.insert_len_); j != 0; j-- {</code></span>
+<span class="codeline" id="line-1395"><code>			var literal byte = input[pos&amp;mask]</code></span>
+<span class="codeline" id="line-1396"><code>			writeBits(uint(lit_depth[literal]), uint64(lit_bits[literal]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1397"><code>			pos++</code></span>
+<span class="codeline" id="line-1398"><code>		}</code></span>
+<span class="codeline" id="line-1399"><code></code></span>
+<span class="codeline" id="line-1400"><code>		pos += uint(commandCopyLen(&amp;cmd))</code></span>
+<span class="codeline" id="line-1401"><code>		if commandCopyLen(&amp;cmd) != 0 &amp;&amp; cmd.cmd_prefix_ &gt;= 128 {</code></span>
+<span class="codeline" id="line-1402"><code>			var dist_code uint = uint(cmd.dist_prefix_) &amp; 0x3FF</code></span>
+<span class="codeline" id="line-1403"><code>			var distnumextra uint32 = uint32(cmd.dist_prefix_) &gt;&gt; 10</code></span>
+<span class="codeline" id="line-1404"><code>			var distextra uint32 = cmd.dist_extra_</code></span>
+<span class="codeline" id="line-1405"><code>			writeBits(uint(dist_depth[dist_code]), uint64(dist_bits[dist_code]), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1406"><code>			writeBits(uint(distnumextra), uint64(distextra), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1407"><code>		}</code></span>
+<span class="codeline" id="line-1408"><code>	}</code></span>
+<span class="codeline" id="line-1409"><code>}</code></span>
+<span class="codeline" id="line-1410"><code></code></span>
+<span class="codeline" id="line-1411"><code>func storeMetaBlockTrivial(input []byte, start_pos uint, length uint, mask uint, is_last bool, params *encoderParams, commands []command, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1412"><code>	var lit_histo histogramLiteral</code></span>
+<span class="codeline" id="line-1413"><code>	var cmd_histo histogramCommand</code></span>
+<span class="codeline" id="line-1414"><code>	var dist_histo histogramDistance</code></span>
+<span class="codeline" id="line-1415"><code>	var lit_depth [numLiteralSymbols]byte</code></span>
+<span class="codeline" id="line-1416"><code>	var lit_bits [numLiteralSymbols]uint16</code></span>
+<span class="codeline" id="line-1417"><code>	var cmd_depth [numCommandSymbols]byte</code></span>
+<span class="codeline" id="line-1418"><code>	var cmd_bits [numCommandSymbols]uint16</code></span>
+<span class="codeline" id="line-1419"><code>	var dist_depth [maxSimpleDistanceAlphabetSize]byte</code></span>
+<span class="codeline" id="line-1420"><code>	var dist_bits [maxSimpleDistanceAlphabetSize]uint16</code></span>
+<span class="codeline" id="line-1421"><code>	var tree []huffmanTree</code></span>
+<span class="codeline" id="line-1422"><code>	var num_distance_symbols uint32 = params.dist.alphabet_size</code></span>
+<span class="codeline" id="line-1423"><code></code></span>
+<span class="codeline" id="line-1424"><code>	storeCompressedMetaBlockHeader(is_last, length, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1425"><code></code></span>
+<span class="codeline" id="line-1426"><code>	histogramClearLiteral(&amp;lit_histo)</code></span>
+<span class="codeline" id="line-1427"><code>	histogramClearCommand(&amp;cmd_histo)</code></span>
+<span class="codeline" id="line-1428"><code>	histogramClearDistance(&amp;dist_histo)</code></span>
+<span class="codeline" id="line-1429"><code></code></span>
+<span class="codeline" id="line-1430"><code>	buildHistograms(input, start_pos, mask, commands, &amp;lit_histo, &amp;cmd_histo, &amp;dist_histo)</code></span>
+<span class="codeline" id="line-1431"><code></code></span>
+<span class="codeline" id="line-1432"><code>	writeBits(13, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1433"><code></code></span>
+<span class="codeline" id="line-1434"><code>	tree = make([]huffmanTree, maxHuffmanTreeSize)</code></span>
+<span class="codeline" id="line-1435"><code>	buildAndStoreHuffmanTree(lit_histo.data_[:], numLiteralSymbols, numLiteralSymbols, tree, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1436"><code>	buildAndStoreHuffmanTree(cmd_histo.data_[:], numCommandSymbols, numCommandSymbols, tree, cmd_depth[:], cmd_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1437"><code>	buildAndStoreHuffmanTree(dist_histo.data_[:], maxSimpleDistanceAlphabetSize, uint(num_distance_symbols), tree, dist_depth[:], dist_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1438"><code>	tree = nil</code></span>
+<span class="codeline" id="line-1439"><code>	storeDataWithHuffmanCodes(input, start_pos, mask, commands, lit_depth[:], lit_bits[:], cmd_depth[:], cmd_bits[:], dist_depth[:], dist_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1440"><code>	if is_last {</code></span>
+<span class="codeline" id="line-1441"><code>		jumpToByteBoundary(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1442"><code>	}</code></span>
+<span class="codeline" id="line-1443"><code>}</code></span>
+<span class="codeline" id="line-1444"><code></code></span>
+<span class="codeline" id="line-1445"><code>func storeMetaBlockFast(input []byte, start_pos uint, length uint, mask uint, is_last bool, params *encoderParams, commands []command, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1446"><code>	var num_distance_symbols uint32 = params.dist.alphabet_size</code></span>
+<span class="codeline" id="line-1447"><code>	var distance_alphabet_bits uint32 = log2FloorNonZero(uint(num_distance_symbols-1)) + 1</code></span>
+<span class="codeline" id="line-1448"><code></code></span>
+<span class="codeline" id="line-1449"><code>	storeCompressedMetaBlockHeader(is_last, length, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1450"><code></code></span>
+<span class="codeline" id="line-1451"><code>	writeBits(13, 0, storage_ix, storage)</code></span>
+<span class="codeline" id="line-1452"><code></code></span>
+<span class="codeline" id="line-1453"><code>	if len(commands) &lt;= 128 {</code></span>
+<span class="codeline" id="line-1454"><code>		var histogram = [numLiteralSymbols]uint32{0}</code></span>
+<span class="codeline" id="line-1455"><code>		var pos uint = start_pos</code></span>
+<span class="codeline" id="line-1456"><code>		var num_literals uint = 0</code></span>
+<span class="codeline" id="line-1457"><code>		var lit_depth [numLiteralSymbols]byte</code></span>
+<span class="codeline" id="line-1458"><code>		var lit_bits [numLiteralSymbols]uint16</code></span>
+<span class="codeline" id="line-1459"><code>		for _, cmd := range commands {</code></span>
+<span class="codeline" id="line-1460"><code>			var j uint</code></span>
+<span class="codeline" id="line-1461"><code>			for j = uint(cmd.insert_len_); j != 0; j-- {</code></span>
+<span class="codeline" id="line-1462"><code>				histogram[input[pos&amp;mask]]++</code></span>
+<span class="codeline" id="line-1463"><code>				pos++</code></span>
+<span class="codeline" id="line-1464"><code>			}</code></span>
+<span class="codeline" id="line-1465"><code></code></span>
+<span class="codeline" id="line-1466"><code>			num_literals += uint(cmd.insert_len_)</code></span>
+<span class="codeline" id="line-1467"><code>			pos += uint(commandCopyLen(&amp;cmd))</code></span>
+<span class="codeline" id="line-1468"><code>		}</code></span>
+<span class="codeline" id="line-1469"><code></code></span>
+<span class="codeline" id="line-1470"><code>		buildAndStoreHuffmanTreeFast(histogram[:], num_literals, /* max_bits = */</code></span>
+<span class="codeline" id="line-1471"><code>			8, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1472"><code></code></span>
+<span class="codeline" id="line-1473"><code>		storeStaticCommandHuffmanTree(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1474"><code>		storeStaticDistanceHuffmanTree(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1475"><code>		storeDataWithHuffmanCodes(input, start_pos, mask, commands, lit_depth[:], lit_bits[:], kStaticCommandCodeDepth[:], kStaticCommandCodeBits[:], kStaticDistanceCodeDepth[:], kStaticDistanceCodeBits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1476"><code>	} else {</code></span>
+<span class="codeline" id="line-1477"><code>		var lit_histo histogramLiteral</code></span>
+<span class="codeline" id="line-1478"><code>		var cmd_histo histogramCommand</code></span>
+<span class="codeline" id="line-1479"><code>		var dist_histo histogramDistance</code></span>
+<span class="codeline" id="line-1480"><code>		var lit_depth [numLiteralSymbols]byte</code></span>
+<span class="codeline" id="line-1481"><code>		var lit_bits [numLiteralSymbols]uint16</code></span>
+<span class="codeline" id="line-1482"><code>		var cmd_depth [numCommandSymbols]byte</code></span>
+<span class="codeline" id="line-1483"><code>		var cmd_bits [numCommandSymbols]uint16</code></span>
+<span class="codeline" id="line-1484"><code>		var dist_depth [maxSimpleDistanceAlphabetSize]byte</code></span>
+<span class="codeline" id="line-1485"><code>		var dist_bits [maxSimpleDistanceAlphabetSize]uint16</code></span>
+<span class="codeline" id="line-1486"><code>		histogramClearLiteral(&amp;lit_histo)</code></span>
+<span class="codeline" id="line-1487"><code>		histogramClearCommand(&amp;cmd_histo)</code></span>
+<span class="codeline" id="line-1488"><code>		histogramClearDistance(&amp;dist_histo)</code></span>
+<span class="codeline" id="line-1489"><code>		buildHistograms(input, start_pos, mask, commands, &amp;lit_histo, &amp;cmd_histo, &amp;dist_histo)</code></span>
+<span class="codeline" id="line-1490"><code>		buildAndStoreHuffmanTreeFast(lit_histo.data_[:], lit_histo.total_count_, /* max_bits = */</code></span>
+<span class="codeline" id="line-1491"><code>			8, lit_depth[:], lit_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1492"><code></code></span>
+<span class="codeline" id="line-1493"><code>		buildAndStoreHuffmanTreeFast(cmd_histo.data_[:], cmd_histo.total_count_, /* max_bits = */</code></span>
+<span class="codeline" id="line-1494"><code>			10, cmd_depth[:], cmd_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1495"><code></code></span>
+<span class="codeline" id="line-1496"><code>		buildAndStoreHuffmanTreeFast(dist_histo.data_[:], dist_histo.total_count_, /* max_bits = */</code></span>
+<span class="codeline" id="line-1497"><code>			uint(distance_alphabet_bits), dist_depth[:], dist_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1498"><code></code></span>
+<span class="codeline" id="line-1499"><code>		storeDataWithHuffmanCodes(input, start_pos, mask, commands, lit_depth[:], lit_bits[:], cmd_depth[:], cmd_bits[:], dist_depth[:], dist_bits[:], storage_ix, storage)</code></span>
+<span class="codeline" id="line-1500"><code>	}</code></span>
+<span class="codeline" id="line-1501"><code></code></span>
+<span class="codeline" id="line-1502"><code>	if is_last {</code></span>
+<span class="codeline" id="line-1503"><code>		jumpToByteBoundary(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1504"><code>	}</code></span>
+<span class="codeline" id="line-1505"><code>}</code></span>
+<span class="codeline" id="line-1506"><code></code></span>
+<span class="codeline" id="line-1507"><code>/*</code></span>
+<span class="codeline" id="line-1508"><code>This is for storing uncompressed blocks (simple raw storage of</code></span>
+<span class="codeline" id="line-1509"><code></code></span>
+<span class="codeline" id="line-1510"><code>	bytes-as-bytes).</code></span>
+<span class="codeline" id="line-1511"><code>*/</code></span>
+<span class="codeline" id="line-1512"><code>func storeUncompressedMetaBlock(is_final_block bool, input []byte, position uint, mask uint, len uint, storage_ix *uint, storage []byte) {</code></span>
+<span class="codeline" id="line-1513"><code>	var masked_pos uint = position &amp; mask</code></span>
+<span class="codeline" id="line-1514"><code>	storeUncompressedMetaBlockHeader(uint(len), storage_ix, storage)</code></span>
+<span class="codeline" id="line-1515"><code>	jumpToByteBoundary(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1516"><code></code></span>
+<span class="codeline" id="line-1517"><code>	if masked_pos+len &gt; mask+1 {</code></span>
+<span class="codeline" id="line-1518"><code>		var len1 uint = mask + 1 - masked_pos</code></span>
+<span class="codeline" id="line-1519"><code>		copy(storage[*storage_ix&gt;&gt;3:], input[masked_pos:][:len1])</code></span>
+<span class="codeline" id="line-1520"><code>		*storage_ix += len1 &lt;&lt; 3</code></span>
+<span class="codeline" id="line-1521"><code>		len -= len1</code></span>
+<span class="codeline" id="line-1522"><code>		masked_pos = 0</code></span>
+<span class="codeline" id="line-1523"><code>	}</code></span>
+<span class="codeline" id="line-1524"><code></code></span>
+<span class="codeline" id="line-1525"><code>	copy(storage[*storage_ix&gt;&gt;3:], input[masked_pos:][:len])</code></span>
+<span class="codeline" id="line-1526"><code>	*storage_ix += uint(len &lt;&lt; 3)</code></span>
+<span class="codeline" id="line-1527"><code></code></span>
+<span class="codeline" id="line-1528"><code>	/* We need to clear the next 4 bytes to continue to be</code></span>
+<span class="codeline" id="line-1529"><code>	   compatible with BrotliWriteBits. */</code></span>
+<span class="codeline" id="line-1530"><code>	writeBitsPrepareStorage(*storage_ix, storage)</code></span>
+<span class="codeline" id="line-1531"><code></code></span>
+<span class="codeline" id="line-1532"><code>	/* Since the uncompressed block itself may not be the final block, add an</code></span>
+<span class="codeline" id="line-1533"><code>	   empty one after this. */</code></span>
+<span class="codeline" id="line-1534"><code>	if is_final_block {</code></span>
+<span class="codeline" id="line-1535"><code>		writeBits(1, 1, storage_ix, storage) /* islast */</code></span>
+<span class="codeline" id="line-1536"><code>		writeBits(1, 1, storage_ix, storage) /* isempty */</code></span>
+<span class="codeline" id="line-1537"><code>		jumpToByteBoundary(storage_ix, storage)</code></span>
+<span class="codeline" id="line-1538"><code>	}</code></span>
+<span class="codeline" id="line-1539"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

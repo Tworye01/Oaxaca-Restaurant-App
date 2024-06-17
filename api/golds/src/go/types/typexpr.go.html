@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: typexpr.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	typexpr.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2013 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// This file implements type-checking of identifiers and type expressions.</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package types</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"fmt"</code></span>
+<span class="codeline" id="line-11"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-12"><code>	"go/constant"</code></span>
+<span class="codeline" id="line-13"><code>	"go/internal/typeparams"</code></span>
+<span class="codeline" id="line-14"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-15"><code>	"strings"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>// ident type-checks identifier e and initializes x with the value or type of e.</code></span>
+<span class="codeline" id="line-19"><code>// If an error occurred, x.mode is set to invalid.</code></span>
+<span class="codeline" id="line-20"><code>// For the meaning of def, see Checker.definedType, below.</code></span>
+<span class="codeline" id="line-21"><code>// If wantType is set, the identifier e is expected to denote a type.</code></span>
+<span class="codeline" id="line-22"><code>func (check *Checker) ident(x *operand, e *ast.Ident, def *TypeName, wantType bool) {</code></span>
+<span class="codeline" id="line-23"><code>	x.mode = invalid</code></span>
+<span class="codeline" id="line-24"><code>	x.expr = e</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>	// Note that we cannot use check.lookup here because the returned scope</code></span>
+<span class="codeline" id="line-27"><code>	// may be different from obj.Parent(). See also Scope.LookupParent doc.</code></span>
+<span class="codeline" id="line-28"><code>	scope, obj := check.scope.LookupParent(e.Name, check.pos)</code></span>
+<span class="codeline" id="line-29"><code>	switch obj {</code></span>
+<span class="codeline" id="line-30"><code>	case nil:</code></span>
+<span class="codeline" id="line-31"><code>		if e.Name == "_" {</code></span>
+<span class="codeline" id="line-32"><code>			// Blank identifiers are never declared, but the current identifier may</code></span>
+<span class="codeline" id="line-33"><code>			// be a placeholder for a receiver type parameter. In this case we can</code></span>
+<span class="codeline" id="line-34"><code>			// resolve its type and object from Checker.recvTParamMap.</code></span>
+<span class="codeline" id="line-35"><code>			if tpar := check.recvTParamMap[e]; tpar != nil {</code></span>
+<span class="codeline" id="line-36"><code>				x.mode = typexpr</code></span>
+<span class="codeline" id="line-37"><code>				x.typ = tpar</code></span>
+<span class="codeline" id="line-38"><code>			} else {</code></span>
+<span class="codeline" id="line-39"><code>				check.error(e, InvalidBlank, "cannot use _ as value or type")</code></span>
+<span class="codeline" id="line-40"><code>			}</code></span>
+<span class="codeline" id="line-41"><code>		} else {</code></span>
+<span class="codeline" id="line-42"><code>			check.errorf(e, UndeclaredName, "undefined: %s", e.Name)</code></span>
+<span class="codeline" id="line-43"><code>		}</code></span>
+<span class="codeline" id="line-44"><code>		return</code></span>
+<span class="codeline" id="line-45"><code>	case universeAny, universeComparable:</code></span>
+<span class="codeline" id="line-46"><code>		if !check.verifyVersionf(e, go1_18, "predeclared %s", e.Name) {</code></span>
+<span class="codeline" id="line-47"><code>			return // avoid follow-on errors</code></span>
+<span class="codeline" id="line-48"><code>		}</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code>	check.recordUse(e, obj)</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>	// Type-check the object.</code></span>
+<span class="codeline" id="line-53"><code>	// Only call Checker.objDecl if the object doesn't have a type yet</code></span>
+<span class="codeline" id="line-54"><code>	// (in which case we must actually determine it) or the object is a</code></span>
+<span class="codeline" id="line-55"><code>	// TypeName and we also want a type (in which case we might detect</code></span>
+<span class="codeline" id="line-56"><code>	// a cycle which needs to be reported). Otherwise we can skip the</code></span>
+<span class="codeline" id="line-57"><code>	// call and avoid a possible cycle error in favor of the more</code></span>
+<span class="codeline" id="line-58"><code>	// informative "not a type/value" error that this function's caller</code></span>
+<span class="codeline" id="line-59"><code>	// will issue (see go.dev/issue/25790).</code></span>
+<span class="codeline" id="line-60"><code>	typ := obj.Type()</code></span>
+<span class="codeline" id="line-61"><code>	if _, gotType := obj.(*TypeName); typ == nil || gotType &amp;&amp; wantType {</code></span>
+<span class="codeline" id="line-62"><code>		check.objDecl(obj, def)</code></span>
+<span class="codeline" id="line-63"><code>		typ = obj.Type() // type must have been assigned by Checker.objDecl</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code>	assert(typ != nil)</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>	// The object may have been dot-imported.</code></span>
+<span class="codeline" id="line-68"><code>	// If so, mark the respective package as used.</code></span>
+<span class="codeline" id="line-69"><code>	// (This code is only needed for dot-imports. Without them,</code></span>
+<span class="codeline" id="line-70"><code>	// we only have to mark variables, see *Var case below).</code></span>
+<span class="codeline" id="line-71"><code>	if pkgName := check.dotImportMap[dotImportKey{scope, obj.Name()}]; pkgName != nil {</code></span>
+<span class="codeline" id="line-72"><code>		pkgName.used = true</code></span>
+<span class="codeline" id="line-73"><code>	}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>	switch obj := obj.(type) {</code></span>
+<span class="codeline" id="line-76"><code>	case *PkgName:</code></span>
+<span class="codeline" id="line-77"><code>		check.errorf(e, InvalidPkgUse, "use of package %s not in selector", obj.name)</code></span>
+<span class="codeline" id="line-78"><code>		return</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>	case *Const:</code></span>
+<span class="codeline" id="line-81"><code>		check.addDeclDep(obj)</code></span>
+<span class="codeline" id="line-82"><code>		if !isValid(typ) {</code></span>
+<span class="codeline" id="line-83"><code>			return</code></span>
+<span class="codeline" id="line-84"><code>		}</code></span>
+<span class="codeline" id="line-85"><code>		if obj == universeIota {</code></span>
+<span class="codeline" id="line-86"><code>			if check.iota == nil {</code></span>
+<span class="codeline" id="line-87"><code>				check.error(e, InvalidIota, "cannot use iota outside constant declaration")</code></span>
+<span class="codeline" id="line-88"><code>				return</code></span>
+<span class="codeline" id="line-89"><code>			}</code></span>
+<span class="codeline" id="line-90"><code>			x.val = check.iota</code></span>
+<span class="codeline" id="line-91"><code>		} else {</code></span>
+<span class="codeline" id="line-92"><code>			x.val = obj.val</code></span>
+<span class="codeline" id="line-93"><code>		}</code></span>
+<span class="codeline" id="line-94"><code>		assert(x.val != nil)</code></span>
+<span class="codeline" id="line-95"><code>		x.mode = constant_</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>	case *TypeName:</code></span>
+<span class="codeline" id="line-98"><code>		if !check.enableAlias &amp;&amp; check.isBrokenAlias(obj) {</code></span>
+<span class="codeline" id="line-99"><code>			check.errorf(e, InvalidDeclCycle, "invalid use of type alias %s in recursive type (see go.dev/issue/50729)", obj.name)</code></span>
+<span class="codeline" id="line-100"><code>			return</code></span>
+<span class="codeline" id="line-101"><code>		}</code></span>
+<span class="codeline" id="line-102"><code>		x.mode = typexpr</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	case *Var:</code></span>
+<span class="codeline" id="line-105"><code>		// It's ok to mark non-local variables, but ignore variables</code></span>
+<span class="codeline" id="line-106"><code>		// from other packages to avoid potential race conditions with</code></span>
+<span class="codeline" id="line-107"><code>		// dot-imported variables.</code></span>
+<span class="codeline" id="line-108"><code>		if obj.pkg == check.pkg {</code></span>
+<span class="codeline" id="line-109"><code>			obj.used = true</code></span>
+<span class="codeline" id="line-110"><code>		}</code></span>
+<span class="codeline" id="line-111"><code>		check.addDeclDep(obj)</code></span>
+<span class="codeline" id="line-112"><code>		if !isValid(typ) {</code></span>
+<span class="codeline" id="line-113"><code>			return</code></span>
+<span class="codeline" id="line-114"><code>		}</code></span>
+<span class="codeline" id="line-115"><code>		x.mode = variable</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>	case *Func:</code></span>
+<span class="codeline" id="line-118"><code>		check.addDeclDep(obj)</code></span>
+<span class="codeline" id="line-119"><code>		x.mode = value</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>	case *Builtin:</code></span>
+<span class="codeline" id="line-122"><code>		x.id = obj.id</code></span>
+<span class="codeline" id="line-123"><code>		x.mode = builtin</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>	case *Nil:</code></span>
+<span class="codeline" id="line-126"><code>		x.mode = value</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>	default:</code></span>
+<span class="codeline" id="line-129"><code>		unreachable()</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	x.typ = typ</code></span>
+<span class="codeline" id="line-133"><code>}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>// typ type-checks the type expression e and returns its type, or Typ[Invalid].</code></span>
+<span class="codeline" id="line-136"><code>// The type must not be an (uninstantiated) generic type.</code></span>
+<span class="codeline" id="line-137"><code>func (check *Checker) typ(e ast.Expr) Type {</code></span>
+<span class="codeline" id="line-138"><code>	return check.definedType(e, nil)</code></span>
+<span class="codeline" id="line-139"><code>}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>// varType type-checks the type expression e and returns its type, or Typ[Invalid].</code></span>
+<span class="codeline" id="line-142"><code>// The type must not be an (uninstantiated) generic type and it must not be a</code></span>
+<span class="codeline" id="line-143"><code>// constraint interface.</code></span>
+<span class="codeline" id="line-144"><code>func (check *Checker) varType(e ast.Expr) Type {</code></span>
+<span class="codeline" id="line-145"><code>	typ := check.definedType(e, nil)</code></span>
+<span class="codeline" id="line-146"><code>	check.validVarType(e, typ)</code></span>
+<span class="codeline" id="line-147"><code>	return typ</code></span>
+<span class="codeline" id="line-148"><code>}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// validVarType reports an error if typ is a constraint interface.</code></span>
+<span class="codeline" id="line-151"><code>// The expression e is used for error reporting, if any.</code></span>
+<span class="codeline" id="line-152"><code>func (check *Checker) validVarType(e ast.Expr, typ Type) {</code></span>
+<span class="codeline" id="line-153"><code>	// If we have a type parameter there's nothing to do.</code></span>
+<span class="codeline" id="line-154"><code>	if isTypeParam(typ) {</code></span>
+<span class="codeline" id="line-155"><code>		return</code></span>
+<span class="codeline" id="line-156"><code>	}</code></span>
+<span class="codeline" id="line-157"><code></code></span>
+<span class="codeline" id="line-158"><code>	// We don't want to call under() or complete interfaces while we are in</code></span>
+<span class="codeline" id="line-159"><code>	// the middle of type-checking parameter declarations that might belong</code></span>
+<span class="codeline" id="line-160"><code>	// to interface methods. Delay this check to the end of type-checking.</code></span>
+<span class="codeline" id="line-161"><code>	check.later(func() {</code></span>
+<span class="codeline" id="line-162"><code>		if t, _ := under(typ).(*Interface); t != nil {</code></span>
+<span class="codeline" id="line-163"><code>			tset := computeInterfaceTypeSet(check, e.Pos(), t) // TODO(gri) is this the correct position?</code></span>
+<span class="codeline" id="line-164"><code>			if !tset.IsMethodSet() {</code></span>
+<span class="codeline" id="line-165"><code>				if tset.comparable {</code></span>
+<span class="codeline" id="line-166"><code>					check.softErrorf(e, MisplacedConstraintIface, "cannot use type %s outside a type constraint: interface is (or embeds) comparable", typ)</code></span>
+<span class="codeline" id="line-167"><code>				} else {</code></span>
+<span class="codeline" id="line-168"><code>					check.softErrorf(e, MisplacedConstraintIface, "cannot use type %s outside a type constraint: interface contains type constraints", typ)</code></span>
+<span class="codeline" id="line-169"><code>				}</code></span>
+<span class="codeline" id="line-170"><code>			}</code></span>
+<span class="codeline" id="line-171"><code>		}</code></span>
+<span class="codeline" id="line-172"><code>	}).describef(e, "check var type %s", typ)</code></span>
+<span class="codeline" id="line-173"><code>}</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>// definedType is like typ but also accepts a type name def.</code></span>
+<span class="codeline" id="line-176"><code>// If def != nil, e is the type specification for the type named def, declared</code></span>
+<span class="codeline" id="line-177"><code>// in a type declaration, and def.typ.underlying will be set to the type of e</code></span>
+<span class="codeline" id="line-178"><code>// before any components of e are type-checked.</code></span>
+<span class="codeline" id="line-179"><code>func (check *Checker) definedType(e ast.Expr, def *TypeName) Type {</code></span>
+<span class="codeline" id="line-180"><code>	typ := check.typInternal(e, def)</code></span>
+<span class="codeline" id="line-181"><code>	assert(isTyped(typ))</code></span>
+<span class="codeline" id="line-182"><code>	if isGeneric(typ) {</code></span>
+<span class="codeline" id="line-183"><code>		check.errorf(e, WrongTypeArgCount, "cannot use generic type %s without instantiation", typ)</code></span>
+<span class="codeline" id="line-184"><code>		typ = Typ[Invalid]</code></span>
+<span class="codeline" id="line-185"><code>	}</code></span>
+<span class="codeline" id="line-186"><code>	check.recordTypeAndValue(e, typexpr, typ, nil)</code></span>
+<span class="codeline" id="line-187"><code>	return typ</code></span>
+<span class="codeline" id="line-188"><code>}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>// genericType is like typ but the type must be an (uninstantiated) generic</code></span>
+<span class="codeline" id="line-191"><code>// type. If cause is non-nil and the type expression was a valid type but not</code></span>
+<span class="codeline" id="line-192"><code>// generic, cause will be populated with a message describing the error.</code></span>
+<span class="codeline" id="line-193"><code>func (check *Checker) genericType(e ast.Expr, cause *string) Type {</code></span>
+<span class="codeline" id="line-194"><code>	typ := check.typInternal(e, nil)</code></span>
+<span class="codeline" id="line-195"><code>	assert(isTyped(typ))</code></span>
+<span class="codeline" id="line-196"><code>	if isValid(typ) &amp;&amp; !isGeneric(typ) {</code></span>
+<span class="codeline" id="line-197"><code>		if cause != nil {</code></span>
+<span class="codeline" id="line-198"><code>			*cause = check.sprintf("%s is not a generic type", typ)</code></span>
+<span class="codeline" id="line-199"><code>		}</code></span>
+<span class="codeline" id="line-200"><code>		typ = Typ[Invalid]</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code>	// TODO(gri) what is the correct call below?</code></span>
+<span class="codeline" id="line-203"><code>	check.recordTypeAndValue(e, typexpr, typ, nil)</code></span>
+<span class="codeline" id="line-204"><code>	return typ</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>// goTypeName returns the Go type name for typ and</code></span>
+<span class="codeline" id="line-208"><code>// removes any occurrences of "types." from that name.</code></span>
+<span class="codeline" id="line-209"><code>func goTypeName(typ Type) string {</code></span>
+<span class="codeline" id="line-210"><code>	return strings.ReplaceAll(fmt.Sprintf("%T", typ), "types.", "")</code></span>
+<span class="codeline" id="line-211"><code>}</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>// typInternal drives type checking of types.</code></span>
+<span class="codeline" id="line-214"><code>// Must only be called by definedType or genericType.</code></span>
+<span class="codeline" id="line-215"><code>func (check *Checker) typInternal(e0 ast.Expr, def *TypeName) (T Type) {</code></span>
+<span class="codeline" id="line-216"><code>	if check.conf._Trace {</code></span>
+<span class="codeline" id="line-217"><code>		check.trace(e0.Pos(), "-- type %s", e0)</code></span>
+<span class="codeline" id="line-218"><code>		check.indent++</code></span>
+<span class="codeline" id="line-219"><code>		defer func() {</code></span>
+<span class="codeline" id="line-220"><code>			check.indent--</code></span>
+<span class="codeline" id="line-221"><code>			var under Type</code></span>
+<span class="codeline" id="line-222"><code>			if T != nil {</code></span>
+<span class="codeline" id="line-223"><code>				// Calling under() here may lead to endless instantiations.</code></span>
+<span class="codeline" id="line-224"><code>				// Test case: type T[P any] *T[P]</code></span>
+<span class="codeline" id="line-225"><code>				under = safeUnderlying(T)</code></span>
+<span class="codeline" id="line-226"><code>			}</code></span>
+<span class="codeline" id="line-227"><code>			if T == under {</code></span>
+<span class="codeline" id="line-228"><code>				check.trace(e0.Pos(), "=&gt; %s // %s", T, goTypeName(T))</code></span>
+<span class="codeline" id="line-229"><code>			} else {</code></span>
+<span class="codeline" id="line-230"><code>				check.trace(e0.Pos(), "=&gt; %s (under = %s) // %s", T, under, goTypeName(T))</code></span>
+<span class="codeline" id="line-231"><code>			}</code></span>
+<span class="codeline" id="line-232"><code>		}()</code></span>
+<span class="codeline" id="line-233"><code>	}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>	switch e := e0.(type) {</code></span>
+<span class="codeline" id="line-236"><code>	case *ast.BadExpr:</code></span>
+<span class="codeline" id="line-237"><code>		// ignore - error reported before</code></span>
+<span class="codeline" id="line-238"><code></code></span>
+<span class="codeline" id="line-239"><code>	case *ast.Ident:</code></span>
+<span class="codeline" id="line-240"><code>		var x operand</code></span>
+<span class="codeline" id="line-241"><code>		check.ident(&amp;x, e, def, true)</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>		switch x.mode {</code></span>
+<span class="codeline" id="line-244"><code>		case typexpr:</code></span>
+<span class="codeline" id="line-245"><code>			typ := x.typ</code></span>
+<span class="codeline" id="line-246"><code>			setDefType(def, typ)</code></span>
+<span class="codeline" id="line-247"><code>			return typ</code></span>
+<span class="codeline" id="line-248"><code>		case invalid:</code></span>
+<span class="codeline" id="line-249"><code>			// ignore - error reported before</code></span>
+<span class="codeline" id="line-250"><code>		case novalue:</code></span>
+<span class="codeline" id="line-251"><code>			check.errorf(&amp;x, NotAType, "%s used as type", &amp;x)</code></span>
+<span class="codeline" id="line-252"><code>		default:</code></span>
+<span class="codeline" id="line-253"><code>			check.errorf(&amp;x, NotAType, "%s is not a type", &amp;x)</code></span>
+<span class="codeline" id="line-254"><code>		}</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>	case *ast.SelectorExpr:</code></span>
+<span class="codeline" id="line-257"><code>		var x operand</code></span>
+<span class="codeline" id="line-258"><code>		check.selector(&amp;x, e, def, true)</code></span>
+<span class="codeline" id="line-259"><code></code></span>
+<span class="codeline" id="line-260"><code>		switch x.mode {</code></span>
+<span class="codeline" id="line-261"><code>		case typexpr:</code></span>
+<span class="codeline" id="line-262"><code>			typ := x.typ</code></span>
+<span class="codeline" id="line-263"><code>			setDefType(def, typ)</code></span>
+<span class="codeline" id="line-264"><code>			return typ</code></span>
+<span class="codeline" id="line-265"><code>		case invalid:</code></span>
+<span class="codeline" id="line-266"><code>			// ignore - error reported before</code></span>
+<span class="codeline" id="line-267"><code>		case novalue:</code></span>
+<span class="codeline" id="line-268"><code>			check.errorf(&amp;x, NotAType, "%s used as type", &amp;x)</code></span>
+<span class="codeline" id="line-269"><code>		default:</code></span>
+<span class="codeline" id="line-270"><code>			check.errorf(&amp;x, NotAType, "%s is not a type", &amp;x)</code></span>
+<span class="codeline" id="line-271"><code>		}</code></span>
+<span class="codeline" id="line-272"><code></code></span>
+<span class="codeline" id="line-273"><code>	case *ast.IndexExpr, *ast.IndexListExpr:</code></span>
+<span class="codeline" id="line-274"><code>		ix := typeparams.UnpackIndexExpr(e)</code></span>
+<span class="codeline" id="line-275"><code>		check.verifyVersionf(inNode(e, ix.Lbrack), go1_18, "type instantiation")</code></span>
+<span class="codeline" id="line-276"><code>		return check.instantiatedType(ix, def)</code></span>
+<span class="codeline" id="line-277"><code></code></span>
+<span class="codeline" id="line-278"><code>	case *ast.ParenExpr:</code></span>
+<span class="codeline" id="line-279"><code>		// Generic types must be instantiated before they can be used in any form.</code></span>
+<span class="codeline" id="line-280"><code>		// Consequently, generic types cannot be parenthesized.</code></span>
+<span class="codeline" id="line-281"><code>		return check.definedType(e.X, def)</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>	case *ast.ArrayType:</code></span>
+<span class="codeline" id="line-284"><code>		if e.Len == nil {</code></span>
+<span class="codeline" id="line-285"><code>			typ := new(Slice)</code></span>
+<span class="codeline" id="line-286"><code>			setDefType(def, typ)</code></span>
+<span class="codeline" id="line-287"><code>			typ.elem = check.varType(e.Elt)</code></span>
+<span class="codeline" id="line-288"><code>			return typ</code></span>
+<span class="codeline" id="line-289"><code>		}</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>		typ := new(Array)</code></span>
+<span class="codeline" id="line-292"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-293"><code>		// Provide a more specific error when encountering a [...] array</code></span>
+<span class="codeline" id="line-294"><code>		// rather than leaving it to the handling of the ... expression.</code></span>
+<span class="codeline" id="line-295"><code>		if _, ok := e.Len.(*ast.Ellipsis); ok {</code></span>
+<span class="codeline" id="line-296"><code>			check.error(e.Len, BadDotDotDotSyntax, "invalid use of [...] array (outside a composite literal)")</code></span>
+<span class="codeline" id="line-297"><code>			typ.len = -1</code></span>
+<span class="codeline" id="line-298"><code>		} else {</code></span>
+<span class="codeline" id="line-299"><code>			typ.len = check.arrayLength(e.Len)</code></span>
+<span class="codeline" id="line-300"><code>		}</code></span>
+<span class="codeline" id="line-301"><code>		typ.elem = check.varType(e.Elt)</code></span>
+<span class="codeline" id="line-302"><code>		if typ.len &gt;= 0 {</code></span>
+<span class="codeline" id="line-303"><code>			return typ</code></span>
+<span class="codeline" id="line-304"><code>		}</code></span>
+<span class="codeline" id="line-305"><code>		// report error if we encountered [...]</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>	case *ast.Ellipsis:</code></span>
+<span class="codeline" id="line-308"><code>		// dots are handled explicitly where they are legal</code></span>
+<span class="codeline" id="line-309"><code>		// (array composite literals and parameter lists)</code></span>
+<span class="codeline" id="line-310"><code>		check.error(e, InvalidDotDotDot, "invalid use of '...'")</code></span>
+<span class="codeline" id="line-311"><code>		check.use(e.Elt)</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>	case *ast.StructType:</code></span>
+<span class="codeline" id="line-314"><code>		typ := new(Struct)</code></span>
+<span class="codeline" id="line-315"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-316"><code>		check.structType(typ, e)</code></span>
+<span class="codeline" id="line-317"><code>		return typ</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>	case *ast.StarExpr:</code></span>
+<span class="codeline" id="line-320"><code>		typ := new(Pointer)</code></span>
+<span class="codeline" id="line-321"><code>		typ.base = Typ[Invalid] // avoid nil base in invalid recursive type declaration</code></span>
+<span class="codeline" id="line-322"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-323"><code>		typ.base = check.varType(e.X)</code></span>
+<span class="codeline" id="line-324"><code>		return typ</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>	case *ast.FuncType:</code></span>
+<span class="codeline" id="line-327"><code>		typ := new(Signature)</code></span>
+<span class="codeline" id="line-328"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-329"><code>		check.funcType(typ, nil, e)</code></span>
+<span class="codeline" id="line-330"><code>		return typ</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>	case *ast.InterfaceType:</code></span>
+<span class="codeline" id="line-333"><code>		typ := check.newInterface()</code></span>
+<span class="codeline" id="line-334"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-335"><code>		check.interfaceType(typ, e, def)</code></span>
+<span class="codeline" id="line-336"><code>		return typ</code></span>
+<span class="codeline" id="line-337"><code></code></span>
+<span class="codeline" id="line-338"><code>	case *ast.MapType:</code></span>
+<span class="codeline" id="line-339"><code>		typ := new(Map)</code></span>
+<span class="codeline" id="line-340"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-341"><code></code></span>
+<span class="codeline" id="line-342"><code>		typ.key = check.varType(e.Key)</code></span>
+<span class="codeline" id="line-343"><code>		typ.elem = check.varType(e.Value)</code></span>
+<span class="codeline" id="line-344"><code></code></span>
+<span class="codeline" id="line-345"><code>		// spec: "The comparison operators == and != must be fully defined</code></span>
+<span class="codeline" id="line-346"><code>		// for operands of the key type; thus the key type must not be a</code></span>
+<span class="codeline" id="line-347"><code>		// function, map, or slice."</code></span>
+<span class="codeline" id="line-348"><code>		//</code></span>
+<span class="codeline" id="line-349"><code>		// Delay this check because it requires fully setup types;</code></span>
+<span class="codeline" id="line-350"><code>		// it is safe to continue in any case (was go.dev/issue/6667).</code></span>
+<span class="codeline" id="line-351"><code>		check.later(func() {</code></span>
+<span class="codeline" id="line-352"><code>			if !Comparable(typ.key) {</code></span>
+<span class="codeline" id="line-353"><code>				var why string</code></span>
+<span class="codeline" id="line-354"><code>				if isTypeParam(typ.key) {</code></span>
+<span class="codeline" id="line-355"><code>					why = " (missing comparable constraint)"</code></span>
+<span class="codeline" id="line-356"><code>				}</code></span>
+<span class="codeline" id="line-357"><code>				check.errorf(e.Key, IncomparableMapKey, "invalid map key type %s%s", typ.key, why)</code></span>
+<span class="codeline" id="line-358"><code>			}</code></span>
+<span class="codeline" id="line-359"><code>		}).describef(e.Key, "check map key %s", typ.key)</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>		return typ</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>	case *ast.ChanType:</code></span>
+<span class="codeline" id="line-364"><code>		typ := new(Chan)</code></span>
+<span class="codeline" id="line-365"><code>		setDefType(def, typ)</code></span>
+<span class="codeline" id="line-366"><code></code></span>
+<span class="codeline" id="line-367"><code>		dir := SendRecv</code></span>
+<span class="codeline" id="line-368"><code>		switch e.Dir {</code></span>
+<span class="codeline" id="line-369"><code>		case ast.SEND | ast.RECV:</code></span>
+<span class="codeline" id="line-370"><code>			// nothing to do</code></span>
+<span class="codeline" id="line-371"><code>		case ast.SEND:</code></span>
+<span class="codeline" id="line-372"><code>			dir = SendOnly</code></span>
+<span class="codeline" id="line-373"><code>		case ast.RECV:</code></span>
+<span class="codeline" id="line-374"><code>			dir = RecvOnly</code></span>
+<span class="codeline" id="line-375"><code>		default:</code></span>
+<span class="codeline" id="line-376"><code>			check.errorf(e, InvalidSyntaxTree, "unknown channel direction %d", e.Dir)</code></span>
+<span class="codeline" id="line-377"><code>			// ok to continue</code></span>
+<span class="codeline" id="line-378"><code>		}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>		typ.dir = dir</code></span>
+<span class="codeline" id="line-381"><code>		typ.elem = check.varType(e.Value)</code></span>
+<span class="codeline" id="line-382"><code>		return typ</code></span>
+<span class="codeline" id="line-383"><code></code></span>
+<span class="codeline" id="line-384"><code>	default:</code></span>
+<span class="codeline" id="line-385"><code>		check.errorf(e0, NotAType, "%s is not a type", e0)</code></span>
+<span class="codeline" id="line-386"><code>		check.use(e0)</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code></code></span>
+<span class="codeline" id="line-389"><code>	typ := Typ[Invalid]</code></span>
+<span class="codeline" id="line-390"><code>	setDefType(def, typ)</code></span>
+<span class="codeline" id="line-391"><code>	return typ</code></span>
+<span class="codeline" id="line-392"><code>}</code></span>
+<span class="codeline" id="line-393"><code></code></span>
+<span class="codeline" id="line-394"><code>func setDefType(def *TypeName, typ Type) {</code></span>
+<span class="codeline" id="line-395"><code>	if def != nil {</code></span>
+<span class="codeline" id="line-396"><code>		switch t := def.typ.(type) {</code></span>
+<span class="codeline" id="line-397"><code>		case *Alias:</code></span>
+<span class="codeline" id="line-398"><code>			// t.fromRHS should always be set, either to an invalid type</code></span>
+<span class="codeline" id="line-399"><code>			// in the beginning, or to typ in certain cyclic declarations.</code></span>
+<span class="codeline" id="line-400"><code>			if t.fromRHS != Typ[Invalid] &amp;&amp; t.fromRHS != typ {</code></span>
+<span class="codeline" id="line-401"><code>				panic(sprintf(nil, nil, true, "t.fromRHS = %s, typ = %s\n", t.fromRHS, typ))</code></span>
+<span class="codeline" id="line-402"><code>			}</code></span>
+<span class="codeline" id="line-403"><code>			t.fromRHS = typ</code></span>
+<span class="codeline" id="line-404"><code>		case *Basic:</code></span>
+<span class="codeline" id="line-405"><code>			assert(t == Typ[Invalid])</code></span>
+<span class="codeline" id="line-406"><code>		case *Named:</code></span>
+<span class="codeline" id="line-407"><code>			t.underlying = typ</code></span>
+<span class="codeline" id="line-408"><code>		default:</code></span>
+<span class="codeline" id="line-409"><code>			panic(fmt.Sprintf("unexpected type %T", t))</code></span>
+<span class="codeline" id="line-410"><code>		}</code></span>
+<span class="codeline" id="line-411"><code>	}</code></span>
+<span class="codeline" id="line-412"><code>}</code></span>
+<span class="codeline" id="line-413"><code></code></span>
+<span class="codeline" id="line-414"><code>func (check *Checker) instantiatedType(ix *typeparams.IndexExpr, def *TypeName) (res Type) {</code></span>
+<span class="codeline" id="line-415"><code>	if check.conf._Trace {</code></span>
+<span class="codeline" id="line-416"><code>		check.trace(ix.Pos(), "-- instantiating type %s with %s", ix.X, ix.Indices)</code></span>
+<span class="codeline" id="line-417"><code>		check.indent++</code></span>
+<span class="codeline" id="line-418"><code>		defer func() {</code></span>
+<span class="codeline" id="line-419"><code>			check.indent--</code></span>
+<span class="codeline" id="line-420"><code>			// Don't format the underlying here. It will always be nil.</code></span>
+<span class="codeline" id="line-421"><code>			check.trace(ix.Pos(), "=&gt; %s", res)</code></span>
+<span class="codeline" id="line-422"><code>		}()</code></span>
+<span class="codeline" id="line-423"><code>	}</code></span>
+<span class="codeline" id="line-424"><code></code></span>
+<span class="codeline" id="line-425"><code>	var cause string</code></span>
+<span class="codeline" id="line-426"><code>	gtyp := check.genericType(ix.X, &amp;cause)</code></span>
+<span class="codeline" id="line-427"><code>	if cause != "" {</code></span>
+<span class="codeline" id="line-428"><code>		check.errorf(ix.Orig, NotAGenericType, invalidOp+"%s (%s)", ix.Orig, cause)</code></span>
+<span class="codeline" id="line-429"><code>	}</code></span>
+<span class="codeline" id="line-430"><code>	if !isValid(gtyp) {</code></span>
+<span class="codeline" id="line-431"><code>		return gtyp // error already reported</code></span>
+<span class="codeline" id="line-432"><code>	}</code></span>
+<span class="codeline" id="line-433"><code></code></span>
+<span class="codeline" id="line-434"><code>	orig := asNamed(gtyp)</code></span>
+<span class="codeline" id="line-435"><code>	if orig == nil {</code></span>
+<span class="codeline" id="line-436"><code>		panic(fmt.Sprintf("%v: cannot instantiate %v", ix.Pos(), gtyp))</code></span>
+<span class="codeline" id="line-437"><code>	}</code></span>
+<span class="codeline" id="line-438"><code></code></span>
+<span class="codeline" id="line-439"><code>	// evaluate arguments</code></span>
+<span class="codeline" id="line-440"><code>	targs := check.typeList(ix.Indices)</code></span>
+<span class="codeline" id="line-441"><code>	if targs == nil {</code></span>
+<span class="codeline" id="line-442"><code>		setDefType(def, Typ[Invalid]) // avoid errors later due to lazy instantiation</code></span>
+<span class="codeline" id="line-443"><code>		return Typ[Invalid]</code></span>
+<span class="codeline" id="line-444"><code>	}</code></span>
+<span class="codeline" id="line-445"><code></code></span>
+<span class="codeline" id="line-446"><code>	// create the instance</code></span>
+<span class="codeline" id="line-447"><code>	inst := asNamed(check.instance(ix.Pos(), orig, targs, nil, check.context()))</code></span>
+<span class="codeline" id="line-448"><code>	setDefType(def, inst)</code></span>
+<span class="codeline" id="line-449"><code></code></span>
+<span class="codeline" id="line-450"><code>	// orig.tparams may not be set up, so we need to do expansion later.</code></span>
+<span class="codeline" id="line-451"><code>	check.later(func() {</code></span>
+<span class="codeline" id="line-452"><code>		// This is an instance from the source, not from recursive substitution,</code></span>
+<span class="codeline" id="line-453"><code>		// and so it must be resolved during type-checking so that we can report</code></span>
+<span class="codeline" id="line-454"><code>		// errors.</code></span>
+<span class="codeline" id="line-455"><code>		check.recordInstance(ix.Orig, inst.TypeArgs().list(), inst)</code></span>
+<span class="codeline" id="line-456"><code></code></span>
+<span class="codeline" id="line-457"><code>		if check.validateTArgLen(ix.Pos(), inst.obj.name, inst.TypeParams().Len(), inst.TypeArgs().Len()) {</code></span>
+<span class="codeline" id="line-458"><code>			if i, err := check.verify(ix.Pos(), inst.TypeParams().list(), inst.TypeArgs().list(), check.context()); err != nil {</code></span>
+<span class="codeline" id="line-459"><code>				// best position for error reporting</code></span>
+<span class="codeline" id="line-460"><code>				pos := ix.Pos()</code></span>
+<span class="codeline" id="line-461"><code>				if i &lt; len(ix.Indices) {</code></span>
+<span class="codeline" id="line-462"><code>					pos = ix.Indices[i].Pos()</code></span>
+<span class="codeline" id="line-463"><code>				}</code></span>
+<span class="codeline" id="line-464"><code>				check.softErrorf(atPos(pos), InvalidTypeArg, err.Error())</code></span>
+<span class="codeline" id="line-465"><code>			} else {</code></span>
+<span class="codeline" id="line-466"><code>				check.mono.recordInstance(check.pkg, ix.Pos(), inst.TypeParams().list(), inst.TypeArgs().list(), ix.Indices)</code></span>
+<span class="codeline" id="line-467"><code>			}</code></span>
+<span class="codeline" id="line-468"><code>		}</code></span>
+<span class="codeline" id="line-469"><code></code></span>
+<span class="codeline" id="line-470"><code>		// TODO(rfindley): remove this call: we don't need to call validType here,</code></span>
+<span class="codeline" id="line-471"><code>		// as cycles can only occur for types used inside a Named type declaration,</code></span>
+<span class="codeline" id="line-472"><code>		// and so it suffices to call validType from declared types.</code></span>
+<span class="codeline" id="line-473"><code>		check.validType(inst)</code></span>
+<span class="codeline" id="line-474"><code>	}).describef(ix, "resolve instance %s", inst)</code></span>
+<span class="codeline" id="line-475"><code></code></span>
+<span class="codeline" id="line-476"><code>	return inst</code></span>
+<span class="codeline" id="line-477"><code>}</code></span>
+<span class="codeline" id="line-478"><code></code></span>
+<span class="codeline" id="line-479"><code>// arrayLength type-checks the array length expression e</code></span>
+<span class="codeline" id="line-480"><code>// and returns the constant length &gt;= 0, or a value &lt; 0</code></span>
+<span class="codeline" id="line-481"><code>// to indicate an error (and thus an unknown length).</code></span>
+<span class="codeline" id="line-482"><code>func (check *Checker) arrayLength(e ast.Expr) int64 {</code></span>
+<span class="codeline" id="line-483"><code>	// If e is an identifier, the array declaration might be an</code></span>
+<span class="codeline" id="line-484"><code>	// attempt at a parameterized type declaration with missing</code></span>
+<span class="codeline" id="line-485"><code>	// constraint. Provide an error message that mentions array</code></span>
+<span class="codeline" id="line-486"><code>	// length.</code></span>
+<span class="codeline" id="line-487"><code>	if name, _ := e.(*ast.Ident); name != nil {</code></span>
+<span class="codeline" id="line-488"><code>		obj := check.lookup(name.Name)</code></span>
+<span class="codeline" id="line-489"><code>		if obj == nil {</code></span>
+<span class="codeline" id="line-490"><code>			check.errorf(name, InvalidArrayLen, "undefined array length %s or missing type constraint", name.Name)</code></span>
+<span class="codeline" id="line-491"><code>			return -1</code></span>
+<span class="codeline" id="line-492"><code>		}</code></span>
+<span class="codeline" id="line-493"><code>		if _, ok := obj.(*Const); !ok {</code></span>
+<span class="codeline" id="line-494"><code>			check.errorf(name, InvalidArrayLen, "invalid array length %s", name.Name)</code></span>
+<span class="codeline" id="line-495"><code>			return -1</code></span>
+<span class="codeline" id="line-496"><code>		}</code></span>
+<span class="codeline" id="line-497"><code>	}</code></span>
+<span class="codeline" id="line-498"><code></code></span>
+<span class="codeline" id="line-499"><code>	var x operand</code></span>
+<span class="codeline" id="line-500"><code>	check.expr(nil, &amp;x, e)</code></span>
+<span class="codeline" id="line-501"><code>	if x.mode != constant_ {</code></span>
+<span class="codeline" id="line-502"><code>		if x.mode != invalid {</code></span>
+<span class="codeline" id="line-503"><code>			check.errorf(&amp;x, InvalidArrayLen, "array length %s must be constant", &amp;x)</code></span>
+<span class="codeline" id="line-504"><code>		}</code></span>
+<span class="codeline" id="line-505"><code>		return -1</code></span>
+<span class="codeline" id="line-506"><code>	}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>	if isUntyped(x.typ) || isInteger(x.typ) {</code></span>
+<span class="codeline" id="line-509"><code>		if val := constant.ToInt(x.val); val.Kind() == constant.Int {</code></span>
+<span class="codeline" id="line-510"><code>			if representableConst(val, check, Typ[Int], nil) {</code></span>
+<span class="codeline" id="line-511"><code>				if n, ok := constant.Int64Val(val); ok &amp;&amp; n &gt;= 0 {</code></span>
+<span class="codeline" id="line-512"><code>					return n</code></span>
+<span class="codeline" id="line-513"><code>				}</code></span>
+<span class="codeline" id="line-514"><code>			}</code></span>
+<span class="codeline" id="line-515"><code>		}</code></span>
+<span class="codeline" id="line-516"><code>	}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>	var msg string</code></span>
+<span class="codeline" id="line-519"><code>	if isInteger(x.typ) {</code></span>
+<span class="codeline" id="line-520"><code>		msg = "invalid array length %s"</code></span>
+<span class="codeline" id="line-521"><code>	} else {</code></span>
+<span class="codeline" id="line-522"><code>		msg = "array length %s must be integer"</code></span>
+<span class="codeline" id="line-523"><code>	}</code></span>
+<span class="codeline" id="line-524"><code>	check.errorf(&amp;x, InvalidArrayLen, msg, &amp;x)</code></span>
+<span class="codeline" id="line-525"><code>	return -1</code></span>
+<span class="codeline" id="line-526"><code>}</code></span>
+<span class="codeline" id="line-527"><code></code></span>
+<span class="codeline" id="line-528"><code>// typeList provides the list of types corresponding to the incoming expression list.</code></span>
+<span class="codeline" id="line-529"><code>// If an error occurred, the result is nil, but all list elements were type-checked.</code></span>
+<span class="codeline" id="line-530"><code>func (check *Checker) typeList(list []ast.Expr) []Type {</code></span>
+<span class="codeline" id="line-531"><code>	res := make([]Type, len(list)) // res != nil even if len(list) == 0</code></span>
+<span class="codeline" id="line-532"><code>	for i, x := range list {</code></span>
+<span class="codeline" id="line-533"><code>		t := check.varType(x)</code></span>
+<span class="codeline" id="line-534"><code>		if !isValid(t) {</code></span>
+<span class="codeline" id="line-535"><code>			res = nil</code></span>
+<span class="codeline" id="line-536"><code>		}</code></span>
+<span class="codeline" id="line-537"><code>		if res != nil {</code></span>
+<span class="codeline" id="line-538"><code>			res[i] = t</code></span>
+<span class="codeline" id="line-539"><code>		}</code></span>
+<span class="codeline" id="line-540"><code>	}</code></span>
+<span class="codeline" id="line-541"><code>	return res</code></span>
+<span class="codeline" id="line-542"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

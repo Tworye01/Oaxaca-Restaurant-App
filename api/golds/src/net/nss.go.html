@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: nss.go in package net</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	nss.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/net.html">net</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2015 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package net</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"errors"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/bytealg"</code></span>
+<span class="codeline" id="line-10"><code>	"os"</code></span>
+<span class="codeline" id="line-11"><code>	"sync"</code></span>
+<span class="codeline" id="line-12"><code>	"time"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>const (</code></span>
+<span class="codeline" id="line-16"><code>	nssConfigPath = "/etc/nsswitch.conf"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>var nssConfig nsswitchConfig</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>type nsswitchConfig struct {</code></span>
+<span class="codeline" id="line-22"><code>	initOnce sync.Once // guards init of nsswitchConfig</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>	// ch is used as a semaphore that only allows one lookup at a</code></span>
+<span class="codeline" id="line-25"><code>	// time to recheck nsswitch.conf</code></span>
+<span class="codeline" id="line-26"><code>	ch          chan struct{} // guards lastChecked and modTime</code></span>
+<span class="codeline" id="line-27"><code>	lastChecked time.Time     // last time nsswitch.conf was checked</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>	mu      sync.Mutex // protects nssConf</code></span>
+<span class="codeline" id="line-30"><code>	nssConf *nssConf</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>func getSystemNSS() *nssConf {</code></span>
+<span class="codeline" id="line-34"><code>	nssConfig.tryUpdate()</code></span>
+<span class="codeline" id="line-35"><code>	nssConfig.mu.Lock()</code></span>
+<span class="codeline" id="line-36"><code>	conf := nssConfig.nssConf</code></span>
+<span class="codeline" id="line-37"><code>	nssConfig.mu.Unlock()</code></span>
+<span class="codeline" id="line-38"><code>	return conf</code></span>
+<span class="codeline" id="line-39"><code>}</code></span>
+<span class="codeline" id="line-40"><code></code></span>
+<span class="codeline" id="line-41"><code>// init initializes conf and is only called via conf.initOnce.</code></span>
+<span class="codeline" id="line-42"><code>func (conf *nsswitchConfig) init() {</code></span>
+<span class="codeline" id="line-43"><code>	conf.nssConf = parseNSSConfFile("/etc/nsswitch.conf")</code></span>
+<span class="codeline" id="line-44"><code>	conf.lastChecked = time.Now()</code></span>
+<span class="codeline" id="line-45"><code>	conf.ch = make(chan struct{}, 1)</code></span>
+<span class="codeline" id="line-46"><code>}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>// tryUpdate tries to update conf.</code></span>
+<span class="codeline" id="line-49"><code>func (conf *nsswitchConfig) tryUpdate() {</code></span>
+<span class="codeline" id="line-50"><code>	conf.initOnce.Do(conf.init)</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>	// Ensure only one update at a time checks nsswitch.conf</code></span>
+<span class="codeline" id="line-53"><code>	if !conf.tryAcquireSema() {</code></span>
+<span class="codeline" id="line-54"><code>		return</code></span>
+<span class="codeline" id="line-55"><code>	}</code></span>
+<span class="codeline" id="line-56"><code>	defer conf.releaseSema()</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>	now := time.Now()</code></span>
+<span class="codeline" id="line-59"><code>	if conf.lastChecked.After(now.Add(-5 * time.Second)) {</code></span>
+<span class="codeline" id="line-60"><code>		return</code></span>
+<span class="codeline" id="line-61"><code>	}</code></span>
+<span class="codeline" id="line-62"><code>	conf.lastChecked = now</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>	var mtime time.Time</code></span>
+<span class="codeline" id="line-65"><code>	if fi, err := os.Stat(nssConfigPath); err == nil {</code></span>
+<span class="codeline" id="line-66"><code>		mtime = fi.ModTime()</code></span>
+<span class="codeline" id="line-67"><code>	}</code></span>
+<span class="codeline" id="line-68"><code>	if mtime.Equal(conf.nssConf.mtime) {</code></span>
+<span class="codeline" id="line-69"><code>		return</code></span>
+<span class="codeline" id="line-70"><code>	}</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	nssConf := parseNSSConfFile(nssConfigPath)</code></span>
+<span class="codeline" id="line-73"><code>	conf.mu.Lock()</code></span>
+<span class="codeline" id="line-74"><code>	conf.nssConf = nssConf</code></span>
+<span class="codeline" id="line-75"><code>	conf.mu.Unlock()</code></span>
+<span class="codeline" id="line-76"><code>}</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>func (conf *nsswitchConfig) acquireSema() {</code></span>
+<span class="codeline" id="line-79"><code>	conf.ch &lt;- struct{}{}</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>func (conf *nsswitchConfig) tryAcquireSema() bool {</code></span>
+<span class="codeline" id="line-83"><code>	select {</code></span>
+<span class="codeline" id="line-84"><code>	case conf.ch &lt;- struct{}{}:</code></span>
+<span class="codeline" id="line-85"><code>		return true</code></span>
+<span class="codeline" id="line-86"><code>	default:</code></span>
+<span class="codeline" id="line-87"><code>		return false</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>func (conf *nsswitchConfig) releaseSema() {</code></span>
+<span class="codeline" id="line-92"><code>	&lt;-conf.ch</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>// nssConf represents the state of the machine's /etc/nsswitch.conf file.</code></span>
+<span class="codeline" id="line-96"><code>type nssConf struct {</code></span>
+<span class="codeline" id="line-97"><code>	mtime   time.Time              // time of nsswitch.conf modification</code></span>
+<span class="codeline" id="line-98"><code>	err     error                  // any error encountered opening or parsing the file</code></span>
+<span class="codeline" id="line-99"><code>	sources map[string][]nssSource // keyed by database (e.g. "hosts")</code></span>
+<span class="codeline" id="line-100"><code>}</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>type nssSource struct {</code></span>
+<span class="codeline" id="line-103"><code>	source   string // e.g. "compat", "files", "mdns4_minimal"</code></span>
+<span class="codeline" id="line-104"><code>	criteria []nssCriterion</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// standardCriteria reports all specified criteria have the default</code></span>
+<span class="codeline" id="line-108"><code>// status actions.</code></span>
+<span class="codeline" id="line-109"><code>func (s nssSource) standardCriteria() bool {</code></span>
+<span class="codeline" id="line-110"><code>	for i, crit := range s.criteria {</code></span>
+<span class="codeline" id="line-111"><code>		if !crit.standardStatusAction(i == len(s.criteria)-1) {</code></span>
+<span class="codeline" id="line-112"><code>			return false</code></span>
+<span class="codeline" id="line-113"><code>		}</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code>	return true</code></span>
+<span class="codeline" id="line-116"><code>}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>// nssCriterion is the parsed structure of one of the criteria in brackets</code></span>
+<span class="codeline" id="line-119"><code>// after an NSS source name.</code></span>
+<span class="codeline" id="line-120"><code>type nssCriterion struct {</code></span>
+<span class="codeline" id="line-121"><code>	negate bool   // if "!" was present</code></span>
+<span class="codeline" id="line-122"><code>	status string // e.g. "success", "unavail" (lowercase)</code></span>
+<span class="codeline" id="line-123"><code>	action string // e.g. "return", "continue" (lowercase)</code></span>
+<span class="codeline" id="line-124"><code>}</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>// standardStatusAction reports whether c is equivalent to not</code></span>
+<span class="codeline" id="line-127"><code>// specifying the criterion at all. last is whether this criteria is the</code></span>
+<span class="codeline" id="line-128"><code>// last in the list.</code></span>
+<span class="codeline" id="line-129"><code>func (c nssCriterion) standardStatusAction(last bool) bool {</code></span>
+<span class="codeline" id="line-130"><code>	if c.negate {</code></span>
+<span class="codeline" id="line-131"><code>		return false</code></span>
+<span class="codeline" id="line-132"><code>	}</code></span>
+<span class="codeline" id="line-133"><code>	var def string</code></span>
+<span class="codeline" id="line-134"><code>	switch c.status {</code></span>
+<span class="codeline" id="line-135"><code>	case "success":</code></span>
+<span class="codeline" id="line-136"><code>		def = "return"</code></span>
+<span class="codeline" id="line-137"><code>	case "notfound", "unavail", "tryagain":</code></span>
+<span class="codeline" id="line-138"><code>		def = "continue"</code></span>
+<span class="codeline" id="line-139"><code>	default:</code></span>
+<span class="codeline" id="line-140"><code>		// Unknown status</code></span>
+<span class="codeline" id="line-141"><code>		return false</code></span>
+<span class="codeline" id="line-142"><code>	}</code></span>
+<span class="codeline" id="line-143"><code>	if last &amp;&amp; c.action == "return" {</code></span>
+<span class="codeline" id="line-144"><code>		return true</code></span>
+<span class="codeline" id="line-145"><code>	}</code></span>
+<span class="codeline" id="line-146"><code>	return c.action == def</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>func parseNSSConfFile(file string) *nssConf {</code></span>
+<span class="codeline" id="line-150"><code>	f, err := open(file)</code></span>
+<span class="codeline" id="line-151"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-152"><code>		return &amp;nssConf{err: err}</code></span>
+<span class="codeline" id="line-153"><code>	}</code></span>
+<span class="codeline" id="line-154"><code>	defer f.close()</code></span>
+<span class="codeline" id="line-155"><code>	mtime, _, err := f.stat()</code></span>
+<span class="codeline" id="line-156"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-157"><code>		return &amp;nssConf{err: err}</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>	conf := parseNSSConf(f)</code></span>
+<span class="codeline" id="line-161"><code>	conf.mtime = mtime</code></span>
+<span class="codeline" id="line-162"><code>	return conf</code></span>
+<span class="codeline" id="line-163"><code>}</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>func parseNSSConf(f *file) *nssConf {</code></span>
+<span class="codeline" id="line-166"><code>	conf := new(nssConf)</code></span>
+<span class="codeline" id="line-167"><code>	for line, ok := f.readLine(); ok; line, ok = f.readLine() {</code></span>
+<span class="codeline" id="line-168"><code>		line = trimSpace(removeComment(line))</code></span>
+<span class="codeline" id="line-169"><code>		if len(line) == 0 {</code></span>
+<span class="codeline" id="line-170"><code>			continue</code></span>
+<span class="codeline" id="line-171"><code>		}</code></span>
+<span class="codeline" id="line-172"><code>		colon := bytealg.IndexByteString(line, ':')</code></span>
+<span class="codeline" id="line-173"><code>		if colon == -1 {</code></span>
+<span class="codeline" id="line-174"><code>			conf.err = errors.New("no colon on line")</code></span>
+<span class="codeline" id="line-175"><code>			return conf</code></span>
+<span class="codeline" id="line-176"><code>		}</code></span>
+<span class="codeline" id="line-177"><code>		db := trimSpace(line[:colon])</code></span>
+<span class="codeline" id="line-178"><code>		srcs := line[colon+1:]</code></span>
+<span class="codeline" id="line-179"><code>		for {</code></span>
+<span class="codeline" id="line-180"><code>			srcs = trimSpace(srcs)</code></span>
+<span class="codeline" id="line-181"><code>			if len(srcs) == 0 {</code></span>
+<span class="codeline" id="line-182"><code>				break</code></span>
+<span class="codeline" id="line-183"><code>			}</code></span>
+<span class="codeline" id="line-184"><code>			sp := bytealg.IndexByteString(srcs, ' ')</code></span>
+<span class="codeline" id="line-185"><code>			var src string</code></span>
+<span class="codeline" id="line-186"><code>			if sp == -1 {</code></span>
+<span class="codeline" id="line-187"><code>				src = srcs</code></span>
+<span class="codeline" id="line-188"><code>				srcs = "" // done</code></span>
+<span class="codeline" id="line-189"><code>			} else {</code></span>
+<span class="codeline" id="line-190"><code>				src = srcs[:sp]</code></span>
+<span class="codeline" id="line-191"><code>				srcs = trimSpace(srcs[sp+1:])</code></span>
+<span class="codeline" id="line-192"><code>			}</code></span>
+<span class="codeline" id="line-193"><code>			var criteria []nssCriterion</code></span>
+<span class="codeline" id="line-194"><code>			// See if there's a criteria block in brackets.</code></span>
+<span class="codeline" id="line-195"><code>			if len(srcs) &gt; 0 &amp;&amp; srcs[0] == '[' {</code></span>
+<span class="codeline" id="line-196"><code>				bclose := bytealg.IndexByteString(srcs, ']')</code></span>
+<span class="codeline" id="line-197"><code>				if bclose == -1 {</code></span>
+<span class="codeline" id="line-198"><code>					conf.err = errors.New("unclosed criterion bracket")</code></span>
+<span class="codeline" id="line-199"><code>					return conf</code></span>
+<span class="codeline" id="line-200"><code>				}</code></span>
+<span class="codeline" id="line-201"><code>				var err error</code></span>
+<span class="codeline" id="line-202"><code>				criteria, err = parseCriteria(srcs[1:bclose])</code></span>
+<span class="codeline" id="line-203"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-204"><code>					conf.err = errors.New("invalid criteria: " + srcs[1:bclose])</code></span>
+<span class="codeline" id="line-205"><code>					return conf</code></span>
+<span class="codeline" id="line-206"><code>				}</code></span>
+<span class="codeline" id="line-207"><code>				srcs = srcs[bclose+1:]</code></span>
+<span class="codeline" id="line-208"><code>			}</code></span>
+<span class="codeline" id="line-209"><code>			if conf.sources == nil {</code></span>
+<span class="codeline" id="line-210"><code>				conf.sources = make(map[string][]nssSource)</code></span>
+<span class="codeline" id="line-211"><code>			}</code></span>
+<span class="codeline" id="line-212"><code>			conf.sources[db] = append(conf.sources[db], nssSource{</code></span>
+<span class="codeline" id="line-213"><code>				source:   src,</code></span>
+<span class="codeline" id="line-214"><code>				criteria: criteria,</code></span>
+<span class="codeline" id="line-215"><code>			})</code></span>
+<span class="codeline" id="line-216"><code>		}</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code>	return conf</code></span>
+<span class="codeline" id="line-219"><code>}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>// parses "foo=bar !foo=bar"</code></span>
+<span class="codeline" id="line-222"><code>func parseCriteria(x string) (c []nssCriterion, err error) {</code></span>
+<span class="codeline" id="line-223"><code>	err = foreachField(x, func(f string) error {</code></span>
+<span class="codeline" id="line-224"><code>		not := false</code></span>
+<span class="codeline" id="line-225"><code>		if len(f) &gt; 0 &amp;&amp; f[0] == '!' {</code></span>
+<span class="codeline" id="line-226"><code>			not = true</code></span>
+<span class="codeline" id="line-227"><code>			f = f[1:]</code></span>
+<span class="codeline" id="line-228"><code>		}</code></span>
+<span class="codeline" id="line-229"><code>		if len(f) &lt; 3 {</code></span>
+<span class="codeline" id="line-230"><code>			return errors.New("criterion too short")</code></span>
+<span class="codeline" id="line-231"><code>		}</code></span>
+<span class="codeline" id="line-232"><code>		eq := bytealg.IndexByteString(f, '=')</code></span>
+<span class="codeline" id="line-233"><code>		if eq == -1 {</code></span>
+<span class="codeline" id="line-234"><code>			return errors.New("criterion lacks equal sign")</code></span>
+<span class="codeline" id="line-235"><code>		}</code></span>
+<span class="codeline" id="line-236"><code>		if hasUpperCase(f) {</code></span>
+<span class="codeline" id="line-237"><code>			lower := []byte(f)</code></span>
+<span class="codeline" id="line-238"><code>			lowerASCIIBytes(lower)</code></span>
+<span class="codeline" id="line-239"><code>			f = string(lower)</code></span>
+<span class="codeline" id="line-240"><code>		}</code></span>
+<span class="codeline" id="line-241"><code>		c = append(c, nssCriterion{</code></span>
+<span class="codeline" id="line-242"><code>			negate: not,</code></span>
+<span class="codeline" id="line-243"><code>			status: f[:eq],</code></span>
+<span class="codeline" id="line-244"><code>			action: f[eq+1:],</code></span>
+<span class="codeline" id="line-245"><code>		})</code></span>
+<span class="codeline" id="line-246"><code>		return nil</code></span>
+<span class="codeline" id="line-247"><code>	})</code></span>
+<span class="codeline" id="line-248"><code>	return</code></span>
+<span class="codeline" id="line-249"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

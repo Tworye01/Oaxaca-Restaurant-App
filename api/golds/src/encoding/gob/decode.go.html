@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: decode.go in package encoding/gob</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	decode.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/encoding/gob.html">encoding/gob</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:generate go run decgen.go -output dec_helpers.go</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package gob</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"encoding"</code></span>
+<span class="codeline" id="line-11"><code>	"errors"</code></span>
+<span class="codeline" id="line-12"><code>	"internal/saferio"</code></span>
+<span class="codeline" id="line-13"><code>	"io"</code></span>
+<span class="codeline" id="line-14"><code>	"math"</code></span>
+<span class="codeline" id="line-15"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-16"><code>	"reflect"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>var (</code></span>
+<span class="codeline" id="line-20"><code>	errBadUint = errors.New("gob: encoded unsigned integer out of range")</code></span>
+<span class="codeline" id="line-21"><code>	errBadType = errors.New("gob: unknown type id or corrupted data")</code></span>
+<span class="codeline" id="line-22"><code>	errRange   = errors.New("gob: bad data: field numbers out of bounds")</code></span>
+<span class="codeline" id="line-23"><code>)</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>type decHelper func(state *decoderState, v reflect.Value, length int, ovfl error) bool</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>// decoderState is the execution state of an instance of the decoder. A new state</code></span>
+<span class="codeline" id="line-28"><code>// is created for nested objects.</code></span>
+<span class="codeline" id="line-29"><code>type decoderState struct {</code></span>
+<span class="codeline" id="line-30"><code>	dec *Decoder</code></span>
+<span class="codeline" id="line-31"><code>	// The buffer is stored with an extra indirection because it may be replaced</code></span>
+<span class="codeline" id="line-32"><code>	// if we load a type during decode (when reading an interface value).</code></span>
+<span class="codeline" id="line-33"><code>	b        *decBuffer</code></span>
+<span class="codeline" id="line-34"><code>	fieldnum int           // the last field number read.</code></span>
+<span class="codeline" id="line-35"><code>	next     *decoderState // for free list</code></span>
+<span class="codeline" id="line-36"><code>}</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>// decBuffer is an extremely simple, fast implementation of a read-only byte buffer.</code></span>
+<span class="codeline" id="line-39"><code>// It is initialized by calling Size and then copying the data into the slice returned by Bytes().</code></span>
+<span class="codeline" id="line-40"><code>type decBuffer struct {</code></span>
+<span class="codeline" id="line-41"><code>	data   []byte</code></span>
+<span class="codeline" id="line-42"><code>	offset int // Read offset.</code></span>
+<span class="codeline" id="line-43"><code>}</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>func (d *decBuffer) Read(p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-46"><code>	n := copy(p, d.data[d.offset:])</code></span>
+<span class="codeline" id="line-47"><code>	if n == 0 &amp;&amp; len(p) != 0 {</code></span>
+<span class="codeline" id="line-48"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code>	d.offset += n</code></span>
+<span class="codeline" id="line-51"><code>	return n, nil</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>func (d *decBuffer) Drop(n int) {</code></span>
+<span class="codeline" id="line-55"><code>	if n &gt; d.Len() {</code></span>
+<span class="codeline" id="line-56"><code>		panic("drop")</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	d.offset += n</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>func (d *decBuffer) ReadByte() (byte, error) {</code></span>
+<span class="codeline" id="line-62"><code>	if d.offset &gt;= len(d.data) {</code></span>
+<span class="codeline" id="line-63"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code>	c := d.data[d.offset]</code></span>
+<span class="codeline" id="line-66"><code>	d.offset++</code></span>
+<span class="codeline" id="line-67"><code>	return c, nil</code></span>
+<span class="codeline" id="line-68"><code>}</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>func (d *decBuffer) Len() int {</code></span>
+<span class="codeline" id="line-71"><code>	return len(d.data) - d.offset</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>func (d *decBuffer) Bytes() []byte {</code></span>
+<span class="codeline" id="line-75"><code>	return d.data[d.offset:]</code></span>
+<span class="codeline" id="line-76"><code>}</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>// SetBytes sets the buffer to the bytes, discarding any existing data.</code></span>
+<span class="codeline" id="line-79"><code>func (d *decBuffer) SetBytes(data []byte) {</code></span>
+<span class="codeline" id="line-80"><code>	d.data = data</code></span>
+<span class="codeline" id="line-81"><code>	d.offset = 0</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>func (d *decBuffer) Reset() {</code></span>
+<span class="codeline" id="line-85"><code>	d.data = d.data[0:0]</code></span>
+<span class="codeline" id="line-86"><code>	d.offset = 0</code></span>
+<span class="codeline" id="line-87"><code>}</code></span>
+<span class="codeline" id="line-88"><code></code></span>
+<span class="codeline" id="line-89"><code>// We pass the bytes.Buffer separately for easier testing of the infrastructure</code></span>
+<span class="codeline" id="line-90"><code>// without requiring a full Decoder.</code></span>
+<span class="codeline" id="line-91"><code>func (dec *Decoder) newDecoderState(buf *decBuffer) *decoderState {</code></span>
+<span class="codeline" id="line-92"><code>	d := dec.freeList</code></span>
+<span class="codeline" id="line-93"><code>	if d == nil {</code></span>
+<span class="codeline" id="line-94"><code>		d = new(decoderState)</code></span>
+<span class="codeline" id="line-95"><code>		d.dec = dec</code></span>
+<span class="codeline" id="line-96"><code>	} else {</code></span>
+<span class="codeline" id="line-97"><code>		dec.freeList = d.next</code></span>
+<span class="codeline" id="line-98"><code>	}</code></span>
+<span class="codeline" id="line-99"><code>	d.b = buf</code></span>
+<span class="codeline" id="line-100"><code>	return d</code></span>
+<span class="codeline" id="line-101"><code>}</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>func (dec *Decoder) freeDecoderState(d *decoderState) {</code></span>
+<span class="codeline" id="line-104"><code>	d.next = dec.freeList</code></span>
+<span class="codeline" id="line-105"><code>	dec.freeList = d</code></span>
+<span class="codeline" id="line-106"><code>}</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>func overflow(name string) error {</code></span>
+<span class="codeline" id="line-109"><code>	return errors.New(`value for "` + name + `" out of range`)</code></span>
+<span class="codeline" id="line-110"><code>}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>// decodeUintReader reads an encoded unsigned integer from an io.Reader.</code></span>
+<span class="codeline" id="line-113"><code>// Used only by the Decoder to read the message length.</code></span>
+<span class="codeline" id="line-114"><code>func decodeUintReader(r io.Reader, buf []byte) (x uint64, width int, err error) {</code></span>
+<span class="codeline" id="line-115"><code>	width = 1</code></span>
+<span class="codeline" id="line-116"><code>	n, err := io.ReadFull(r, buf[0:width])</code></span>
+<span class="codeline" id="line-117"><code>	if n == 0 {</code></span>
+<span class="codeline" id="line-118"><code>		return</code></span>
+<span class="codeline" id="line-119"><code>	}</code></span>
+<span class="codeline" id="line-120"><code>	b := buf[0]</code></span>
+<span class="codeline" id="line-121"><code>	if b &lt;= 0x7f {</code></span>
+<span class="codeline" id="line-122"><code>		return uint64(b), width, nil</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	n = -int(int8(b))</code></span>
+<span class="codeline" id="line-125"><code>	if n &gt; uint64Size {</code></span>
+<span class="codeline" id="line-126"><code>		err = errBadUint</code></span>
+<span class="codeline" id="line-127"><code>		return</code></span>
+<span class="codeline" id="line-128"><code>	}</code></span>
+<span class="codeline" id="line-129"><code>	width, err = io.ReadFull(r, buf[0:n])</code></span>
+<span class="codeline" id="line-130"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-131"><code>		if err == io.EOF {</code></span>
+<span class="codeline" id="line-132"><code>			err = io.ErrUnexpectedEOF</code></span>
+<span class="codeline" id="line-133"><code>		}</code></span>
+<span class="codeline" id="line-134"><code>		return</code></span>
+<span class="codeline" id="line-135"><code>	}</code></span>
+<span class="codeline" id="line-136"><code>	// Could check that the high byte is zero but it's not worth it.</code></span>
+<span class="codeline" id="line-137"><code>	for _, b := range buf[0:width] {</code></span>
+<span class="codeline" id="line-138"><code>		x = x&lt;&lt;8 | uint64(b)</code></span>
+<span class="codeline" id="line-139"><code>	}</code></span>
+<span class="codeline" id="line-140"><code>	width++ // +1 for length byte</code></span>
+<span class="codeline" id="line-141"><code>	return</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>// decodeUint reads an encoded unsigned integer from state.r.</code></span>
+<span class="codeline" id="line-145"><code>// Does not check for overflow.</code></span>
+<span class="codeline" id="line-146"><code>func (state *decoderState) decodeUint() (x uint64) {</code></span>
+<span class="codeline" id="line-147"><code>	b, err := state.b.ReadByte()</code></span>
+<span class="codeline" id="line-148"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-149"><code>		error_(err)</code></span>
+<span class="codeline" id="line-150"><code>	}</code></span>
+<span class="codeline" id="line-151"><code>	if b &lt;= 0x7f {</code></span>
+<span class="codeline" id="line-152"><code>		return uint64(b)</code></span>
+<span class="codeline" id="line-153"><code>	}</code></span>
+<span class="codeline" id="line-154"><code>	n := -int(int8(b))</code></span>
+<span class="codeline" id="line-155"><code>	if n &gt; uint64Size {</code></span>
+<span class="codeline" id="line-156"><code>		error_(errBadUint)</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code>	buf := state.b.Bytes()</code></span>
+<span class="codeline" id="line-159"><code>	if len(buf) &lt; n {</code></span>
+<span class="codeline" id="line-160"><code>		errorf("invalid uint data length %d: exceeds input size %d", n, len(buf))</code></span>
+<span class="codeline" id="line-161"><code>	}</code></span>
+<span class="codeline" id="line-162"><code>	// Don't need to check error; it's safe to loop regardless.</code></span>
+<span class="codeline" id="line-163"><code>	// Could check that the high byte is zero but it's not worth it.</code></span>
+<span class="codeline" id="line-164"><code>	for _, b := range buf[0:n] {</code></span>
+<span class="codeline" id="line-165"><code>		x = x&lt;&lt;8 | uint64(b)</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-168"><code>	return x</code></span>
+<span class="codeline" id="line-169"><code>}</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>// decodeInt reads an encoded signed integer from state.r.</code></span>
+<span class="codeline" id="line-172"><code>// Does not check for overflow.</code></span>
+<span class="codeline" id="line-173"><code>func (state *decoderState) decodeInt() int64 {</code></span>
+<span class="codeline" id="line-174"><code>	x := state.decodeUint()</code></span>
+<span class="codeline" id="line-175"><code>	if x&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-176"><code>		return ^int64(x &gt;&gt; 1)</code></span>
+<span class="codeline" id="line-177"><code>	}</code></span>
+<span class="codeline" id="line-178"><code>	return int64(x &gt;&gt; 1)</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>// getLength decodes the next uint and makes sure it is a possible</code></span>
+<span class="codeline" id="line-182"><code>// size for a data item that follows, which means it must fit in a</code></span>
+<span class="codeline" id="line-183"><code>// non-negative int and fit in the buffer.</code></span>
+<span class="codeline" id="line-184"><code>func (state *decoderState) getLength() (int, bool) {</code></span>
+<span class="codeline" id="line-185"><code>	n := int(state.decodeUint())</code></span>
+<span class="codeline" id="line-186"><code>	if n &lt; 0 || state.b.Len() &lt; n || tooBig &lt;= n {</code></span>
+<span class="codeline" id="line-187"><code>		return 0, false</code></span>
+<span class="codeline" id="line-188"><code>	}</code></span>
+<span class="codeline" id="line-189"><code>	return n, true</code></span>
+<span class="codeline" id="line-190"><code>}</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>// decOp is the signature of a decoding operator for a given type.</code></span>
+<span class="codeline" id="line-193"><code>type decOp func(i *decInstr, state *decoderState, v reflect.Value)</code></span>
+<span class="codeline" id="line-194"><code></code></span>
+<span class="codeline" id="line-195"><code>// The 'instructions' of the decoding machine</code></span>
+<span class="codeline" id="line-196"><code>type decInstr struct {</code></span>
+<span class="codeline" id="line-197"><code>	op    decOp</code></span>
+<span class="codeline" id="line-198"><code>	field int   // field number of the wire type</code></span>
+<span class="codeline" id="line-199"><code>	index []int // field access indices for destination type</code></span>
+<span class="codeline" id="line-200"><code>	ovfl  error // error message for overflow/underflow (for arrays, of the elements)</code></span>
+<span class="codeline" id="line-201"><code>}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>// ignoreUint discards a uint value with no destination.</code></span>
+<span class="codeline" id="line-204"><code>func ignoreUint(i *decInstr, state *decoderState, v reflect.Value) {</code></span>
+<span class="codeline" id="line-205"><code>	state.decodeUint()</code></span>
+<span class="codeline" id="line-206"><code>}</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>// ignoreTwoUints discards a uint value with no destination. It's used to skip</code></span>
+<span class="codeline" id="line-209"><code>// complex values.</code></span>
+<span class="codeline" id="line-210"><code>func ignoreTwoUints(i *decInstr, state *decoderState, v reflect.Value) {</code></span>
+<span class="codeline" id="line-211"><code>	state.decodeUint()</code></span>
+<span class="codeline" id="line-212"><code>	state.decodeUint()</code></span>
+<span class="codeline" id="line-213"><code>}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>// Since the encoder writes no zeros, if we arrive at a decoder we have</code></span>
+<span class="codeline" id="line-216"><code>// a value to extract and store. The field number has already been read</code></span>
+<span class="codeline" id="line-217"><code>// (it's how we knew to call this decoder).</code></span>
+<span class="codeline" id="line-218"><code>// Each decoder is responsible for handling any indirections associated</code></span>
+<span class="codeline" id="line-219"><code>// with the data structure. If any pointer so reached is nil, allocation must</code></span>
+<span class="codeline" id="line-220"><code>// be done.</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>// decAlloc takes a value and returns a settable value that can</code></span>
+<span class="codeline" id="line-223"><code>// be assigned to. If the value is a pointer, decAlloc guarantees it points to storage.</code></span>
+<span class="codeline" id="line-224"><code>// The callers to the individual decoders are expected to have used decAlloc.</code></span>
+<span class="codeline" id="line-225"><code>// The individual decoders don't need it.</code></span>
+<span class="codeline" id="line-226"><code>func decAlloc(v reflect.Value) reflect.Value {</code></span>
+<span class="codeline" id="line-227"><code>	for v.Kind() == reflect.Pointer {</code></span>
+<span class="codeline" id="line-228"><code>		if v.IsNil() {</code></span>
+<span class="codeline" id="line-229"><code>			v.Set(reflect.New(v.Type().Elem()))</code></span>
+<span class="codeline" id="line-230"><code>		}</code></span>
+<span class="codeline" id="line-231"><code>		v = v.Elem()</code></span>
+<span class="codeline" id="line-232"><code>	}</code></span>
+<span class="codeline" id="line-233"><code>	return v</code></span>
+<span class="codeline" id="line-234"><code>}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>// decBool decodes a uint and stores it as a boolean in value.</code></span>
+<span class="codeline" id="line-237"><code>func decBool(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-238"><code>	value.SetBool(state.decodeUint() != 0)</code></span>
+<span class="codeline" id="line-239"><code>}</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>// decInt8 decodes an integer and stores it as an int8 in value.</code></span>
+<span class="codeline" id="line-242"><code>func decInt8(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-243"><code>	v := state.decodeInt()</code></span>
+<span class="codeline" id="line-244"><code>	if v &lt; math.MinInt8 || math.MaxInt8 &lt; v {</code></span>
+<span class="codeline" id="line-245"><code>		error_(i.ovfl)</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code>	value.SetInt(v)</code></span>
+<span class="codeline" id="line-248"><code>}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>// decUint8 decodes an unsigned integer and stores it as a uint8 in value.</code></span>
+<span class="codeline" id="line-251"><code>func decUint8(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-252"><code>	v := state.decodeUint()</code></span>
+<span class="codeline" id="line-253"><code>	if math.MaxUint8 &lt; v {</code></span>
+<span class="codeline" id="line-254"><code>		error_(i.ovfl)</code></span>
+<span class="codeline" id="line-255"><code>	}</code></span>
+<span class="codeline" id="line-256"><code>	value.SetUint(v)</code></span>
+<span class="codeline" id="line-257"><code>}</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>// decInt16 decodes an integer and stores it as an int16 in value.</code></span>
+<span class="codeline" id="line-260"><code>func decInt16(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-261"><code>	v := state.decodeInt()</code></span>
+<span class="codeline" id="line-262"><code>	if v &lt; math.MinInt16 || math.MaxInt16 &lt; v {</code></span>
+<span class="codeline" id="line-263"><code>		error_(i.ovfl)</code></span>
+<span class="codeline" id="line-264"><code>	}</code></span>
+<span class="codeline" id="line-265"><code>	value.SetInt(v)</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// decUint16 decodes an unsigned integer and stores it as a uint16 in value.</code></span>
+<span class="codeline" id="line-269"><code>func decUint16(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-270"><code>	v := state.decodeUint()</code></span>
+<span class="codeline" id="line-271"><code>	if math.MaxUint16 &lt; v {</code></span>
+<span class="codeline" id="line-272"><code>		error_(i.ovfl)</code></span>
+<span class="codeline" id="line-273"><code>	}</code></span>
+<span class="codeline" id="line-274"><code>	value.SetUint(v)</code></span>
+<span class="codeline" id="line-275"><code>}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>// decInt32 decodes an integer and stores it as an int32 in value.</code></span>
+<span class="codeline" id="line-278"><code>func decInt32(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-279"><code>	v := state.decodeInt()</code></span>
+<span class="codeline" id="line-280"><code>	if v &lt; math.MinInt32 || math.MaxInt32 &lt; v {</code></span>
+<span class="codeline" id="line-281"><code>		error_(i.ovfl)</code></span>
+<span class="codeline" id="line-282"><code>	}</code></span>
+<span class="codeline" id="line-283"><code>	value.SetInt(v)</code></span>
+<span class="codeline" id="line-284"><code>}</code></span>
+<span class="codeline" id="line-285"><code></code></span>
+<span class="codeline" id="line-286"><code>// decUint32 decodes an unsigned integer and stores it as a uint32 in value.</code></span>
+<span class="codeline" id="line-287"><code>func decUint32(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-288"><code>	v := state.decodeUint()</code></span>
+<span class="codeline" id="line-289"><code>	if math.MaxUint32 &lt; v {</code></span>
+<span class="codeline" id="line-290"><code>		error_(i.ovfl)</code></span>
+<span class="codeline" id="line-291"><code>	}</code></span>
+<span class="codeline" id="line-292"><code>	value.SetUint(v)</code></span>
+<span class="codeline" id="line-293"><code>}</code></span>
+<span class="codeline" id="line-294"><code></code></span>
+<span class="codeline" id="line-295"><code>// decInt64 decodes an integer and stores it as an int64 in value.</code></span>
+<span class="codeline" id="line-296"><code>func decInt64(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-297"><code>	v := state.decodeInt()</code></span>
+<span class="codeline" id="line-298"><code>	value.SetInt(v)</code></span>
+<span class="codeline" id="line-299"><code>}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>// decUint64 decodes an unsigned integer and stores it as a uint64 in value.</code></span>
+<span class="codeline" id="line-302"><code>func decUint64(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-303"><code>	v := state.decodeUint()</code></span>
+<span class="codeline" id="line-304"><code>	value.SetUint(v)</code></span>
+<span class="codeline" id="line-305"><code>}</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>// Floating-point numbers are transmitted as uint64s holding the bits</code></span>
+<span class="codeline" id="line-308"><code>// of the underlying representation. They are sent byte-reversed, with</code></span>
+<span class="codeline" id="line-309"><code>// the exponent end coming out first, so integer floating point numbers</code></span>
+<span class="codeline" id="line-310"><code>// (for example) transmit more compactly. This routine does the</code></span>
+<span class="codeline" id="line-311"><code>// unswizzling.</code></span>
+<span class="codeline" id="line-312"><code>func float64FromBits(u uint64) float64 {</code></span>
+<span class="codeline" id="line-313"><code>	v := bits.ReverseBytes64(u)</code></span>
+<span class="codeline" id="line-314"><code>	return math.Float64frombits(v)</code></span>
+<span class="codeline" id="line-315"><code>}</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>// float32FromBits decodes an unsigned integer, treats it as a 32-bit floating-point</code></span>
+<span class="codeline" id="line-318"><code>// number, and returns it. It's a helper function for float32 and complex64.</code></span>
+<span class="codeline" id="line-319"><code>// It returns a float64 because that's what reflection needs, but its return</code></span>
+<span class="codeline" id="line-320"><code>// value is known to be accurately representable in a float32.</code></span>
+<span class="codeline" id="line-321"><code>func float32FromBits(u uint64, ovfl error) float64 {</code></span>
+<span class="codeline" id="line-322"><code>	v := float64FromBits(u)</code></span>
+<span class="codeline" id="line-323"><code>	av := v</code></span>
+<span class="codeline" id="line-324"><code>	if av &lt; 0 {</code></span>
+<span class="codeline" id="line-325"><code>		av = -av</code></span>
+<span class="codeline" id="line-326"><code>	}</code></span>
+<span class="codeline" id="line-327"><code>	// +Inf is OK in both 32- and 64-bit floats. Underflow is always OK.</code></span>
+<span class="codeline" id="line-328"><code>	if math.MaxFloat32 &lt; av &amp;&amp; av &lt;= math.MaxFloat64 {</code></span>
+<span class="codeline" id="line-329"><code>		error_(ovfl)</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	return v</code></span>
+<span class="codeline" id="line-332"><code>}</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>// decFloat32 decodes an unsigned integer, treats it as a 32-bit floating-point</code></span>
+<span class="codeline" id="line-335"><code>// number, and stores it in value.</code></span>
+<span class="codeline" id="line-336"><code>func decFloat32(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-337"><code>	value.SetFloat(float32FromBits(state.decodeUint(), i.ovfl))</code></span>
+<span class="codeline" id="line-338"><code>}</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>// decFloat64 decodes an unsigned integer, treats it as a 64-bit floating-point</code></span>
+<span class="codeline" id="line-341"><code>// number, and stores it in value.</code></span>
+<span class="codeline" id="line-342"><code>func decFloat64(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-343"><code>	value.SetFloat(float64FromBits(state.decodeUint()))</code></span>
+<span class="codeline" id="line-344"><code>}</code></span>
+<span class="codeline" id="line-345"><code></code></span>
+<span class="codeline" id="line-346"><code>// decComplex64 decodes a pair of unsigned integers, treats them as a</code></span>
+<span class="codeline" id="line-347"><code>// pair of floating point numbers, and stores them as a complex64 in value.</code></span>
+<span class="codeline" id="line-348"><code>// The real part comes first.</code></span>
+<span class="codeline" id="line-349"><code>func decComplex64(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-350"><code>	real := float32FromBits(state.decodeUint(), i.ovfl)</code></span>
+<span class="codeline" id="line-351"><code>	imag := float32FromBits(state.decodeUint(), i.ovfl)</code></span>
+<span class="codeline" id="line-352"><code>	value.SetComplex(complex(real, imag))</code></span>
+<span class="codeline" id="line-353"><code>}</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>// decComplex128 decodes a pair of unsigned integers, treats them as a</code></span>
+<span class="codeline" id="line-356"><code>// pair of floating point numbers, and stores them as a complex128 in value.</code></span>
+<span class="codeline" id="line-357"><code>// The real part comes first.</code></span>
+<span class="codeline" id="line-358"><code>func decComplex128(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-359"><code>	real := float64FromBits(state.decodeUint())</code></span>
+<span class="codeline" id="line-360"><code>	imag := float64FromBits(state.decodeUint())</code></span>
+<span class="codeline" id="line-361"><code>	value.SetComplex(complex(real, imag))</code></span>
+<span class="codeline" id="line-362"><code>}</code></span>
+<span class="codeline" id="line-363"><code></code></span>
+<span class="codeline" id="line-364"><code>// decUint8Slice decodes a byte slice and stores in value a slice header</code></span>
+<span class="codeline" id="line-365"><code>// describing the data.</code></span>
+<span class="codeline" id="line-366"><code>// uint8 slices are encoded as an unsigned count followed by the raw bytes.</code></span>
+<span class="codeline" id="line-367"><code>func decUint8Slice(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-368"><code>	n, ok := state.getLength()</code></span>
+<span class="codeline" id="line-369"><code>	if !ok {</code></span>
+<span class="codeline" id="line-370"><code>		errorf("bad %s slice length: %d", value.Type(), n)</code></span>
+<span class="codeline" id="line-371"><code>	}</code></span>
+<span class="codeline" id="line-372"><code>	if value.Cap() &lt; n {</code></span>
+<span class="codeline" id="line-373"><code>		safe := saferio.SliceCap[byte](uint64(n))</code></span>
+<span class="codeline" id="line-374"><code>		if safe &lt; 0 {</code></span>
+<span class="codeline" id="line-375"><code>			errorf("%s slice too big: %d elements", value.Type(), n)</code></span>
+<span class="codeline" id="line-376"><code>		}</code></span>
+<span class="codeline" id="line-377"><code>		value.Set(reflect.MakeSlice(value.Type(), safe, safe))</code></span>
+<span class="codeline" id="line-378"><code>		ln := safe</code></span>
+<span class="codeline" id="line-379"><code>		i := 0</code></span>
+<span class="codeline" id="line-380"><code>		for i &lt; n {</code></span>
+<span class="codeline" id="line-381"><code>			if i &gt;= ln {</code></span>
+<span class="codeline" id="line-382"><code>				// We didn't allocate the entire slice,</code></span>
+<span class="codeline" id="line-383"><code>				// due to using saferio.SliceCap.</code></span>
+<span class="codeline" id="line-384"><code>				// Grow the slice for one more element.</code></span>
+<span class="codeline" id="line-385"><code>				// The slice is full, so this should</code></span>
+<span class="codeline" id="line-386"><code>				// bump up the capacity.</code></span>
+<span class="codeline" id="line-387"><code>				value.Grow(1)</code></span>
+<span class="codeline" id="line-388"><code>			}</code></span>
+<span class="codeline" id="line-389"><code>			// Copy into s up to the capacity or n,</code></span>
+<span class="codeline" id="line-390"><code>			// whichever is less.</code></span>
+<span class="codeline" id="line-391"><code>			ln = value.Cap()</code></span>
+<span class="codeline" id="line-392"><code>			if ln &gt; n {</code></span>
+<span class="codeline" id="line-393"><code>				ln = n</code></span>
+<span class="codeline" id="line-394"><code>			}</code></span>
+<span class="codeline" id="line-395"><code>			value.SetLen(ln)</code></span>
+<span class="codeline" id="line-396"><code>			sub := value.Slice(i, ln)</code></span>
+<span class="codeline" id="line-397"><code>			if _, err := state.b.Read(sub.Bytes()); err != nil {</code></span>
+<span class="codeline" id="line-398"><code>				errorf("error decoding []byte at %d: %s", i, err)</code></span>
+<span class="codeline" id="line-399"><code>			}</code></span>
+<span class="codeline" id="line-400"><code>			i = ln</code></span>
+<span class="codeline" id="line-401"><code>		}</code></span>
+<span class="codeline" id="line-402"><code>	} else {</code></span>
+<span class="codeline" id="line-403"><code>		value.SetLen(n)</code></span>
+<span class="codeline" id="line-404"><code>		if _, err := state.b.Read(value.Bytes()); err != nil {</code></span>
+<span class="codeline" id="line-405"><code>			errorf("error decoding []byte: %s", err)</code></span>
+<span class="codeline" id="line-406"><code>		}</code></span>
+<span class="codeline" id="line-407"><code>	}</code></span>
+<span class="codeline" id="line-408"><code>}</code></span>
+<span class="codeline" id="line-409"><code></code></span>
+<span class="codeline" id="line-410"><code>// decString decodes byte array and stores in value a string header</code></span>
+<span class="codeline" id="line-411"><code>// describing the data.</code></span>
+<span class="codeline" id="line-412"><code>// Strings are encoded as an unsigned count followed by the raw bytes.</code></span>
+<span class="codeline" id="line-413"><code>func decString(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-414"><code>	n, ok := state.getLength()</code></span>
+<span class="codeline" id="line-415"><code>	if !ok {</code></span>
+<span class="codeline" id="line-416"><code>		errorf("bad %s slice length: %d", value.Type(), n)</code></span>
+<span class="codeline" id="line-417"><code>	}</code></span>
+<span class="codeline" id="line-418"><code>	// Read the data.</code></span>
+<span class="codeline" id="line-419"><code>	data := state.b.Bytes()</code></span>
+<span class="codeline" id="line-420"><code>	if len(data) &lt; n {</code></span>
+<span class="codeline" id="line-421"><code>		errorf("invalid string length %d: exceeds input size %d", n, len(data))</code></span>
+<span class="codeline" id="line-422"><code>	}</code></span>
+<span class="codeline" id="line-423"><code>	s := string(data[:n])</code></span>
+<span class="codeline" id="line-424"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-425"><code>	value.SetString(s)</code></span>
+<span class="codeline" id="line-426"><code>}</code></span>
+<span class="codeline" id="line-427"><code></code></span>
+<span class="codeline" id="line-428"><code>// ignoreUint8Array skips over the data for a byte slice value with no destination.</code></span>
+<span class="codeline" id="line-429"><code>func ignoreUint8Array(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-430"><code>	n, ok := state.getLength()</code></span>
+<span class="codeline" id="line-431"><code>	if !ok {</code></span>
+<span class="codeline" id="line-432"><code>		errorf("slice length too large")</code></span>
+<span class="codeline" id="line-433"><code>	}</code></span>
+<span class="codeline" id="line-434"><code>	bn := state.b.Len()</code></span>
+<span class="codeline" id="line-435"><code>	if bn &lt; n {</code></span>
+<span class="codeline" id="line-436"><code>		errorf("invalid slice length %d: exceeds input size %d", n, bn)</code></span>
+<span class="codeline" id="line-437"><code>	}</code></span>
+<span class="codeline" id="line-438"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-439"><code>}</code></span>
+<span class="codeline" id="line-440"><code></code></span>
+<span class="codeline" id="line-441"><code>// Execution engine</code></span>
+<span class="codeline" id="line-442"><code></code></span>
+<span class="codeline" id="line-443"><code>// The encoder engine is an array of instructions indexed by field number of the incoming</code></span>
+<span class="codeline" id="line-444"><code>// decoder. It is executed with random access according to field number.</code></span>
+<span class="codeline" id="line-445"><code>type decEngine struct {</code></span>
+<span class="codeline" id="line-446"><code>	instr    []decInstr</code></span>
+<span class="codeline" id="line-447"><code>	numInstr int // the number of active instructions</code></span>
+<span class="codeline" id="line-448"><code>}</code></span>
+<span class="codeline" id="line-449"><code></code></span>
+<span class="codeline" id="line-450"><code>// decodeSingle decodes a top-level value that is not a struct and stores it in value.</code></span>
+<span class="codeline" id="line-451"><code>// Such values are preceded by a zero, making them have the memory layout of a</code></span>
+<span class="codeline" id="line-452"><code>// struct field (although with an illegal field number).</code></span>
+<span class="codeline" id="line-453"><code>func (dec *Decoder) decodeSingle(engine *decEngine, value reflect.Value) {</code></span>
+<span class="codeline" id="line-454"><code>	state := dec.newDecoderState(&amp;dec.buf)</code></span>
+<span class="codeline" id="line-455"><code>	defer dec.freeDecoderState(state)</code></span>
+<span class="codeline" id="line-456"><code>	state.fieldnum = singletonField</code></span>
+<span class="codeline" id="line-457"><code>	if state.decodeUint() != 0 {</code></span>
+<span class="codeline" id="line-458"><code>		errorf("decode: corrupted data: non-zero delta for singleton")</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	instr := &amp;engine.instr[singletonField]</code></span>
+<span class="codeline" id="line-461"><code>	instr.op(instr, state, value)</code></span>
+<span class="codeline" id="line-462"><code>}</code></span>
+<span class="codeline" id="line-463"><code></code></span>
+<span class="codeline" id="line-464"><code>// decodeStruct decodes a top-level struct and stores it in value.</code></span>
+<span class="codeline" id="line-465"><code>// Indir is for the value, not the type. At the time of the call it may</code></span>
+<span class="codeline" id="line-466"><code>// differ from ut.indir, which was computed when the engine was built.</code></span>
+<span class="codeline" id="line-467"><code>// This state cannot arise for decodeSingle, which is called directly</code></span>
+<span class="codeline" id="line-468"><code>// from the user's value, not from the innards of an engine.</code></span>
+<span class="codeline" id="line-469"><code>func (dec *Decoder) decodeStruct(engine *decEngine, value reflect.Value) {</code></span>
+<span class="codeline" id="line-470"><code>	state := dec.newDecoderState(&amp;dec.buf)</code></span>
+<span class="codeline" id="line-471"><code>	defer dec.freeDecoderState(state)</code></span>
+<span class="codeline" id="line-472"><code>	state.fieldnum = -1</code></span>
+<span class="codeline" id="line-473"><code>	for state.b.Len() &gt; 0 {</code></span>
+<span class="codeline" id="line-474"><code>		delta := int(state.decodeUint())</code></span>
+<span class="codeline" id="line-475"><code>		if delta &lt; 0 {</code></span>
+<span class="codeline" id="line-476"><code>			errorf("decode: corrupted data: negative delta")</code></span>
+<span class="codeline" id="line-477"><code>		}</code></span>
+<span class="codeline" id="line-478"><code>		if delta == 0 { // struct terminator is zero delta fieldnum</code></span>
+<span class="codeline" id="line-479"><code>			break</code></span>
+<span class="codeline" id="line-480"><code>		}</code></span>
+<span class="codeline" id="line-481"><code>		if state.fieldnum &gt;= len(engine.instr)-delta { // subtract to compare without overflow</code></span>
+<span class="codeline" id="line-482"><code>			error_(errRange)</code></span>
+<span class="codeline" id="line-483"><code>		}</code></span>
+<span class="codeline" id="line-484"><code>		fieldnum := state.fieldnum + delta</code></span>
+<span class="codeline" id="line-485"><code>		instr := &amp;engine.instr[fieldnum]</code></span>
+<span class="codeline" id="line-486"><code>		var field reflect.Value</code></span>
+<span class="codeline" id="line-487"><code>		if instr.index != nil {</code></span>
+<span class="codeline" id="line-488"><code>			// Otherwise the field is unknown to us and instr.op is an ignore op.</code></span>
+<span class="codeline" id="line-489"><code>			field = value.FieldByIndex(instr.index)</code></span>
+<span class="codeline" id="line-490"><code>			if field.Kind() == reflect.Pointer {</code></span>
+<span class="codeline" id="line-491"><code>				field = decAlloc(field)</code></span>
+<span class="codeline" id="line-492"><code>			}</code></span>
+<span class="codeline" id="line-493"><code>		}</code></span>
+<span class="codeline" id="line-494"><code>		instr.op(instr, state, field)</code></span>
+<span class="codeline" id="line-495"><code>		state.fieldnum = fieldnum</code></span>
+<span class="codeline" id="line-496"><code>	}</code></span>
+<span class="codeline" id="line-497"><code>}</code></span>
+<span class="codeline" id="line-498"><code></code></span>
+<span class="codeline" id="line-499"><code>var noValue reflect.Value</code></span>
+<span class="codeline" id="line-500"><code></code></span>
+<span class="codeline" id="line-501"><code>// ignoreStruct discards the data for a struct with no destination.</code></span>
+<span class="codeline" id="line-502"><code>func (dec *Decoder) ignoreStruct(engine *decEngine) {</code></span>
+<span class="codeline" id="line-503"><code>	state := dec.newDecoderState(&amp;dec.buf)</code></span>
+<span class="codeline" id="line-504"><code>	defer dec.freeDecoderState(state)</code></span>
+<span class="codeline" id="line-505"><code>	state.fieldnum = -1</code></span>
+<span class="codeline" id="line-506"><code>	for state.b.Len() &gt; 0 {</code></span>
+<span class="codeline" id="line-507"><code>		delta := int(state.decodeUint())</code></span>
+<span class="codeline" id="line-508"><code>		if delta &lt; 0 {</code></span>
+<span class="codeline" id="line-509"><code>			errorf("ignore decode: corrupted data: negative delta")</code></span>
+<span class="codeline" id="line-510"><code>		}</code></span>
+<span class="codeline" id="line-511"><code>		if delta == 0 { // struct terminator is zero delta fieldnum</code></span>
+<span class="codeline" id="line-512"><code>			break</code></span>
+<span class="codeline" id="line-513"><code>		}</code></span>
+<span class="codeline" id="line-514"><code>		fieldnum := state.fieldnum + delta</code></span>
+<span class="codeline" id="line-515"><code>		if fieldnum &gt;= len(engine.instr) {</code></span>
+<span class="codeline" id="line-516"><code>			error_(errRange)</code></span>
+<span class="codeline" id="line-517"><code>		}</code></span>
+<span class="codeline" id="line-518"><code>		instr := &amp;engine.instr[fieldnum]</code></span>
+<span class="codeline" id="line-519"><code>		instr.op(instr, state, noValue)</code></span>
+<span class="codeline" id="line-520"><code>		state.fieldnum = fieldnum</code></span>
+<span class="codeline" id="line-521"><code>	}</code></span>
+<span class="codeline" id="line-522"><code>}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>// ignoreSingle discards the data for a top-level non-struct value with no</code></span>
+<span class="codeline" id="line-525"><code>// destination. It's used when calling Decode with a nil value.</code></span>
+<span class="codeline" id="line-526"><code>func (dec *Decoder) ignoreSingle(engine *decEngine) {</code></span>
+<span class="codeline" id="line-527"><code>	state := dec.newDecoderState(&amp;dec.buf)</code></span>
+<span class="codeline" id="line-528"><code>	defer dec.freeDecoderState(state)</code></span>
+<span class="codeline" id="line-529"><code>	state.fieldnum = singletonField</code></span>
+<span class="codeline" id="line-530"><code>	delta := int(state.decodeUint())</code></span>
+<span class="codeline" id="line-531"><code>	if delta != 0 {</code></span>
+<span class="codeline" id="line-532"><code>		errorf("decode: corrupted data: non-zero delta for singleton")</code></span>
+<span class="codeline" id="line-533"><code>	}</code></span>
+<span class="codeline" id="line-534"><code>	instr := &amp;engine.instr[singletonField]</code></span>
+<span class="codeline" id="line-535"><code>	instr.op(instr, state, noValue)</code></span>
+<span class="codeline" id="line-536"><code>}</code></span>
+<span class="codeline" id="line-537"><code></code></span>
+<span class="codeline" id="line-538"><code>// decodeArrayHelper does the work for decoding arrays and slices.</code></span>
+<span class="codeline" id="line-539"><code>func (dec *Decoder) decodeArrayHelper(state *decoderState, value reflect.Value, elemOp decOp, length int, ovfl error, helper decHelper) {</code></span>
+<span class="codeline" id="line-540"><code>	if helper != nil &amp;&amp; helper(state, value, length, ovfl) {</code></span>
+<span class="codeline" id="line-541"><code>		return</code></span>
+<span class="codeline" id="line-542"><code>	}</code></span>
+<span class="codeline" id="line-543"><code>	instr := &amp;decInstr{elemOp, 0, nil, ovfl}</code></span>
+<span class="codeline" id="line-544"><code>	isPtr := value.Type().Elem().Kind() == reflect.Pointer</code></span>
+<span class="codeline" id="line-545"><code>	ln := value.Len()</code></span>
+<span class="codeline" id="line-546"><code>	for i := 0; i &lt; length; i++ {</code></span>
+<span class="codeline" id="line-547"><code>		if state.b.Len() == 0 {</code></span>
+<span class="codeline" id="line-548"><code>			errorf("decoding array or slice: length exceeds input size (%d elements)", length)</code></span>
+<span class="codeline" id="line-549"><code>		}</code></span>
+<span class="codeline" id="line-550"><code>		if i &gt;= ln {</code></span>
+<span class="codeline" id="line-551"><code>			// This is a slice that we only partially allocated.</code></span>
+<span class="codeline" id="line-552"><code>			// Grow it up to length.</code></span>
+<span class="codeline" id="line-553"><code>			value.Grow(1)</code></span>
+<span class="codeline" id="line-554"><code>			cp := value.Cap()</code></span>
+<span class="codeline" id="line-555"><code>			if cp &gt; length {</code></span>
+<span class="codeline" id="line-556"><code>				cp = length</code></span>
+<span class="codeline" id="line-557"><code>			}</code></span>
+<span class="codeline" id="line-558"><code>			value.SetLen(cp)</code></span>
+<span class="codeline" id="line-559"><code>			ln = cp</code></span>
+<span class="codeline" id="line-560"><code>		}</code></span>
+<span class="codeline" id="line-561"><code>		v := value.Index(i)</code></span>
+<span class="codeline" id="line-562"><code>		if isPtr {</code></span>
+<span class="codeline" id="line-563"><code>			v = decAlloc(v)</code></span>
+<span class="codeline" id="line-564"><code>		}</code></span>
+<span class="codeline" id="line-565"><code>		elemOp(instr, state, v)</code></span>
+<span class="codeline" id="line-566"><code>	}</code></span>
+<span class="codeline" id="line-567"><code>}</code></span>
+<span class="codeline" id="line-568"><code></code></span>
+<span class="codeline" id="line-569"><code>// decodeArray decodes an array and stores it in value.</code></span>
+<span class="codeline" id="line-570"><code>// The length is an unsigned integer preceding the elements. Even though the length is redundant</code></span>
+<span class="codeline" id="line-571"><code>// (it's part of the type), it's a useful check and is included in the encoding.</code></span>
+<span class="codeline" id="line-572"><code>func (dec *Decoder) decodeArray(state *decoderState, value reflect.Value, elemOp decOp, length int, ovfl error, helper decHelper) {</code></span>
+<span class="codeline" id="line-573"><code>	if n := state.decodeUint(); n != uint64(length) {</code></span>
+<span class="codeline" id="line-574"><code>		errorf("length mismatch in decodeArray")</code></span>
+<span class="codeline" id="line-575"><code>	}</code></span>
+<span class="codeline" id="line-576"><code>	dec.decodeArrayHelper(state, value, elemOp, length, ovfl, helper)</code></span>
+<span class="codeline" id="line-577"><code>}</code></span>
+<span class="codeline" id="line-578"><code></code></span>
+<span class="codeline" id="line-579"><code>// decodeIntoValue is a helper for map decoding.</code></span>
+<span class="codeline" id="line-580"><code>func decodeIntoValue(state *decoderState, op decOp, isPtr bool, value reflect.Value, instr *decInstr) reflect.Value {</code></span>
+<span class="codeline" id="line-581"><code>	v := value</code></span>
+<span class="codeline" id="line-582"><code>	if isPtr {</code></span>
+<span class="codeline" id="line-583"><code>		v = decAlloc(value)</code></span>
+<span class="codeline" id="line-584"><code>	}</code></span>
+<span class="codeline" id="line-585"><code></code></span>
+<span class="codeline" id="line-586"><code>	op(instr, state, v)</code></span>
+<span class="codeline" id="line-587"><code>	return value</code></span>
+<span class="codeline" id="line-588"><code>}</code></span>
+<span class="codeline" id="line-589"><code></code></span>
+<span class="codeline" id="line-590"><code>// decodeMap decodes a map and stores it in value.</code></span>
+<span class="codeline" id="line-591"><code>// Maps are encoded as a length followed by key:value pairs.</code></span>
+<span class="codeline" id="line-592"><code>// Because the internals of maps are not visible to us, we must</code></span>
+<span class="codeline" id="line-593"><code>// use reflection rather than pointer magic.</code></span>
+<span class="codeline" id="line-594"><code>func (dec *Decoder) decodeMap(mtyp reflect.Type, state *decoderState, value reflect.Value, keyOp, elemOp decOp, ovfl error) {</code></span>
+<span class="codeline" id="line-595"><code>	n := int(state.decodeUint())</code></span>
+<span class="codeline" id="line-596"><code>	if value.IsNil() {</code></span>
+<span class="codeline" id="line-597"><code>		value.Set(reflect.MakeMapWithSize(mtyp, n))</code></span>
+<span class="codeline" id="line-598"><code>	}</code></span>
+<span class="codeline" id="line-599"><code>	keyIsPtr := mtyp.Key().Kind() == reflect.Pointer</code></span>
+<span class="codeline" id="line-600"><code>	elemIsPtr := mtyp.Elem().Kind() == reflect.Pointer</code></span>
+<span class="codeline" id="line-601"><code>	keyInstr := &amp;decInstr{keyOp, 0, nil, ovfl}</code></span>
+<span class="codeline" id="line-602"><code>	elemInstr := &amp;decInstr{elemOp, 0, nil, ovfl}</code></span>
+<span class="codeline" id="line-603"><code>	keyP := reflect.New(mtyp.Key())</code></span>
+<span class="codeline" id="line-604"><code>	elemP := reflect.New(mtyp.Elem())</code></span>
+<span class="codeline" id="line-605"><code>	for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-606"><code>		key := decodeIntoValue(state, keyOp, keyIsPtr, keyP.Elem(), keyInstr)</code></span>
+<span class="codeline" id="line-607"><code>		elem := decodeIntoValue(state, elemOp, elemIsPtr, elemP.Elem(), elemInstr)</code></span>
+<span class="codeline" id="line-608"><code>		value.SetMapIndex(key, elem)</code></span>
+<span class="codeline" id="line-609"><code>		keyP.Elem().SetZero()</code></span>
+<span class="codeline" id="line-610"><code>		elemP.Elem().SetZero()</code></span>
+<span class="codeline" id="line-611"><code>	}</code></span>
+<span class="codeline" id="line-612"><code>}</code></span>
+<span class="codeline" id="line-613"><code></code></span>
+<span class="codeline" id="line-614"><code>// ignoreArrayHelper does the work for discarding arrays and slices.</code></span>
+<span class="codeline" id="line-615"><code>func (dec *Decoder) ignoreArrayHelper(state *decoderState, elemOp decOp, length int) {</code></span>
+<span class="codeline" id="line-616"><code>	instr := &amp;decInstr{elemOp, 0, nil, errors.New("no error")}</code></span>
+<span class="codeline" id="line-617"><code>	for i := 0; i &lt; length; i++ {</code></span>
+<span class="codeline" id="line-618"><code>		if state.b.Len() == 0 {</code></span>
+<span class="codeline" id="line-619"><code>			errorf("decoding array or slice: length exceeds input size (%d elements)", length)</code></span>
+<span class="codeline" id="line-620"><code>		}</code></span>
+<span class="codeline" id="line-621"><code>		elemOp(instr, state, noValue)</code></span>
+<span class="codeline" id="line-622"><code>	}</code></span>
+<span class="codeline" id="line-623"><code>}</code></span>
+<span class="codeline" id="line-624"><code></code></span>
+<span class="codeline" id="line-625"><code>// ignoreArray discards the data for an array value with no destination.</code></span>
+<span class="codeline" id="line-626"><code>func (dec *Decoder) ignoreArray(state *decoderState, elemOp decOp, length int) {</code></span>
+<span class="codeline" id="line-627"><code>	if n := state.decodeUint(); n != uint64(length) {</code></span>
+<span class="codeline" id="line-628"><code>		errorf("length mismatch in ignoreArray")</code></span>
+<span class="codeline" id="line-629"><code>	}</code></span>
+<span class="codeline" id="line-630"><code>	dec.ignoreArrayHelper(state, elemOp, length)</code></span>
+<span class="codeline" id="line-631"><code>}</code></span>
+<span class="codeline" id="line-632"><code></code></span>
+<span class="codeline" id="line-633"><code>// ignoreMap discards the data for a map value with no destination.</code></span>
+<span class="codeline" id="line-634"><code>func (dec *Decoder) ignoreMap(state *decoderState, keyOp, elemOp decOp) {</code></span>
+<span class="codeline" id="line-635"><code>	n := int(state.decodeUint())</code></span>
+<span class="codeline" id="line-636"><code>	keyInstr := &amp;decInstr{keyOp, 0, nil, errors.New("no error")}</code></span>
+<span class="codeline" id="line-637"><code>	elemInstr := &amp;decInstr{elemOp, 0, nil, errors.New("no error")}</code></span>
+<span class="codeline" id="line-638"><code>	for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-639"><code>		keyOp(keyInstr, state, noValue)</code></span>
+<span class="codeline" id="line-640"><code>		elemOp(elemInstr, state, noValue)</code></span>
+<span class="codeline" id="line-641"><code>	}</code></span>
+<span class="codeline" id="line-642"><code>}</code></span>
+<span class="codeline" id="line-643"><code></code></span>
+<span class="codeline" id="line-644"><code>// decodeSlice decodes a slice and stores it in value.</code></span>
+<span class="codeline" id="line-645"><code>// Slices are encoded as an unsigned length followed by the elements.</code></span>
+<span class="codeline" id="line-646"><code>func (dec *Decoder) decodeSlice(state *decoderState, value reflect.Value, elemOp decOp, ovfl error, helper decHelper) {</code></span>
+<span class="codeline" id="line-647"><code>	u := state.decodeUint()</code></span>
+<span class="codeline" id="line-648"><code>	typ := value.Type()</code></span>
+<span class="codeline" id="line-649"><code>	size := uint64(typ.Elem().Size())</code></span>
+<span class="codeline" id="line-650"><code>	nBytes := u * size</code></span>
+<span class="codeline" id="line-651"><code>	n := int(u)</code></span>
+<span class="codeline" id="line-652"><code>	// Take care with overflow in this calculation.</code></span>
+<span class="codeline" id="line-653"><code>	if n &lt; 0 || uint64(n) != u || nBytes &gt; tooBig || (size &gt; 0 &amp;&amp; nBytes/size != u) {</code></span>
+<span class="codeline" id="line-654"><code>		// We don't check n against buffer length here because if it's a slice</code></span>
+<span class="codeline" id="line-655"><code>		// of interfaces, there will be buffer reloads.</code></span>
+<span class="codeline" id="line-656"><code>		errorf("%s slice too big: %d elements of %d bytes", typ.Elem(), u, size)</code></span>
+<span class="codeline" id="line-657"><code>	}</code></span>
+<span class="codeline" id="line-658"><code>	if value.Cap() &lt; n {</code></span>
+<span class="codeline" id="line-659"><code>		safe := saferio.SliceCapWithSize(size, uint64(n))</code></span>
+<span class="codeline" id="line-660"><code>		if safe &lt; 0 {</code></span>
+<span class="codeline" id="line-661"><code>			errorf("%s slice too big: %d elements of %d bytes", typ.Elem(), u, size)</code></span>
+<span class="codeline" id="line-662"><code>		}</code></span>
+<span class="codeline" id="line-663"><code>		value.Set(reflect.MakeSlice(typ, safe, safe))</code></span>
+<span class="codeline" id="line-664"><code>	} else {</code></span>
+<span class="codeline" id="line-665"><code>		value.SetLen(n)</code></span>
+<span class="codeline" id="line-666"><code>	}</code></span>
+<span class="codeline" id="line-667"><code>	dec.decodeArrayHelper(state, value, elemOp, n, ovfl, helper)</code></span>
+<span class="codeline" id="line-668"><code>}</code></span>
+<span class="codeline" id="line-669"><code></code></span>
+<span class="codeline" id="line-670"><code>// ignoreSlice skips over the data for a slice value with no destination.</code></span>
+<span class="codeline" id="line-671"><code>func (dec *Decoder) ignoreSlice(state *decoderState, elemOp decOp) {</code></span>
+<span class="codeline" id="line-672"><code>	dec.ignoreArrayHelper(state, elemOp, int(state.decodeUint()))</code></span>
+<span class="codeline" id="line-673"><code>}</code></span>
+<span class="codeline" id="line-674"><code></code></span>
+<span class="codeline" id="line-675"><code>// decodeInterface decodes an interface value and stores it in value.</code></span>
+<span class="codeline" id="line-676"><code>// Interfaces are encoded as the name of a concrete type followed by a value.</code></span>
+<span class="codeline" id="line-677"><code>// If the name is empty, the value is nil and no value is sent.</code></span>
+<span class="codeline" id="line-678"><code>func (dec *Decoder) decodeInterface(ityp reflect.Type, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-679"><code>	// Read the name of the concrete type.</code></span>
+<span class="codeline" id="line-680"><code>	nr := state.decodeUint()</code></span>
+<span class="codeline" id="line-681"><code>	if nr &gt; 1&lt;&lt;31 { // zero is permissible for anonymous types</code></span>
+<span class="codeline" id="line-682"><code>		errorf("invalid type name length %d", nr)</code></span>
+<span class="codeline" id="line-683"><code>	}</code></span>
+<span class="codeline" id="line-684"><code>	if nr &gt; uint64(state.b.Len()) {</code></span>
+<span class="codeline" id="line-685"><code>		errorf("invalid type name length %d: exceeds input size", nr)</code></span>
+<span class="codeline" id="line-686"><code>	}</code></span>
+<span class="codeline" id="line-687"><code>	n := int(nr)</code></span>
+<span class="codeline" id="line-688"><code>	name := state.b.Bytes()[:n]</code></span>
+<span class="codeline" id="line-689"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-690"><code>	// Allocate the destination interface value.</code></span>
+<span class="codeline" id="line-691"><code>	if len(name) == 0 {</code></span>
+<span class="codeline" id="line-692"><code>		// Copy the nil interface value to the target.</code></span>
+<span class="codeline" id="line-693"><code>		value.SetZero()</code></span>
+<span class="codeline" id="line-694"><code>		return</code></span>
+<span class="codeline" id="line-695"><code>	}</code></span>
+<span class="codeline" id="line-696"><code>	if len(name) &gt; 1024 {</code></span>
+<span class="codeline" id="line-697"><code>		errorf("name too long (%d bytes): %.20q...", len(name), name)</code></span>
+<span class="codeline" id="line-698"><code>	}</code></span>
+<span class="codeline" id="line-699"><code>	// The concrete type must be registered.</code></span>
+<span class="codeline" id="line-700"><code>	typi, ok := nameToConcreteType.Load(string(name))</code></span>
+<span class="codeline" id="line-701"><code>	if !ok {</code></span>
+<span class="codeline" id="line-702"><code>		errorf("name not registered for interface: %q", name)</code></span>
+<span class="codeline" id="line-703"><code>	}</code></span>
+<span class="codeline" id="line-704"><code>	typ := typi.(reflect.Type)</code></span>
+<span class="codeline" id="line-705"><code></code></span>
+<span class="codeline" id="line-706"><code>	// Read the type id of the concrete value.</code></span>
+<span class="codeline" id="line-707"><code>	concreteId := dec.decodeTypeSequence(true)</code></span>
+<span class="codeline" id="line-708"><code>	if concreteId &lt; 0 {</code></span>
+<span class="codeline" id="line-709"><code>		error_(dec.err)</code></span>
+<span class="codeline" id="line-710"><code>	}</code></span>
+<span class="codeline" id="line-711"><code>	// Byte count of value is next; we don't care what it is (it's there</code></span>
+<span class="codeline" id="line-712"><code>	// in case we want to ignore the value by skipping it completely).</code></span>
+<span class="codeline" id="line-713"><code>	state.decodeUint()</code></span>
+<span class="codeline" id="line-714"><code>	// Read the concrete value.</code></span>
+<span class="codeline" id="line-715"><code>	v := allocValue(typ)</code></span>
+<span class="codeline" id="line-716"><code>	dec.decodeValue(concreteId, v)</code></span>
+<span class="codeline" id="line-717"><code>	if dec.err != nil {</code></span>
+<span class="codeline" id="line-718"><code>		error_(dec.err)</code></span>
+<span class="codeline" id="line-719"><code>	}</code></span>
+<span class="codeline" id="line-720"><code>	// Assign the concrete value to the interface.</code></span>
+<span class="codeline" id="line-721"><code>	// Tread carefully; it might not satisfy the interface.</code></span>
+<span class="codeline" id="line-722"><code>	if !typ.AssignableTo(ityp) {</code></span>
+<span class="codeline" id="line-723"><code>		errorf("%s is not assignable to type %s", typ, ityp)</code></span>
+<span class="codeline" id="line-724"><code>	}</code></span>
+<span class="codeline" id="line-725"><code>	// Copy the interface value to the target.</code></span>
+<span class="codeline" id="line-726"><code>	value.Set(v)</code></span>
+<span class="codeline" id="line-727"><code>}</code></span>
+<span class="codeline" id="line-728"><code></code></span>
+<span class="codeline" id="line-729"><code>// ignoreInterface discards the data for an interface value with no destination.</code></span>
+<span class="codeline" id="line-730"><code>func (dec *Decoder) ignoreInterface(state *decoderState) {</code></span>
+<span class="codeline" id="line-731"><code>	// Read the name of the concrete type.</code></span>
+<span class="codeline" id="line-732"><code>	n, ok := state.getLength()</code></span>
+<span class="codeline" id="line-733"><code>	if !ok {</code></span>
+<span class="codeline" id="line-734"><code>		errorf("bad interface encoding: name too large for buffer")</code></span>
+<span class="codeline" id="line-735"><code>	}</code></span>
+<span class="codeline" id="line-736"><code>	bn := state.b.Len()</code></span>
+<span class="codeline" id="line-737"><code>	if bn &lt; n {</code></span>
+<span class="codeline" id="line-738"><code>		errorf("invalid interface value length %d: exceeds input size %d", n, bn)</code></span>
+<span class="codeline" id="line-739"><code>	}</code></span>
+<span class="codeline" id="line-740"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-741"><code>	id := dec.decodeTypeSequence(true)</code></span>
+<span class="codeline" id="line-742"><code>	if id &lt; 0 {</code></span>
+<span class="codeline" id="line-743"><code>		error_(dec.err)</code></span>
+<span class="codeline" id="line-744"><code>	}</code></span>
+<span class="codeline" id="line-745"><code>	// At this point, the decoder buffer contains a delimited value. Just toss it.</code></span>
+<span class="codeline" id="line-746"><code>	n, ok = state.getLength()</code></span>
+<span class="codeline" id="line-747"><code>	if !ok {</code></span>
+<span class="codeline" id="line-748"><code>		errorf("bad interface encoding: data length too large for buffer")</code></span>
+<span class="codeline" id="line-749"><code>	}</code></span>
+<span class="codeline" id="line-750"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-751"><code>}</code></span>
+<span class="codeline" id="line-752"><code></code></span>
+<span class="codeline" id="line-753"><code>// decodeGobDecoder decodes something implementing the GobDecoder interface.</code></span>
+<span class="codeline" id="line-754"><code>// The data is encoded as a byte slice.</code></span>
+<span class="codeline" id="line-755"><code>func (dec *Decoder) decodeGobDecoder(ut *userTypeInfo, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-756"><code>	// Read the bytes for the value.</code></span>
+<span class="codeline" id="line-757"><code>	n, ok := state.getLength()</code></span>
+<span class="codeline" id="line-758"><code>	if !ok {</code></span>
+<span class="codeline" id="line-759"><code>		errorf("GobDecoder: length too large for buffer")</code></span>
+<span class="codeline" id="line-760"><code>	}</code></span>
+<span class="codeline" id="line-761"><code>	b := state.b.Bytes()</code></span>
+<span class="codeline" id="line-762"><code>	if len(b) &lt; n {</code></span>
+<span class="codeline" id="line-763"><code>		errorf("GobDecoder: invalid data length %d: exceeds input size %d", n, len(b))</code></span>
+<span class="codeline" id="line-764"><code>	}</code></span>
+<span class="codeline" id="line-765"><code>	b = b[:n]</code></span>
+<span class="codeline" id="line-766"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-767"><code>	var err error</code></span>
+<span class="codeline" id="line-768"><code>	// We know it's one of these.</code></span>
+<span class="codeline" id="line-769"><code>	switch ut.externalDec {</code></span>
+<span class="codeline" id="line-770"><code>	case xGob:</code></span>
+<span class="codeline" id="line-771"><code>		err = value.Interface().(GobDecoder).GobDecode(b)</code></span>
+<span class="codeline" id="line-772"><code>	case xBinary:</code></span>
+<span class="codeline" id="line-773"><code>		err = value.Interface().(encoding.BinaryUnmarshaler).UnmarshalBinary(b)</code></span>
+<span class="codeline" id="line-774"><code>	case xText:</code></span>
+<span class="codeline" id="line-775"><code>		err = value.Interface().(encoding.TextUnmarshaler).UnmarshalText(b)</code></span>
+<span class="codeline" id="line-776"><code>	}</code></span>
+<span class="codeline" id="line-777"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-778"><code>		error_(err)</code></span>
+<span class="codeline" id="line-779"><code>	}</code></span>
+<span class="codeline" id="line-780"><code>}</code></span>
+<span class="codeline" id="line-781"><code></code></span>
+<span class="codeline" id="line-782"><code>// ignoreGobDecoder discards the data for a GobDecoder value with no destination.</code></span>
+<span class="codeline" id="line-783"><code>func (dec *Decoder) ignoreGobDecoder(state *decoderState) {</code></span>
+<span class="codeline" id="line-784"><code>	// Read the bytes for the value.</code></span>
+<span class="codeline" id="line-785"><code>	n, ok := state.getLength()</code></span>
+<span class="codeline" id="line-786"><code>	if !ok {</code></span>
+<span class="codeline" id="line-787"><code>		errorf("GobDecoder: length too large for buffer")</code></span>
+<span class="codeline" id="line-788"><code>	}</code></span>
+<span class="codeline" id="line-789"><code>	bn := state.b.Len()</code></span>
+<span class="codeline" id="line-790"><code>	if bn &lt; n {</code></span>
+<span class="codeline" id="line-791"><code>		errorf("GobDecoder: invalid data length %d: exceeds input size %d", n, bn)</code></span>
+<span class="codeline" id="line-792"><code>	}</code></span>
+<span class="codeline" id="line-793"><code>	state.b.Drop(n)</code></span>
+<span class="codeline" id="line-794"><code>}</code></span>
+<span class="codeline" id="line-795"><code></code></span>
+<span class="codeline" id="line-796"><code>// Index by Go types.</code></span>
+<span class="codeline" id="line-797"><code>var decOpTable = [...]decOp{</code></span>
+<span class="codeline" id="line-798"><code>	reflect.Bool:       decBool,</code></span>
+<span class="codeline" id="line-799"><code>	reflect.Int8:       decInt8,</code></span>
+<span class="codeline" id="line-800"><code>	reflect.Int16:      decInt16,</code></span>
+<span class="codeline" id="line-801"><code>	reflect.Int32:      decInt32,</code></span>
+<span class="codeline" id="line-802"><code>	reflect.Int64:      decInt64,</code></span>
+<span class="codeline" id="line-803"><code>	reflect.Uint8:      decUint8,</code></span>
+<span class="codeline" id="line-804"><code>	reflect.Uint16:     decUint16,</code></span>
+<span class="codeline" id="line-805"><code>	reflect.Uint32:     decUint32,</code></span>
+<span class="codeline" id="line-806"><code>	reflect.Uint64:     decUint64,</code></span>
+<span class="codeline" id="line-807"><code>	reflect.Float32:    decFloat32,</code></span>
+<span class="codeline" id="line-808"><code>	reflect.Float64:    decFloat64,</code></span>
+<span class="codeline" id="line-809"><code>	reflect.Complex64:  decComplex64,</code></span>
+<span class="codeline" id="line-810"><code>	reflect.Complex128: decComplex128,</code></span>
+<span class="codeline" id="line-811"><code>	reflect.String:     decString,</code></span>
+<span class="codeline" id="line-812"><code>}</code></span>
+<span class="codeline" id="line-813"><code></code></span>
+<span class="codeline" id="line-814"><code>// Indexed by gob types.  tComplex will be added during type.init().</code></span>
+<span class="codeline" id="line-815"><code>var decIgnoreOpMap = map[typeId]decOp{</code></span>
+<span class="codeline" id="line-816"><code>	tBool:    ignoreUint,</code></span>
+<span class="codeline" id="line-817"><code>	tInt:     ignoreUint,</code></span>
+<span class="codeline" id="line-818"><code>	tUint:    ignoreUint,</code></span>
+<span class="codeline" id="line-819"><code>	tFloat:   ignoreUint,</code></span>
+<span class="codeline" id="line-820"><code>	tBytes:   ignoreUint8Array,</code></span>
+<span class="codeline" id="line-821"><code>	tString:  ignoreUint8Array,</code></span>
+<span class="codeline" id="line-822"><code>	tComplex: ignoreTwoUints,</code></span>
+<span class="codeline" id="line-823"><code>}</code></span>
+<span class="codeline" id="line-824"><code></code></span>
+<span class="codeline" id="line-825"><code>// decOpFor returns the decoding op for the base type under rt and</code></span>
+<span class="codeline" id="line-826"><code>// the indirection count to reach it.</code></span>
+<span class="codeline" id="line-827"><code>func (dec *Decoder) decOpFor(wireId typeId, rt reflect.Type, name string, inProgress map[reflect.Type]*decOp) *decOp {</code></span>
+<span class="codeline" id="line-828"><code>	ut := userType(rt)</code></span>
+<span class="codeline" id="line-829"><code>	// If the type implements GobEncoder, we handle it without further processing.</code></span>
+<span class="codeline" id="line-830"><code>	if ut.externalDec != 0 {</code></span>
+<span class="codeline" id="line-831"><code>		return dec.gobDecodeOpFor(ut)</code></span>
+<span class="codeline" id="line-832"><code>	}</code></span>
+<span class="codeline" id="line-833"><code></code></span>
+<span class="codeline" id="line-834"><code>	// If this type is already in progress, it's a recursive type (e.g. map[string]*T).</code></span>
+<span class="codeline" id="line-835"><code>	// Return the pointer to the op we're already building.</code></span>
+<span class="codeline" id="line-836"><code>	if opPtr := inProgress[rt]; opPtr != nil {</code></span>
+<span class="codeline" id="line-837"><code>		return opPtr</code></span>
+<span class="codeline" id="line-838"><code>	}</code></span>
+<span class="codeline" id="line-839"><code>	typ := ut.base</code></span>
+<span class="codeline" id="line-840"><code>	var op decOp</code></span>
+<span class="codeline" id="line-841"><code>	k := typ.Kind()</code></span>
+<span class="codeline" id="line-842"><code>	if int(k) &lt; len(decOpTable) {</code></span>
+<span class="codeline" id="line-843"><code>		op = decOpTable[k]</code></span>
+<span class="codeline" id="line-844"><code>	}</code></span>
+<span class="codeline" id="line-845"><code>	if op == nil {</code></span>
+<span class="codeline" id="line-846"><code>		inProgress[rt] = &amp;op</code></span>
+<span class="codeline" id="line-847"><code>		// Special cases</code></span>
+<span class="codeline" id="line-848"><code>		switch t := typ; t.Kind() {</code></span>
+<span class="codeline" id="line-849"><code>		case reflect.Array:</code></span>
+<span class="codeline" id="line-850"><code>			name = "element of " + name</code></span>
+<span class="codeline" id="line-851"><code>			elemId := dec.wireType[wireId].ArrayT.Elem</code></span>
+<span class="codeline" id="line-852"><code>			elemOp := dec.decOpFor(elemId, t.Elem(), name, inProgress)</code></span>
+<span class="codeline" id="line-853"><code>			ovfl := overflow(name)</code></span>
+<span class="codeline" id="line-854"><code>			helper := decArrayHelper[t.Elem().Kind()]</code></span>
+<span class="codeline" id="line-855"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-856"><code>				state.dec.decodeArray(state, value, *elemOp, t.Len(), ovfl, helper)</code></span>
+<span class="codeline" id="line-857"><code>			}</code></span>
+<span class="codeline" id="line-858"><code></code></span>
+<span class="codeline" id="line-859"><code>		case reflect.Map:</code></span>
+<span class="codeline" id="line-860"><code>			keyId := dec.wireType[wireId].MapT.Key</code></span>
+<span class="codeline" id="line-861"><code>			elemId := dec.wireType[wireId].MapT.Elem</code></span>
+<span class="codeline" id="line-862"><code>			keyOp := dec.decOpFor(keyId, t.Key(), "key of "+name, inProgress)</code></span>
+<span class="codeline" id="line-863"><code>			elemOp := dec.decOpFor(elemId, t.Elem(), "element of "+name, inProgress)</code></span>
+<span class="codeline" id="line-864"><code>			ovfl := overflow(name)</code></span>
+<span class="codeline" id="line-865"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-866"><code>				state.dec.decodeMap(t, state, value, *keyOp, *elemOp, ovfl)</code></span>
+<span class="codeline" id="line-867"><code>			}</code></span>
+<span class="codeline" id="line-868"><code></code></span>
+<span class="codeline" id="line-869"><code>		case reflect.Slice:</code></span>
+<span class="codeline" id="line-870"><code>			name = "element of " + name</code></span>
+<span class="codeline" id="line-871"><code>			if t.Elem().Kind() == reflect.Uint8 {</code></span>
+<span class="codeline" id="line-872"><code>				op = decUint8Slice</code></span>
+<span class="codeline" id="line-873"><code>				break</code></span>
+<span class="codeline" id="line-874"><code>			}</code></span>
+<span class="codeline" id="line-875"><code>			var elemId typeId</code></span>
+<span class="codeline" id="line-876"><code>			if tt := builtinIdToType(wireId); tt != nil {</code></span>
+<span class="codeline" id="line-877"><code>				elemId = tt.(*sliceType).Elem</code></span>
+<span class="codeline" id="line-878"><code>			} else {</code></span>
+<span class="codeline" id="line-879"><code>				elemId = dec.wireType[wireId].SliceT.Elem</code></span>
+<span class="codeline" id="line-880"><code>			}</code></span>
+<span class="codeline" id="line-881"><code>			elemOp := dec.decOpFor(elemId, t.Elem(), name, inProgress)</code></span>
+<span class="codeline" id="line-882"><code>			ovfl := overflow(name)</code></span>
+<span class="codeline" id="line-883"><code>			helper := decSliceHelper[t.Elem().Kind()]</code></span>
+<span class="codeline" id="line-884"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-885"><code>				state.dec.decodeSlice(state, value, *elemOp, ovfl, helper)</code></span>
+<span class="codeline" id="line-886"><code>			}</code></span>
+<span class="codeline" id="line-887"><code></code></span>
+<span class="codeline" id="line-888"><code>		case reflect.Struct:</code></span>
+<span class="codeline" id="line-889"><code>			// Generate a closure that calls out to the engine for the nested type.</code></span>
+<span class="codeline" id="line-890"><code>			ut := userType(typ)</code></span>
+<span class="codeline" id="line-891"><code>			enginePtr, err := dec.getDecEnginePtr(wireId, ut)</code></span>
+<span class="codeline" id="line-892"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-893"><code>				error_(err)</code></span>
+<span class="codeline" id="line-894"><code>			}</code></span>
+<span class="codeline" id="line-895"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-896"><code>				// indirect through enginePtr to delay evaluation for recursive structs.</code></span>
+<span class="codeline" id="line-897"><code>				dec.decodeStruct(*enginePtr, value)</code></span>
+<span class="codeline" id="line-898"><code>			}</code></span>
+<span class="codeline" id="line-899"><code>		case reflect.Interface:</code></span>
+<span class="codeline" id="line-900"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-901"><code>				state.dec.decodeInterface(t, state, value)</code></span>
+<span class="codeline" id="line-902"><code>			}</code></span>
+<span class="codeline" id="line-903"><code>		}</code></span>
+<span class="codeline" id="line-904"><code>	}</code></span>
+<span class="codeline" id="line-905"><code>	if op == nil {</code></span>
+<span class="codeline" id="line-906"><code>		errorf("decode can't handle type %s", rt)</code></span>
+<span class="codeline" id="line-907"><code>	}</code></span>
+<span class="codeline" id="line-908"><code>	return &amp;op</code></span>
+<span class="codeline" id="line-909"><code>}</code></span>
+<span class="codeline" id="line-910"><code></code></span>
+<span class="codeline" id="line-911"><code>var maxIgnoreNestingDepth = 10000</code></span>
+<span class="codeline" id="line-912"><code></code></span>
+<span class="codeline" id="line-913"><code>// decIgnoreOpFor returns the decoding op for a field that has no destination.</code></span>
+<span class="codeline" id="line-914"><code>func (dec *Decoder) decIgnoreOpFor(wireId typeId, inProgress map[typeId]*decOp, depth int) *decOp {</code></span>
+<span class="codeline" id="line-915"><code>	if depth &gt; maxIgnoreNestingDepth {</code></span>
+<span class="codeline" id="line-916"><code>		error_(errors.New("invalid nesting depth"))</code></span>
+<span class="codeline" id="line-917"><code>	}</code></span>
+<span class="codeline" id="line-918"><code>	// If this type is already in progress, it's a recursive type (e.g. map[string]*T).</code></span>
+<span class="codeline" id="line-919"><code>	// Return the pointer to the op we're already building.</code></span>
+<span class="codeline" id="line-920"><code>	if opPtr := inProgress[wireId]; opPtr != nil {</code></span>
+<span class="codeline" id="line-921"><code>		return opPtr</code></span>
+<span class="codeline" id="line-922"><code>	}</code></span>
+<span class="codeline" id="line-923"><code>	op, ok := decIgnoreOpMap[wireId]</code></span>
+<span class="codeline" id="line-924"><code>	if !ok {</code></span>
+<span class="codeline" id="line-925"><code>		inProgress[wireId] = &amp;op</code></span>
+<span class="codeline" id="line-926"><code>		if wireId == tInterface {</code></span>
+<span class="codeline" id="line-927"><code>			// Special case because it's a method: the ignored item might</code></span>
+<span class="codeline" id="line-928"><code>			// define types and we need to record their state in the decoder.</code></span>
+<span class="codeline" id="line-929"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-930"><code>				state.dec.ignoreInterface(state)</code></span>
+<span class="codeline" id="line-931"><code>			}</code></span>
+<span class="codeline" id="line-932"><code>			return &amp;op</code></span>
+<span class="codeline" id="line-933"><code>		}</code></span>
+<span class="codeline" id="line-934"><code>		// Special cases</code></span>
+<span class="codeline" id="line-935"><code>		wire := dec.wireType[wireId]</code></span>
+<span class="codeline" id="line-936"><code>		switch {</code></span>
+<span class="codeline" id="line-937"><code>		case wire == nil:</code></span>
+<span class="codeline" id="line-938"><code>			errorf("bad data: undefined type %s", wireId.string())</code></span>
+<span class="codeline" id="line-939"><code>		case wire.ArrayT != nil:</code></span>
+<span class="codeline" id="line-940"><code>			elemId := wire.ArrayT.Elem</code></span>
+<span class="codeline" id="line-941"><code>			elemOp := dec.decIgnoreOpFor(elemId, inProgress, depth+1)</code></span>
+<span class="codeline" id="line-942"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-943"><code>				state.dec.ignoreArray(state, *elemOp, wire.ArrayT.Len)</code></span>
+<span class="codeline" id="line-944"><code>			}</code></span>
+<span class="codeline" id="line-945"><code></code></span>
+<span class="codeline" id="line-946"><code>		case wire.MapT != nil:</code></span>
+<span class="codeline" id="line-947"><code>			keyId := dec.wireType[wireId].MapT.Key</code></span>
+<span class="codeline" id="line-948"><code>			elemId := dec.wireType[wireId].MapT.Elem</code></span>
+<span class="codeline" id="line-949"><code>			keyOp := dec.decIgnoreOpFor(keyId, inProgress, depth+1)</code></span>
+<span class="codeline" id="line-950"><code>			elemOp := dec.decIgnoreOpFor(elemId, inProgress, depth+1)</code></span>
+<span class="codeline" id="line-951"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-952"><code>				state.dec.ignoreMap(state, *keyOp, *elemOp)</code></span>
+<span class="codeline" id="line-953"><code>			}</code></span>
+<span class="codeline" id="line-954"><code></code></span>
+<span class="codeline" id="line-955"><code>		case wire.SliceT != nil:</code></span>
+<span class="codeline" id="line-956"><code>			elemId := wire.SliceT.Elem</code></span>
+<span class="codeline" id="line-957"><code>			elemOp := dec.decIgnoreOpFor(elemId, inProgress, depth+1)</code></span>
+<span class="codeline" id="line-958"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-959"><code>				state.dec.ignoreSlice(state, *elemOp)</code></span>
+<span class="codeline" id="line-960"><code>			}</code></span>
+<span class="codeline" id="line-961"><code></code></span>
+<span class="codeline" id="line-962"><code>		case wire.StructT != nil:</code></span>
+<span class="codeline" id="line-963"><code>			// Generate a closure that calls out to the engine for the nested type.</code></span>
+<span class="codeline" id="line-964"><code>			enginePtr, err := dec.getIgnoreEnginePtr(wireId)</code></span>
+<span class="codeline" id="line-965"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-966"><code>				error_(err)</code></span>
+<span class="codeline" id="line-967"><code>			}</code></span>
+<span class="codeline" id="line-968"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-969"><code>				// indirect through enginePtr to delay evaluation for recursive structs</code></span>
+<span class="codeline" id="line-970"><code>				state.dec.ignoreStruct(*enginePtr)</code></span>
+<span class="codeline" id="line-971"><code>			}</code></span>
+<span class="codeline" id="line-972"><code></code></span>
+<span class="codeline" id="line-973"><code>		case wire.GobEncoderT != nil, wire.BinaryMarshalerT != nil, wire.TextMarshalerT != nil:</code></span>
+<span class="codeline" id="line-974"><code>			op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-975"><code>				state.dec.ignoreGobDecoder(state)</code></span>
+<span class="codeline" id="line-976"><code>			}</code></span>
+<span class="codeline" id="line-977"><code>		}</code></span>
+<span class="codeline" id="line-978"><code>	}</code></span>
+<span class="codeline" id="line-979"><code>	if op == nil {</code></span>
+<span class="codeline" id="line-980"><code>		errorf("bad data: ignore can't handle type %s", wireId.string())</code></span>
+<span class="codeline" id="line-981"><code>	}</code></span>
+<span class="codeline" id="line-982"><code>	return &amp;op</code></span>
+<span class="codeline" id="line-983"><code>}</code></span>
+<span class="codeline" id="line-984"><code></code></span>
+<span class="codeline" id="line-985"><code>// gobDecodeOpFor returns the op for a type that is known to implement</code></span>
+<span class="codeline" id="line-986"><code>// GobDecoder.</code></span>
+<span class="codeline" id="line-987"><code>func (dec *Decoder) gobDecodeOpFor(ut *userTypeInfo) *decOp {</code></span>
+<span class="codeline" id="line-988"><code>	rcvrType := ut.user</code></span>
+<span class="codeline" id="line-989"><code>	if ut.decIndir == -1 {</code></span>
+<span class="codeline" id="line-990"><code>		rcvrType = reflect.PointerTo(rcvrType)</code></span>
+<span class="codeline" id="line-991"><code>	} else if ut.decIndir &gt; 0 {</code></span>
+<span class="codeline" id="line-992"><code>		for i := int8(0); i &lt; ut.decIndir; i++ {</code></span>
+<span class="codeline" id="line-993"><code>			rcvrType = rcvrType.Elem()</code></span>
+<span class="codeline" id="line-994"><code>		}</code></span>
+<span class="codeline" id="line-995"><code>	}</code></span>
+<span class="codeline" id="line-996"><code>	var op decOp</code></span>
+<span class="codeline" id="line-997"><code>	op = func(i *decInstr, state *decoderState, value reflect.Value) {</code></span>
+<span class="codeline" id="line-998"><code>		// We now have the base type. We need its address if the receiver is a pointer.</code></span>
+<span class="codeline" id="line-999"><code>		if value.Kind() != reflect.Pointer &amp;&amp; rcvrType.Kind() == reflect.Pointer {</code></span>
+<span class="codeline" id="line-1000"><code>			value = value.Addr()</code></span>
+<span class="codeline" id="line-1001"><code>		}</code></span>
+<span class="codeline" id="line-1002"><code>		state.dec.decodeGobDecoder(ut, state, value)</code></span>
+<span class="codeline" id="line-1003"><code>	}</code></span>
+<span class="codeline" id="line-1004"><code>	return &amp;op</code></span>
+<span class="codeline" id="line-1005"><code>}</code></span>
+<span class="codeline" id="line-1006"><code></code></span>
+<span class="codeline" id="line-1007"><code>// compatibleType asks: Are these two gob Types compatible?</code></span>
+<span class="codeline" id="line-1008"><code>// Answers the question for basic types, arrays, maps and slices, plus</code></span>
+<span class="codeline" id="line-1009"><code>// GobEncoder/Decoder pairs.</code></span>
+<span class="codeline" id="line-1010"><code>// Structs are considered ok; fields will be checked later.</code></span>
+<span class="codeline" id="line-1011"><code>func (dec *Decoder) compatibleType(fr reflect.Type, fw typeId, inProgress map[reflect.Type]typeId) bool {</code></span>
+<span class="codeline" id="line-1012"><code>	if rhs, ok := inProgress[fr]; ok {</code></span>
+<span class="codeline" id="line-1013"><code>		return rhs == fw</code></span>
+<span class="codeline" id="line-1014"><code>	}</code></span>
+<span class="codeline" id="line-1015"><code>	inProgress[fr] = fw</code></span>
+<span class="codeline" id="line-1016"><code>	ut := userType(fr)</code></span>
+<span class="codeline" id="line-1017"><code>	wire, ok := dec.wireType[fw]</code></span>
+<span class="codeline" id="line-1018"><code>	// If wire was encoded with an encoding method, fr must have that method.</code></span>
+<span class="codeline" id="line-1019"><code>	// And if not, it must not.</code></span>
+<span class="codeline" id="line-1020"><code>	// At most one of the booleans in ut is set.</code></span>
+<span class="codeline" id="line-1021"><code>	// We could possibly relax this constraint in the future in order to</code></span>
+<span class="codeline" id="line-1022"><code>	// choose the decoding method using the data in the wireType.</code></span>
+<span class="codeline" id="line-1023"><code>	// The parentheses look odd but are correct.</code></span>
+<span class="codeline" id="line-1024"><code>	if (ut.externalDec == xGob) != (ok &amp;&amp; wire.GobEncoderT != nil) ||</code></span>
+<span class="codeline" id="line-1025"><code>		(ut.externalDec == xBinary) != (ok &amp;&amp; wire.BinaryMarshalerT != nil) ||</code></span>
+<span class="codeline" id="line-1026"><code>		(ut.externalDec == xText) != (ok &amp;&amp; wire.TextMarshalerT != nil) {</code></span>
+<span class="codeline" id="line-1027"><code>		return false</code></span>
+<span class="codeline" id="line-1028"><code>	}</code></span>
+<span class="codeline" id="line-1029"><code>	if ut.externalDec != 0 { // This test trumps all others.</code></span>
+<span class="codeline" id="line-1030"><code>		return true</code></span>
+<span class="codeline" id="line-1031"><code>	}</code></span>
+<span class="codeline" id="line-1032"><code>	switch t := ut.base; t.Kind() {</code></span>
+<span class="codeline" id="line-1033"><code>	default:</code></span>
+<span class="codeline" id="line-1034"><code>		// chan, etc: cannot handle.</code></span>
+<span class="codeline" id="line-1035"><code>		return false</code></span>
+<span class="codeline" id="line-1036"><code>	case reflect.Bool:</code></span>
+<span class="codeline" id="line-1037"><code>		return fw == tBool</code></span>
+<span class="codeline" id="line-1038"><code>	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:</code></span>
+<span class="codeline" id="line-1039"><code>		return fw == tInt</code></span>
+<span class="codeline" id="line-1040"><code>	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:</code></span>
+<span class="codeline" id="line-1041"><code>		return fw == tUint</code></span>
+<span class="codeline" id="line-1042"><code>	case reflect.Float32, reflect.Float64:</code></span>
+<span class="codeline" id="line-1043"><code>		return fw == tFloat</code></span>
+<span class="codeline" id="line-1044"><code>	case reflect.Complex64, reflect.Complex128:</code></span>
+<span class="codeline" id="line-1045"><code>		return fw == tComplex</code></span>
+<span class="codeline" id="line-1046"><code>	case reflect.String:</code></span>
+<span class="codeline" id="line-1047"><code>		return fw == tString</code></span>
+<span class="codeline" id="line-1048"><code>	case reflect.Interface:</code></span>
+<span class="codeline" id="line-1049"><code>		return fw == tInterface</code></span>
+<span class="codeline" id="line-1050"><code>	case reflect.Array:</code></span>
+<span class="codeline" id="line-1051"><code>		if !ok || wire.ArrayT == nil {</code></span>
+<span class="codeline" id="line-1052"><code>			return false</code></span>
+<span class="codeline" id="line-1053"><code>		}</code></span>
+<span class="codeline" id="line-1054"><code>		array := wire.ArrayT</code></span>
+<span class="codeline" id="line-1055"><code>		return t.Len() == array.Len &amp;&amp; dec.compatibleType(t.Elem(), array.Elem, inProgress)</code></span>
+<span class="codeline" id="line-1056"><code>	case reflect.Map:</code></span>
+<span class="codeline" id="line-1057"><code>		if !ok || wire.MapT == nil {</code></span>
+<span class="codeline" id="line-1058"><code>			return false</code></span>
+<span class="codeline" id="line-1059"><code>		}</code></span>
+<span class="codeline" id="line-1060"><code>		MapType := wire.MapT</code></span>
+<span class="codeline" id="line-1061"><code>		return dec.compatibleType(t.Key(), MapType.Key, inProgress) &amp;&amp; dec.compatibleType(t.Elem(), MapType.Elem, inProgress)</code></span>
+<span class="codeline" id="line-1062"><code>	case reflect.Slice:</code></span>
+<span class="codeline" id="line-1063"><code>		// Is it an array of bytes?</code></span>
+<span class="codeline" id="line-1064"><code>		if t.Elem().Kind() == reflect.Uint8 {</code></span>
+<span class="codeline" id="line-1065"><code>			return fw == tBytes</code></span>
+<span class="codeline" id="line-1066"><code>		}</code></span>
+<span class="codeline" id="line-1067"><code>		// Extract and compare element types.</code></span>
+<span class="codeline" id="line-1068"><code>		var sw *sliceType</code></span>
+<span class="codeline" id="line-1069"><code>		if tt := builtinIdToType(fw); tt != nil {</code></span>
+<span class="codeline" id="line-1070"><code>			sw, _ = tt.(*sliceType)</code></span>
+<span class="codeline" id="line-1071"><code>		} else if wire != nil {</code></span>
+<span class="codeline" id="line-1072"><code>			sw = wire.SliceT</code></span>
+<span class="codeline" id="line-1073"><code>		}</code></span>
+<span class="codeline" id="line-1074"><code>		elem := userType(t.Elem()).base</code></span>
+<span class="codeline" id="line-1075"><code>		return sw != nil &amp;&amp; dec.compatibleType(elem, sw.Elem, inProgress)</code></span>
+<span class="codeline" id="line-1076"><code>	case reflect.Struct:</code></span>
+<span class="codeline" id="line-1077"><code>		return true</code></span>
+<span class="codeline" id="line-1078"><code>	}</code></span>
+<span class="codeline" id="line-1079"><code>}</code></span>
+<span class="codeline" id="line-1080"><code></code></span>
+<span class="codeline" id="line-1081"><code>// typeString returns a human-readable description of the type identified by remoteId.</code></span>
+<span class="codeline" id="line-1082"><code>func (dec *Decoder) typeString(remoteId typeId) string {</code></span>
+<span class="codeline" id="line-1083"><code>	typeLock.Lock()</code></span>
+<span class="codeline" id="line-1084"><code>	defer typeLock.Unlock()</code></span>
+<span class="codeline" id="line-1085"><code>	if t := idToType(remoteId); t != nil {</code></span>
+<span class="codeline" id="line-1086"><code>		// globally known type.</code></span>
+<span class="codeline" id="line-1087"><code>		return t.string()</code></span>
+<span class="codeline" id="line-1088"><code>	}</code></span>
+<span class="codeline" id="line-1089"><code>	return dec.wireType[remoteId].string()</code></span>
+<span class="codeline" id="line-1090"><code>}</code></span>
+<span class="codeline" id="line-1091"><code></code></span>
+<span class="codeline" id="line-1092"><code>// compileSingle compiles the decoder engine for a non-struct top-level value, including</code></span>
+<span class="codeline" id="line-1093"><code>// GobDecoders.</code></span>
+<span class="codeline" id="line-1094"><code>func (dec *Decoder) compileSingle(remoteId typeId, ut *userTypeInfo) (engine *decEngine, err error) {</code></span>
+<span class="codeline" id="line-1095"><code>	rt := ut.user</code></span>
+<span class="codeline" id="line-1096"><code>	engine = new(decEngine)</code></span>
+<span class="codeline" id="line-1097"><code>	engine.instr = make([]decInstr, 1) // one item</code></span>
+<span class="codeline" id="line-1098"><code>	name := rt.String()                // best we can do</code></span>
+<span class="codeline" id="line-1099"><code>	if !dec.compatibleType(rt, remoteId, make(map[reflect.Type]typeId)) {</code></span>
+<span class="codeline" id="line-1100"><code>		remoteType := dec.typeString(remoteId)</code></span>
+<span class="codeline" id="line-1101"><code>		// Common confusing case: local interface type, remote concrete type.</code></span>
+<span class="codeline" id="line-1102"><code>		if ut.base.Kind() == reflect.Interface &amp;&amp; remoteId != tInterface {</code></span>
+<span class="codeline" id="line-1103"><code>			return nil, errors.New("gob: local interface type " + name + " can only be decoded from remote interface type; received concrete type " + remoteType)</code></span>
+<span class="codeline" id="line-1104"><code>		}</code></span>
+<span class="codeline" id="line-1105"><code>		return nil, errors.New("gob: decoding into local type " + name + ", received remote type " + remoteType)</code></span>
+<span class="codeline" id="line-1106"><code>	}</code></span>
+<span class="codeline" id="line-1107"><code>	op := dec.decOpFor(remoteId, rt, name, make(map[reflect.Type]*decOp))</code></span>
+<span class="codeline" id="line-1108"><code>	ovfl := errors.New(`value for "` + name + `" out of range`)</code></span>
+<span class="codeline" id="line-1109"><code>	engine.instr[singletonField] = decInstr{*op, singletonField, nil, ovfl}</code></span>
+<span class="codeline" id="line-1110"><code>	engine.numInstr = 1</code></span>
+<span class="codeline" id="line-1111"><code>	return</code></span>
+<span class="codeline" id="line-1112"><code>}</code></span>
+<span class="codeline" id="line-1113"><code></code></span>
+<span class="codeline" id="line-1114"><code>// compileIgnoreSingle compiles the decoder engine for a non-struct top-level value that will be discarded.</code></span>
+<span class="codeline" id="line-1115"><code>func (dec *Decoder) compileIgnoreSingle(remoteId typeId) *decEngine {</code></span>
+<span class="codeline" id="line-1116"><code>	engine := new(decEngine)</code></span>
+<span class="codeline" id="line-1117"><code>	engine.instr = make([]decInstr, 1) // one item</code></span>
+<span class="codeline" id="line-1118"><code>	op := dec.decIgnoreOpFor(remoteId, make(map[typeId]*decOp), 0)</code></span>
+<span class="codeline" id="line-1119"><code>	ovfl := overflow(dec.typeString(remoteId))</code></span>
+<span class="codeline" id="line-1120"><code>	engine.instr[0] = decInstr{*op, 0, nil, ovfl}</code></span>
+<span class="codeline" id="line-1121"><code>	engine.numInstr = 1</code></span>
+<span class="codeline" id="line-1122"><code>	return engine</code></span>
+<span class="codeline" id="line-1123"><code>}</code></span>
+<span class="codeline" id="line-1124"><code></code></span>
+<span class="codeline" id="line-1125"><code>// compileDec compiles the decoder engine for a value. If the value is not a struct,</code></span>
+<span class="codeline" id="line-1126"><code>// it calls out to compileSingle.</code></span>
+<span class="codeline" id="line-1127"><code>func (dec *Decoder) compileDec(remoteId typeId, ut *userTypeInfo) (engine *decEngine, err error) {</code></span>
+<span class="codeline" id="line-1128"><code>	defer catchError(&amp;err)</code></span>
+<span class="codeline" id="line-1129"><code>	rt := ut.base</code></span>
+<span class="codeline" id="line-1130"><code>	srt := rt</code></span>
+<span class="codeline" id="line-1131"><code>	if srt.Kind() != reflect.Struct || ut.externalDec != 0 {</code></span>
+<span class="codeline" id="line-1132"><code>		return dec.compileSingle(remoteId, ut)</code></span>
+<span class="codeline" id="line-1133"><code>	}</code></span>
+<span class="codeline" id="line-1134"><code>	var wireStruct *structType</code></span>
+<span class="codeline" id="line-1135"><code>	// Builtin types can come from global pool; the rest must be defined by the decoder.</code></span>
+<span class="codeline" id="line-1136"><code>	// Also we know we're decoding a struct now, so the client must have sent one.</code></span>
+<span class="codeline" id="line-1137"><code>	if t := builtinIdToType(remoteId); t != nil {</code></span>
+<span class="codeline" id="line-1138"><code>		wireStruct, _ = t.(*structType)</code></span>
+<span class="codeline" id="line-1139"><code>	} else {</code></span>
+<span class="codeline" id="line-1140"><code>		wire := dec.wireType[remoteId]</code></span>
+<span class="codeline" id="line-1141"><code>		if wire == nil {</code></span>
+<span class="codeline" id="line-1142"><code>			error_(errBadType)</code></span>
+<span class="codeline" id="line-1143"><code>		}</code></span>
+<span class="codeline" id="line-1144"><code>		wireStruct = wire.StructT</code></span>
+<span class="codeline" id="line-1145"><code>	}</code></span>
+<span class="codeline" id="line-1146"><code>	if wireStruct == nil {</code></span>
+<span class="codeline" id="line-1147"><code>		errorf("type mismatch in decoder: want struct type %s; got non-struct", rt)</code></span>
+<span class="codeline" id="line-1148"><code>	}</code></span>
+<span class="codeline" id="line-1149"><code>	engine = new(decEngine)</code></span>
+<span class="codeline" id="line-1150"><code>	engine.instr = make([]decInstr, len(wireStruct.Field))</code></span>
+<span class="codeline" id="line-1151"><code>	seen := make(map[reflect.Type]*decOp)</code></span>
+<span class="codeline" id="line-1152"><code>	// Loop over the fields of the wire type.</code></span>
+<span class="codeline" id="line-1153"><code>	for fieldnum := 0; fieldnum &lt; len(wireStruct.Field); fieldnum++ {</code></span>
+<span class="codeline" id="line-1154"><code>		wireField := wireStruct.Field[fieldnum]</code></span>
+<span class="codeline" id="line-1155"><code>		if wireField.Name == "" {</code></span>
+<span class="codeline" id="line-1156"><code>			errorf("empty name for remote field of type %s", wireStruct.Name)</code></span>
+<span class="codeline" id="line-1157"><code>		}</code></span>
+<span class="codeline" id="line-1158"><code>		ovfl := overflow(wireField.Name)</code></span>
+<span class="codeline" id="line-1159"><code>		// Find the field of the local type with the same name.</code></span>
+<span class="codeline" id="line-1160"><code>		localField, present := srt.FieldByName(wireField.Name)</code></span>
+<span class="codeline" id="line-1161"><code>		// TODO(r): anonymous names</code></span>
+<span class="codeline" id="line-1162"><code>		if !present || !isExported(wireField.Name) {</code></span>
+<span class="codeline" id="line-1163"><code>			op := dec.decIgnoreOpFor(wireField.Id, make(map[typeId]*decOp), 0)</code></span>
+<span class="codeline" id="line-1164"><code>			engine.instr[fieldnum] = decInstr{*op, fieldnum, nil, ovfl}</code></span>
+<span class="codeline" id="line-1165"><code>			continue</code></span>
+<span class="codeline" id="line-1166"><code>		}</code></span>
+<span class="codeline" id="line-1167"><code>		if !dec.compatibleType(localField.Type, wireField.Id, make(map[reflect.Type]typeId)) {</code></span>
+<span class="codeline" id="line-1168"><code>			errorf("wrong type (%s) for received field %s.%s", localField.Type, wireStruct.Name, wireField.Name)</code></span>
+<span class="codeline" id="line-1169"><code>		}</code></span>
+<span class="codeline" id="line-1170"><code>		op := dec.decOpFor(wireField.Id, localField.Type, localField.Name, seen)</code></span>
+<span class="codeline" id="line-1171"><code>		engine.instr[fieldnum] = decInstr{*op, fieldnum, localField.Index, ovfl}</code></span>
+<span class="codeline" id="line-1172"><code>		engine.numInstr++</code></span>
+<span class="codeline" id="line-1173"><code>	}</code></span>
+<span class="codeline" id="line-1174"><code>	return</code></span>
+<span class="codeline" id="line-1175"><code>}</code></span>
+<span class="codeline" id="line-1176"><code></code></span>
+<span class="codeline" id="line-1177"><code>// getDecEnginePtr returns the engine for the specified type.</code></span>
+<span class="codeline" id="line-1178"><code>func (dec *Decoder) getDecEnginePtr(remoteId typeId, ut *userTypeInfo) (enginePtr **decEngine, err error) {</code></span>
+<span class="codeline" id="line-1179"><code>	rt := ut.user</code></span>
+<span class="codeline" id="line-1180"><code>	decoderMap, ok := dec.decoderCache[rt]</code></span>
+<span class="codeline" id="line-1181"><code>	if !ok {</code></span>
+<span class="codeline" id="line-1182"><code>		decoderMap = make(map[typeId]**decEngine)</code></span>
+<span class="codeline" id="line-1183"><code>		dec.decoderCache[rt] = decoderMap</code></span>
+<span class="codeline" id="line-1184"><code>	}</code></span>
+<span class="codeline" id="line-1185"><code>	if enginePtr, ok = decoderMap[remoteId]; !ok {</code></span>
+<span class="codeline" id="line-1186"><code>		// To handle recursive types, mark this engine as underway before compiling.</code></span>
+<span class="codeline" id="line-1187"><code>		enginePtr = new(*decEngine)</code></span>
+<span class="codeline" id="line-1188"><code>		decoderMap[remoteId] = enginePtr</code></span>
+<span class="codeline" id="line-1189"><code>		*enginePtr, err = dec.compileDec(remoteId, ut)</code></span>
+<span class="codeline" id="line-1190"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1191"><code>			delete(decoderMap, remoteId)</code></span>
+<span class="codeline" id="line-1192"><code>		}</code></span>
+<span class="codeline" id="line-1193"><code>	}</code></span>
+<span class="codeline" id="line-1194"><code>	return</code></span>
+<span class="codeline" id="line-1195"><code>}</code></span>
+<span class="codeline" id="line-1196"><code></code></span>
+<span class="codeline" id="line-1197"><code>// emptyStruct is the type we compile into when ignoring a struct value.</code></span>
+<span class="codeline" id="line-1198"><code>type emptyStruct struct{}</code></span>
+<span class="codeline" id="line-1199"><code></code></span>
+<span class="codeline" id="line-1200"><code>var emptyStructType = reflect.TypeFor[emptyStruct]()</code></span>
+<span class="codeline" id="line-1201"><code></code></span>
+<span class="codeline" id="line-1202"><code>// getIgnoreEnginePtr returns the engine for the specified type when the value is to be discarded.</code></span>
+<span class="codeline" id="line-1203"><code>func (dec *Decoder) getIgnoreEnginePtr(wireId typeId) (enginePtr **decEngine, err error) {</code></span>
+<span class="codeline" id="line-1204"><code>	var ok bool</code></span>
+<span class="codeline" id="line-1205"><code>	if enginePtr, ok = dec.ignorerCache[wireId]; !ok {</code></span>
+<span class="codeline" id="line-1206"><code>		// To handle recursive types, mark this engine as underway before compiling.</code></span>
+<span class="codeline" id="line-1207"><code>		enginePtr = new(*decEngine)</code></span>
+<span class="codeline" id="line-1208"><code>		dec.ignorerCache[wireId] = enginePtr</code></span>
+<span class="codeline" id="line-1209"><code>		wire := dec.wireType[wireId]</code></span>
+<span class="codeline" id="line-1210"><code>		if wire != nil &amp;&amp; wire.StructT != nil {</code></span>
+<span class="codeline" id="line-1211"><code>			*enginePtr, err = dec.compileDec(wireId, userType(emptyStructType))</code></span>
+<span class="codeline" id="line-1212"><code>		} else {</code></span>
+<span class="codeline" id="line-1213"><code>			*enginePtr = dec.compileIgnoreSingle(wireId)</code></span>
+<span class="codeline" id="line-1214"><code>		}</code></span>
+<span class="codeline" id="line-1215"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1216"><code>			delete(dec.ignorerCache, wireId)</code></span>
+<span class="codeline" id="line-1217"><code>		}</code></span>
+<span class="codeline" id="line-1218"><code>	}</code></span>
+<span class="codeline" id="line-1219"><code>	return</code></span>
+<span class="codeline" id="line-1220"><code>}</code></span>
+<span class="codeline" id="line-1221"><code></code></span>
+<span class="codeline" id="line-1222"><code>// decodeValue decodes the data stream representing a value and stores it in value.</code></span>
+<span class="codeline" id="line-1223"><code>func (dec *Decoder) decodeValue(wireId typeId, value reflect.Value) {</code></span>
+<span class="codeline" id="line-1224"><code>	defer catchError(&amp;dec.err)</code></span>
+<span class="codeline" id="line-1225"><code>	// If the value is nil, it means we should just ignore this item.</code></span>
+<span class="codeline" id="line-1226"><code>	if !value.IsValid() {</code></span>
+<span class="codeline" id="line-1227"><code>		dec.decodeIgnoredValue(wireId)</code></span>
+<span class="codeline" id="line-1228"><code>		return</code></span>
+<span class="codeline" id="line-1229"><code>	}</code></span>
+<span class="codeline" id="line-1230"><code>	// Dereference down to the underlying type.</code></span>
+<span class="codeline" id="line-1231"><code>	ut := userType(value.Type())</code></span>
+<span class="codeline" id="line-1232"><code>	base := ut.base</code></span>
+<span class="codeline" id="line-1233"><code>	var enginePtr **decEngine</code></span>
+<span class="codeline" id="line-1234"><code>	enginePtr, dec.err = dec.getDecEnginePtr(wireId, ut)</code></span>
+<span class="codeline" id="line-1235"><code>	if dec.err != nil {</code></span>
+<span class="codeline" id="line-1236"><code>		return</code></span>
+<span class="codeline" id="line-1237"><code>	}</code></span>
+<span class="codeline" id="line-1238"><code>	value = decAlloc(value)</code></span>
+<span class="codeline" id="line-1239"><code>	engine := *enginePtr</code></span>
+<span class="codeline" id="line-1240"><code>	if st := base; st.Kind() == reflect.Struct &amp;&amp; ut.externalDec == 0 {</code></span>
+<span class="codeline" id="line-1241"><code>		wt := dec.wireType[wireId]</code></span>
+<span class="codeline" id="line-1242"><code>		if engine.numInstr == 0 &amp;&amp; st.NumField() &gt; 0 &amp;&amp;</code></span>
+<span class="codeline" id="line-1243"><code>			wt != nil &amp;&amp; len(wt.StructT.Field) &gt; 0 {</code></span>
+<span class="codeline" id="line-1244"><code>			name := base.Name()</code></span>
+<span class="codeline" id="line-1245"><code>			errorf("type mismatch: no fields matched compiling decoder for %s", name)</code></span>
+<span class="codeline" id="line-1246"><code>		}</code></span>
+<span class="codeline" id="line-1247"><code>		dec.decodeStruct(engine, value)</code></span>
+<span class="codeline" id="line-1248"><code>	} else {</code></span>
+<span class="codeline" id="line-1249"><code>		dec.decodeSingle(engine, value)</code></span>
+<span class="codeline" id="line-1250"><code>	}</code></span>
+<span class="codeline" id="line-1251"><code>}</code></span>
+<span class="codeline" id="line-1252"><code></code></span>
+<span class="codeline" id="line-1253"><code>// decodeIgnoredValue decodes the data stream representing a value of the specified type and discards it.</code></span>
+<span class="codeline" id="line-1254"><code>func (dec *Decoder) decodeIgnoredValue(wireId typeId) {</code></span>
+<span class="codeline" id="line-1255"><code>	var enginePtr **decEngine</code></span>
+<span class="codeline" id="line-1256"><code>	enginePtr, dec.err = dec.getIgnoreEnginePtr(wireId)</code></span>
+<span class="codeline" id="line-1257"><code>	if dec.err != nil {</code></span>
+<span class="codeline" id="line-1258"><code>		return</code></span>
+<span class="codeline" id="line-1259"><code>	}</code></span>
+<span class="codeline" id="line-1260"><code>	wire := dec.wireType[wireId]</code></span>
+<span class="codeline" id="line-1261"><code>	if wire != nil &amp;&amp; wire.StructT != nil {</code></span>
+<span class="codeline" id="line-1262"><code>		dec.ignoreStruct(*enginePtr)</code></span>
+<span class="codeline" id="line-1263"><code>	} else {</code></span>
+<span class="codeline" id="line-1264"><code>		dec.ignoreSingle(*enginePtr)</code></span>
+<span class="codeline" id="line-1265"><code>	}</code></span>
+<span class="codeline" id="line-1266"><code>}</code></span>
+<span class="codeline" id="line-1267"><code></code></span>
+<span class="codeline" id="line-1268"><code>const (</code></span>
+<span class="codeline" id="line-1269"><code>	intBits     = 32 &lt;&lt; (^uint(0) &gt;&gt; 63)</code></span>
+<span class="codeline" id="line-1270"><code>	uintptrBits = 32 &lt;&lt; (^uintptr(0) &gt;&gt; 63)</code></span>
+<span class="codeline" id="line-1271"><code>)</code></span>
+<span class="codeline" id="line-1272"><code></code></span>
+<span class="codeline" id="line-1273"><code>func init() {</code></span>
+<span class="codeline" id="line-1274"><code>	var iop, uop decOp</code></span>
+<span class="codeline" id="line-1275"><code>	switch intBits {</code></span>
+<span class="codeline" id="line-1276"><code>	case 32:</code></span>
+<span class="codeline" id="line-1277"><code>		iop = decInt32</code></span>
+<span class="codeline" id="line-1278"><code>		uop = decUint32</code></span>
+<span class="codeline" id="line-1279"><code>	case 64:</code></span>
+<span class="codeline" id="line-1280"><code>		iop = decInt64</code></span>
+<span class="codeline" id="line-1281"><code>		uop = decUint64</code></span>
+<span class="codeline" id="line-1282"><code>	default:</code></span>
+<span class="codeline" id="line-1283"><code>		panic("gob: unknown size of int/uint")</code></span>
+<span class="codeline" id="line-1284"><code>	}</code></span>
+<span class="codeline" id="line-1285"><code>	decOpTable[reflect.Int] = iop</code></span>
+<span class="codeline" id="line-1286"><code>	decOpTable[reflect.Uint] = uop</code></span>
+<span class="codeline" id="line-1287"><code></code></span>
+<span class="codeline" id="line-1288"><code>	// Finally uintptr</code></span>
+<span class="codeline" id="line-1289"><code>	switch uintptrBits {</code></span>
+<span class="codeline" id="line-1290"><code>	case 32:</code></span>
+<span class="codeline" id="line-1291"><code>		uop = decUint32</code></span>
+<span class="codeline" id="line-1292"><code>	case 64:</code></span>
+<span class="codeline" id="line-1293"><code>		uop = decUint64</code></span>
+<span class="codeline" id="line-1294"><code>	default:</code></span>
+<span class="codeline" id="line-1295"><code>		panic("gob: unknown size of uintptr")</code></span>
+<span class="codeline" id="line-1296"><code>	}</code></span>
+<span class="codeline" id="line-1297"><code>	decOpTable[reflect.Uintptr] = uop</code></span>
+<span class="codeline" id="line-1298"><code>}</code></span>
+<span class="codeline" id="line-1299"><code></code></span>
+<span class="codeline" id="line-1300"><code>// Gob depends on being able to take the address</code></span>
+<span class="codeline" id="line-1301"><code>// of zeroed Values it creates, so use this wrapper instead</code></span>
+<span class="codeline" id="line-1302"><code>// of the standard reflect.Zero.</code></span>
+<span class="codeline" id="line-1303"><code>// Each call allocates once.</code></span>
+<span class="codeline" id="line-1304"><code>func allocValue(t reflect.Type) reflect.Value {</code></span>
+<span class="codeline" id="line-1305"><code>	return reflect.New(t).Elem()</code></span>
+<span class="codeline" id="line-1306"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

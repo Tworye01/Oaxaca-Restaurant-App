@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: exec.go in package regexp</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	exec.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/regexp.html">regexp</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2011 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package regexp</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"io"</code></span>
+<span class="codeline" id="line-9"><code>	"regexp/syntax"</code></span>
+<span class="codeline" id="line-10"><code>	"sync"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// A queue is a 'sparse array' holding pending threads of execution.</code></span>
+<span class="codeline" id="line-14"><code>// See https://research.swtch.com/2008/03/using-uninitialized-memory-for-fun-and.html</code></span>
+<span class="codeline" id="line-15"><code>type queue struct {</code></span>
+<span class="codeline" id="line-16"><code>	sparse []uint32</code></span>
+<span class="codeline" id="line-17"><code>	dense  []entry</code></span>
+<span class="codeline" id="line-18"><code>}</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>// An entry is an entry on a queue.</code></span>
+<span class="codeline" id="line-21"><code>// It holds both the instruction pc and the actual thread.</code></span>
+<span class="codeline" id="line-22"><code>// Some queue entries are just place holders so that the machine</code></span>
+<span class="codeline" id="line-23"><code>// knows it has considered that pc. Such entries have t == nil.</code></span>
+<span class="codeline" id="line-24"><code>type entry struct {</code></span>
+<span class="codeline" id="line-25"><code>	pc uint32</code></span>
+<span class="codeline" id="line-26"><code>	t  *thread</code></span>
+<span class="codeline" id="line-27"><code>}</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>// A thread is the state of a single path through the machine:</code></span>
+<span class="codeline" id="line-30"><code>// an instruction and a corresponding capture array.</code></span>
+<span class="codeline" id="line-31"><code>// See https://swtch.com/~rsc/regexp/regexp2.html</code></span>
+<span class="codeline" id="line-32"><code>type thread struct {</code></span>
+<span class="codeline" id="line-33"><code>	inst *syntax.Inst</code></span>
+<span class="codeline" id="line-34"><code>	cap  []int</code></span>
+<span class="codeline" id="line-35"><code>}</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// A machine holds all the state during an NFA simulation for p.</code></span>
+<span class="codeline" id="line-38"><code>type machine struct {</code></span>
+<span class="codeline" id="line-39"><code>	re       *Regexp      // corresponding Regexp</code></span>
+<span class="codeline" id="line-40"><code>	p        *syntax.Prog // compiled program</code></span>
+<span class="codeline" id="line-41"><code>	q0, q1   queue        // two queues for runq, nextq</code></span>
+<span class="codeline" id="line-42"><code>	pool     []*thread    // pool of available threads</code></span>
+<span class="codeline" id="line-43"><code>	matched  bool         // whether a match was found</code></span>
+<span class="codeline" id="line-44"><code>	matchcap []int        // capture information for the match</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>	inputs inputs</code></span>
+<span class="codeline" id="line-47"><code>}</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>type inputs struct {</code></span>
+<span class="codeline" id="line-50"><code>	// cached inputs, to avoid allocation</code></span>
+<span class="codeline" id="line-51"><code>	bytes  inputBytes</code></span>
+<span class="codeline" id="line-52"><code>	string inputString</code></span>
+<span class="codeline" id="line-53"><code>	reader inputReader</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>func (i *inputs) newBytes(b []byte) input {</code></span>
+<span class="codeline" id="line-57"><code>	i.bytes.str = b</code></span>
+<span class="codeline" id="line-58"><code>	return &amp;i.bytes</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>func (i *inputs) newString(s string) input {</code></span>
+<span class="codeline" id="line-62"><code>	i.string.str = s</code></span>
+<span class="codeline" id="line-63"><code>	return &amp;i.string</code></span>
+<span class="codeline" id="line-64"><code>}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>func (i *inputs) newReader(r io.RuneReader) input {</code></span>
+<span class="codeline" id="line-67"><code>	i.reader.r = r</code></span>
+<span class="codeline" id="line-68"><code>	i.reader.atEOT = false</code></span>
+<span class="codeline" id="line-69"><code>	i.reader.pos = 0</code></span>
+<span class="codeline" id="line-70"><code>	return &amp;i.reader</code></span>
+<span class="codeline" id="line-71"><code>}</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>func (i *inputs) clear() {</code></span>
+<span class="codeline" id="line-74"><code>	// We need to clear 1 of these.</code></span>
+<span class="codeline" id="line-75"><code>	// Avoid the expense of clearing the others (pointer write barrier).</code></span>
+<span class="codeline" id="line-76"><code>	if i.bytes.str != nil {</code></span>
+<span class="codeline" id="line-77"><code>		i.bytes.str = nil</code></span>
+<span class="codeline" id="line-78"><code>	} else if i.reader.r != nil {</code></span>
+<span class="codeline" id="line-79"><code>		i.reader.r = nil</code></span>
+<span class="codeline" id="line-80"><code>	} else {</code></span>
+<span class="codeline" id="line-81"><code>		i.string.str = ""</code></span>
+<span class="codeline" id="line-82"><code>	}</code></span>
+<span class="codeline" id="line-83"><code>}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>func (i *inputs) init(r io.RuneReader, b []byte, s string) (input, int) {</code></span>
+<span class="codeline" id="line-86"><code>	if r != nil {</code></span>
+<span class="codeline" id="line-87"><code>		return i.newReader(r), 0</code></span>
+<span class="codeline" id="line-88"><code>	}</code></span>
+<span class="codeline" id="line-89"><code>	if b != nil {</code></span>
+<span class="codeline" id="line-90"><code>		return i.newBytes(b), len(b)</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code>	return i.newString(s), len(s)</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>func (m *machine) init(ncap int) {</code></span>
+<span class="codeline" id="line-96"><code>	for _, t := range m.pool {</code></span>
+<span class="codeline" id="line-97"><code>		t.cap = t.cap[:ncap]</code></span>
+<span class="codeline" id="line-98"><code>	}</code></span>
+<span class="codeline" id="line-99"><code>	m.matchcap = m.matchcap[:ncap]</code></span>
+<span class="codeline" id="line-100"><code>}</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>// alloc allocates a new thread with the given instruction.</code></span>
+<span class="codeline" id="line-103"><code>// It uses the free pool if possible.</code></span>
+<span class="codeline" id="line-104"><code>func (m *machine) alloc(i *syntax.Inst) *thread {</code></span>
+<span class="codeline" id="line-105"><code>	var t *thread</code></span>
+<span class="codeline" id="line-106"><code>	if n := len(m.pool); n &gt; 0 {</code></span>
+<span class="codeline" id="line-107"><code>		t = m.pool[n-1]</code></span>
+<span class="codeline" id="line-108"><code>		m.pool = m.pool[:n-1]</code></span>
+<span class="codeline" id="line-109"><code>	} else {</code></span>
+<span class="codeline" id="line-110"><code>		t = new(thread)</code></span>
+<span class="codeline" id="line-111"><code>		t.cap = make([]int, len(m.matchcap), cap(m.matchcap))</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code>	t.inst = i</code></span>
+<span class="codeline" id="line-114"><code>	return t</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>// A lazyFlag is a lazily-evaluated syntax.EmptyOp,</code></span>
+<span class="codeline" id="line-118"><code>// for checking zero-width flags like ^ $ \A \z \B \b.</code></span>
+<span class="codeline" id="line-119"><code>// It records the pair of relevant runes and does not</code></span>
+<span class="codeline" id="line-120"><code>// determine the implied flags until absolutely necessary</code></span>
+<span class="codeline" id="line-121"><code>// (most of the time, that means never).</code></span>
+<span class="codeline" id="line-122"><code>type lazyFlag uint64</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>func newLazyFlag(r1, r2 rune) lazyFlag {</code></span>
+<span class="codeline" id="line-125"><code>	return lazyFlag(uint64(r1)&lt;&lt;32 | uint64(uint32(r2)))</code></span>
+<span class="codeline" id="line-126"><code>}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>func (f lazyFlag) match(op syntax.EmptyOp) bool {</code></span>
+<span class="codeline" id="line-129"><code>	if op == 0 {</code></span>
+<span class="codeline" id="line-130"><code>		return true</code></span>
+<span class="codeline" id="line-131"><code>	}</code></span>
+<span class="codeline" id="line-132"><code>	r1 := rune(f &gt;&gt; 32)</code></span>
+<span class="codeline" id="line-133"><code>	if op&amp;syntax.EmptyBeginLine != 0 {</code></span>
+<span class="codeline" id="line-134"><code>		if r1 != '\n' &amp;&amp; r1 &gt;= 0 {</code></span>
+<span class="codeline" id="line-135"><code>			return false</code></span>
+<span class="codeline" id="line-136"><code>		}</code></span>
+<span class="codeline" id="line-137"><code>		op &amp;^= syntax.EmptyBeginLine</code></span>
+<span class="codeline" id="line-138"><code>	}</code></span>
+<span class="codeline" id="line-139"><code>	if op&amp;syntax.EmptyBeginText != 0 {</code></span>
+<span class="codeline" id="line-140"><code>		if r1 &gt;= 0 {</code></span>
+<span class="codeline" id="line-141"><code>			return false</code></span>
+<span class="codeline" id="line-142"><code>		}</code></span>
+<span class="codeline" id="line-143"><code>		op &amp;^= syntax.EmptyBeginText</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code>	if op == 0 {</code></span>
+<span class="codeline" id="line-146"><code>		return true</code></span>
+<span class="codeline" id="line-147"><code>	}</code></span>
+<span class="codeline" id="line-148"><code>	r2 := rune(f)</code></span>
+<span class="codeline" id="line-149"><code>	if op&amp;syntax.EmptyEndLine != 0 {</code></span>
+<span class="codeline" id="line-150"><code>		if r2 != '\n' &amp;&amp; r2 &gt;= 0 {</code></span>
+<span class="codeline" id="line-151"><code>			return false</code></span>
+<span class="codeline" id="line-152"><code>		}</code></span>
+<span class="codeline" id="line-153"><code>		op &amp;^= syntax.EmptyEndLine</code></span>
+<span class="codeline" id="line-154"><code>	}</code></span>
+<span class="codeline" id="line-155"><code>	if op&amp;syntax.EmptyEndText != 0 {</code></span>
+<span class="codeline" id="line-156"><code>		if r2 &gt;= 0 {</code></span>
+<span class="codeline" id="line-157"><code>			return false</code></span>
+<span class="codeline" id="line-158"><code>		}</code></span>
+<span class="codeline" id="line-159"><code>		op &amp;^= syntax.EmptyEndText</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code>	if op == 0 {</code></span>
+<span class="codeline" id="line-162"><code>		return true</code></span>
+<span class="codeline" id="line-163"><code>	}</code></span>
+<span class="codeline" id="line-164"><code>	if syntax.IsWordChar(r1) != syntax.IsWordChar(r2) {</code></span>
+<span class="codeline" id="line-165"><code>		op &amp;^= syntax.EmptyWordBoundary</code></span>
+<span class="codeline" id="line-166"><code>	} else {</code></span>
+<span class="codeline" id="line-167"><code>		op &amp;^= syntax.EmptyNoWordBoundary</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code>	return op == 0</code></span>
+<span class="codeline" id="line-170"><code>}</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>// match runs the machine over the input starting at pos.</code></span>
+<span class="codeline" id="line-173"><code>// It reports whether a match was found.</code></span>
+<span class="codeline" id="line-174"><code>// If so, m.matchcap holds the submatch information.</code></span>
+<span class="codeline" id="line-175"><code>func (m *machine) match(i input, pos int) bool {</code></span>
+<span class="codeline" id="line-176"><code>	startCond := m.re.cond</code></span>
+<span class="codeline" id="line-177"><code>	if startCond == ^syntax.EmptyOp(0) { // impossible</code></span>
+<span class="codeline" id="line-178"><code>		return false</code></span>
+<span class="codeline" id="line-179"><code>	}</code></span>
+<span class="codeline" id="line-180"><code>	m.matched = false</code></span>
+<span class="codeline" id="line-181"><code>	for i := range m.matchcap {</code></span>
+<span class="codeline" id="line-182"><code>		m.matchcap[i] = -1</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code>	runq, nextq := &amp;m.q0, &amp;m.q1</code></span>
+<span class="codeline" id="line-185"><code>	r, r1 := endOfText, endOfText</code></span>
+<span class="codeline" id="line-186"><code>	width, width1 := 0, 0</code></span>
+<span class="codeline" id="line-187"><code>	r, width = i.step(pos)</code></span>
+<span class="codeline" id="line-188"><code>	if r != endOfText {</code></span>
+<span class="codeline" id="line-189"><code>		r1, width1 = i.step(pos + width)</code></span>
+<span class="codeline" id="line-190"><code>	}</code></span>
+<span class="codeline" id="line-191"><code>	var flag lazyFlag</code></span>
+<span class="codeline" id="line-192"><code>	if pos == 0 {</code></span>
+<span class="codeline" id="line-193"><code>		flag = newLazyFlag(-1, r)</code></span>
+<span class="codeline" id="line-194"><code>	} else {</code></span>
+<span class="codeline" id="line-195"><code>		flag = i.context(pos)</code></span>
+<span class="codeline" id="line-196"><code>	}</code></span>
+<span class="codeline" id="line-197"><code>	for {</code></span>
+<span class="codeline" id="line-198"><code>		if len(runq.dense) == 0 {</code></span>
+<span class="codeline" id="line-199"><code>			if startCond&amp;syntax.EmptyBeginText != 0 &amp;&amp; pos != 0 {</code></span>
+<span class="codeline" id="line-200"><code>				// Anchored match, past beginning of text.</code></span>
+<span class="codeline" id="line-201"><code>				break</code></span>
+<span class="codeline" id="line-202"><code>			}</code></span>
+<span class="codeline" id="line-203"><code>			if m.matched {</code></span>
+<span class="codeline" id="line-204"><code>				// Have match; finished exploring alternatives.</code></span>
+<span class="codeline" id="line-205"><code>				break</code></span>
+<span class="codeline" id="line-206"><code>			}</code></span>
+<span class="codeline" id="line-207"><code>			if len(m.re.prefix) &gt; 0 &amp;&amp; r1 != m.re.prefixRune &amp;&amp; i.canCheckPrefix() {</code></span>
+<span class="codeline" id="line-208"><code>				// Match requires literal prefix; fast search for it.</code></span>
+<span class="codeline" id="line-209"><code>				advance := i.index(m.re, pos)</code></span>
+<span class="codeline" id="line-210"><code>				if advance &lt; 0 {</code></span>
+<span class="codeline" id="line-211"><code>					break</code></span>
+<span class="codeline" id="line-212"><code>				}</code></span>
+<span class="codeline" id="line-213"><code>				pos += advance</code></span>
+<span class="codeline" id="line-214"><code>				r, width = i.step(pos)</code></span>
+<span class="codeline" id="line-215"><code>				r1, width1 = i.step(pos + width)</code></span>
+<span class="codeline" id="line-216"><code>			}</code></span>
+<span class="codeline" id="line-217"><code>		}</code></span>
+<span class="codeline" id="line-218"><code>		if !m.matched {</code></span>
+<span class="codeline" id="line-219"><code>			if len(m.matchcap) &gt; 0 {</code></span>
+<span class="codeline" id="line-220"><code>				m.matchcap[0] = pos</code></span>
+<span class="codeline" id="line-221"><code>			}</code></span>
+<span class="codeline" id="line-222"><code>			m.add(runq, uint32(m.p.Start), pos, m.matchcap, &amp;flag, nil)</code></span>
+<span class="codeline" id="line-223"><code>		}</code></span>
+<span class="codeline" id="line-224"><code>		flag = newLazyFlag(r, r1)</code></span>
+<span class="codeline" id="line-225"><code>		m.step(runq, nextq, pos, pos+width, r, &amp;flag)</code></span>
+<span class="codeline" id="line-226"><code>		if width == 0 {</code></span>
+<span class="codeline" id="line-227"><code>			break</code></span>
+<span class="codeline" id="line-228"><code>		}</code></span>
+<span class="codeline" id="line-229"><code>		if len(m.matchcap) == 0 &amp;&amp; m.matched {</code></span>
+<span class="codeline" id="line-230"><code>			// Found a match and not paying attention</code></span>
+<span class="codeline" id="line-231"><code>			// to where it is, so any match will do.</code></span>
+<span class="codeline" id="line-232"><code>			break</code></span>
+<span class="codeline" id="line-233"><code>		}</code></span>
+<span class="codeline" id="line-234"><code>		pos += width</code></span>
+<span class="codeline" id="line-235"><code>		r, width = r1, width1</code></span>
+<span class="codeline" id="line-236"><code>		if r != endOfText {</code></span>
+<span class="codeline" id="line-237"><code>			r1, width1 = i.step(pos + width)</code></span>
+<span class="codeline" id="line-238"><code>		}</code></span>
+<span class="codeline" id="line-239"><code>		runq, nextq = nextq, runq</code></span>
+<span class="codeline" id="line-240"><code>	}</code></span>
+<span class="codeline" id="line-241"><code>	m.clear(nextq)</code></span>
+<span class="codeline" id="line-242"><code>	return m.matched</code></span>
+<span class="codeline" id="line-243"><code>}</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>// clear frees all threads on the thread queue.</code></span>
+<span class="codeline" id="line-246"><code>func (m *machine) clear(q *queue) {</code></span>
+<span class="codeline" id="line-247"><code>	for _, d := range q.dense {</code></span>
+<span class="codeline" id="line-248"><code>		if d.t != nil {</code></span>
+<span class="codeline" id="line-249"><code>			m.pool = append(m.pool, d.t)</code></span>
+<span class="codeline" id="line-250"><code>		}</code></span>
+<span class="codeline" id="line-251"><code>	}</code></span>
+<span class="codeline" id="line-252"><code>	q.dense = q.dense[:0]</code></span>
+<span class="codeline" id="line-253"><code>}</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>// step executes one step of the machine, running each of the threads</code></span>
+<span class="codeline" id="line-256"><code>// on runq and appending new threads to nextq.</code></span>
+<span class="codeline" id="line-257"><code>// The step processes the rune c (which may be endOfText),</code></span>
+<span class="codeline" id="line-258"><code>// which starts at position pos and ends at nextPos.</code></span>
+<span class="codeline" id="line-259"><code>// nextCond gives the setting for the empty-width flags after c.</code></span>
+<span class="codeline" id="line-260"><code>func (m *machine) step(runq, nextq *queue, pos, nextPos int, c rune, nextCond *lazyFlag) {</code></span>
+<span class="codeline" id="line-261"><code>	longest := m.re.longest</code></span>
+<span class="codeline" id="line-262"><code>	for j := 0; j &lt; len(runq.dense); j++ {</code></span>
+<span class="codeline" id="line-263"><code>		d := &amp;runq.dense[j]</code></span>
+<span class="codeline" id="line-264"><code>		t := d.t</code></span>
+<span class="codeline" id="line-265"><code>		if t == nil {</code></span>
+<span class="codeline" id="line-266"><code>			continue</code></span>
+<span class="codeline" id="line-267"><code>		}</code></span>
+<span class="codeline" id="line-268"><code>		if longest &amp;&amp; m.matched &amp;&amp; len(t.cap) &gt; 0 &amp;&amp; m.matchcap[0] &lt; t.cap[0] {</code></span>
+<span class="codeline" id="line-269"><code>			m.pool = append(m.pool, t)</code></span>
+<span class="codeline" id="line-270"><code>			continue</code></span>
+<span class="codeline" id="line-271"><code>		}</code></span>
+<span class="codeline" id="line-272"><code>		i := t.inst</code></span>
+<span class="codeline" id="line-273"><code>		add := false</code></span>
+<span class="codeline" id="line-274"><code>		switch i.Op {</code></span>
+<span class="codeline" id="line-275"><code>		default:</code></span>
+<span class="codeline" id="line-276"><code>			panic("bad inst")</code></span>
+<span class="codeline" id="line-277"><code></code></span>
+<span class="codeline" id="line-278"><code>		case syntax.InstMatch:</code></span>
+<span class="codeline" id="line-279"><code>			if len(t.cap) &gt; 0 &amp;&amp; (!longest || !m.matched || m.matchcap[1] &lt; pos) {</code></span>
+<span class="codeline" id="line-280"><code>				t.cap[1] = pos</code></span>
+<span class="codeline" id="line-281"><code>				copy(m.matchcap, t.cap)</code></span>
+<span class="codeline" id="line-282"><code>			}</code></span>
+<span class="codeline" id="line-283"><code>			if !longest {</code></span>
+<span class="codeline" id="line-284"><code>				// First-match mode: cut off all lower-priority threads.</code></span>
+<span class="codeline" id="line-285"><code>				for _, d := range runq.dense[j+1:] {</code></span>
+<span class="codeline" id="line-286"><code>					if d.t != nil {</code></span>
+<span class="codeline" id="line-287"><code>						m.pool = append(m.pool, d.t)</code></span>
+<span class="codeline" id="line-288"><code>					}</code></span>
+<span class="codeline" id="line-289"><code>				}</code></span>
+<span class="codeline" id="line-290"><code>				runq.dense = runq.dense[:0]</code></span>
+<span class="codeline" id="line-291"><code>			}</code></span>
+<span class="codeline" id="line-292"><code>			m.matched = true</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>		case syntax.InstRune:</code></span>
+<span class="codeline" id="line-295"><code>			add = i.MatchRune(c)</code></span>
+<span class="codeline" id="line-296"><code>		case syntax.InstRune1:</code></span>
+<span class="codeline" id="line-297"><code>			add = c == i.Rune[0]</code></span>
+<span class="codeline" id="line-298"><code>		case syntax.InstRuneAny:</code></span>
+<span class="codeline" id="line-299"><code>			add = true</code></span>
+<span class="codeline" id="line-300"><code>		case syntax.InstRuneAnyNotNL:</code></span>
+<span class="codeline" id="line-301"><code>			add = c != '\n'</code></span>
+<span class="codeline" id="line-302"><code>		}</code></span>
+<span class="codeline" id="line-303"><code>		if add {</code></span>
+<span class="codeline" id="line-304"><code>			t = m.add(nextq, i.Out, nextPos, t.cap, nextCond, t)</code></span>
+<span class="codeline" id="line-305"><code>		}</code></span>
+<span class="codeline" id="line-306"><code>		if t != nil {</code></span>
+<span class="codeline" id="line-307"><code>			m.pool = append(m.pool, t)</code></span>
+<span class="codeline" id="line-308"><code>		}</code></span>
+<span class="codeline" id="line-309"><code>	}</code></span>
+<span class="codeline" id="line-310"><code>	runq.dense = runq.dense[:0]</code></span>
+<span class="codeline" id="line-311"><code>}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>// add adds an entry to q for pc, unless the q already has such an entry.</code></span>
+<span class="codeline" id="line-314"><code>// It also recursively adds an entry for all instructions reachable from pc by following</code></span>
+<span class="codeline" id="line-315"><code>// empty-width conditions satisfied by cond.  pos gives the current position</code></span>
+<span class="codeline" id="line-316"><code>// in the input.</code></span>
+<span class="codeline" id="line-317"><code>func (m *machine) add(q *queue, pc uint32, pos int, cap []int, cond *lazyFlag, t *thread) *thread {</code></span>
+<span class="codeline" id="line-318"><code>Again:</code></span>
+<span class="codeline" id="line-319"><code>	if pc == 0 {</code></span>
+<span class="codeline" id="line-320"><code>		return t</code></span>
+<span class="codeline" id="line-321"><code>	}</code></span>
+<span class="codeline" id="line-322"><code>	if j := q.sparse[pc]; j &lt; uint32(len(q.dense)) &amp;&amp; q.dense[j].pc == pc {</code></span>
+<span class="codeline" id="line-323"><code>		return t</code></span>
+<span class="codeline" id="line-324"><code>	}</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>	j := len(q.dense)</code></span>
+<span class="codeline" id="line-327"><code>	q.dense = q.dense[:j+1]</code></span>
+<span class="codeline" id="line-328"><code>	d := &amp;q.dense[j]</code></span>
+<span class="codeline" id="line-329"><code>	d.t = nil</code></span>
+<span class="codeline" id="line-330"><code>	d.pc = pc</code></span>
+<span class="codeline" id="line-331"><code>	q.sparse[pc] = uint32(j)</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>	i := &amp;m.p.Inst[pc]</code></span>
+<span class="codeline" id="line-334"><code>	switch i.Op {</code></span>
+<span class="codeline" id="line-335"><code>	default:</code></span>
+<span class="codeline" id="line-336"><code>		panic("unhandled")</code></span>
+<span class="codeline" id="line-337"><code>	case syntax.InstFail:</code></span>
+<span class="codeline" id="line-338"><code>		// nothing</code></span>
+<span class="codeline" id="line-339"><code>	case syntax.InstAlt, syntax.InstAltMatch:</code></span>
+<span class="codeline" id="line-340"><code>		t = m.add(q, i.Out, pos, cap, cond, t)</code></span>
+<span class="codeline" id="line-341"><code>		pc = i.Arg</code></span>
+<span class="codeline" id="line-342"><code>		goto Again</code></span>
+<span class="codeline" id="line-343"><code>	case syntax.InstEmptyWidth:</code></span>
+<span class="codeline" id="line-344"><code>		if cond.match(syntax.EmptyOp(i.Arg)) {</code></span>
+<span class="codeline" id="line-345"><code>			pc = i.Out</code></span>
+<span class="codeline" id="line-346"><code>			goto Again</code></span>
+<span class="codeline" id="line-347"><code>		}</code></span>
+<span class="codeline" id="line-348"><code>	case syntax.InstNop:</code></span>
+<span class="codeline" id="line-349"><code>		pc = i.Out</code></span>
+<span class="codeline" id="line-350"><code>		goto Again</code></span>
+<span class="codeline" id="line-351"><code>	case syntax.InstCapture:</code></span>
+<span class="codeline" id="line-352"><code>		if int(i.Arg) &lt; len(cap) {</code></span>
+<span class="codeline" id="line-353"><code>			opos := cap[i.Arg]</code></span>
+<span class="codeline" id="line-354"><code>			cap[i.Arg] = pos</code></span>
+<span class="codeline" id="line-355"><code>			m.add(q, i.Out, pos, cap, cond, nil)</code></span>
+<span class="codeline" id="line-356"><code>			cap[i.Arg] = opos</code></span>
+<span class="codeline" id="line-357"><code>		} else {</code></span>
+<span class="codeline" id="line-358"><code>			pc = i.Out</code></span>
+<span class="codeline" id="line-359"><code>			goto Again</code></span>
+<span class="codeline" id="line-360"><code>		}</code></span>
+<span class="codeline" id="line-361"><code>	case syntax.InstMatch, syntax.InstRune, syntax.InstRune1, syntax.InstRuneAny, syntax.InstRuneAnyNotNL:</code></span>
+<span class="codeline" id="line-362"><code>		if t == nil {</code></span>
+<span class="codeline" id="line-363"><code>			t = m.alloc(i)</code></span>
+<span class="codeline" id="line-364"><code>		} else {</code></span>
+<span class="codeline" id="line-365"><code>			t.inst = i</code></span>
+<span class="codeline" id="line-366"><code>		}</code></span>
+<span class="codeline" id="line-367"><code>		if len(cap) &gt; 0 &amp;&amp; &amp;t.cap[0] != &amp;cap[0] {</code></span>
+<span class="codeline" id="line-368"><code>			copy(t.cap, cap)</code></span>
+<span class="codeline" id="line-369"><code>		}</code></span>
+<span class="codeline" id="line-370"><code>		d.t = t</code></span>
+<span class="codeline" id="line-371"><code>		t = nil</code></span>
+<span class="codeline" id="line-372"><code>	}</code></span>
+<span class="codeline" id="line-373"><code>	return t</code></span>
+<span class="codeline" id="line-374"><code>}</code></span>
+<span class="codeline" id="line-375"><code></code></span>
+<span class="codeline" id="line-376"><code>type onePassMachine struct {</code></span>
+<span class="codeline" id="line-377"><code>	inputs   inputs</code></span>
+<span class="codeline" id="line-378"><code>	matchcap []int</code></span>
+<span class="codeline" id="line-379"><code>}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>var onePassPool sync.Pool</code></span>
+<span class="codeline" id="line-382"><code></code></span>
+<span class="codeline" id="line-383"><code>func newOnePassMachine() *onePassMachine {</code></span>
+<span class="codeline" id="line-384"><code>	m, ok := onePassPool.Get().(*onePassMachine)</code></span>
+<span class="codeline" id="line-385"><code>	if !ok {</code></span>
+<span class="codeline" id="line-386"><code>		m = new(onePassMachine)</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code>	return m</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>func freeOnePassMachine(m *onePassMachine) {</code></span>
+<span class="codeline" id="line-392"><code>	m.inputs.clear()</code></span>
+<span class="codeline" id="line-393"><code>	onePassPool.Put(m)</code></span>
+<span class="codeline" id="line-394"><code>}</code></span>
+<span class="codeline" id="line-395"><code></code></span>
+<span class="codeline" id="line-396"><code>// doOnePass implements r.doExecute using the one-pass execution engine.</code></span>
+<span class="codeline" id="line-397"><code>func (re *Regexp) doOnePass(ir io.RuneReader, ib []byte, is string, pos, ncap int, dstCap []int) []int {</code></span>
+<span class="codeline" id="line-398"><code>	startCond := re.cond</code></span>
+<span class="codeline" id="line-399"><code>	if startCond == ^syntax.EmptyOp(0) { // impossible</code></span>
+<span class="codeline" id="line-400"><code>		return nil</code></span>
+<span class="codeline" id="line-401"><code>	}</code></span>
+<span class="codeline" id="line-402"><code></code></span>
+<span class="codeline" id="line-403"><code>	m := newOnePassMachine()</code></span>
+<span class="codeline" id="line-404"><code>	if cap(m.matchcap) &lt; ncap {</code></span>
+<span class="codeline" id="line-405"><code>		m.matchcap = make([]int, ncap)</code></span>
+<span class="codeline" id="line-406"><code>	} else {</code></span>
+<span class="codeline" id="line-407"><code>		m.matchcap = m.matchcap[:ncap]</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code></code></span>
+<span class="codeline" id="line-410"><code>	matched := false</code></span>
+<span class="codeline" id="line-411"><code>	for i := range m.matchcap {</code></span>
+<span class="codeline" id="line-412"><code>		m.matchcap[i] = -1</code></span>
+<span class="codeline" id="line-413"><code>	}</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>	i, _ := m.inputs.init(ir, ib, is)</code></span>
+<span class="codeline" id="line-416"><code></code></span>
+<span class="codeline" id="line-417"><code>	r, r1 := endOfText, endOfText</code></span>
+<span class="codeline" id="line-418"><code>	width, width1 := 0, 0</code></span>
+<span class="codeline" id="line-419"><code>	r, width = i.step(pos)</code></span>
+<span class="codeline" id="line-420"><code>	if r != endOfText {</code></span>
+<span class="codeline" id="line-421"><code>		r1, width1 = i.step(pos + width)</code></span>
+<span class="codeline" id="line-422"><code>	}</code></span>
+<span class="codeline" id="line-423"><code>	var flag lazyFlag</code></span>
+<span class="codeline" id="line-424"><code>	if pos == 0 {</code></span>
+<span class="codeline" id="line-425"><code>		flag = newLazyFlag(-1, r)</code></span>
+<span class="codeline" id="line-426"><code>	} else {</code></span>
+<span class="codeline" id="line-427"><code>		flag = i.context(pos)</code></span>
+<span class="codeline" id="line-428"><code>	}</code></span>
+<span class="codeline" id="line-429"><code>	pc := re.onepass.Start</code></span>
+<span class="codeline" id="line-430"><code>	inst := &amp;re.onepass.Inst[pc]</code></span>
+<span class="codeline" id="line-431"><code>	// If there is a simple literal prefix, skip over it.</code></span>
+<span class="codeline" id="line-432"><code>	if pos == 0 &amp;&amp; flag.match(syntax.EmptyOp(inst.Arg)) &amp;&amp;</code></span>
+<span class="codeline" id="line-433"><code>		len(re.prefix) &gt; 0 &amp;&amp; i.canCheckPrefix() {</code></span>
+<span class="codeline" id="line-434"><code>		// Match requires literal prefix; fast search for it.</code></span>
+<span class="codeline" id="line-435"><code>		if !i.hasPrefix(re) {</code></span>
+<span class="codeline" id="line-436"><code>			goto Return</code></span>
+<span class="codeline" id="line-437"><code>		}</code></span>
+<span class="codeline" id="line-438"><code>		pos += len(re.prefix)</code></span>
+<span class="codeline" id="line-439"><code>		r, width = i.step(pos)</code></span>
+<span class="codeline" id="line-440"><code>		r1, width1 = i.step(pos + width)</code></span>
+<span class="codeline" id="line-441"><code>		flag = i.context(pos)</code></span>
+<span class="codeline" id="line-442"><code>		pc = int(re.prefixEnd)</code></span>
+<span class="codeline" id="line-443"><code>	}</code></span>
+<span class="codeline" id="line-444"><code>	for {</code></span>
+<span class="codeline" id="line-445"><code>		inst = &amp;re.onepass.Inst[pc]</code></span>
+<span class="codeline" id="line-446"><code>		pc = int(inst.Out)</code></span>
+<span class="codeline" id="line-447"><code>		switch inst.Op {</code></span>
+<span class="codeline" id="line-448"><code>		default:</code></span>
+<span class="codeline" id="line-449"><code>			panic("bad inst")</code></span>
+<span class="codeline" id="line-450"><code>		case syntax.InstMatch:</code></span>
+<span class="codeline" id="line-451"><code>			matched = true</code></span>
+<span class="codeline" id="line-452"><code>			if len(m.matchcap) &gt; 0 {</code></span>
+<span class="codeline" id="line-453"><code>				m.matchcap[0] = 0</code></span>
+<span class="codeline" id="line-454"><code>				m.matchcap[1] = pos</code></span>
+<span class="codeline" id="line-455"><code>			}</code></span>
+<span class="codeline" id="line-456"><code>			goto Return</code></span>
+<span class="codeline" id="line-457"><code>		case syntax.InstRune:</code></span>
+<span class="codeline" id="line-458"><code>			if !inst.MatchRune(r) {</code></span>
+<span class="codeline" id="line-459"><code>				goto Return</code></span>
+<span class="codeline" id="line-460"><code>			}</code></span>
+<span class="codeline" id="line-461"><code>		case syntax.InstRune1:</code></span>
+<span class="codeline" id="line-462"><code>			if r != inst.Rune[0] {</code></span>
+<span class="codeline" id="line-463"><code>				goto Return</code></span>
+<span class="codeline" id="line-464"><code>			}</code></span>
+<span class="codeline" id="line-465"><code>		case syntax.InstRuneAny:</code></span>
+<span class="codeline" id="line-466"><code>			// Nothing</code></span>
+<span class="codeline" id="line-467"><code>		case syntax.InstRuneAnyNotNL:</code></span>
+<span class="codeline" id="line-468"><code>			if r == '\n' {</code></span>
+<span class="codeline" id="line-469"><code>				goto Return</code></span>
+<span class="codeline" id="line-470"><code>			}</code></span>
+<span class="codeline" id="line-471"><code>		// peek at the input rune to see which branch of the Alt to take</code></span>
+<span class="codeline" id="line-472"><code>		case syntax.InstAlt, syntax.InstAltMatch:</code></span>
+<span class="codeline" id="line-473"><code>			pc = int(onePassNext(inst, r))</code></span>
+<span class="codeline" id="line-474"><code>			continue</code></span>
+<span class="codeline" id="line-475"><code>		case syntax.InstFail:</code></span>
+<span class="codeline" id="line-476"><code>			goto Return</code></span>
+<span class="codeline" id="line-477"><code>		case syntax.InstNop:</code></span>
+<span class="codeline" id="line-478"><code>			continue</code></span>
+<span class="codeline" id="line-479"><code>		case syntax.InstEmptyWidth:</code></span>
+<span class="codeline" id="line-480"><code>			if !flag.match(syntax.EmptyOp(inst.Arg)) {</code></span>
+<span class="codeline" id="line-481"><code>				goto Return</code></span>
+<span class="codeline" id="line-482"><code>			}</code></span>
+<span class="codeline" id="line-483"><code>			continue</code></span>
+<span class="codeline" id="line-484"><code>		case syntax.InstCapture:</code></span>
+<span class="codeline" id="line-485"><code>			if int(inst.Arg) &lt; len(m.matchcap) {</code></span>
+<span class="codeline" id="line-486"><code>				m.matchcap[inst.Arg] = pos</code></span>
+<span class="codeline" id="line-487"><code>			}</code></span>
+<span class="codeline" id="line-488"><code>			continue</code></span>
+<span class="codeline" id="line-489"><code>		}</code></span>
+<span class="codeline" id="line-490"><code>		if width == 0 {</code></span>
+<span class="codeline" id="line-491"><code>			break</code></span>
+<span class="codeline" id="line-492"><code>		}</code></span>
+<span class="codeline" id="line-493"><code>		flag = newLazyFlag(r, r1)</code></span>
+<span class="codeline" id="line-494"><code>		pos += width</code></span>
+<span class="codeline" id="line-495"><code>		r, width = r1, width1</code></span>
+<span class="codeline" id="line-496"><code>		if r != endOfText {</code></span>
+<span class="codeline" id="line-497"><code>			r1, width1 = i.step(pos + width)</code></span>
+<span class="codeline" id="line-498"><code>		}</code></span>
+<span class="codeline" id="line-499"><code>	}</code></span>
+<span class="codeline" id="line-500"><code></code></span>
+<span class="codeline" id="line-501"><code>Return:</code></span>
+<span class="codeline" id="line-502"><code>	if !matched {</code></span>
+<span class="codeline" id="line-503"><code>		freeOnePassMachine(m)</code></span>
+<span class="codeline" id="line-504"><code>		return nil</code></span>
+<span class="codeline" id="line-505"><code>	}</code></span>
+<span class="codeline" id="line-506"><code></code></span>
+<span class="codeline" id="line-507"><code>	dstCap = append(dstCap, m.matchcap...)</code></span>
+<span class="codeline" id="line-508"><code>	freeOnePassMachine(m)</code></span>
+<span class="codeline" id="line-509"><code>	return dstCap</code></span>
+<span class="codeline" id="line-510"><code>}</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>// doMatch reports whether either r, b or s match the regexp.</code></span>
+<span class="codeline" id="line-513"><code>func (re *Regexp) doMatch(r io.RuneReader, b []byte, s string) bool {</code></span>
+<span class="codeline" id="line-514"><code>	return re.doExecute(r, b, s, 0, 0, nil) != nil</code></span>
+<span class="codeline" id="line-515"><code>}</code></span>
+<span class="codeline" id="line-516"><code></code></span>
+<span class="codeline" id="line-517"><code>// doExecute finds the leftmost match in the input, appends the position</code></span>
+<span class="codeline" id="line-518"><code>// of its subexpressions to dstCap and returns dstCap.</code></span>
+<span class="codeline" id="line-519"><code>//</code></span>
+<span class="codeline" id="line-520"><code>// nil is returned if no matches are found and non-nil if matches are found.</code></span>
+<span class="codeline" id="line-521"><code>func (re *Regexp) doExecute(r io.RuneReader, b []byte, s string, pos int, ncap int, dstCap []int) []int {</code></span>
+<span class="codeline" id="line-522"><code>	if dstCap == nil {</code></span>
+<span class="codeline" id="line-523"><code>		// Make sure 'return dstCap' is non-nil.</code></span>
+<span class="codeline" id="line-524"><code>		dstCap = arrayNoInts[:0:0]</code></span>
+<span class="codeline" id="line-525"><code>	}</code></span>
+<span class="codeline" id="line-526"><code></code></span>
+<span class="codeline" id="line-527"><code>	if r == nil &amp;&amp; len(b)+len(s) &lt; re.minInputLen {</code></span>
+<span class="codeline" id="line-528"><code>		return nil</code></span>
+<span class="codeline" id="line-529"><code>	}</code></span>
+<span class="codeline" id="line-530"><code></code></span>
+<span class="codeline" id="line-531"><code>	if re.onepass != nil {</code></span>
+<span class="codeline" id="line-532"><code>		return re.doOnePass(r, b, s, pos, ncap, dstCap)</code></span>
+<span class="codeline" id="line-533"><code>	}</code></span>
+<span class="codeline" id="line-534"><code>	if r == nil &amp;&amp; len(b)+len(s) &lt; re.maxBitStateLen {</code></span>
+<span class="codeline" id="line-535"><code>		return re.backtrack(b, s, pos, ncap, dstCap)</code></span>
+<span class="codeline" id="line-536"><code>	}</code></span>
+<span class="codeline" id="line-537"><code></code></span>
+<span class="codeline" id="line-538"><code>	m := re.get()</code></span>
+<span class="codeline" id="line-539"><code>	i, _ := m.inputs.init(r, b, s)</code></span>
+<span class="codeline" id="line-540"><code></code></span>
+<span class="codeline" id="line-541"><code>	m.init(ncap)</code></span>
+<span class="codeline" id="line-542"><code>	if !m.match(i, pos) {</code></span>
+<span class="codeline" id="line-543"><code>		re.put(m)</code></span>
+<span class="codeline" id="line-544"><code>		return nil</code></span>
+<span class="codeline" id="line-545"><code>	}</code></span>
+<span class="codeline" id="line-546"><code></code></span>
+<span class="codeline" id="line-547"><code>	dstCap = append(dstCap, m.matchcap...)</code></span>
+<span class="codeline" id="line-548"><code>	re.put(m)</code></span>
+<span class="codeline" id="line-549"><code>	return dstCap</code></span>
+<span class="codeline" id="line-550"><code>}</code></span>
+<span class="codeline" id="line-551"><code></code></span>
+<span class="codeline" id="line-552"><code>// arrayNoInts is returned by doExecute match if nil dstCap is passed</code></span>
+<span class="codeline" id="line-553"><code>// to it with ncap=0.</code></span>
+<span class="codeline" id="line-554"><code>var arrayNoInts [0]int</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: prefork.go in package github.com/gofiber/fiber/v2</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	prefork.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/github.com/gofiber/fiber/v2.html">github.com/gofiber/fiber/v2</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package fiber</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"crypto/tls"</code></span>
+<span class="codeline" id="line-5"><code>	"errors"</code></span>
+<span class="codeline" id="line-6"><code>	"fmt"</code></span>
+<span class="codeline" id="line-7"><code>	"os"</code></span>
+<span class="codeline" id="line-8"><code>	"os/exec"</code></span>
+<span class="codeline" id="line-9"><code>	"runtime"</code></span>
+<span class="codeline" id="line-10"><code>	"strconv"</code></span>
+<span class="codeline" id="line-11"><code>	"strings"</code></span>
+<span class="codeline" id="line-12"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-13"><code>	"time"</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>	"github.com/valyala/fasthttp/reuseport"</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>	"github.com/gofiber/fiber/v2/log"</code></span>
+<span class="codeline" id="line-18"><code>)</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>const (</code></span>
+<span class="codeline" id="line-21"><code>	envPreforkChildKey = "FIBER_PREFORK_CHILD"</code></span>
+<span class="codeline" id="line-22"><code>	envPreforkChildVal = "1"</code></span>
+<span class="codeline" id="line-23"><code>)</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>var (</code></span>
+<span class="codeline" id="line-26"><code>	testPreforkMaster = false</code></span>
+<span class="codeline" id="line-27"><code>	testOnPrefork     = false</code></span>
+<span class="codeline" id="line-28"><code>)</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>// IsChild determines if the current process is a child of Prefork</code></span>
+<span class="codeline" id="line-31"><code>func IsChild() bool {</code></span>
+<span class="codeline" id="line-32"><code>	return os.Getenv(envPreforkChildKey) == envPreforkChildVal</code></span>
+<span class="codeline" id="line-33"><code>}</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>// prefork manages child processes to make use of the OS REUSEPORT or REUSEADDR feature</code></span>
+<span class="codeline" id="line-36"><code>func (app *App) prefork(network, addr string, tlsConfig *tls.Config) error {</code></span>
+<span class="codeline" id="line-37"><code>	// 👶 child process 👶</code></span>
+<span class="codeline" id="line-38"><code>	if IsChild() {</code></span>
+<span class="codeline" id="line-39"><code>		// use 1 cpu core per child process</code></span>
+<span class="codeline" id="line-40"><code>		runtime.GOMAXPROCS(1)</code></span>
+<span class="codeline" id="line-41"><code>		// Linux will use SO_REUSEPORT and Windows falls back to SO_REUSEADDR</code></span>
+<span class="codeline" id="line-42"><code>		// Only tcp4 or tcp6 is supported when preforking, both are not supported</code></span>
+<span class="codeline" id="line-43"><code>		ln, err := reuseport.Listen(network, addr)</code></span>
+<span class="codeline" id="line-44"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-45"><code>			if !app.config.DisableStartupMessage {</code></span>
+<span class="codeline" id="line-46"><code>				const sleepDuration = 100 * time.Millisecond</code></span>
+<span class="codeline" id="line-47"><code>				time.Sleep(sleepDuration) // avoid colliding with startup message</code></span>
+<span class="codeline" id="line-48"><code>			}</code></span>
+<span class="codeline" id="line-49"><code>			return fmt.Errorf("prefork: %w", err)</code></span>
+<span class="codeline" id="line-50"><code>		}</code></span>
+<span class="codeline" id="line-51"><code>		// wrap a tls config around the listener if provided</code></span>
+<span class="codeline" id="line-52"><code>		if tlsConfig != nil {</code></span>
+<span class="codeline" id="line-53"><code>			ln = tls.NewListener(ln, tlsConfig)</code></span>
+<span class="codeline" id="line-54"><code>		}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>		// kill current child proc when master exits</code></span>
+<span class="codeline" id="line-57"><code>		go watchMaster()</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>		// prepare the server for the start</code></span>
+<span class="codeline" id="line-60"><code>		app.startupProcess()</code></span>
+<span class="codeline" id="line-61"><code></code></span>
+<span class="codeline" id="line-62"><code>		// listen for incoming connections</code></span>
+<span class="codeline" id="line-63"><code>		return app.server.Serve(ln)</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>	// 👮 master process 👮</code></span>
+<span class="codeline" id="line-67"><code>	type child struct {</code></span>
+<span class="codeline" id="line-68"><code>		pid int</code></span>
+<span class="codeline" id="line-69"><code>		err error</code></span>
+<span class="codeline" id="line-70"><code>	}</code></span>
+<span class="codeline" id="line-71"><code>	// create variables</code></span>
+<span class="codeline" id="line-72"><code>	max := runtime.GOMAXPROCS(0)</code></span>
+<span class="codeline" id="line-73"><code>	childs := make(map[int]*exec.Cmd)</code></span>
+<span class="codeline" id="line-74"><code>	channel := make(chan child, max)</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>	// kill child procs when master exits</code></span>
+<span class="codeline" id="line-77"><code>	defer func() {</code></span>
+<span class="codeline" id="line-78"><code>		for _, proc := range childs {</code></span>
+<span class="codeline" id="line-79"><code>			if err := proc.Process.Kill(); err != nil {</code></span>
+<span class="codeline" id="line-80"><code>				if !errors.Is(err, os.ErrProcessDone) {</code></span>
+<span class="codeline" id="line-81"><code>					log.Errorf("prefork: failed to kill child: %v", err)</code></span>
+<span class="codeline" id="line-82"><code>				}</code></span>
+<span class="codeline" id="line-83"><code>			}</code></span>
+<span class="codeline" id="line-84"><code>		}</code></span>
+<span class="codeline" id="line-85"><code>	}()</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>	// collect child pids</code></span>
+<span class="codeline" id="line-88"><code>	var pids []string</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	// launch child procs</code></span>
+<span class="codeline" id="line-91"><code>	for i := 0; i &lt; max; i++ {</code></span>
+<span class="codeline" id="line-92"><code>		cmd := exec.Command(os.Args[0], os.Args[1:]...) //nolint:gosec // It's fine to launch the same process again</code></span>
+<span class="codeline" id="line-93"><code>		if testPreforkMaster {</code></span>
+<span class="codeline" id="line-94"><code>			// When test prefork master,</code></span>
+<span class="codeline" id="line-95"><code>			// just start the child process with a dummy cmd,</code></span>
+<span class="codeline" id="line-96"><code>			// which will exit soon</code></span>
+<span class="codeline" id="line-97"><code>			cmd = dummyCmd()</code></span>
+<span class="codeline" id="line-98"><code>		}</code></span>
+<span class="codeline" id="line-99"><code>		cmd.Stdout = os.Stdout</code></span>
+<span class="codeline" id="line-100"><code>		cmd.Stderr = os.Stderr</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>		// add fiber prefork child flag into child proc env</code></span>
+<span class="codeline" id="line-103"><code>		cmd.Env = append(os.Environ(),</code></span>
+<span class="codeline" id="line-104"><code>			fmt.Sprintf("%s=%s", envPreforkChildKey, envPreforkChildVal),</code></span>
+<span class="codeline" id="line-105"><code>		)</code></span>
+<span class="codeline" id="line-106"><code>		if err := cmd.Start(); err != nil {</code></span>
+<span class="codeline" id="line-107"><code>			return fmt.Errorf("failed to start a child prefork process, error: %w", err)</code></span>
+<span class="codeline" id="line-108"><code>		}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>		// store child process</code></span>
+<span class="codeline" id="line-111"><code>		pid := cmd.Process.Pid</code></span>
+<span class="codeline" id="line-112"><code>		childs[pid] = cmd</code></span>
+<span class="codeline" id="line-113"><code>		pids = append(pids, strconv.Itoa(pid))</code></span>
+<span class="codeline" id="line-114"><code></code></span>
+<span class="codeline" id="line-115"><code>		// execute fork hook</code></span>
+<span class="codeline" id="line-116"><code>		if app.hooks != nil {</code></span>
+<span class="codeline" id="line-117"><code>			if testOnPrefork {</code></span>
+<span class="codeline" id="line-118"><code>				app.hooks.executeOnForkHooks(dummyPid)</code></span>
+<span class="codeline" id="line-119"><code>			} else {</code></span>
+<span class="codeline" id="line-120"><code>				app.hooks.executeOnForkHooks(pid)</code></span>
+<span class="codeline" id="line-121"><code>			}</code></span>
+<span class="codeline" id="line-122"><code>		}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>		// notify master if child crashes</code></span>
+<span class="codeline" id="line-125"><code>		go func() {</code></span>
+<span class="codeline" id="line-126"><code>			channel &lt;- child{pid, cmd.Wait()}</code></span>
+<span class="codeline" id="line-127"><code>		}()</code></span>
+<span class="codeline" id="line-128"><code>	}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>	// Run onListen hooks</code></span>
+<span class="codeline" id="line-131"><code>	// Hooks have to be run here as different as non-prefork mode due to they should run as child or master</code></span>
+<span class="codeline" id="line-132"><code>	app.runOnListenHooks(app.prepareListenData(addr, tlsConfig != nil))</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>	// Print startup message</code></span>
+<span class="codeline" id="line-135"><code>	if !app.config.DisableStartupMessage {</code></span>
+<span class="codeline" id="line-136"><code>		app.startupMessage(addr, tlsConfig != nil, ","+strings.Join(pids, ","))</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	// return error if child crashes</code></span>
+<span class="codeline" id="line-140"><code>	return (&lt;-channel).err</code></span>
+<span class="codeline" id="line-141"><code>}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>// watchMaster watches child procs</code></span>
+<span class="codeline" id="line-144"><code>func watchMaster() {</code></span>
+<span class="codeline" id="line-145"><code>	if runtime.GOOS == "windows" {</code></span>
+<span class="codeline" id="line-146"><code>		// finds parent process,</code></span>
+<span class="codeline" id="line-147"><code>		// and waits for it to exit</code></span>
+<span class="codeline" id="line-148"><code>		p, err := os.FindProcess(os.Getppid())</code></span>
+<span class="codeline" id="line-149"><code>		if err == nil {</code></span>
+<span class="codeline" id="line-150"><code>			_, _ = p.Wait() //nolint:errcheck // It is fine to ignore the error here</code></span>
+<span class="codeline" id="line-151"><code>		}</code></span>
+<span class="codeline" id="line-152"><code>		os.Exit(1) //nolint:revive // Calling os.Exit is fine here in the prefork</code></span>
+<span class="codeline" id="line-153"><code>	}</code></span>
+<span class="codeline" id="line-154"><code>	// if it is equal to 1 (init process ID),</code></span>
+<span class="codeline" id="line-155"><code>	// it indicates that the master process has exited</code></span>
+<span class="codeline" id="line-156"><code>	const watchInterval = 500 * time.Millisecond</code></span>
+<span class="codeline" id="line-157"><code>	for range time.NewTicker(watchInterval).C {</code></span>
+<span class="codeline" id="line-158"><code>		if os.Getppid() == 1 {</code></span>
+<span class="codeline" id="line-159"><code>			os.Exit(1) //nolint:revive // Calling os.Exit is fine here in the prefork</code></span>
+<span class="codeline" id="line-160"><code>		}</code></span>
+<span class="codeline" id="line-161"><code>	}</code></span>
+<span class="codeline" id="line-162"><code>}</code></span>
+<span class="codeline" id="line-163"><code></code></span>
+<span class="codeline" id="line-164"><code>var (</code></span>
+<span class="codeline" id="line-165"><code>	dummyPid      = 1</code></span>
+<span class="codeline" id="line-166"><code>	dummyChildCmd atomic.Value</code></span>
+<span class="codeline" id="line-167"><code>)</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>// dummyCmd is for internal prefork testing</code></span>
+<span class="codeline" id="line-170"><code>func dummyCmd() *exec.Cmd {</code></span>
+<span class="codeline" id="line-171"><code>	command := "go"</code></span>
+<span class="codeline" id="line-172"><code>	if storeCommand := dummyChildCmd.Load(); storeCommand != nil &amp;&amp; storeCommand != "" {</code></span>
+<span class="codeline" id="line-173"><code>		command = storeCommand.(string) //nolint:forcetypeassert,errcheck // We always store a string in here</code></span>
+<span class="codeline" id="line-174"><code>	}</code></span>
+<span class="codeline" id="line-175"><code>	if runtime.GOOS == "windows" {</code></span>
+<span class="codeline" id="line-176"><code>		return exec.Command("cmd", "/C", command, "version")</code></span>
+<span class="codeline" id="line-177"><code>	}</code></span>
+<span class="codeline" id="line-178"><code>	return exec.Command(command, "version")</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

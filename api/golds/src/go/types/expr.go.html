@@ -1,0 +1,1641 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: expr.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	expr.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2012 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// This file implements typechecking of expressions.</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package types</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"fmt"</code></span>
+<span class="codeline" id="line-11"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-12"><code>	"go/constant"</code></span>
+<span class="codeline" id="line-13"><code>	"go/internal/typeparams"</code></span>
+<span class="codeline" id="line-14"><code>	"go/token"</code></span>
+<span class="codeline" id="line-15"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>/*</code></span>
+<span class="codeline" id="line-19"><code>Basic algorithm:</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>Expressions are checked recursively, top down. Expression checker functions</code></span>
+<span class="codeline" id="line-22"><code>are generally of the form:</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>  func f(x *operand, e *ast.Expr, ...)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>where e is the expression to be checked, and x is the result of the check.</code></span>
+<span class="codeline" id="line-27"><code>The check performed by f may fail in which case x.mode == invalid, and</code></span>
+<span class="codeline" id="line-28"><code>related error messages will have been issued by f.</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>If a hint argument is present, it is the composite literal element type</code></span>
+<span class="codeline" id="line-31"><code>of an outer composite literal; it is used to type-check composite literal</code></span>
+<span class="codeline" id="line-32"><code>elements that have no explicit type specification in the source</code></span>
+<span class="codeline" id="line-33"><code>(e.g.: []T{{...}, {...}}, the hint is the type T in this case).</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>All expressions are checked via rawExpr, which dispatches according</code></span>
+<span class="codeline" id="line-36"><code>to expression kind. Upon returning, rawExpr is recording the types and</code></span>
+<span class="codeline" id="line-37"><code>constant values for all expressions that have an untyped type (those types</code></span>
+<span class="codeline" id="line-38"><code>may change on the way up in the expression tree). Usually these are constants,</code></span>
+<span class="codeline" id="line-39"><code>but the results of comparisons or non-constant shifts of untyped constants</code></span>
+<span class="codeline" id="line-40"><code>may also be untyped, but not constant.</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>Untyped expressions may eventually become fully typed (i.e., not untyped),</code></span>
+<span class="codeline" id="line-43"><code>typically when the value is assigned to a variable, or is used otherwise.</code></span>
+<span class="codeline" id="line-44"><code>The updateExprType method is used to record this final type and update</code></span>
+<span class="codeline" id="line-45"><code>the recorded types: the type-checked expression tree is again traversed down,</code></span>
+<span class="codeline" id="line-46"><code>and the new type is propagated as needed. Untyped constant expression values</code></span>
+<span class="codeline" id="line-47"><code>that become fully typed must now be representable by the full type (constant</code></span>
+<span class="codeline" id="line-48"><code>sub-expression trees are left alone except for their roots). This mechanism</code></span>
+<span class="codeline" id="line-49"><code>ensures that a client sees the actual (run-time) type an untyped value would</code></span>
+<span class="codeline" id="line-50"><code>have. It also permits type-checking of lhs shift operands "as if the shift</code></span>
+<span class="codeline" id="line-51"><code>were not present": when updateExprType visits an untyped lhs shift operand</code></span>
+<span class="codeline" id="line-52"><code>and assigns it it's final type, that type must be an integer type, and a</code></span>
+<span class="codeline" id="line-53"><code>constant lhs must be representable as an integer.</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>When an expression gets its final type, either on the way out from rawExpr,</code></span>
+<span class="codeline" id="line-56"><code>on the way down in updateExprType, or at the end of the type checker run,</code></span>
+<span class="codeline" id="line-57"><code>the type (and constant value, if any) is recorded via Info.Types, if present.</code></span>
+<span class="codeline" id="line-58"><code>*/</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>type opPredicates map[token.Token]func(Type) bool</code></span>
+<span class="codeline" id="line-61"><code></code></span>
+<span class="codeline" id="line-62"><code>var unaryOpPredicates opPredicates</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>func init() {</code></span>
+<span class="codeline" id="line-65"><code>	// Setting unaryOpPredicates in init avoids declaration cycles.</code></span>
+<span class="codeline" id="line-66"><code>	unaryOpPredicates = opPredicates{</code></span>
+<span class="codeline" id="line-67"><code>		token.ADD: allNumeric,</code></span>
+<span class="codeline" id="line-68"><code>		token.SUB: allNumeric,</code></span>
+<span class="codeline" id="line-69"><code>		token.XOR: allInteger,</code></span>
+<span class="codeline" id="line-70"><code>		token.NOT: allBoolean,</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>func (check *Checker) op(m opPredicates, x *operand, op token.Token) bool {</code></span>
+<span class="codeline" id="line-75"><code>	if pred := m[op]; pred != nil {</code></span>
+<span class="codeline" id="line-76"><code>		if !pred(x.typ) {</code></span>
+<span class="codeline" id="line-77"><code>			check.errorf(x, UndefinedOp, invalidOp+"operator %s not defined on %s", op, x)</code></span>
+<span class="codeline" id="line-78"><code>			return false</code></span>
+<span class="codeline" id="line-79"><code>		}</code></span>
+<span class="codeline" id="line-80"><code>	} else {</code></span>
+<span class="codeline" id="line-81"><code>		check.errorf(x, InvalidSyntaxTree, "unknown operator %s", op)</code></span>
+<span class="codeline" id="line-82"><code>		return false</code></span>
+<span class="codeline" id="line-83"><code>	}</code></span>
+<span class="codeline" id="line-84"><code>	return true</code></span>
+<span class="codeline" id="line-85"><code>}</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>// opName returns the name of the operation if x is an operation</code></span>
+<span class="codeline" id="line-88"><code>// that might overflow; otherwise it returns the empty string.</code></span>
+<span class="codeline" id="line-89"><code>func opName(e ast.Expr) string {</code></span>
+<span class="codeline" id="line-90"><code>	switch e := e.(type) {</code></span>
+<span class="codeline" id="line-91"><code>	case *ast.BinaryExpr:</code></span>
+<span class="codeline" id="line-92"><code>		if int(e.Op) &lt; len(op2str2) {</code></span>
+<span class="codeline" id="line-93"><code>			return op2str2[e.Op]</code></span>
+<span class="codeline" id="line-94"><code>		}</code></span>
+<span class="codeline" id="line-95"><code>	case *ast.UnaryExpr:</code></span>
+<span class="codeline" id="line-96"><code>		if int(e.Op) &lt; len(op2str1) {</code></span>
+<span class="codeline" id="line-97"><code>			return op2str1[e.Op]</code></span>
+<span class="codeline" id="line-98"><code>		}</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	return ""</code></span>
+<span class="codeline" id="line-101"><code>}</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>var op2str1 = [...]string{</code></span>
+<span class="codeline" id="line-104"><code>	token.XOR: "bitwise complement",</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// This is only used for operations that may cause overflow.</code></span>
+<span class="codeline" id="line-108"><code>var op2str2 = [...]string{</code></span>
+<span class="codeline" id="line-109"><code>	token.ADD: "addition",</code></span>
+<span class="codeline" id="line-110"><code>	token.SUB: "subtraction",</code></span>
+<span class="codeline" id="line-111"><code>	token.XOR: "bitwise XOR",</code></span>
+<span class="codeline" id="line-112"><code>	token.MUL: "multiplication",</code></span>
+<span class="codeline" id="line-113"><code>	token.SHL: "shift",</code></span>
+<span class="codeline" id="line-114"><code>}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>// If typ is a type parameter, underIs returns the result of typ.underIs(f).</code></span>
+<span class="codeline" id="line-117"><code>// Otherwise, underIs returns the result of f(under(typ)).</code></span>
+<span class="codeline" id="line-118"><code>func underIs(typ Type, f func(Type) bool) bool {</code></span>
+<span class="codeline" id="line-119"><code>	if tpar, _ := typ.(*TypeParam); tpar != nil {</code></span>
+<span class="codeline" id="line-120"><code>		return tpar.underIs(f)</code></span>
+<span class="codeline" id="line-121"><code>	}</code></span>
+<span class="codeline" id="line-122"><code>	return f(under(typ))</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// The unary expression e may be nil. It's passed in for better error messages only.</code></span>
+<span class="codeline" id="line-126"><code>func (check *Checker) unary(x *operand, e *ast.UnaryExpr) {</code></span>
+<span class="codeline" id="line-127"><code>	check.expr(nil, x, e.X)</code></span>
+<span class="codeline" id="line-128"><code>	if x.mode == invalid {</code></span>
+<span class="codeline" id="line-129"><code>		return</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	op := e.Op</code></span>
+<span class="codeline" id="line-133"><code>	switch op {</code></span>
+<span class="codeline" id="line-134"><code>	case token.AND:</code></span>
+<span class="codeline" id="line-135"><code>		// spec: "As an exception to the addressability</code></span>
+<span class="codeline" id="line-136"><code>		// requirement x may also be a composite literal."</code></span>
+<span class="codeline" id="line-137"><code>		if _, ok := unparen(e.X).(*ast.CompositeLit); !ok &amp;&amp; x.mode != variable {</code></span>
+<span class="codeline" id="line-138"><code>			check.errorf(x, UnaddressableOperand, invalidOp+"cannot take address of %s", x)</code></span>
+<span class="codeline" id="line-139"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-140"><code>			return</code></span>
+<span class="codeline" id="line-141"><code>		}</code></span>
+<span class="codeline" id="line-142"><code>		x.mode = value</code></span>
+<span class="codeline" id="line-143"><code>		x.typ = &amp;Pointer{base: x.typ}</code></span>
+<span class="codeline" id="line-144"><code>		return</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	case token.ARROW:</code></span>
+<span class="codeline" id="line-147"><code>		u := coreType(x.typ)</code></span>
+<span class="codeline" id="line-148"><code>		if u == nil {</code></span>
+<span class="codeline" id="line-149"><code>			check.errorf(x, InvalidReceive, invalidOp+"cannot receive from %s (no core type)", x)</code></span>
+<span class="codeline" id="line-150"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-151"><code>			return</code></span>
+<span class="codeline" id="line-152"><code>		}</code></span>
+<span class="codeline" id="line-153"><code>		ch, _ := u.(*Chan)</code></span>
+<span class="codeline" id="line-154"><code>		if ch == nil {</code></span>
+<span class="codeline" id="line-155"><code>			check.errorf(x, InvalidReceive, invalidOp+"cannot receive from non-channel %s", x)</code></span>
+<span class="codeline" id="line-156"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-157"><code>			return</code></span>
+<span class="codeline" id="line-158"><code>		}</code></span>
+<span class="codeline" id="line-159"><code>		if ch.dir == SendOnly {</code></span>
+<span class="codeline" id="line-160"><code>			check.errorf(x, InvalidReceive, invalidOp+"cannot receive from send-only channel %s", x)</code></span>
+<span class="codeline" id="line-161"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-162"><code>			return</code></span>
+<span class="codeline" id="line-163"><code>		}</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>		x.mode = commaok</code></span>
+<span class="codeline" id="line-166"><code>		x.typ = ch.elem</code></span>
+<span class="codeline" id="line-167"><code>		check.hasCallOrRecv = true</code></span>
+<span class="codeline" id="line-168"><code>		return</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>	case token.TILDE:</code></span>
+<span class="codeline" id="line-171"><code>		// Provide a better error position and message than what check.op below would do.</code></span>
+<span class="codeline" id="line-172"><code>		if !allInteger(x.typ) {</code></span>
+<span class="codeline" id="line-173"><code>			check.error(e, UndefinedOp, "cannot use ~ outside of interface or type constraint")</code></span>
+<span class="codeline" id="line-174"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-175"><code>			return</code></span>
+<span class="codeline" id="line-176"><code>		}</code></span>
+<span class="codeline" id="line-177"><code>		check.error(e, UndefinedOp, "cannot use ~ outside of interface or type constraint (use ^ for bitwise complement)")</code></span>
+<span class="codeline" id="line-178"><code>		op = token.XOR</code></span>
+<span class="codeline" id="line-179"><code>	}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>	if !check.op(unaryOpPredicates, x, op) {</code></span>
+<span class="codeline" id="line-182"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-183"><code>		return</code></span>
+<span class="codeline" id="line-184"><code>	}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>	if x.mode == constant_ {</code></span>
+<span class="codeline" id="line-187"><code>		if x.val.Kind() == constant.Unknown {</code></span>
+<span class="codeline" id="line-188"><code>			// nothing to do (and don't cause an error below in the overflow check)</code></span>
+<span class="codeline" id="line-189"><code>			return</code></span>
+<span class="codeline" id="line-190"><code>		}</code></span>
+<span class="codeline" id="line-191"><code>		var prec uint</code></span>
+<span class="codeline" id="line-192"><code>		if isUnsigned(x.typ) {</code></span>
+<span class="codeline" id="line-193"><code>			prec = uint(check.conf.sizeof(x.typ) * 8)</code></span>
+<span class="codeline" id="line-194"><code>		}</code></span>
+<span class="codeline" id="line-195"><code>		x.val = constant.UnaryOp(op, x.val, prec)</code></span>
+<span class="codeline" id="line-196"><code>		x.expr = e</code></span>
+<span class="codeline" id="line-197"><code>		check.overflow(x, x.Pos())</code></span>
+<span class="codeline" id="line-198"><code>		return</code></span>
+<span class="codeline" id="line-199"><code>	}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>	x.mode = value</code></span>
+<span class="codeline" id="line-202"><code>	// x.typ remains unchanged</code></span>
+<span class="codeline" id="line-203"><code>}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>func isShift(op token.Token) bool {</code></span>
+<span class="codeline" id="line-206"><code>	return op == token.SHL || op == token.SHR</code></span>
+<span class="codeline" id="line-207"><code>}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>func isComparison(op token.Token) bool {</code></span>
+<span class="codeline" id="line-210"><code>	// Note: tokens are not ordered well to make this much easier</code></span>
+<span class="codeline" id="line-211"><code>	switch op {</code></span>
+<span class="codeline" id="line-212"><code>	case token.EQL, token.NEQ, token.LSS, token.LEQ, token.GTR, token.GEQ:</code></span>
+<span class="codeline" id="line-213"><code>		return true</code></span>
+<span class="codeline" id="line-214"><code>	}</code></span>
+<span class="codeline" id="line-215"><code>	return false</code></span>
+<span class="codeline" id="line-216"><code>}</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>// updateExprType updates the type of x to typ and invokes itself</code></span>
+<span class="codeline" id="line-219"><code>// recursively for the operands of x, depending on expression kind.</code></span>
+<span class="codeline" id="line-220"><code>// If typ is still an untyped and not the final type, updateExprType</code></span>
+<span class="codeline" id="line-221"><code>// only updates the recorded untyped type for x and possibly its</code></span>
+<span class="codeline" id="line-222"><code>// operands. Otherwise (i.e., typ is not an untyped type anymore,</code></span>
+<span class="codeline" id="line-223"><code>// or it is the final type for x), the type and value are recorded.</code></span>
+<span class="codeline" id="line-224"><code>// Also, if x is a constant, it must be representable as a value of typ,</code></span>
+<span class="codeline" id="line-225"><code>// and if x is the (formerly untyped) lhs operand of a non-constant</code></span>
+<span class="codeline" id="line-226"><code>// shift, it must be an integer value.</code></span>
+<span class="codeline" id="line-227"><code>func (check *Checker) updateExprType(x ast.Expr, typ Type, final bool) {</code></span>
+<span class="codeline" id="line-228"><code>	check.updateExprType0(nil, x, typ, final)</code></span>
+<span class="codeline" id="line-229"><code>}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>func (check *Checker) updateExprType0(parent, x ast.Expr, typ Type, final bool) {</code></span>
+<span class="codeline" id="line-232"><code>	old, found := check.untyped[x]</code></span>
+<span class="codeline" id="line-233"><code>	if !found {</code></span>
+<span class="codeline" id="line-234"><code>		return // nothing to do</code></span>
+<span class="codeline" id="line-235"><code>	}</code></span>
+<span class="codeline" id="line-236"><code></code></span>
+<span class="codeline" id="line-237"><code>	// update operands of x if necessary</code></span>
+<span class="codeline" id="line-238"><code>	switch x := x.(type) {</code></span>
+<span class="codeline" id="line-239"><code>	case *ast.BadExpr,</code></span>
+<span class="codeline" id="line-240"><code>		*ast.FuncLit,</code></span>
+<span class="codeline" id="line-241"><code>		*ast.CompositeLit,</code></span>
+<span class="codeline" id="line-242"><code>		*ast.IndexExpr,</code></span>
+<span class="codeline" id="line-243"><code>		*ast.SliceExpr,</code></span>
+<span class="codeline" id="line-244"><code>		*ast.TypeAssertExpr,</code></span>
+<span class="codeline" id="line-245"><code>		*ast.StarExpr,</code></span>
+<span class="codeline" id="line-246"><code>		*ast.KeyValueExpr,</code></span>
+<span class="codeline" id="line-247"><code>		*ast.ArrayType,</code></span>
+<span class="codeline" id="line-248"><code>		*ast.StructType,</code></span>
+<span class="codeline" id="line-249"><code>		*ast.FuncType,</code></span>
+<span class="codeline" id="line-250"><code>		*ast.InterfaceType,</code></span>
+<span class="codeline" id="line-251"><code>		*ast.MapType,</code></span>
+<span class="codeline" id="line-252"><code>		*ast.ChanType:</code></span>
+<span class="codeline" id="line-253"><code>		// These expression are never untyped - nothing to do.</code></span>
+<span class="codeline" id="line-254"><code>		// The respective sub-expressions got their final types</code></span>
+<span class="codeline" id="line-255"><code>		// upon assignment or use.</code></span>
+<span class="codeline" id="line-256"><code>		if debug {</code></span>
+<span class="codeline" id="line-257"><code>			check.dump("%v: found old type(%s): %s (new: %s)", x.Pos(), x, old.typ, typ)</code></span>
+<span class="codeline" id="line-258"><code>			unreachable()</code></span>
+<span class="codeline" id="line-259"><code>		}</code></span>
+<span class="codeline" id="line-260"><code>		return</code></span>
+<span class="codeline" id="line-261"><code></code></span>
+<span class="codeline" id="line-262"><code>	case *ast.CallExpr:</code></span>
+<span class="codeline" id="line-263"><code>		// Resulting in an untyped constant (e.g., built-in complex).</code></span>
+<span class="codeline" id="line-264"><code>		// The respective calls take care of calling updateExprType</code></span>
+<span class="codeline" id="line-265"><code>		// for the arguments if necessary.</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>	case *ast.Ident, *ast.BasicLit, *ast.SelectorExpr:</code></span>
+<span class="codeline" id="line-268"><code>		// An identifier denoting a constant, a constant literal,</code></span>
+<span class="codeline" id="line-269"><code>		// or a qualified identifier (imported untyped constant).</code></span>
+<span class="codeline" id="line-270"><code>		// No operands to take care of.</code></span>
+<span class="codeline" id="line-271"><code></code></span>
+<span class="codeline" id="line-272"><code>	case *ast.ParenExpr:</code></span>
+<span class="codeline" id="line-273"><code>		check.updateExprType0(x, x.X, typ, final)</code></span>
+<span class="codeline" id="line-274"><code></code></span>
+<span class="codeline" id="line-275"><code>	case *ast.UnaryExpr:</code></span>
+<span class="codeline" id="line-276"><code>		// If x is a constant, the operands were constants.</code></span>
+<span class="codeline" id="line-277"><code>		// The operands don't need to be updated since they</code></span>
+<span class="codeline" id="line-278"><code>		// never get "materialized" into a typed value. If</code></span>
+<span class="codeline" id="line-279"><code>		// left in the untyped map, they will be processed</code></span>
+<span class="codeline" id="line-280"><code>		// at the end of the type check.</code></span>
+<span class="codeline" id="line-281"><code>		if old.val != nil {</code></span>
+<span class="codeline" id="line-282"><code>			break</code></span>
+<span class="codeline" id="line-283"><code>		}</code></span>
+<span class="codeline" id="line-284"><code>		check.updateExprType0(x, x.X, typ, final)</code></span>
+<span class="codeline" id="line-285"><code></code></span>
+<span class="codeline" id="line-286"><code>	case *ast.BinaryExpr:</code></span>
+<span class="codeline" id="line-287"><code>		if old.val != nil {</code></span>
+<span class="codeline" id="line-288"><code>			break // see comment for unary expressions</code></span>
+<span class="codeline" id="line-289"><code>		}</code></span>
+<span class="codeline" id="line-290"><code>		if isComparison(x.Op) {</code></span>
+<span class="codeline" id="line-291"><code>			// The result type is independent of operand types</code></span>
+<span class="codeline" id="line-292"><code>			// and the operand types must have final types.</code></span>
+<span class="codeline" id="line-293"><code>		} else if isShift(x.Op) {</code></span>
+<span class="codeline" id="line-294"><code>			// The result type depends only on lhs operand.</code></span>
+<span class="codeline" id="line-295"><code>			// The rhs type was updated when checking the shift.</code></span>
+<span class="codeline" id="line-296"><code>			check.updateExprType0(x, x.X, typ, final)</code></span>
+<span class="codeline" id="line-297"><code>		} else {</code></span>
+<span class="codeline" id="line-298"><code>			// The operand types match the result type.</code></span>
+<span class="codeline" id="line-299"><code>			check.updateExprType0(x, x.X, typ, final)</code></span>
+<span class="codeline" id="line-300"><code>			check.updateExprType0(x, x.Y, typ, final)</code></span>
+<span class="codeline" id="line-301"><code>		}</code></span>
+<span class="codeline" id="line-302"><code></code></span>
+<span class="codeline" id="line-303"><code>	default:</code></span>
+<span class="codeline" id="line-304"><code>		unreachable()</code></span>
+<span class="codeline" id="line-305"><code>	}</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>	// If the new type is not final and still untyped, just</code></span>
+<span class="codeline" id="line-308"><code>	// update the recorded type.</code></span>
+<span class="codeline" id="line-309"><code>	if !final &amp;&amp; isUntyped(typ) {</code></span>
+<span class="codeline" id="line-310"><code>		old.typ = under(typ).(*Basic)</code></span>
+<span class="codeline" id="line-311"><code>		check.untyped[x] = old</code></span>
+<span class="codeline" id="line-312"><code>		return</code></span>
+<span class="codeline" id="line-313"><code>	}</code></span>
+<span class="codeline" id="line-314"><code></code></span>
+<span class="codeline" id="line-315"><code>	// Otherwise we have the final (typed or untyped type).</code></span>
+<span class="codeline" id="line-316"><code>	// Remove it from the map of yet untyped expressions.</code></span>
+<span class="codeline" id="line-317"><code>	delete(check.untyped, x)</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>	if old.isLhs {</code></span>
+<span class="codeline" id="line-320"><code>		// If x is the lhs of a shift, its final type must be integer.</code></span>
+<span class="codeline" id="line-321"><code>		// We already know from the shift check that it is representable</code></span>
+<span class="codeline" id="line-322"><code>		// as an integer if it is a constant.</code></span>
+<span class="codeline" id="line-323"><code>		if !allInteger(typ) {</code></span>
+<span class="codeline" id="line-324"><code>			check.errorf(x, InvalidShiftOperand, invalidOp+"shifted operand %s (type %s) must be integer", x, typ)</code></span>
+<span class="codeline" id="line-325"><code>			return</code></span>
+<span class="codeline" id="line-326"><code>		}</code></span>
+<span class="codeline" id="line-327"><code>		// Even if we have an integer, if the value is a constant we</code></span>
+<span class="codeline" id="line-328"><code>		// still must check that it is representable as the specific</code></span>
+<span class="codeline" id="line-329"><code>		// int type requested (was go.dev/issue/22969). Fall through here.</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	if old.val != nil {</code></span>
+<span class="codeline" id="line-332"><code>		// If x is a constant, it must be representable as a value of typ.</code></span>
+<span class="codeline" id="line-333"><code>		c := operand{old.mode, x, old.typ, old.val, 0}</code></span>
+<span class="codeline" id="line-334"><code>		check.convertUntyped(&amp;c, typ)</code></span>
+<span class="codeline" id="line-335"><code>		if c.mode == invalid {</code></span>
+<span class="codeline" id="line-336"><code>			return</code></span>
+<span class="codeline" id="line-337"><code>		}</code></span>
+<span class="codeline" id="line-338"><code>	}</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>	// Everything's fine, record final type and value for x.</code></span>
+<span class="codeline" id="line-341"><code>	check.recordTypeAndValue(x, old.mode, typ, old.val)</code></span>
+<span class="codeline" id="line-342"><code>}</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>// updateExprVal updates the value of x to val.</code></span>
+<span class="codeline" id="line-345"><code>func (check *Checker) updateExprVal(x ast.Expr, val constant.Value) {</code></span>
+<span class="codeline" id="line-346"><code>	if info, ok := check.untyped[x]; ok {</code></span>
+<span class="codeline" id="line-347"><code>		info.val = val</code></span>
+<span class="codeline" id="line-348"><code>		check.untyped[x] = info</code></span>
+<span class="codeline" id="line-349"><code>	}</code></span>
+<span class="codeline" id="line-350"><code>}</code></span>
+<span class="codeline" id="line-351"><code></code></span>
+<span class="codeline" id="line-352"><code>// implicitTypeAndValue returns the implicit type of x when used in a context</code></span>
+<span class="codeline" id="line-353"><code>// where the target type is expected. If no such implicit conversion is</code></span>
+<span class="codeline" id="line-354"><code>// possible, it returns a nil Type and non-zero error code.</code></span>
+<span class="codeline" id="line-355"><code>//</code></span>
+<span class="codeline" id="line-356"><code>// If x is a constant operand, the returned constant.Value will be the</code></span>
+<span class="codeline" id="line-357"><code>// representation of x in this context.</code></span>
+<span class="codeline" id="line-358"><code>func (check *Checker) implicitTypeAndValue(x *operand, target Type) (Type, constant.Value, Code) {</code></span>
+<span class="codeline" id="line-359"><code>	if x.mode == invalid || isTyped(x.typ) || !isValid(target) {</code></span>
+<span class="codeline" id="line-360"><code>		return x.typ, nil, 0</code></span>
+<span class="codeline" id="line-361"><code>	}</code></span>
+<span class="codeline" id="line-362"><code>	// x is untyped</code></span>
+<span class="codeline" id="line-363"><code></code></span>
+<span class="codeline" id="line-364"><code>	if isUntyped(target) {</code></span>
+<span class="codeline" id="line-365"><code>		// both x and target are untyped</code></span>
+<span class="codeline" id="line-366"><code>		if m := maxType(x.typ, target); m != nil {</code></span>
+<span class="codeline" id="line-367"><code>			return m, nil, 0</code></span>
+<span class="codeline" id="line-368"><code>		}</code></span>
+<span class="codeline" id="line-369"><code>		return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-370"><code>	}</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>	switch u := under(target).(type) {</code></span>
+<span class="codeline" id="line-373"><code>	case *Basic:</code></span>
+<span class="codeline" id="line-374"><code>		if x.mode == constant_ {</code></span>
+<span class="codeline" id="line-375"><code>			v, code := check.representation(x, u)</code></span>
+<span class="codeline" id="line-376"><code>			if code != 0 {</code></span>
+<span class="codeline" id="line-377"><code>				return nil, nil, code</code></span>
+<span class="codeline" id="line-378"><code>			}</code></span>
+<span class="codeline" id="line-379"><code>			return target, v, code</code></span>
+<span class="codeline" id="line-380"><code>		}</code></span>
+<span class="codeline" id="line-381"><code>		// Non-constant untyped values may appear as the</code></span>
+<span class="codeline" id="line-382"><code>		// result of comparisons (untyped bool), intermediate</code></span>
+<span class="codeline" id="line-383"><code>		// (delayed-checked) rhs operands of shifts, and as</code></span>
+<span class="codeline" id="line-384"><code>		// the value nil.</code></span>
+<span class="codeline" id="line-385"><code>		switch x.typ.(*Basic).kind {</code></span>
+<span class="codeline" id="line-386"><code>		case UntypedBool:</code></span>
+<span class="codeline" id="line-387"><code>			if !isBoolean(target) {</code></span>
+<span class="codeline" id="line-388"><code>				return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-389"><code>			}</code></span>
+<span class="codeline" id="line-390"><code>		case UntypedInt, UntypedRune, UntypedFloat, UntypedComplex:</code></span>
+<span class="codeline" id="line-391"><code>			if !isNumeric(target) {</code></span>
+<span class="codeline" id="line-392"><code>				return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-393"><code>			}</code></span>
+<span class="codeline" id="line-394"><code>		case UntypedString:</code></span>
+<span class="codeline" id="line-395"><code>			// Non-constant untyped string values are not permitted by the spec and</code></span>
+<span class="codeline" id="line-396"><code>			// should not occur during normal typechecking passes, but this path is</code></span>
+<span class="codeline" id="line-397"><code>			// reachable via the AssignableTo API.</code></span>
+<span class="codeline" id="line-398"><code>			if !isString(target) {</code></span>
+<span class="codeline" id="line-399"><code>				return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-400"><code>			}</code></span>
+<span class="codeline" id="line-401"><code>		case UntypedNil:</code></span>
+<span class="codeline" id="line-402"><code>			// Unsafe.Pointer is a basic type that includes nil.</code></span>
+<span class="codeline" id="line-403"><code>			if !hasNil(target) {</code></span>
+<span class="codeline" id="line-404"><code>				return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-405"><code>			}</code></span>
+<span class="codeline" id="line-406"><code>			// Preserve the type of nil as UntypedNil: see go.dev/issue/13061.</code></span>
+<span class="codeline" id="line-407"><code>			return Typ[UntypedNil], nil, 0</code></span>
+<span class="codeline" id="line-408"><code>		default:</code></span>
+<span class="codeline" id="line-409"><code>			return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-410"><code>		}</code></span>
+<span class="codeline" id="line-411"><code>	case *Interface:</code></span>
+<span class="codeline" id="line-412"><code>		if isTypeParam(target) {</code></span>
+<span class="codeline" id="line-413"><code>			if !u.typeSet().underIs(func(u Type) bool {</code></span>
+<span class="codeline" id="line-414"><code>				if u == nil {</code></span>
+<span class="codeline" id="line-415"><code>					return false</code></span>
+<span class="codeline" id="line-416"><code>				}</code></span>
+<span class="codeline" id="line-417"><code>				t, _, _ := check.implicitTypeAndValue(x, u)</code></span>
+<span class="codeline" id="line-418"><code>				return t != nil</code></span>
+<span class="codeline" id="line-419"><code>			}) {</code></span>
+<span class="codeline" id="line-420"><code>				return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-421"><code>			}</code></span>
+<span class="codeline" id="line-422"><code>			// keep nil untyped (was bug go.dev/issue/39755)</code></span>
+<span class="codeline" id="line-423"><code>			if x.isNil() {</code></span>
+<span class="codeline" id="line-424"><code>				return Typ[UntypedNil], nil, 0</code></span>
+<span class="codeline" id="line-425"><code>			}</code></span>
+<span class="codeline" id="line-426"><code>			break</code></span>
+<span class="codeline" id="line-427"><code>		}</code></span>
+<span class="codeline" id="line-428"><code>		// Values must have concrete dynamic types. If the value is nil,</code></span>
+<span class="codeline" id="line-429"><code>		// keep it untyped (this is important for tools such as go vet which</code></span>
+<span class="codeline" id="line-430"><code>		// need the dynamic type for argument checking of say, print</code></span>
+<span class="codeline" id="line-431"><code>		// functions)</code></span>
+<span class="codeline" id="line-432"><code>		if x.isNil() {</code></span>
+<span class="codeline" id="line-433"><code>			return Typ[UntypedNil], nil, 0</code></span>
+<span class="codeline" id="line-434"><code>		}</code></span>
+<span class="codeline" id="line-435"><code>		// cannot assign untyped values to non-empty interfaces</code></span>
+<span class="codeline" id="line-436"><code>		if !u.Empty() {</code></span>
+<span class="codeline" id="line-437"><code>			return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-438"><code>		}</code></span>
+<span class="codeline" id="line-439"><code>		return Default(x.typ), nil, 0</code></span>
+<span class="codeline" id="line-440"><code>	case *Pointer, *Signature, *Slice, *Map, *Chan:</code></span>
+<span class="codeline" id="line-441"><code>		if !x.isNil() {</code></span>
+<span class="codeline" id="line-442"><code>			return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-443"><code>		}</code></span>
+<span class="codeline" id="line-444"><code>		// Keep nil untyped - see comment for interfaces, above.</code></span>
+<span class="codeline" id="line-445"><code>		return Typ[UntypedNil], nil, 0</code></span>
+<span class="codeline" id="line-446"><code>	default:</code></span>
+<span class="codeline" id="line-447"><code>		return nil, nil, InvalidUntypedConversion</code></span>
+<span class="codeline" id="line-448"><code>	}</code></span>
+<span class="codeline" id="line-449"><code>	return target, nil, 0</code></span>
+<span class="codeline" id="line-450"><code>}</code></span>
+<span class="codeline" id="line-451"><code></code></span>
+<span class="codeline" id="line-452"><code>// If switchCase is true, the operator op is ignored.</code></span>
+<span class="codeline" id="line-453"><code>func (check *Checker) comparison(x, y *operand, op token.Token, switchCase bool) {</code></span>
+<span class="codeline" id="line-454"><code>	// Avoid spurious errors if any of the operands has an invalid type (go.dev/issue/54405).</code></span>
+<span class="codeline" id="line-455"><code>	if !isValid(x.typ) || !isValid(y.typ) {</code></span>
+<span class="codeline" id="line-456"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-457"><code>		return</code></span>
+<span class="codeline" id="line-458"><code>	}</code></span>
+<span class="codeline" id="line-459"><code></code></span>
+<span class="codeline" id="line-460"><code>	if switchCase {</code></span>
+<span class="codeline" id="line-461"><code>		op = token.EQL</code></span>
+<span class="codeline" id="line-462"><code>	}</code></span>
+<span class="codeline" id="line-463"><code></code></span>
+<span class="codeline" id="line-464"><code>	errOp := x  // operand for which error is reported, if any</code></span>
+<span class="codeline" id="line-465"><code>	cause := "" // specific error cause, if any</code></span>
+<span class="codeline" id="line-466"><code></code></span>
+<span class="codeline" id="line-467"><code>	// spec: "In any comparison, the first operand must be assignable</code></span>
+<span class="codeline" id="line-468"><code>	// to the type of the second operand, or vice versa."</code></span>
+<span class="codeline" id="line-469"><code>	code := MismatchedTypes</code></span>
+<span class="codeline" id="line-470"><code>	ok, _ := x.assignableTo(check, y.typ, nil)</code></span>
+<span class="codeline" id="line-471"><code>	if !ok {</code></span>
+<span class="codeline" id="line-472"><code>		ok, _ = y.assignableTo(check, x.typ, nil)</code></span>
+<span class="codeline" id="line-473"><code>	}</code></span>
+<span class="codeline" id="line-474"><code>	if !ok {</code></span>
+<span class="codeline" id="line-475"><code>		// Report the error on the 2nd operand since we only</code></span>
+<span class="codeline" id="line-476"><code>		// know after seeing the 2nd operand whether we have</code></span>
+<span class="codeline" id="line-477"><code>		// a type mismatch.</code></span>
+<span class="codeline" id="line-478"><code>		errOp = y</code></span>
+<span class="codeline" id="line-479"><code>		cause = check.sprintf("mismatched types %s and %s", x.typ, y.typ)</code></span>
+<span class="codeline" id="line-480"><code>		goto Error</code></span>
+<span class="codeline" id="line-481"><code>	}</code></span>
+<span class="codeline" id="line-482"><code></code></span>
+<span class="codeline" id="line-483"><code>	// check if comparison is defined for operands</code></span>
+<span class="codeline" id="line-484"><code>	code = UndefinedOp</code></span>
+<span class="codeline" id="line-485"><code>	switch op {</code></span>
+<span class="codeline" id="line-486"><code>	case token.EQL, token.NEQ:</code></span>
+<span class="codeline" id="line-487"><code>		// spec: "The equality operators == and != apply to operands that are comparable."</code></span>
+<span class="codeline" id="line-488"><code>		switch {</code></span>
+<span class="codeline" id="line-489"><code>		case x.isNil() || y.isNil():</code></span>
+<span class="codeline" id="line-490"><code>			// Comparison against nil requires that the other operand type has nil.</code></span>
+<span class="codeline" id="line-491"><code>			typ := x.typ</code></span>
+<span class="codeline" id="line-492"><code>			if x.isNil() {</code></span>
+<span class="codeline" id="line-493"><code>				typ = y.typ</code></span>
+<span class="codeline" id="line-494"><code>			}</code></span>
+<span class="codeline" id="line-495"><code>			if !hasNil(typ) {</code></span>
+<span class="codeline" id="line-496"><code>				// This case should only be possible for "nil == nil".</code></span>
+<span class="codeline" id="line-497"><code>				// Report the error on the 2nd operand since we only</code></span>
+<span class="codeline" id="line-498"><code>				// know after seeing the 2nd operand whether we have</code></span>
+<span class="codeline" id="line-499"><code>				// an invalid comparison.</code></span>
+<span class="codeline" id="line-500"><code>				errOp = y</code></span>
+<span class="codeline" id="line-501"><code>				goto Error</code></span>
+<span class="codeline" id="line-502"><code>			}</code></span>
+<span class="codeline" id="line-503"><code></code></span>
+<span class="codeline" id="line-504"><code>		case !Comparable(x.typ):</code></span>
+<span class="codeline" id="line-505"><code>			errOp = x</code></span>
+<span class="codeline" id="line-506"><code>			cause = check.incomparableCause(x.typ)</code></span>
+<span class="codeline" id="line-507"><code>			goto Error</code></span>
+<span class="codeline" id="line-508"><code></code></span>
+<span class="codeline" id="line-509"><code>		case !Comparable(y.typ):</code></span>
+<span class="codeline" id="line-510"><code>			errOp = y</code></span>
+<span class="codeline" id="line-511"><code>			cause = check.incomparableCause(y.typ)</code></span>
+<span class="codeline" id="line-512"><code>			goto Error</code></span>
+<span class="codeline" id="line-513"><code>		}</code></span>
+<span class="codeline" id="line-514"><code></code></span>
+<span class="codeline" id="line-515"><code>	case token.LSS, token.LEQ, token.GTR, token.GEQ:</code></span>
+<span class="codeline" id="line-516"><code>		// spec: The ordering operators &lt;, &lt;=, &gt;, and &gt;= apply to operands that are ordered."</code></span>
+<span class="codeline" id="line-517"><code>		switch {</code></span>
+<span class="codeline" id="line-518"><code>		case !allOrdered(x.typ):</code></span>
+<span class="codeline" id="line-519"><code>			errOp = x</code></span>
+<span class="codeline" id="line-520"><code>			goto Error</code></span>
+<span class="codeline" id="line-521"><code>		case !allOrdered(y.typ):</code></span>
+<span class="codeline" id="line-522"><code>			errOp = y</code></span>
+<span class="codeline" id="line-523"><code>			goto Error</code></span>
+<span class="codeline" id="line-524"><code>		}</code></span>
+<span class="codeline" id="line-525"><code></code></span>
+<span class="codeline" id="line-526"><code>	default:</code></span>
+<span class="codeline" id="line-527"><code>		unreachable()</code></span>
+<span class="codeline" id="line-528"><code>	}</code></span>
+<span class="codeline" id="line-529"><code></code></span>
+<span class="codeline" id="line-530"><code>	// comparison is ok</code></span>
+<span class="codeline" id="line-531"><code>	if x.mode == constant_ &amp;&amp; y.mode == constant_ {</code></span>
+<span class="codeline" id="line-532"><code>		x.val = constant.MakeBool(constant.Compare(x.val, op, y.val))</code></span>
+<span class="codeline" id="line-533"><code>		// The operands are never materialized; no need to update</code></span>
+<span class="codeline" id="line-534"><code>		// their types.</code></span>
+<span class="codeline" id="line-535"><code>	} else {</code></span>
+<span class="codeline" id="line-536"><code>		x.mode = value</code></span>
+<span class="codeline" id="line-537"><code>		// The operands have now their final types, which at run-</code></span>
+<span class="codeline" id="line-538"><code>		// time will be materialized. Update the expression trees.</code></span>
+<span class="codeline" id="line-539"><code>		// If the current types are untyped, the materialized type</code></span>
+<span class="codeline" id="line-540"><code>		// is the respective default type.</code></span>
+<span class="codeline" id="line-541"><code>		check.updateExprType(x.expr, Default(x.typ), true)</code></span>
+<span class="codeline" id="line-542"><code>		check.updateExprType(y.expr, Default(y.typ), true)</code></span>
+<span class="codeline" id="line-543"><code>	}</code></span>
+<span class="codeline" id="line-544"><code></code></span>
+<span class="codeline" id="line-545"><code>	// spec: "Comparison operators compare two operands and yield</code></span>
+<span class="codeline" id="line-546"><code>	//        an untyped boolean value."</code></span>
+<span class="codeline" id="line-547"><code>	x.typ = Typ[UntypedBool]</code></span>
+<span class="codeline" id="line-548"><code>	return</code></span>
+<span class="codeline" id="line-549"><code></code></span>
+<span class="codeline" id="line-550"><code>Error:</code></span>
+<span class="codeline" id="line-551"><code>	// We have an offending operand errOp and possibly an error cause.</code></span>
+<span class="codeline" id="line-552"><code>	if cause == "" {</code></span>
+<span class="codeline" id="line-553"><code>		if isTypeParam(x.typ) || isTypeParam(y.typ) {</code></span>
+<span class="codeline" id="line-554"><code>			// TODO(gri) should report the specific type causing the problem, if any</code></span>
+<span class="codeline" id="line-555"><code>			if !isTypeParam(x.typ) {</code></span>
+<span class="codeline" id="line-556"><code>				errOp = y</code></span>
+<span class="codeline" id="line-557"><code>			}</code></span>
+<span class="codeline" id="line-558"><code>			cause = check.sprintf("type parameter %s is not comparable with %s", errOp.typ, op)</code></span>
+<span class="codeline" id="line-559"><code>		} else {</code></span>
+<span class="codeline" id="line-560"><code>			cause = check.sprintf("operator %s not defined on %s", op, check.kindString(errOp.typ)) // catch-all</code></span>
+<span class="codeline" id="line-561"><code>		}</code></span>
+<span class="codeline" id="line-562"><code>	}</code></span>
+<span class="codeline" id="line-563"><code>	if switchCase {</code></span>
+<span class="codeline" id="line-564"><code>		check.errorf(x, code, "invalid case %s in switch on %s (%s)", x.expr, y.expr, cause) // error position always at 1st operand</code></span>
+<span class="codeline" id="line-565"><code>	} else {</code></span>
+<span class="codeline" id="line-566"><code>		check.errorf(errOp, code, invalidOp+"%s %s %s (%s)", x.expr, op, y.expr, cause)</code></span>
+<span class="codeline" id="line-567"><code>	}</code></span>
+<span class="codeline" id="line-568"><code>	x.mode = invalid</code></span>
+<span class="codeline" id="line-569"><code>}</code></span>
+<span class="codeline" id="line-570"><code></code></span>
+<span class="codeline" id="line-571"><code>// incomparableCause returns a more specific cause why typ is not comparable.</code></span>
+<span class="codeline" id="line-572"><code>// If there is no more specific cause, the result is "".</code></span>
+<span class="codeline" id="line-573"><code>func (check *Checker) incomparableCause(typ Type) string {</code></span>
+<span class="codeline" id="line-574"><code>	switch under(typ).(type) {</code></span>
+<span class="codeline" id="line-575"><code>	case *Slice, *Signature, *Map:</code></span>
+<span class="codeline" id="line-576"><code>		return check.kindString(typ) + " can only be compared to nil"</code></span>
+<span class="codeline" id="line-577"><code>	}</code></span>
+<span class="codeline" id="line-578"><code>	// see if we can extract a more specific error</code></span>
+<span class="codeline" id="line-579"><code>	var cause string</code></span>
+<span class="codeline" id="line-580"><code>	comparable(typ, true, nil, func(format string, args ...interface{}) {</code></span>
+<span class="codeline" id="line-581"><code>		cause = check.sprintf(format, args...)</code></span>
+<span class="codeline" id="line-582"><code>	})</code></span>
+<span class="codeline" id="line-583"><code>	return cause</code></span>
+<span class="codeline" id="line-584"><code>}</code></span>
+<span class="codeline" id="line-585"><code></code></span>
+<span class="codeline" id="line-586"><code>// kindString returns the type kind as a string.</code></span>
+<span class="codeline" id="line-587"><code>func (check *Checker) kindString(typ Type) string {</code></span>
+<span class="codeline" id="line-588"><code>	switch under(typ).(type) {</code></span>
+<span class="codeline" id="line-589"><code>	case *Array:</code></span>
+<span class="codeline" id="line-590"><code>		return "array"</code></span>
+<span class="codeline" id="line-591"><code>	case *Slice:</code></span>
+<span class="codeline" id="line-592"><code>		return "slice"</code></span>
+<span class="codeline" id="line-593"><code>	case *Struct:</code></span>
+<span class="codeline" id="line-594"><code>		return "struct"</code></span>
+<span class="codeline" id="line-595"><code>	case *Pointer:</code></span>
+<span class="codeline" id="line-596"><code>		return "pointer"</code></span>
+<span class="codeline" id="line-597"><code>	case *Signature:</code></span>
+<span class="codeline" id="line-598"><code>		return "func"</code></span>
+<span class="codeline" id="line-599"><code>	case *Interface:</code></span>
+<span class="codeline" id="line-600"><code>		if isTypeParam(typ) {</code></span>
+<span class="codeline" id="line-601"><code>			return check.sprintf("type parameter %s", typ)</code></span>
+<span class="codeline" id="line-602"><code>		}</code></span>
+<span class="codeline" id="line-603"><code>		return "interface"</code></span>
+<span class="codeline" id="line-604"><code>	case *Map:</code></span>
+<span class="codeline" id="line-605"><code>		return "map"</code></span>
+<span class="codeline" id="line-606"><code>	case *Chan:</code></span>
+<span class="codeline" id="line-607"><code>		return "chan"</code></span>
+<span class="codeline" id="line-608"><code>	default:</code></span>
+<span class="codeline" id="line-609"><code>		return check.sprintf("%s", typ) // catch-all</code></span>
+<span class="codeline" id="line-610"><code>	}</code></span>
+<span class="codeline" id="line-611"><code>}</code></span>
+<span class="codeline" id="line-612"><code></code></span>
+<span class="codeline" id="line-613"><code>// If e != nil, it must be the shift expression; it may be nil for non-constant shifts.</code></span>
+<span class="codeline" id="line-614"><code>func (check *Checker) shift(x, y *operand, e ast.Expr, op token.Token) {</code></span>
+<span class="codeline" id="line-615"><code>	// TODO(gri) This function seems overly complex. Revisit.</code></span>
+<span class="codeline" id="line-616"><code></code></span>
+<span class="codeline" id="line-617"><code>	var xval constant.Value</code></span>
+<span class="codeline" id="line-618"><code>	if x.mode == constant_ {</code></span>
+<span class="codeline" id="line-619"><code>		xval = constant.ToInt(x.val)</code></span>
+<span class="codeline" id="line-620"><code>	}</code></span>
+<span class="codeline" id="line-621"><code></code></span>
+<span class="codeline" id="line-622"><code>	if allInteger(x.typ) || isUntyped(x.typ) &amp;&amp; xval != nil &amp;&amp; xval.Kind() == constant.Int {</code></span>
+<span class="codeline" id="line-623"><code>		// The lhs is of integer type or an untyped constant representable</code></span>
+<span class="codeline" id="line-624"><code>		// as an integer. Nothing to do.</code></span>
+<span class="codeline" id="line-625"><code>	} else {</code></span>
+<span class="codeline" id="line-626"><code>		// shift has no chance</code></span>
+<span class="codeline" id="line-627"><code>		check.errorf(x, InvalidShiftOperand, invalidOp+"shifted operand %s must be integer", x)</code></span>
+<span class="codeline" id="line-628"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-629"><code>		return</code></span>
+<span class="codeline" id="line-630"><code>	}</code></span>
+<span class="codeline" id="line-631"><code></code></span>
+<span class="codeline" id="line-632"><code>	// spec: "The right operand in a shift expression must have integer type</code></span>
+<span class="codeline" id="line-633"><code>	// or be an untyped constant representable by a value of type uint."</code></span>
+<span class="codeline" id="line-634"><code></code></span>
+<span class="codeline" id="line-635"><code>	// Check that constants are representable by uint, but do not convert them</code></span>
+<span class="codeline" id="line-636"><code>	// (see also go.dev/issue/47243).</code></span>
+<span class="codeline" id="line-637"><code>	var yval constant.Value</code></span>
+<span class="codeline" id="line-638"><code>	if y.mode == constant_ {</code></span>
+<span class="codeline" id="line-639"><code>		// Provide a good error message for negative shift counts.</code></span>
+<span class="codeline" id="line-640"><code>		yval = constant.ToInt(y.val) // consider -1, 1.0, but not -1.1</code></span>
+<span class="codeline" id="line-641"><code>		if yval.Kind() == constant.Int &amp;&amp; constant.Sign(yval) &lt; 0 {</code></span>
+<span class="codeline" id="line-642"><code>			check.errorf(y, InvalidShiftCount, invalidOp+"negative shift count %s", y)</code></span>
+<span class="codeline" id="line-643"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-644"><code>			return</code></span>
+<span class="codeline" id="line-645"><code>		}</code></span>
+<span class="codeline" id="line-646"><code></code></span>
+<span class="codeline" id="line-647"><code>		if isUntyped(y.typ) {</code></span>
+<span class="codeline" id="line-648"><code>			// Caution: Check for representability here, rather than in the switch</code></span>
+<span class="codeline" id="line-649"><code>			// below, because isInteger includes untyped integers (was bug go.dev/issue/43697).</code></span>
+<span class="codeline" id="line-650"><code>			check.representable(y, Typ[Uint])</code></span>
+<span class="codeline" id="line-651"><code>			if y.mode == invalid {</code></span>
+<span class="codeline" id="line-652"><code>				x.mode = invalid</code></span>
+<span class="codeline" id="line-653"><code>				return</code></span>
+<span class="codeline" id="line-654"><code>			}</code></span>
+<span class="codeline" id="line-655"><code>		}</code></span>
+<span class="codeline" id="line-656"><code>	} else {</code></span>
+<span class="codeline" id="line-657"><code>		// Check that RHS is otherwise at least of integer type.</code></span>
+<span class="codeline" id="line-658"><code>		switch {</code></span>
+<span class="codeline" id="line-659"><code>		case allInteger(y.typ):</code></span>
+<span class="codeline" id="line-660"><code>			if !allUnsigned(y.typ) &amp;&amp; !check.verifyVersionf(y, go1_13, invalidOp+"signed shift count %s", y) {</code></span>
+<span class="codeline" id="line-661"><code>				x.mode = invalid</code></span>
+<span class="codeline" id="line-662"><code>				return</code></span>
+<span class="codeline" id="line-663"><code>			}</code></span>
+<span class="codeline" id="line-664"><code>		case isUntyped(y.typ):</code></span>
+<span class="codeline" id="line-665"><code>			// This is incorrect, but preserves pre-existing behavior.</code></span>
+<span class="codeline" id="line-666"><code>			// See also go.dev/issue/47410.</code></span>
+<span class="codeline" id="line-667"><code>			check.convertUntyped(y, Typ[Uint])</code></span>
+<span class="codeline" id="line-668"><code>			if y.mode == invalid {</code></span>
+<span class="codeline" id="line-669"><code>				x.mode = invalid</code></span>
+<span class="codeline" id="line-670"><code>				return</code></span>
+<span class="codeline" id="line-671"><code>			}</code></span>
+<span class="codeline" id="line-672"><code>		default:</code></span>
+<span class="codeline" id="line-673"><code>			check.errorf(y, InvalidShiftCount, invalidOp+"shift count %s must be integer", y)</code></span>
+<span class="codeline" id="line-674"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-675"><code>			return</code></span>
+<span class="codeline" id="line-676"><code>		}</code></span>
+<span class="codeline" id="line-677"><code>	}</code></span>
+<span class="codeline" id="line-678"><code></code></span>
+<span class="codeline" id="line-679"><code>	if x.mode == constant_ {</code></span>
+<span class="codeline" id="line-680"><code>		if y.mode == constant_ {</code></span>
+<span class="codeline" id="line-681"><code>			// if either x or y has an unknown value, the result is unknown</code></span>
+<span class="codeline" id="line-682"><code>			if x.val.Kind() == constant.Unknown || y.val.Kind() == constant.Unknown {</code></span>
+<span class="codeline" id="line-683"><code>				x.val = constant.MakeUnknown()</code></span>
+<span class="codeline" id="line-684"><code>				// ensure the correct type - see comment below</code></span>
+<span class="codeline" id="line-685"><code>				if !isInteger(x.typ) {</code></span>
+<span class="codeline" id="line-686"><code>					x.typ = Typ[UntypedInt]</code></span>
+<span class="codeline" id="line-687"><code>				}</code></span>
+<span class="codeline" id="line-688"><code>				return</code></span>
+<span class="codeline" id="line-689"><code>			}</code></span>
+<span class="codeline" id="line-690"><code>			// rhs must be within reasonable bounds in constant shifts</code></span>
+<span class="codeline" id="line-691"><code>			const shiftBound = 1023 - 1 + 52 // so we can express smallestFloat64 (see go.dev/issue/44057)</code></span>
+<span class="codeline" id="line-692"><code>			s, ok := constant.Uint64Val(yval)</code></span>
+<span class="codeline" id="line-693"><code>			if !ok || s &gt; shiftBound {</code></span>
+<span class="codeline" id="line-694"><code>				check.errorf(y, InvalidShiftCount, invalidOp+"invalid shift count %s", y)</code></span>
+<span class="codeline" id="line-695"><code>				x.mode = invalid</code></span>
+<span class="codeline" id="line-696"><code>				return</code></span>
+<span class="codeline" id="line-697"><code>			}</code></span>
+<span class="codeline" id="line-698"><code>			// The lhs is representable as an integer but may not be an integer</code></span>
+<span class="codeline" id="line-699"><code>			// (e.g., 2.0, an untyped float) - this can only happen for untyped</code></span>
+<span class="codeline" id="line-700"><code>			// non-integer numeric constants. Correct the type so that the shift</code></span>
+<span class="codeline" id="line-701"><code>			// result is of integer type.</code></span>
+<span class="codeline" id="line-702"><code>			if !isInteger(x.typ) {</code></span>
+<span class="codeline" id="line-703"><code>				x.typ = Typ[UntypedInt]</code></span>
+<span class="codeline" id="line-704"><code>			}</code></span>
+<span class="codeline" id="line-705"><code>			// x is a constant so xval != nil and it must be of Int kind.</code></span>
+<span class="codeline" id="line-706"><code>			x.val = constant.Shift(xval, op, uint(s))</code></span>
+<span class="codeline" id="line-707"><code>			x.expr = e</code></span>
+<span class="codeline" id="line-708"><code>			opPos := x.Pos()</code></span>
+<span class="codeline" id="line-709"><code>			if b, _ := e.(*ast.BinaryExpr); b != nil {</code></span>
+<span class="codeline" id="line-710"><code>				opPos = b.OpPos</code></span>
+<span class="codeline" id="line-711"><code>			}</code></span>
+<span class="codeline" id="line-712"><code>			check.overflow(x, opPos)</code></span>
+<span class="codeline" id="line-713"><code>			return</code></span>
+<span class="codeline" id="line-714"><code>		}</code></span>
+<span class="codeline" id="line-715"><code></code></span>
+<span class="codeline" id="line-716"><code>		// non-constant shift with constant lhs</code></span>
+<span class="codeline" id="line-717"><code>		if isUntyped(x.typ) {</code></span>
+<span class="codeline" id="line-718"><code>			// spec: "If the left operand of a non-constant shift</code></span>
+<span class="codeline" id="line-719"><code>			// expression is an untyped constant, the type of the</code></span>
+<span class="codeline" id="line-720"><code>			// constant is what it would be if the shift expression</code></span>
+<span class="codeline" id="line-721"><code>			// were replaced by its left operand alone.".</code></span>
+<span class="codeline" id="line-722"><code>			//</code></span>
+<span class="codeline" id="line-723"><code>			// Delay operand checking until we know the final type</code></span>
+<span class="codeline" id="line-724"><code>			// by marking the lhs expression as lhs shift operand.</code></span>
+<span class="codeline" id="line-725"><code>			//</code></span>
+<span class="codeline" id="line-726"><code>			// Usually (in correct programs), the lhs expression</code></span>
+<span class="codeline" id="line-727"><code>			// is in the untyped map. However, it is possible to</code></span>
+<span class="codeline" id="line-728"><code>			// create incorrect programs where the same expression</code></span>
+<span class="codeline" id="line-729"><code>			// is evaluated twice (via a declaration cycle) such</code></span>
+<span class="codeline" id="line-730"><code>			// that the lhs expression type is determined in the</code></span>
+<span class="codeline" id="line-731"><code>			// first round and thus deleted from the map, and then</code></span>
+<span class="codeline" id="line-732"><code>			// not found in the second round (double insertion of</code></span>
+<span class="codeline" id="line-733"><code>			// the same expr node still just leads to one entry for</code></span>
+<span class="codeline" id="line-734"><code>			// that node, and it can only be deleted once).</code></span>
+<span class="codeline" id="line-735"><code>			// Be cautious and check for presence of entry.</code></span>
+<span class="codeline" id="line-736"><code>			// Example: var e, f = int(1&lt;&lt;""[f]) // go.dev/issue/11347</code></span>
+<span class="codeline" id="line-737"><code>			if info, found := check.untyped[x.expr]; found {</code></span>
+<span class="codeline" id="line-738"><code>				info.isLhs = true</code></span>
+<span class="codeline" id="line-739"><code>				check.untyped[x.expr] = info</code></span>
+<span class="codeline" id="line-740"><code>			}</code></span>
+<span class="codeline" id="line-741"><code>			// keep x's type</code></span>
+<span class="codeline" id="line-742"><code>			x.mode = value</code></span>
+<span class="codeline" id="line-743"><code>			return</code></span>
+<span class="codeline" id="line-744"><code>		}</code></span>
+<span class="codeline" id="line-745"><code>	}</code></span>
+<span class="codeline" id="line-746"><code></code></span>
+<span class="codeline" id="line-747"><code>	// non-constant shift - lhs must be an integer</code></span>
+<span class="codeline" id="line-748"><code>	if !allInteger(x.typ) {</code></span>
+<span class="codeline" id="line-749"><code>		check.errorf(x, InvalidShiftOperand, invalidOp+"shifted operand %s must be integer", x)</code></span>
+<span class="codeline" id="line-750"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-751"><code>		return</code></span>
+<span class="codeline" id="line-752"><code>	}</code></span>
+<span class="codeline" id="line-753"><code></code></span>
+<span class="codeline" id="line-754"><code>	x.mode = value</code></span>
+<span class="codeline" id="line-755"><code>}</code></span>
+<span class="codeline" id="line-756"><code></code></span>
+<span class="codeline" id="line-757"><code>var binaryOpPredicates opPredicates</code></span>
+<span class="codeline" id="line-758"><code></code></span>
+<span class="codeline" id="line-759"><code>func init() {</code></span>
+<span class="codeline" id="line-760"><code>	// Setting binaryOpPredicates in init avoids declaration cycles.</code></span>
+<span class="codeline" id="line-761"><code>	binaryOpPredicates = opPredicates{</code></span>
+<span class="codeline" id="line-762"><code>		token.ADD: allNumericOrString,</code></span>
+<span class="codeline" id="line-763"><code>		token.SUB: allNumeric,</code></span>
+<span class="codeline" id="line-764"><code>		token.MUL: allNumeric,</code></span>
+<span class="codeline" id="line-765"><code>		token.QUO: allNumeric,</code></span>
+<span class="codeline" id="line-766"><code>		token.REM: allInteger,</code></span>
+<span class="codeline" id="line-767"><code></code></span>
+<span class="codeline" id="line-768"><code>		token.AND:     allInteger,</code></span>
+<span class="codeline" id="line-769"><code>		token.OR:      allInteger,</code></span>
+<span class="codeline" id="line-770"><code>		token.XOR:     allInteger,</code></span>
+<span class="codeline" id="line-771"><code>		token.AND_NOT: allInteger,</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>		token.LAND: allBoolean,</code></span>
+<span class="codeline" id="line-774"><code>		token.LOR:  allBoolean,</code></span>
+<span class="codeline" id="line-775"><code>	}</code></span>
+<span class="codeline" id="line-776"><code>}</code></span>
+<span class="codeline" id="line-777"><code></code></span>
+<span class="codeline" id="line-778"><code>// If e != nil, it must be the binary expression; it may be nil for non-constant expressions</code></span>
+<span class="codeline" id="line-779"><code>// (when invoked for an assignment operation where the binary expression is implicit).</code></span>
+<span class="codeline" id="line-780"><code>func (check *Checker) binary(x *operand, e ast.Expr, lhs, rhs ast.Expr, op token.Token, opPos token.Pos) {</code></span>
+<span class="codeline" id="line-781"><code>	var y operand</code></span>
+<span class="codeline" id="line-782"><code></code></span>
+<span class="codeline" id="line-783"><code>	check.expr(nil, x, lhs)</code></span>
+<span class="codeline" id="line-784"><code>	check.expr(nil, &amp;y, rhs)</code></span>
+<span class="codeline" id="line-785"><code></code></span>
+<span class="codeline" id="line-786"><code>	if x.mode == invalid {</code></span>
+<span class="codeline" id="line-787"><code>		return</code></span>
+<span class="codeline" id="line-788"><code>	}</code></span>
+<span class="codeline" id="line-789"><code>	if y.mode == invalid {</code></span>
+<span class="codeline" id="line-790"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-791"><code>		x.expr = y.expr</code></span>
+<span class="codeline" id="line-792"><code>		return</code></span>
+<span class="codeline" id="line-793"><code>	}</code></span>
+<span class="codeline" id="line-794"><code></code></span>
+<span class="codeline" id="line-795"><code>	if isShift(op) {</code></span>
+<span class="codeline" id="line-796"><code>		check.shift(x, &amp;y, e, op)</code></span>
+<span class="codeline" id="line-797"><code>		return</code></span>
+<span class="codeline" id="line-798"><code>	}</code></span>
+<span class="codeline" id="line-799"><code></code></span>
+<span class="codeline" id="line-800"><code>	check.matchTypes(x, &amp;y)</code></span>
+<span class="codeline" id="line-801"><code>	if x.mode == invalid {</code></span>
+<span class="codeline" id="line-802"><code>		return</code></span>
+<span class="codeline" id="line-803"><code>	}</code></span>
+<span class="codeline" id="line-804"><code></code></span>
+<span class="codeline" id="line-805"><code>	if isComparison(op) {</code></span>
+<span class="codeline" id="line-806"><code>		check.comparison(x, &amp;y, op, false)</code></span>
+<span class="codeline" id="line-807"><code>		return</code></span>
+<span class="codeline" id="line-808"><code>	}</code></span>
+<span class="codeline" id="line-809"><code></code></span>
+<span class="codeline" id="line-810"><code>	if !Identical(x.typ, y.typ) {</code></span>
+<span class="codeline" id="line-811"><code>		// only report an error if we have valid types</code></span>
+<span class="codeline" id="line-812"><code>		// (otherwise we had an error reported elsewhere already)</code></span>
+<span class="codeline" id="line-813"><code>		if isValid(x.typ) &amp;&amp; isValid(y.typ) {</code></span>
+<span class="codeline" id="line-814"><code>			var posn positioner = x</code></span>
+<span class="codeline" id="line-815"><code>			if e != nil {</code></span>
+<span class="codeline" id="line-816"><code>				posn = e</code></span>
+<span class="codeline" id="line-817"><code>			}</code></span>
+<span class="codeline" id="line-818"><code>			if e != nil {</code></span>
+<span class="codeline" id="line-819"><code>				check.errorf(posn, MismatchedTypes, invalidOp+"%s (mismatched types %s and %s)", e, x.typ, y.typ)</code></span>
+<span class="codeline" id="line-820"><code>			} else {</code></span>
+<span class="codeline" id="line-821"><code>				check.errorf(posn, MismatchedTypes, invalidOp+"%s %s= %s (mismatched types %s and %s)", lhs, op, rhs, x.typ, y.typ)</code></span>
+<span class="codeline" id="line-822"><code>			}</code></span>
+<span class="codeline" id="line-823"><code>		}</code></span>
+<span class="codeline" id="line-824"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-825"><code>		return</code></span>
+<span class="codeline" id="line-826"><code>	}</code></span>
+<span class="codeline" id="line-827"><code></code></span>
+<span class="codeline" id="line-828"><code>	if !check.op(binaryOpPredicates, x, op) {</code></span>
+<span class="codeline" id="line-829"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-830"><code>		return</code></span>
+<span class="codeline" id="line-831"><code>	}</code></span>
+<span class="codeline" id="line-832"><code></code></span>
+<span class="codeline" id="line-833"><code>	if op == token.QUO || op == token.REM {</code></span>
+<span class="codeline" id="line-834"><code>		// check for zero divisor</code></span>
+<span class="codeline" id="line-835"><code>		if (x.mode == constant_ || allInteger(x.typ)) &amp;&amp; y.mode == constant_ &amp;&amp; constant.Sign(y.val) == 0 {</code></span>
+<span class="codeline" id="line-836"><code>			check.error(&amp;y, DivByZero, invalidOp+"division by zero")</code></span>
+<span class="codeline" id="line-837"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-838"><code>			return</code></span>
+<span class="codeline" id="line-839"><code>		}</code></span>
+<span class="codeline" id="line-840"><code></code></span>
+<span class="codeline" id="line-841"><code>		// check for divisor underflow in complex division (see go.dev/issue/20227)</code></span>
+<span class="codeline" id="line-842"><code>		if x.mode == constant_ &amp;&amp; y.mode == constant_ &amp;&amp; isComplex(x.typ) {</code></span>
+<span class="codeline" id="line-843"><code>			re, im := constant.Real(y.val), constant.Imag(y.val)</code></span>
+<span class="codeline" id="line-844"><code>			re2, im2 := constant.BinaryOp(re, token.MUL, re), constant.BinaryOp(im, token.MUL, im)</code></span>
+<span class="codeline" id="line-845"><code>			if constant.Sign(re2) == 0 &amp;&amp; constant.Sign(im2) == 0 {</code></span>
+<span class="codeline" id="line-846"><code>				check.error(&amp;y, DivByZero, invalidOp+"division by zero")</code></span>
+<span class="codeline" id="line-847"><code>				x.mode = invalid</code></span>
+<span class="codeline" id="line-848"><code>				return</code></span>
+<span class="codeline" id="line-849"><code>			}</code></span>
+<span class="codeline" id="line-850"><code>		}</code></span>
+<span class="codeline" id="line-851"><code>	}</code></span>
+<span class="codeline" id="line-852"><code></code></span>
+<span class="codeline" id="line-853"><code>	if x.mode == constant_ &amp;&amp; y.mode == constant_ {</code></span>
+<span class="codeline" id="line-854"><code>		// if either x or y has an unknown value, the result is unknown</code></span>
+<span class="codeline" id="line-855"><code>		if x.val.Kind() == constant.Unknown || y.val.Kind() == constant.Unknown {</code></span>
+<span class="codeline" id="line-856"><code>			x.val = constant.MakeUnknown()</code></span>
+<span class="codeline" id="line-857"><code>			// x.typ is unchanged</code></span>
+<span class="codeline" id="line-858"><code>			return</code></span>
+<span class="codeline" id="line-859"><code>		}</code></span>
+<span class="codeline" id="line-860"><code>		// force integer division of integer operands</code></span>
+<span class="codeline" id="line-861"><code>		if op == token.QUO &amp;&amp; isInteger(x.typ) {</code></span>
+<span class="codeline" id="line-862"><code>			op = token.QUO_ASSIGN</code></span>
+<span class="codeline" id="line-863"><code>		}</code></span>
+<span class="codeline" id="line-864"><code>		x.val = constant.BinaryOp(x.val, op, y.val)</code></span>
+<span class="codeline" id="line-865"><code>		x.expr = e</code></span>
+<span class="codeline" id="line-866"><code>		check.overflow(x, opPos)</code></span>
+<span class="codeline" id="line-867"><code>		return</code></span>
+<span class="codeline" id="line-868"><code>	}</code></span>
+<span class="codeline" id="line-869"><code></code></span>
+<span class="codeline" id="line-870"><code>	x.mode = value</code></span>
+<span class="codeline" id="line-871"><code>	// x.typ is unchanged</code></span>
+<span class="codeline" id="line-872"><code>}</code></span>
+<span class="codeline" id="line-873"><code></code></span>
+<span class="codeline" id="line-874"><code>// matchTypes attempts to convert any untyped types x and y such that they match.</code></span>
+<span class="codeline" id="line-875"><code>// If an error occurs, x.mode is set to invalid.</code></span>
+<span class="codeline" id="line-876"><code>func (check *Checker) matchTypes(x, y *operand) {</code></span>
+<span class="codeline" id="line-877"><code>	// mayConvert reports whether the operands x and y may</code></span>
+<span class="codeline" id="line-878"><code>	// possibly have matching types after converting one</code></span>
+<span class="codeline" id="line-879"><code>	// untyped operand to the type of the other.</code></span>
+<span class="codeline" id="line-880"><code>	// If mayConvert returns true, we try to convert the</code></span>
+<span class="codeline" id="line-881"><code>	// operands to each other's types, and if that fails</code></span>
+<span class="codeline" id="line-882"><code>	// we report a conversion failure.</code></span>
+<span class="codeline" id="line-883"><code>	// If mayConvert returns false, we continue without an</code></span>
+<span class="codeline" id="line-884"><code>	// attempt at conversion, and if the operand types are</code></span>
+<span class="codeline" id="line-885"><code>	// not compatible, we report a type mismatch error.</code></span>
+<span class="codeline" id="line-886"><code>	mayConvert := func(x, y *operand) bool {</code></span>
+<span class="codeline" id="line-887"><code>		// If both operands are typed, there's no need for an implicit conversion.</code></span>
+<span class="codeline" id="line-888"><code>		if isTyped(x.typ) &amp;&amp; isTyped(y.typ) {</code></span>
+<span class="codeline" id="line-889"><code>			return false</code></span>
+<span class="codeline" id="line-890"><code>		}</code></span>
+<span class="codeline" id="line-891"><code>		// An untyped operand may convert to its default type when paired with an empty interface</code></span>
+<span class="codeline" id="line-892"><code>		// TODO(gri) This should only matter for comparisons (the only binary operation that is</code></span>
+<span class="codeline" id="line-893"><code>		//           valid with interfaces), but in that case the assignability check should take</code></span>
+<span class="codeline" id="line-894"><code>		//           care of the conversion. Verify and possibly eliminate this extra test.</code></span>
+<span class="codeline" id="line-895"><code>		if isNonTypeParamInterface(x.typ) || isNonTypeParamInterface(y.typ) {</code></span>
+<span class="codeline" id="line-896"><code>			return true</code></span>
+<span class="codeline" id="line-897"><code>		}</code></span>
+<span class="codeline" id="line-898"><code>		// A boolean type can only convert to another boolean type.</code></span>
+<span class="codeline" id="line-899"><code>		if allBoolean(x.typ) != allBoolean(y.typ) {</code></span>
+<span class="codeline" id="line-900"><code>			return false</code></span>
+<span class="codeline" id="line-901"><code>		}</code></span>
+<span class="codeline" id="line-902"><code>		// A string type can only convert to another string type.</code></span>
+<span class="codeline" id="line-903"><code>		if allString(x.typ) != allString(y.typ) {</code></span>
+<span class="codeline" id="line-904"><code>			return false</code></span>
+<span class="codeline" id="line-905"><code>		}</code></span>
+<span class="codeline" id="line-906"><code>		// Untyped nil can only convert to a type that has a nil.</code></span>
+<span class="codeline" id="line-907"><code>		if x.isNil() {</code></span>
+<span class="codeline" id="line-908"><code>			return hasNil(y.typ)</code></span>
+<span class="codeline" id="line-909"><code>		}</code></span>
+<span class="codeline" id="line-910"><code>		if y.isNil() {</code></span>
+<span class="codeline" id="line-911"><code>			return hasNil(x.typ)</code></span>
+<span class="codeline" id="line-912"><code>		}</code></span>
+<span class="codeline" id="line-913"><code>		// An untyped operand cannot convert to a pointer.</code></span>
+<span class="codeline" id="line-914"><code>		// TODO(gri) generalize to type parameters</code></span>
+<span class="codeline" id="line-915"><code>		if isPointer(x.typ) || isPointer(y.typ) {</code></span>
+<span class="codeline" id="line-916"><code>			return false</code></span>
+<span class="codeline" id="line-917"><code>		}</code></span>
+<span class="codeline" id="line-918"><code>		return true</code></span>
+<span class="codeline" id="line-919"><code>	}</code></span>
+<span class="codeline" id="line-920"><code></code></span>
+<span class="codeline" id="line-921"><code>	if mayConvert(x, y) {</code></span>
+<span class="codeline" id="line-922"><code>		check.convertUntyped(x, y.typ)</code></span>
+<span class="codeline" id="line-923"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-924"><code>			return</code></span>
+<span class="codeline" id="line-925"><code>		}</code></span>
+<span class="codeline" id="line-926"><code>		check.convertUntyped(y, x.typ)</code></span>
+<span class="codeline" id="line-927"><code>		if y.mode == invalid {</code></span>
+<span class="codeline" id="line-928"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-929"><code>			return</code></span>
+<span class="codeline" id="line-930"><code>		}</code></span>
+<span class="codeline" id="line-931"><code>	}</code></span>
+<span class="codeline" id="line-932"><code>}</code></span>
+<span class="codeline" id="line-933"><code></code></span>
+<span class="codeline" id="line-934"><code>// exprKind describes the kind of an expression; the kind</code></span>
+<span class="codeline" id="line-935"><code>// determines if an expression is valid in 'statement context'.</code></span>
+<span class="codeline" id="line-936"><code>type exprKind int</code></span>
+<span class="codeline" id="line-937"><code></code></span>
+<span class="codeline" id="line-938"><code>const (</code></span>
+<span class="codeline" id="line-939"><code>	conversion exprKind = iota</code></span>
+<span class="codeline" id="line-940"><code>	expression</code></span>
+<span class="codeline" id="line-941"><code>	statement</code></span>
+<span class="codeline" id="line-942"><code>)</code></span>
+<span class="codeline" id="line-943"><code></code></span>
+<span class="codeline" id="line-944"><code>// target represent the (signature) type and description of the LHS</code></span>
+<span class="codeline" id="line-945"><code>// variable of an assignment, or of a function result variable.</code></span>
+<span class="codeline" id="line-946"><code>type target struct {</code></span>
+<span class="codeline" id="line-947"><code>	sig  *Signature</code></span>
+<span class="codeline" id="line-948"><code>	desc string</code></span>
+<span class="codeline" id="line-949"><code>}</code></span>
+<span class="codeline" id="line-950"><code></code></span>
+<span class="codeline" id="line-951"><code>// newTarget creates a new target for the given type and description.</code></span>
+<span class="codeline" id="line-952"><code>// The result is nil if typ is not a signature.</code></span>
+<span class="codeline" id="line-953"><code>func newTarget(typ Type, desc string) *target {</code></span>
+<span class="codeline" id="line-954"><code>	if typ != nil {</code></span>
+<span class="codeline" id="line-955"><code>		if sig, _ := under(typ).(*Signature); sig != nil {</code></span>
+<span class="codeline" id="line-956"><code>			return &amp;target{sig, desc}</code></span>
+<span class="codeline" id="line-957"><code>		}</code></span>
+<span class="codeline" id="line-958"><code>	}</code></span>
+<span class="codeline" id="line-959"><code>	return nil</code></span>
+<span class="codeline" id="line-960"><code>}</code></span>
+<span class="codeline" id="line-961"><code></code></span>
+<span class="codeline" id="line-962"><code>// rawExpr typechecks expression e and initializes x with the expression</code></span>
+<span class="codeline" id="line-963"><code>// value or type. If an error occurred, x.mode is set to invalid.</code></span>
+<span class="codeline" id="line-964"><code>// If a non-nil target T is given and e is a generic function,</code></span>
+<span class="codeline" id="line-965"><code>// T is used to infer the type arguments for e.</code></span>
+<span class="codeline" id="line-966"><code>// If hint != nil, it is the type of a composite literal element.</code></span>
+<span class="codeline" id="line-967"><code>// If allowGeneric is set, the operand type may be an uninstantiated</code></span>
+<span class="codeline" id="line-968"><code>// parameterized type or function value.</code></span>
+<span class="codeline" id="line-969"><code>func (check *Checker) rawExpr(T *target, x *operand, e ast.Expr, hint Type, allowGeneric bool) exprKind {</code></span>
+<span class="codeline" id="line-970"><code>	if check.conf._Trace {</code></span>
+<span class="codeline" id="line-971"><code>		check.trace(e.Pos(), "-- expr %s", e)</code></span>
+<span class="codeline" id="line-972"><code>		check.indent++</code></span>
+<span class="codeline" id="line-973"><code>		defer func() {</code></span>
+<span class="codeline" id="line-974"><code>			check.indent--</code></span>
+<span class="codeline" id="line-975"><code>			check.trace(e.Pos(), "=&gt; %s", x)</code></span>
+<span class="codeline" id="line-976"><code>		}()</code></span>
+<span class="codeline" id="line-977"><code>	}</code></span>
+<span class="codeline" id="line-978"><code></code></span>
+<span class="codeline" id="line-979"><code>	kind := check.exprInternal(T, x, e, hint)</code></span>
+<span class="codeline" id="line-980"><code></code></span>
+<span class="codeline" id="line-981"><code>	if !allowGeneric {</code></span>
+<span class="codeline" id="line-982"><code>		check.nonGeneric(T, x)</code></span>
+<span class="codeline" id="line-983"><code>	}</code></span>
+<span class="codeline" id="line-984"><code></code></span>
+<span class="codeline" id="line-985"><code>	check.record(x)</code></span>
+<span class="codeline" id="line-986"><code></code></span>
+<span class="codeline" id="line-987"><code>	return kind</code></span>
+<span class="codeline" id="line-988"><code>}</code></span>
+<span class="codeline" id="line-989"><code></code></span>
+<span class="codeline" id="line-990"><code>// If x is a generic type, or a generic function whose type arguments cannot be inferred</code></span>
+<span class="codeline" id="line-991"><code>// from a non-nil target T, nonGeneric reports an error and invalidates x.mode and x.typ.</code></span>
+<span class="codeline" id="line-992"><code>// Otherwise it leaves x alone.</code></span>
+<span class="codeline" id="line-993"><code>func (check *Checker) nonGeneric(T *target, x *operand) {</code></span>
+<span class="codeline" id="line-994"><code>	if x.mode == invalid || x.mode == novalue {</code></span>
+<span class="codeline" id="line-995"><code>		return</code></span>
+<span class="codeline" id="line-996"><code>	}</code></span>
+<span class="codeline" id="line-997"><code>	var what string</code></span>
+<span class="codeline" id="line-998"><code>	switch t := x.typ.(type) {</code></span>
+<span class="codeline" id="line-999"><code>	case *Named:</code></span>
+<span class="codeline" id="line-1000"><code>		if isGeneric(t) {</code></span>
+<span class="codeline" id="line-1001"><code>			what = "type"</code></span>
+<span class="codeline" id="line-1002"><code>		}</code></span>
+<span class="codeline" id="line-1003"><code>	case *Signature:</code></span>
+<span class="codeline" id="line-1004"><code>		if t.tparams != nil {</code></span>
+<span class="codeline" id="line-1005"><code>			if enableReverseTypeInference &amp;&amp; T != nil {</code></span>
+<span class="codeline" id="line-1006"><code>				check.funcInst(T, x.Pos(), x, nil, true)</code></span>
+<span class="codeline" id="line-1007"><code>				return</code></span>
+<span class="codeline" id="line-1008"><code>			}</code></span>
+<span class="codeline" id="line-1009"><code>			what = "function"</code></span>
+<span class="codeline" id="line-1010"><code>		}</code></span>
+<span class="codeline" id="line-1011"><code>	}</code></span>
+<span class="codeline" id="line-1012"><code>	if what != "" {</code></span>
+<span class="codeline" id="line-1013"><code>		check.errorf(x.expr, WrongTypeArgCount, "cannot use generic %s %s without instantiation", what, x.expr)</code></span>
+<span class="codeline" id="line-1014"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-1015"><code>		x.typ = Typ[Invalid]</code></span>
+<span class="codeline" id="line-1016"><code>	}</code></span>
+<span class="codeline" id="line-1017"><code>}</code></span>
+<span class="codeline" id="line-1018"><code></code></span>
+<span class="codeline" id="line-1019"><code>// exprInternal contains the core of type checking of expressions.</code></span>
+<span class="codeline" id="line-1020"><code>// Must only be called by rawExpr.</code></span>
+<span class="codeline" id="line-1021"><code>// (See rawExpr for an explanation of the parameters.)</code></span>
+<span class="codeline" id="line-1022"><code>func (check *Checker) exprInternal(T *target, x *operand, e ast.Expr, hint Type) exprKind {</code></span>
+<span class="codeline" id="line-1023"><code>	// make sure x has a valid state in case of bailout</code></span>
+<span class="codeline" id="line-1024"><code>	// (was go.dev/issue/5770)</code></span>
+<span class="codeline" id="line-1025"><code>	x.mode = invalid</code></span>
+<span class="codeline" id="line-1026"><code>	x.typ = Typ[Invalid]</code></span>
+<span class="codeline" id="line-1027"><code></code></span>
+<span class="codeline" id="line-1028"><code>	switch e := e.(type) {</code></span>
+<span class="codeline" id="line-1029"><code>	case *ast.BadExpr:</code></span>
+<span class="codeline" id="line-1030"><code>		goto Error // error was reported before</code></span>
+<span class="codeline" id="line-1031"><code></code></span>
+<span class="codeline" id="line-1032"><code>	case *ast.Ident:</code></span>
+<span class="codeline" id="line-1033"><code>		check.ident(x, e, nil, false)</code></span>
+<span class="codeline" id="line-1034"><code></code></span>
+<span class="codeline" id="line-1035"><code>	case *ast.Ellipsis:</code></span>
+<span class="codeline" id="line-1036"><code>		// ellipses are handled explicitly where they are legal</code></span>
+<span class="codeline" id="line-1037"><code>		// (array composite literals and parameter lists)</code></span>
+<span class="codeline" id="line-1038"><code>		check.error(e, BadDotDotDotSyntax, "invalid use of '...'")</code></span>
+<span class="codeline" id="line-1039"><code>		goto Error</code></span>
+<span class="codeline" id="line-1040"><code></code></span>
+<span class="codeline" id="line-1041"><code>	case *ast.BasicLit:</code></span>
+<span class="codeline" id="line-1042"><code>		switch e.Kind {</code></span>
+<span class="codeline" id="line-1043"><code>		case token.INT, token.FLOAT, token.IMAG:</code></span>
+<span class="codeline" id="line-1044"><code>			check.langCompat(e)</code></span>
+<span class="codeline" id="line-1045"><code>			// The max. mantissa precision for untyped numeric values</code></span>
+<span class="codeline" id="line-1046"><code>			// is 512 bits, or 4048 bits for each of the two integer</code></span>
+<span class="codeline" id="line-1047"><code>			// parts of a fraction for floating-point numbers that are</code></span>
+<span class="codeline" id="line-1048"><code>			// represented accurately in the go/constant package.</code></span>
+<span class="codeline" id="line-1049"><code>			// Constant literals that are longer than this many bits</code></span>
+<span class="codeline" id="line-1050"><code>			// are not meaningful; and excessively long constants may</code></span>
+<span class="codeline" id="line-1051"><code>			// consume a lot of space and time for a useless conversion.</code></span>
+<span class="codeline" id="line-1052"><code>			// Cap constant length with a generous upper limit that also</code></span>
+<span class="codeline" id="line-1053"><code>			// allows for separators between all digits.</code></span>
+<span class="codeline" id="line-1054"><code>			const limit = 10000</code></span>
+<span class="codeline" id="line-1055"><code>			if len(e.Value) &gt; limit {</code></span>
+<span class="codeline" id="line-1056"><code>				check.errorf(e, InvalidConstVal, "excessively long constant: %s... (%d chars)", e.Value[:10], len(e.Value))</code></span>
+<span class="codeline" id="line-1057"><code>				goto Error</code></span>
+<span class="codeline" id="line-1058"><code>			}</code></span>
+<span class="codeline" id="line-1059"><code>		}</code></span>
+<span class="codeline" id="line-1060"><code>		x.setConst(e.Kind, e.Value)</code></span>
+<span class="codeline" id="line-1061"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1062"><code>			// The parser already establishes syntactic correctness.</code></span>
+<span class="codeline" id="line-1063"><code>			// If we reach here it's because of number under-/overflow.</code></span>
+<span class="codeline" id="line-1064"><code>			// TODO(gri) setConst (and in turn the go/constant package)</code></span>
+<span class="codeline" id="line-1065"><code>			// should return an error describing the issue.</code></span>
+<span class="codeline" id="line-1066"><code>			check.errorf(e, InvalidConstVal, "malformed constant: %s", e.Value)</code></span>
+<span class="codeline" id="line-1067"><code>			goto Error</code></span>
+<span class="codeline" id="line-1068"><code>		}</code></span>
+<span class="codeline" id="line-1069"><code>		// Ensure that integer values don't overflow (go.dev/issue/54280).</code></span>
+<span class="codeline" id="line-1070"><code>		check.overflow(x, e.Pos())</code></span>
+<span class="codeline" id="line-1071"><code></code></span>
+<span class="codeline" id="line-1072"><code>	case *ast.FuncLit:</code></span>
+<span class="codeline" id="line-1073"><code>		if sig, ok := check.typ(e.Type).(*Signature); ok {</code></span>
+<span class="codeline" id="line-1074"><code>			// Set the Scope's extent to the complete "func (...) {...}"</code></span>
+<span class="codeline" id="line-1075"><code>			// so that Scope.Innermost works correctly.</code></span>
+<span class="codeline" id="line-1076"><code>			sig.scope.pos = e.Pos()</code></span>
+<span class="codeline" id="line-1077"><code>			sig.scope.end = e.End()</code></span>
+<span class="codeline" id="line-1078"><code>			if !check.conf.IgnoreFuncBodies &amp;&amp; e.Body != nil {</code></span>
+<span class="codeline" id="line-1079"><code>				// Anonymous functions are considered part of the</code></span>
+<span class="codeline" id="line-1080"><code>				// init expression/func declaration which contains</code></span>
+<span class="codeline" id="line-1081"><code>				// them: use existing package-level declaration info.</code></span>
+<span class="codeline" id="line-1082"><code>				decl := check.decl // capture for use in closure below</code></span>
+<span class="codeline" id="line-1083"><code>				iota := check.iota // capture for use in closure below (go.dev/issue/22345)</code></span>
+<span class="codeline" id="line-1084"><code>				// Don't type-check right away because the function may</code></span>
+<span class="codeline" id="line-1085"><code>				// be part of a type definition to which the function</code></span>
+<span class="codeline" id="line-1086"><code>				// body refers. Instead, type-check as soon as possible,</code></span>
+<span class="codeline" id="line-1087"><code>				// but before the enclosing scope contents changes (go.dev/issue/22992).</code></span>
+<span class="codeline" id="line-1088"><code>				check.later(func() {</code></span>
+<span class="codeline" id="line-1089"><code>					check.funcBody(decl, "&lt;function literal&gt;", sig, e.Body, iota)</code></span>
+<span class="codeline" id="line-1090"><code>				}).describef(e, "func literal")</code></span>
+<span class="codeline" id="line-1091"><code>			}</code></span>
+<span class="codeline" id="line-1092"><code>			x.mode = value</code></span>
+<span class="codeline" id="line-1093"><code>			x.typ = sig</code></span>
+<span class="codeline" id="line-1094"><code>		} else {</code></span>
+<span class="codeline" id="line-1095"><code>			check.errorf(e, InvalidSyntaxTree, "invalid function literal %s", e)</code></span>
+<span class="codeline" id="line-1096"><code>			goto Error</code></span>
+<span class="codeline" id="line-1097"><code>		}</code></span>
+<span class="codeline" id="line-1098"><code></code></span>
+<span class="codeline" id="line-1099"><code>	case *ast.CompositeLit:</code></span>
+<span class="codeline" id="line-1100"><code>		var typ, base Type</code></span>
+<span class="codeline" id="line-1101"><code></code></span>
+<span class="codeline" id="line-1102"><code>		switch {</code></span>
+<span class="codeline" id="line-1103"><code>		case e.Type != nil:</code></span>
+<span class="codeline" id="line-1104"><code>			// composite literal type present - use it</code></span>
+<span class="codeline" id="line-1105"><code>			// [...]T array types may only appear with composite literals.</code></span>
+<span class="codeline" id="line-1106"><code>			// Check for them here so we don't have to handle ... in general.</code></span>
+<span class="codeline" id="line-1107"><code>			if atyp, _ := e.Type.(*ast.ArrayType); atyp != nil &amp;&amp; atyp.Len != nil {</code></span>
+<span class="codeline" id="line-1108"><code>				if ellip, _ := atyp.Len.(*ast.Ellipsis); ellip != nil &amp;&amp; ellip.Elt == nil {</code></span>
+<span class="codeline" id="line-1109"><code>					// We have an "open" [...]T array type.</code></span>
+<span class="codeline" id="line-1110"><code>					// Create a new ArrayType with unknown length (-1)</code></span>
+<span class="codeline" id="line-1111"><code>					// and finish setting it up after analyzing the literal.</code></span>
+<span class="codeline" id="line-1112"><code>					typ = &amp;Array{len: -1, elem: check.varType(atyp.Elt)}</code></span>
+<span class="codeline" id="line-1113"><code>					base = typ</code></span>
+<span class="codeline" id="line-1114"><code>					break</code></span>
+<span class="codeline" id="line-1115"><code>				}</code></span>
+<span class="codeline" id="line-1116"><code>			}</code></span>
+<span class="codeline" id="line-1117"><code>			typ = check.typ(e.Type)</code></span>
+<span class="codeline" id="line-1118"><code>			base = typ</code></span>
+<span class="codeline" id="line-1119"><code></code></span>
+<span class="codeline" id="line-1120"><code>		case hint != nil:</code></span>
+<span class="codeline" id="line-1121"><code>			// no composite literal type present - use hint (element type of enclosing type)</code></span>
+<span class="codeline" id="line-1122"><code>			typ = hint</code></span>
+<span class="codeline" id="line-1123"><code>			base, _ = deref(coreType(typ)) // *T implies &amp;T{}</code></span>
+<span class="codeline" id="line-1124"><code>			if base == nil {</code></span>
+<span class="codeline" id="line-1125"><code>				check.errorf(e, InvalidLit, "invalid composite literal element type %s (no core type)", typ)</code></span>
+<span class="codeline" id="line-1126"><code>				goto Error</code></span>
+<span class="codeline" id="line-1127"><code>			}</code></span>
+<span class="codeline" id="line-1128"><code></code></span>
+<span class="codeline" id="line-1129"><code>		default:</code></span>
+<span class="codeline" id="line-1130"><code>			// TODO(gri) provide better error messages depending on context</code></span>
+<span class="codeline" id="line-1131"><code>			check.error(e, UntypedLit, "missing type in composite literal")</code></span>
+<span class="codeline" id="line-1132"><code>			goto Error</code></span>
+<span class="codeline" id="line-1133"><code>		}</code></span>
+<span class="codeline" id="line-1134"><code></code></span>
+<span class="codeline" id="line-1135"><code>		switch utyp := coreType(base).(type) {</code></span>
+<span class="codeline" id="line-1136"><code>		case *Struct:</code></span>
+<span class="codeline" id="line-1137"><code>			// Prevent crash if the struct referred to is not yet set up.</code></span>
+<span class="codeline" id="line-1138"><code>			// See analogous comment for *Array.</code></span>
+<span class="codeline" id="line-1139"><code>			if utyp.fields == nil {</code></span>
+<span class="codeline" id="line-1140"><code>				check.error(e, InvalidTypeCycle, "invalid recursive type")</code></span>
+<span class="codeline" id="line-1141"><code>				goto Error</code></span>
+<span class="codeline" id="line-1142"><code>			}</code></span>
+<span class="codeline" id="line-1143"><code>			if len(e.Elts) == 0 {</code></span>
+<span class="codeline" id="line-1144"><code>				break</code></span>
+<span class="codeline" id="line-1145"><code>			}</code></span>
+<span class="codeline" id="line-1146"><code>			// Convention for error messages on invalid struct literals:</code></span>
+<span class="codeline" id="line-1147"><code>			// we mention the struct type only if it clarifies the error</code></span>
+<span class="codeline" id="line-1148"><code>			// (e.g., a duplicate field error doesn't need the struct type).</code></span>
+<span class="codeline" id="line-1149"><code>			fields := utyp.fields</code></span>
+<span class="codeline" id="line-1150"><code>			if _, ok := e.Elts[0].(*ast.KeyValueExpr); ok {</code></span>
+<span class="codeline" id="line-1151"><code>				// all elements must have keys</code></span>
+<span class="codeline" id="line-1152"><code>				visited := make([]bool, len(fields))</code></span>
+<span class="codeline" id="line-1153"><code>				for _, e := range e.Elts {</code></span>
+<span class="codeline" id="line-1154"><code>					kv, _ := e.(*ast.KeyValueExpr)</code></span>
+<span class="codeline" id="line-1155"><code>					if kv == nil {</code></span>
+<span class="codeline" id="line-1156"><code>						check.error(e, MixedStructLit, "mixture of field:value and value elements in struct literal")</code></span>
+<span class="codeline" id="line-1157"><code>						continue</code></span>
+<span class="codeline" id="line-1158"><code>					}</code></span>
+<span class="codeline" id="line-1159"><code>					key, _ := kv.Key.(*ast.Ident)</code></span>
+<span class="codeline" id="line-1160"><code>					// do all possible checks early (before exiting due to errors)</code></span>
+<span class="codeline" id="line-1161"><code>					// so we don't drop information on the floor</code></span>
+<span class="codeline" id="line-1162"><code>					check.expr(nil, x, kv.Value)</code></span>
+<span class="codeline" id="line-1163"><code>					if key == nil {</code></span>
+<span class="codeline" id="line-1164"><code>						check.errorf(kv, InvalidLitField, "invalid field name %s in struct literal", kv.Key)</code></span>
+<span class="codeline" id="line-1165"><code>						continue</code></span>
+<span class="codeline" id="line-1166"><code>					}</code></span>
+<span class="codeline" id="line-1167"><code>					i := fieldIndex(utyp.fields, check.pkg, key.Name)</code></span>
+<span class="codeline" id="line-1168"><code>					if i &lt; 0 {</code></span>
+<span class="codeline" id="line-1169"><code>						check.errorf(kv, MissingLitField, "unknown field %s in struct literal of type %s", key.Name, base)</code></span>
+<span class="codeline" id="line-1170"><code>						continue</code></span>
+<span class="codeline" id="line-1171"><code>					}</code></span>
+<span class="codeline" id="line-1172"><code>					fld := fields[i]</code></span>
+<span class="codeline" id="line-1173"><code>					check.recordUse(key, fld)</code></span>
+<span class="codeline" id="line-1174"><code>					etyp := fld.typ</code></span>
+<span class="codeline" id="line-1175"><code>					check.assignment(x, etyp, "struct literal")</code></span>
+<span class="codeline" id="line-1176"><code>					// 0 &lt;= i &lt; len(fields)</code></span>
+<span class="codeline" id="line-1177"><code>					if visited[i] {</code></span>
+<span class="codeline" id="line-1178"><code>						check.errorf(kv, DuplicateLitField, "duplicate field name %s in struct literal", key.Name)</code></span>
+<span class="codeline" id="line-1179"><code>						continue</code></span>
+<span class="codeline" id="line-1180"><code>					}</code></span>
+<span class="codeline" id="line-1181"><code>					visited[i] = true</code></span>
+<span class="codeline" id="line-1182"><code>				}</code></span>
+<span class="codeline" id="line-1183"><code>			} else {</code></span>
+<span class="codeline" id="line-1184"><code>				// no element must have a key</code></span>
+<span class="codeline" id="line-1185"><code>				for i, e := range e.Elts {</code></span>
+<span class="codeline" id="line-1186"><code>					if kv, _ := e.(*ast.KeyValueExpr); kv != nil {</code></span>
+<span class="codeline" id="line-1187"><code>						check.error(kv, MixedStructLit, "mixture of field:value and value elements in struct literal")</code></span>
+<span class="codeline" id="line-1188"><code>						continue</code></span>
+<span class="codeline" id="line-1189"><code>					}</code></span>
+<span class="codeline" id="line-1190"><code>					check.expr(nil, x, e)</code></span>
+<span class="codeline" id="line-1191"><code>					if i &gt;= len(fields) {</code></span>
+<span class="codeline" id="line-1192"><code>						check.errorf(x, InvalidStructLit, "too many values in struct literal of type %s", base)</code></span>
+<span class="codeline" id="line-1193"><code>						break // cannot continue</code></span>
+<span class="codeline" id="line-1194"><code>					}</code></span>
+<span class="codeline" id="line-1195"><code>					// i &lt; len(fields)</code></span>
+<span class="codeline" id="line-1196"><code>					fld := fields[i]</code></span>
+<span class="codeline" id="line-1197"><code>					if !fld.Exported() &amp;&amp; fld.pkg != check.pkg {</code></span>
+<span class="codeline" id="line-1198"><code>						check.errorf(x,</code></span>
+<span class="codeline" id="line-1199"><code>							UnexportedLitField,</code></span>
+<span class="codeline" id="line-1200"><code>							"implicit assignment to unexported field %s in struct literal of type %s", fld.name, base)</code></span>
+<span class="codeline" id="line-1201"><code>						continue</code></span>
+<span class="codeline" id="line-1202"><code>					}</code></span>
+<span class="codeline" id="line-1203"><code>					etyp := fld.typ</code></span>
+<span class="codeline" id="line-1204"><code>					check.assignment(x, etyp, "struct literal")</code></span>
+<span class="codeline" id="line-1205"><code>				}</code></span>
+<span class="codeline" id="line-1206"><code>				if len(e.Elts) &lt; len(fields) {</code></span>
+<span class="codeline" id="line-1207"><code>					check.errorf(inNode(e, e.Rbrace), InvalidStructLit, "too few values in struct literal of type %s", base)</code></span>
+<span class="codeline" id="line-1208"><code>					// ok to continue</code></span>
+<span class="codeline" id="line-1209"><code>				}</code></span>
+<span class="codeline" id="line-1210"><code>			}</code></span>
+<span class="codeline" id="line-1211"><code></code></span>
+<span class="codeline" id="line-1212"><code>		case *Array:</code></span>
+<span class="codeline" id="line-1213"><code>			// Prevent crash if the array referred to is not yet set up. Was go.dev/issue/18643.</code></span>
+<span class="codeline" id="line-1214"><code>			// This is a stop-gap solution. Should use Checker.objPath to report entire</code></span>
+<span class="codeline" id="line-1215"><code>			// path starting with earliest declaration in the source. TODO(gri) fix this.</code></span>
+<span class="codeline" id="line-1216"><code>			if utyp.elem == nil {</code></span>
+<span class="codeline" id="line-1217"><code>				check.error(e, InvalidTypeCycle, "invalid recursive type")</code></span>
+<span class="codeline" id="line-1218"><code>				goto Error</code></span>
+<span class="codeline" id="line-1219"><code>			}</code></span>
+<span class="codeline" id="line-1220"><code>			n := check.indexedElts(e.Elts, utyp.elem, utyp.len)</code></span>
+<span class="codeline" id="line-1221"><code>			// If we have an array of unknown length (usually [...]T arrays, but also</code></span>
+<span class="codeline" id="line-1222"><code>			// arrays [n]T where n is invalid) set the length now that we know it and</code></span>
+<span class="codeline" id="line-1223"><code>			// record the type for the array (usually done by check.typ which is not</code></span>
+<span class="codeline" id="line-1224"><code>			// called for [...]T). We handle [...]T arrays and arrays with invalid</code></span>
+<span class="codeline" id="line-1225"><code>			// length the same here because it makes sense to "guess" the length for</code></span>
+<span class="codeline" id="line-1226"><code>			// the latter if we have a composite literal; e.g. for [n]int{1, 2, 3}</code></span>
+<span class="codeline" id="line-1227"><code>			// where n is invalid for some reason, it seems fair to assume it should</code></span>
+<span class="codeline" id="line-1228"><code>			// be 3 (see also Checked.arrayLength and go.dev/issue/27346).</code></span>
+<span class="codeline" id="line-1229"><code>			if utyp.len &lt; 0 {</code></span>
+<span class="codeline" id="line-1230"><code>				utyp.len = n</code></span>
+<span class="codeline" id="line-1231"><code>				// e.Type is missing if we have a composite literal element</code></span>
+<span class="codeline" id="line-1232"><code>				// that is itself a composite literal with omitted type. In</code></span>
+<span class="codeline" id="line-1233"><code>				// that case there is nothing to record (there is no type in</code></span>
+<span class="codeline" id="line-1234"><code>				// the source at that point).</code></span>
+<span class="codeline" id="line-1235"><code>				if e.Type != nil {</code></span>
+<span class="codeline" id="line-1236"><code>					check.recordTypeAndValue(e.Type, typexpr, utyp, nil)</code></span>
+<span class="codeline" id="line-1237"><code>				}</code></span>
+<span class="codeline" id="line-1238"><code>			}</code></span>
+<span class="codeline" id="line-1239"><code></code></span>
+<span class="codeline" id="line-1240"><code>		case *Slice:</code></span>
+<span class="codeline" id="line-1241"><code>			// Prevent crash if the slice referred to is not yet set up.</code></span>
+<span class="codeline" id="line-1242"><code>			// See analogous comment for *Array.</code></span>
+<span class="codeline" id="line-1243"><code>			if utyp.elem == nil {</code></span>
+<span class="codeline" id="line-1244"><code>				check.error(e, InvalidTypeCycle, "invalid recursive type")</code></span>
+<span class="codeline" id="line-1245"><code>				goto Error</code></span>
+<span class="codeline" id="line-1246"><code>			}</code></span>
+<span class="codeline" id="line-1247"><code>			check.indexedElts(e.Elts, utyp.elem, -1)</code></span>
+<span class="codeline" id="line-1248"><code></code></span>
+<span class="codeline" id="line-1249"><code>		case *Map:</code></span>
+<span class="codeline" id="line-1250"><code>			// Prevent crash if the map referred to is not yet set up.</code></span>
+<span class="codeline" id="line-1251"><code>			// See analogous comment for *Array.</code></span>
+<span class="codeline" id="line-1252"><code>			if utyp.key == nil || utyp.elem == nil {</code></span>
+<span class="codeline" id="line-1253"><code>				check.error(e, InvalidTypeCycle, "invalid recursive type")</code></span>
+<span class="codeline" id="line-1254"><code>				goto Error</code></span>
+<span class="codeline" id="line-1255"><code>			}</code></span>
+<span class="codeline" id="line-1256"><code>			// If the map key type is an interface (but not a type parameter),</code></span>
+<span class="codeline" id="line-1257"><code>			// the type of a constant key must be considered when checking for</code></span>
+<span class="codeline" id="line-1258"><code>			// duplicates.</code></span>
+<span class="codeline" id="line-1259"><code>			keyIsInterface := isNonTypeParamInterface(utyp.key)</code></span>
+<span class="codeline" id="line-1260"><code>			visited := make(map[any][]Type, len(e.Elts))</code></span>
+<span class="codeline" id="line-1261"><code>			for _, e := range e.Elts {</code></span>
+<span class="codeline" id="line-1262"><code>				kv, _ := e.(*ast.KeyValueExpr)</code></span>
+<span class="codeline" id="line-1263"><code>				if kv == nil {</code></span>
+<span class="codeline" id="line-1264"><code>					check.error(e, MissingLitKey, "missing key in map literal")</code></span>
+<span class="codeline" id="line-1265"><code>					continue</code></span>
+<span class="codeline" id="line-1266"><code>				}</code></span>
+<span class="codeline" id="line-1267"><code>				check.exprWithHint(x, kv.Key, utyp.key)</code></span>
+<span class="codeline" id="line-1268"><code>				check.assignment(x, utyp.key, "map literal")</code></span>
+<span class="codeline" id="line-1269"><code>				if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1270"><code>					continue</code></span>
+<span class="codeline" id="line-1271"><code>				}</code></span>
+<span class="codeline" id="line-1272"><code>				if x.mode == constant_ {</code></span>
+<span class="codeline" id="line-1273"><code>					duplicate := false</code></span>
+<span class="codeline" id="line-1274"><code>					xkey := keyVal(x.val)</code></span>
+<span class="codeline" id="line-1275"><code>					if keyIsInterface {</code></span>
+<span class="codeline" id="line-1276"><code>						for _, vtyp := range visited[xkey] {</code></span>
+<span class="codeline" id="line-1277"><code>							if Identical(vtyp, x.typ) {</code></span>
+<span class="codeline" id="line-1278"><code>								duplicate = true</code></span>
+<span class="codeline" id="line-1279"><code>								break</code></span>
+<span class="codeline" id="line-1280"><code>							}</code></span>
+<span class="codeline" id="line-1281"><code>						}</code></span>
+<span class="codeline" id="line-1282"><code>						visited[xkey] = append(visited[xkey], x.typ)</code></span>
+<span class="codeline" id="line-1283"><code>					} else {</code></span>
+<span class="codeline" id="line-1284"><code>						_, duplicate = visited[xkey]</code></span>
+<span class="codeline" id="line-1285"><code>						visited[xkey] = nil</code></span>
+<span class="codeline" id="line-1286"><code>					}</code></span>
+<span class="codeline" id="line-1287"><code>					if duplicate {</code></span>
+<span class="codeline" id="line-1288"><code>						check.errorf(x, DuplicateLitKey, "duplicate key %s in map literal", x.val)</code></span>
+<span class="codeline" id="line-1289"><code>						continue</code></span>
+<span class="codeline" id="line-1290"><code>					}</code></span>
+<span class="codeline" id="line-1291"><code>				}</code></span>
+<span class="codeline" id="line-1292"><code>				check.exprWithHint(x, kv.Value, utyp.elem)</code></span>
+<span class="codeline" id="line-1293"><code>				check.assignment(x, utyp.elem, "map literal")</code></span>
+<span class="codeline" id="line-1294"><code>			}</code></span>
+<span class="codeline" id="line-1295"><code></code></span>
+<span class="codeline" id="line-1296"><code>		default:</code></span>
+<span class="codeline" id="line-1297"><code>			// when "using" all elements unpack KeyValueExpr</code></span>
+<span class="codeline" id="line-1298"><code>			// explicitly because check.use doesn't accept them</code></span>
+<span class="codeline" id="line-1299"><code>			for _, e := range e.Elts {</code></span>
+<span class="codeline" id="line-1300"><code>				if kv, _ := e.(*ast.KeyValueExpr); kv != nil {</code></span>
+<span class="codeline" id="line-1301"><code>					// Ideally, we should also "use" kv.Key but we can't know</code></span>
+<span class="codeline" id="line-1302"><code>					// if it's an externally defined struct key or not. Going</code></span>
+<span class="codeline" id="line-1303"><code>					// forward anyway can lead to other errors. Give up instead.</code></span>
+<span class="codeline" id="line-1304"><code>					e = kv.Value</code></span>
+<span class="codeline" id="line-1305"><code>				}</code></span>
+<span class="codeline" id="line-1306"><code>				check.use(e)</code></span>
+<span class="codeline" id="line-1307"><code>			}</code></span>
+<span class="codeline" id="line-1308"><code>			// if utyp is invalid, an error was reported before</code></span>
+<span class="codeline" id="line-1309"><code>			if isValid(utyp) {</code></span>
+<span class="codeline" id="line-1310"><code>				check.errorf(e, InvalidLit, "invalid composite literal type %s", typ)</code></span>
+<span class="codeline" id="line-1311"><code>				goto Error</code></span>
+<span class="codeline" id="line-1312"><code>			}</code></span>
+<span class="codeline" id="line-1313"><code>		}</code></span>
+<span class="codeline" id="line-1314"><code></code></span>
+<span class="codeline" id="line-1315"><code>		x.mode = value</code></span>
+<span class="codeline" id="line-1316"><code>		x.typ = typ</code></span>
+<span class="codeline" id="line-1317"><code></code></span>
+<span class="codeline" id="line-1318"><code>	case *ast.ParenExpr:</code></span>
+<span class="codeline" id="line-1319"><code>		// type inference doesn't go past parentheses (targe type T = nil)</code></span>
+<span class="codeline" id="line-1320"><code>		kind := check.rawExpr(nil, x, e.X, nil, false)</code></span>
+<span class="codeline" id="line-1321"><code>		x.expr = e</code></span>
+<span class="codeline" id="line-1322"><code>		return kind</code></span>
+<span class="codeline" id="line-1323"><code></code></span>
+<span class="codeline" id="line-1324"><code>	case *ast.SelectorExpr:</code></span>
+<span class="codeline" id="line-1325"><code>		check.selector(x, e, nil, false)</code></span>
+<span class="codeline" id="line-1326"><code></code></span>
+<span class="codeline" id="line-1327"><code>	case *ast.IndexExpr, *ast.IndexListExpr:</code></span>
+<span class="codeline" id="line-1328"><code>		ix := typeparams.UnpackIndexExpr(e)</code></span>
+<span class="codeline" id="line-1329"><code>		if check.indexExpr(x, ix) {</code></span>
+<span class="codeline" id="line-1330"><code>			if !enableReverseTypeInference {</code></span>
+<span class="codeline" id="line-1331"><code>				T = nil</code></span>
+<span class="codeline" id="line-1332"><code>			}</code></span>
+<span class="codeline" id="line-1333"><code>			check.funcInst(T, e.Pos(), x, ix, true)</code></span>
+<span class="codeline" id="line-1334"><code>		}</code></span>
+<span class="codeline" id="line-1335"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1336"><code>			goto Error</code></span>
+<span class="codeline" id="line-1337"><code>		}</code></span>
+<span class="codeline" id="line-1338"><code></code></span>
+<span class="codeline" id="line-1339"><code>	case *ast.SliceExpr:</code></span>
+<span class="codeline" id="line-1340"><code>		check.sliceExpr(x, e)</code></span>
+<span class="codeline" id="line-1341"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1342"><code>			goto Error</code></span>
+<span class="codeline" id="line-1343"><code>		}</code></span>
+<span class="codeline" id="line-1344"><code></code></span>
+<span class="codeline" id="line-1345"><code>	case *ast.TypeAssertExpr:</code></span>
+<span class="codeline" id="line-1346"><code>		check.expr(nil, x, e.X)</code></span>
+<span class="codeline" id="line-1347"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1348"><code>			goto Error</code></span>
+<span class="codeline" id="line-1349"><code>		}</code></span>
+<span class="codeline" id="line-1350"><code>		// x.(type) expressions are handled explicitly in type switches</code></span>
+<span class="codeline" id="line-1351"><code>		if e.Type == nil {</code></span>
+<span class="codeline" id="line-1352"><code>			// Don't use InvalidSyntaxTree because this can occur in the AST produced by</code></span>
+<span class="codeline" id="line-1353"><code>			// go/parser.</code></span>
+<span class="codeline" id="line-1354"><code>			check.error(e, BadTypeKeyword, "use of .(type) outside type switch")</code></span>
+<span class="codeline" id="line-1355"><code>			goto Error</code></span>
+<span class="codeline" id="line-1356"><code>		}</code></span>
+<span class="codeline" id="line-1357"><code>		if isTypeParam(x.typ) {</code></span>
+<span class="codeline" id="line-1358"><code>			check.errorf(x, InvalidAssert, invalidOp+"cannot use type assertion on type parameter value %s", x)</code></span>
+<span class="codeline" id="line-1359"><code>			goto Error</code></span>
+<span class="codeline" id="line-1360"><code>		}</code></span>
+<span class="codeline" id="line-1361"><code>		if _, ok := under(x.typ).(*Interface); !ok {</code></span>
+<span class="codeline" id="line-1362"><code>			check.errorf(x, InvalidAssert, invalidOp+"%s is not an interface", x)</code></span>
+<span class="codeline" id="line-1363"><code>			goto Error</code></span>
+<span class="codeline" id="line-1364"><code>		}</code></span>
+<span class="codeline" id="line-1365"><code>		T := check.varType(e.Type)</code></span>
+<span class="codeline" id="line-1366"><code>		if !isValid(T) {</code></span>
+<span class="codeline" id="line-1367"><code>			goto Error</code></span>
+<span class="codeline" id="line-1368"><code>		}</code></span>
+<span class="codeline" id="line-1369"><code>		check.typeAssertion(e, x, T, false)</code></span>
+<span class="codeline" id="line-1370"><code>		x.mode = commaok</code></span>
+<span class="codeline" id="line-1371"><code>		x.typ = T</code></span>
+<span class="codeline" id="line-1372"><code></code></span>
+<span class="codeline" id="line-1373"><code>	case *ast.CallExpr:</code></span>
+<span class="codeline" id="line-1374"><code>		return check.callExpr(x, e)</code></span>
+<span class="codeline" id="line-1375"><code></code></span>
+<span class="codeline" id="line-1376"><code>	case *ast.StarExpr:</code></span>
+<span class="codeline" id="line-1377"><code>		check.exprOrType(x, e.X, false)</code></span>
+<span class="codeline" id="line-1378"><code>		switch x.mode {</code></span>
+<span class="codeline" id="line-1379"><code>		case invalid:</code></span>
+<span class="codeline" id="line-1380"><code>			goto Error</code></span>
+<span class="codeline" id="line-1381"><code>		case typexpr:</code></span>
+<span class="codeline" id="line-1382"><code>			check.validVarType(e.X, x.typ)</code></span>
+<span class="codeline" id="line-1383"><code>			x.typ = &amp;Pointer{base: x.typ}</code></span>
+<span class="codeline" id="line-1384"><code>		default:</code></span>
+<span class="codeline" id="line-1385"><code>			var base Type</code></span>
+<span class="codeline" id="line-1386"><code>			if !underIs(x.typ, func(u Type) bool {</code></span>
+<span class="codeline" id="line-1387"><code>				p, _ := u.(*Pointer)</code></span>
+<span class="codeline" id="line-1388"><code>				if p == nil {</code></span>
+<span class="codeline" id="line-1389"><code>					check.errorf(x, InvalidIndirection, invalidOp+"cannot indirect %s", x)</code></span>
+<span class="codeline" id="line-1390"><code>					return false</code></span>
+<span class="codeline" id="line-1391"><code>				}</code></span>
+<span class="codeline" id="line-1392"><code>				if base != nil &amp;&amp; !Identical(p.base, base) {</code></span>
+<span class="codeline" id="line-1393"><code>					check.errorf(x, InvalidIndirection, invalidOp+"pointers of %s must have identical base types", x)</code></span>
+<span class="codeline" id="line-1394"><code>					return false</code></span>
+<span class="codeline" id="line-1395"><code>				}</code></span>
+<span class="codeline" id="line-1396"><code>				base = p.base</code></span>
+<span class="codeline" id="line-1397"><code>				return true</code></span>
+<span class="codeline" id="line-1398"><code>			}) {</code></span>
+<span class="codeline" id="line-1399"><code>				goto Error</code></span>
+<span class="codeline" id="line-1400"><code>			}</code></span>
+<span class="codeline" id="line-1401"><code>			x.mode = variable</code></span>
+<span class="codeline" id="line-1402"><code>			x.typ = base</code></span>
+<span class="codeline" id="line-1403"><code>		}</code></span>
+<span class="codeline" id="line-1404"><code></code></span>
+<span class="codeline" id="line-1405"><code>	case *ast.UnaryExpr:</code></span>
+<span class="codeline" id="line-1406"><code>		check.unary(x, e)</code></span>
+<span class="codeline" id="line-1407"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1408"><code>			goto Error</code></span>
+<span class="codeline" id="line-1409"><code>		}</code></span>
+<span class="codeline" id="line-1410"><code>		if e.Op == token.ARROW {</code></span>
+<span class="codeline" id="line-1411"><code>			x.expr = e</code></span>
+<span class="codeline" id="line-1412"><code>			return statement // receive operations may appear in statement context</code></span>
+<span class="codeline" id="line-1413"><code>		}</code></span>
+<span class="codeline" id="line-1414"><code></code></span>
+<span class="codeline" id="line-1415"><code>	case *ast.BinaryExpr:</code></span>
+<span class="codeline" id="line-1416"><code>		check.binary(x, e, e.X, e.Y, e.Op, e.OpPos)</code></span>
+<span class="codeline" id="line-1417"><code>		if x.mode == invalid {</code></span>
+<span class="codeline" id="line-1418"><code>			goto Error</code></span>
+<span class="codeline" id="line-1419"><code>		}</code></span>
+<span class="codeline" id="line-1420"><code></code></span>
+<span class="codeline" id="line-1421"><code>	case *ast.KeyValueExpr:</code></span>
+<span class="codeline" id="line-1422"><code>		// key:value expressions are handled in composite literals</code></span>
+<span class="codeline" id="line-1423"><code>		check.error(e, InvalidSyntaxTree, "no key:value expected")</code></span>
+<span class="codeline" id="line-1424"><code>		goto Error</code></span>
+<span class="codeline" id="line-1425"><code></code></span>
+<span class="codeline" id="line-1426"><code>	case *ast.ArrayType, *ast.StructType, *ast.FuncType,</code></span>
+<span class="codeline" id="line-1427"><code>		*ast.InterfaceType, *ast.MapType, *ast.ChanType:</code></span>
+<span class="codeline" id="line-1428"><code>		x.mode = typexpr</code></span>
+<span class="codeline" id="line-1429"><code>		x.typ = check.typ(e)</code></span>
+<span class="codeline" id="line-1430"><code>		// Note: rawExpr (caller of exprInternal) will call check.recordTypeAndValue</code></span>
+<span class="codeline" id="line-1431"><code>		// even though check.typ has already called it. This is fine as both</code></span>
+<span class="codeline" id="line-1432"><code>		// times the same expression and type are recorded. It is also not a</code></span>
+<span class="codeline" id="line-1433"><code>		// performance issue because we only reach here for composite literal</code></span>
+<span class="codeline" id="line-1434"><code>		// types, which are comparatively rare.</code></span>
+<span class="codeline" id="line-1435"><code></code></span>
+<span class="codeline" id="line-1436"><code>	default:</code></span>
+<span class="codeline" id="line-1437"><code>		panic(fmt.Sprintf("%s: unknown expression type %T", check.fset.Position(e.Pos()), e))</code></span>
+<span class="codeline" id="line-1438"><code>	}</code></span>
+<span class="codeline" id="line-1439"><code></code></span>
+<span class="codeline" id="line-1440"><code>	// everything went well</code></span>
+<span class="codeline" id="line-1441"><code>	x.expr = e</code></span>
+<span class="codeline" id="line-1442"><code>	return expression</code></span>
+<span class="codeline" id="line-1443"><code></code></span>
+<span class="codeline" id="line-1444"><code>Error:</code></span>
+<span class="codeline" id="line-1445"><code>	x.mode = invalid</code></span>
+<span class="codeline" id="line-1446"><code>	x.expr = e</code></span>
+<span class="codeline" id="line-1447"><code>	return statement // avoid follow-up errors</code></span>
+<span class="codeline" id="line-1448"><code>}</code></span>
+<span class="codeline" id="line-1449"><code></code></span>
+<span class="codeline" id="line-1450"><code>// keyVal maps a complex, float, integer, string or boolean constant value</code></span>
+<span class="codeline" id="line-1451"><code>// to the corresponding complex128, float64, int64, uint64, string, or bool</code></span>
+<span class="codeline" id="line-1452"><code>// Go value if possible; otherwise it returns x.</code></span>
+<span class="codeline" id="line-1453"><code>// A complex constant that can be represented as a float (such as 1.2 + 0i)</code></span>
+<span class="codeline" id="line-1454"><code>// is returned as a floating point value; if a floating point value can be</code></span>
+<span class="codeline" id="line-1455"><code>// represented as an integer (such as 1.0) it is returned as an integer value.</code></span>
+<span class="codeline" id="line-1456"><code>// This ensures that constants of different kind but equal value (such as</code></span>
+<span class="codeline" id="line-1457"><code>// 1.0 + 0i, 1.0, 1) result in the same value.</code></span>
+<span class="codeline" id="line-1458"><code>func keyVal(x constant.Value) interface{} {</code></span>
+<span class="codeline" id="line-1459"><code>	switch x.Kind() {</code></span>
+<span class="codeline" id="line-1460"><code>	case constant.Complex:</code></span>
+<span class="codeline" id="line-1461"><code>		f := constant.ToFloat(x)</code></span>
+<span class="codeline" id="line-1462"><code>		if f.Kind() != constant.Float {</code></span>
+<span class="codeline" id="line-1463"><code>			r, _ := constant.Float64Val(constant.Real(x))</code></span>
+<span class="codeline" id="line-1464"><code>			i, _ := constant.Float64Val(constant.Imag(x))</code></span>
+<span class="codeline" id="line-1465"><code>			return complex(r, i)</code></span>
+<span class="codeline" id="line-1466"><code>		}</code></span>
+<span class="codeline" id="line-1467"><code>		x = f</code></span>
+<span class="codeline" id="line-1468"><code>		fallthrough</code></span>
+<span class="codeline" id="line-1469"><code>	case constant.Float:</code></span>
+<span class="codeline" id="line-1470"><code>		i := constant.ToInt(x)</code></span>
+<span class="codeline" id="line-1471"><code>		if i.Kind() != constant.Int {</code></span>
+<span class="codeline" id="line-1472"><code>			v, _ := constant.Float64Val(x)</code></span>
+<span class="codeline" id="line-1473"><code>			return v</code></span>
+<span class="codeline" id="line-1474"><code>		}</code></span>
+<span class="codeline" id="line-1475"><code>		x = i</code></span>
+<span class="codeline" id="line-1476"><code>		fallthrough</code></span>
+<span class="codeline" id="line-1477"><code>	case constant.Int:</code></span>
+<span class="codeline" id="line-1478"><code>		if v, ok := constant.Int64Val(x); ok {</code></span>
+<span class="codeline" id="line-1479"><code>			return v</code></span>
+<span class="codeline" id="line-1480"><code>		}</code></span>
+<span class="codeline" id="line-1481"><code>		if v, ok := constant.Uint64Val(x); ok {</code></span>
+<span class="codeline" id="line-1482"><code>			return v</code></span>
+<span class="codeline" id="line-1483"><code>		}</code></span>
+<span class="codeline" id="line-1484"><code>	case constant.String:</code></span>
+<span class="codeline" id="line-1485"><code>		return constant.StringVal(x)</code></span>
+<span class="codeline" id="line-1486"><code>	case constant.Bool:</code></span>
+<span class="codeline" id="line-1487"><code>		return constant.BoolVal(x)</code></span>
+<span class="codeline" id="line-1488"><code>	}</code></span>
+<span class="codeline" id="line-1489"><code>	return x</code></span>
+<span class="codeline" id="line-1490"><code>}</code></span>
+<span class="codeline" id="line-1491"><code></code></span>
+<span class="codeline" id="line-1492"><code>// typeAssertion checks x.(T). The type of x must be an interface.</code></span>
+<span class="codeline" id="line-1493"><code>func (check *Checker) typeAssertion(e ast.Expr, x *operand, T Type, typeSwitch bool) {</code></span>
+<span class="codeline" id="line-1494"><code>	var cause string</code></span>
+<span class="codeline" id="line-1495"><code>	if check.assertableTo(x.typ, T, &amp;cause) {</code></span>
+<span class="codeline" id="line-1496"><code>		return // success</code></span>
+<span class="codeline" id="line-1497"><code>	}</code></span>
+<span class="codeline" id="line-1498"><code></code></span>
+<span class="codeline" id="line-1499"><code>	if typeSwitch {</code></span>
+<span class="codeline" id="line-1500"><code>		check.errorf(e, ImpossibleAssert, "impossible type switch case: %s\n\t%s cannot have dynamic type %s %s", e, x, T, cause)</code></span>
+<span class="codeline" id="line-1501"><code>		return</code></span>
+<span class="codeline" id="line-1502"><code>	}</code></span>
+<span class="codeline" id="line-1503"><code></code></span>
+<span class="codeline" id="line-1504"><code>	check.errorf(e, ImpossibleAssert, "impossible type assertion: %s\n\t%s does not implement %s %s", e, T, x.typ, cause)</code></span>
+<span class="codeline" id="line-1505"><code>}</code></span>
+<span class="codeline" id="line-1506"><code></code></span>
+<span class="codeline" id="line-1507"><code>// expr typechecks expression e and initializes x with the expression value.</code></span>
+<span class="codeline" id="line-1508"><code>// If a non-nil target T is given and e is a generic function or</code></span>
+<span class="codeline" id="line-1509"><code>// a function call, T is used to infer the type arguments for e.</code></span>
+<span class="codeline" id="line-1510"><code>// The result must be a single value.</code></span>
+<span class="codeline" id="line-1511"><code>// If an error occurred, x.mode is set to invalid.</code></span>
+<span class="codeline" id="line-1512"><code>func (check *Checker) expr(T *target, x *operand, e ast.Expr) {</code></span>
+<span class="codeline" id="line-1513"><code>	check.rawExpr(T, x, e, nil, false)</code></span>
+<span class="codeline" id="line-1514"><code>	check.exclude(x, 1&lt;&lt;novalue|1&lt;&lt;builtin|1&lt;&lt;typexpr)</code></span>
+<span class="codeline" id="line-1515"><code>	check.singleValue(x)</code></span>
+<span class="codeline" id="line-1516"><code>}</code></span>
+<span class="codeline" id="line-1517"><code></code></span>
+<span class="codeline" id="line-1518"><code>// genericExpr is like expr but the result may also be generic.</code></span>
+<span class="codeline" id="line-1519"><code>func (check *Checker) genericExpr(x *operand, e ast.Expr) {</code></span>
+<span class="codeline" id="line-1520"><code>	check.rawExpr(nil, x, e, nil, true)</code></span>
+<span class="codeline" id="line-1521"><code>	check.exclude(x, 1&lt;&lt;novalue|1&lt;&lt;builtin|1&lt;&lt;typexpr)</code></span>
+<span class="codeline" id="line-1522"><code>	check.singleValue(x)</code></span>
+<span class="codeline" id="line-1523"><code>}</code></span>
+<span class="codeline" id="line-1524"><code></code></span>
+<span class="codeline" id="line-1525"><code>// multiExpr typechecks e and returns its value (or values) in list.</code></span>
+<span class="codeline" id="line-1526"><code>// If allowCommaOk is set and e is a map index, comma-ok, or comma-err</code></span>
+<span class="codeline" id="line-1527"><code>// expression, the result is a two-element list containing the value</code></span>
+<span class="codeline" id="line-1528"><code>// of e, and an untyped bool value or an error value, respectively.</code></span>
+<span class="codeline" id="line-1529"><code>// If an error occurred, list[0] is not valid.</code></span>
+<span class="codeline" id="line-1530"><code>func (check *Checker) multiExpr(e ast.Expr, allowCommaOk bool) (list []*operand, commaOk bool) {</code></span>
+<span class="codeline" id="line-1531"><code>	var x operand</code></span>
+<span class="codeline" id="line-1532"><code>	check.rawExpr(nil, &amp;x, e, nil, false)</code></span>
+<span class="codeline" id="line-1533"><code>	check.exclude(&amp;x, 1&lt;&lt;novalue|1&lt;&lt;builtin|1&lt;&lt;typexpr)</code></span>
+<span class="codeline" id="line-1534"><code></code></span>
+<span class="codeline" id="line-1535"><code>	if t, ok := x.typ.(*Tuple); ok &amp;&amp; x.mode != invalid {</code></span>
+<span class="codeline" id="line-1536"><code>		// multiple values</code></span>
+<span class="codeline" id="line-1537"><code>		list = make([]*operand, t.Len())</code></span>
+<span class="codeline" id="line-1538"><code>		for i, v := range t.vars {</code></span>
+<span class="codeline" id="line-1539"><code>			list[i] = &amp;operand{mode: value, expr: e, typ: v.typ}</code></span>
+<span class="codeline" id="line-1540"><code>		}</code></span>
+<span class="codeline" id="line-1541"><code>		return</code></span>
+<span class="codeline" id="line-1542"><code>	}</code></span>
+<span class="codeline" id="line-1543"><code></code></span>
+<span class="codeline" id="line-1544"><code>	// exactly one (possibly invalid or comma-ok) value</code></span>
+<span class="codeline" id="line-1545"><code>	list = []*operand{&amp;x}</code></span>
+<span class="codeline" id="line-1546"><code>	if allowCommaOk &amp;&amp; (x.mode == mapindex || x.mode == commaok || x.mode == commaerr) {</code></span>
+<span class="codeline" id="line-1547"><code>		x2 := &amp;operand{mode: value, expr: e, typ: Typ[UntypedBool]}</code></span>
+<span class="codeline" id="line-1548"><code>		if x.mode == commaerr {</code></span>
+<span class="codeline" id="line-1549"><code>			x2.typ = universeError</code></span>
+<span class="codeline" id="line-1550"><code>		}</code></span>
+<span class="codeline" id="line-1551"><code>		list = append(list, x2)</code></span>
+<span class="codeline" id="line-1552"><code>		commaOk = true</code></span>
+<span class="codeline" id="line-1553"><code>	}</code></span>
+<span class="codeline" id="line-1554"><code></code></span>
+<span class="codeline" id="line-1555"><code>	return</code></span>
+<span class="codeline" id="line-1556"><code>}</code></span>
+<span class="codeline" id="line-1557"><code></code></span>
+<span class="codeline" id="line-1558"><code>// exprWithHint typechecks expression e and initializes x with the expression value;</code></span>
+<span class="codeline" id="line-1559"><code>// hint is the type of a composite literal element.</code></span>
+<span class="codeline" id="line-1560"><code>// If an error occurred, x.mode is set to invalid.</code></span>
+<span class="codeline" id="line-1561"><code>func (check *Checker) exprWithHint(x *operand, e ast.Expr, hint Type) {</code></span>
+<span class="codeline" id="line-1562"><code>	assert(hint != nil)</code></span>
+<span class="codeline" id="line-1563"><code>	check.rawExpr(nil, x, e, hint, false)</code></span>
+<span class="codeline" id="line-1564"><code>	check.exclude(x, 1&lt;&lt;novalue|1&lt;&lt;builtin|1&lt;&lt;typexpr)</code></span>
+<span class="codeline" id="line-1565"><code>	check.singleValue(x)</code></span>
+<span class="codeline" id="line-1566"><code>}</code></span>
+<span class="codeline" id="line-1567"><code></code></span>
+<span class="codeline" id="line-1568"><code>// exprOrType typechecks expression or type e and initializes x with the expression value or type.</code></span>
+<span class="codeline" id="line-1569"><code>// If allowGeneric is set, the operand type may be an uninstantiated parameterized type or function</code></span>
+<span class="codeline" id="line-1570"><code>// value.</code></span>
+<span class="codeline" id="line-1571"><code>// If an error occurred, x.mode is set to invalid.</code></span>
+<span class="codeline" id="line-1572"><code>func (check *Checker) exprOrType(x *operand, e ast.Expr, allowGeneric bool) {</code></span>
+<span class="codeline" id="line-1573"><code>	check.rawExpr(nil, x, e, nil, allowGeneric)</code></span>
+<span class="codeline" id="line-1574"><code>	check.exclude(x, 1&lt;&lt;novalue)</code></span>
+<span class="codeline" id="line-1575"><code>	check.singleValue(x)</code></span>
+<span class="codeline" id="line-1576"><code>}</code></span>
+<span class="codeline" id="line-1577"><code></code></span>
+<span class="codeline" id="line-1578"><code>// exclude reports an error if x.mode is in modeset and sets x.mode to invalid.</code></span>
+<span class="codeline" id="line-1579"><code>// The modeset may contain any of 1&lt;&lt;novalue, 1&lt;&lt;builtin, 1&lt;&lt;typexpr.</code></span>
+<span class="codeline" id="line-1580"><code>func (check *Checker) exclude(x *operand, modeset uint) {</code></span>
+<span class="codeline" id="line-1581"><code>	if modeset&amp;(1&lt;&lt;x.mode) != 0 {</code></span>
+<span class="codeline" id="line-1582"><code>		var msg string</code></span>
+<span class="codeline" id="line-1583"><code>		var code Code</code></span>
+<span class="codeline" id="line-1584"><code>		switch x.mode {</code></span>
+<span class="codeline" id="line-1585"><code>		case novalue:</code></span>
+<span class="codeline" id="line-1586"><code>			if modeset&amp;(1&lt;&lt;typexpr) != 0 {</code></span>
+<span class="codeline" id="line-1587"><code>				msg = "%s used as value"</code></span>
+<span class="codeline" id="line-1588"><code>			} else {</code></span>
+<span class="codeline" id="line-1589"><code>				msg = "%s used as value or type"</code></span>
+<span class="codeline" id="line-1590"><code>			}</code></span>
+<span class="codeline" id="line-1591"><code>			code = TooManyValues</code></span>
+<span class="codeline" id="line-1592"><code>		case builtin:</code></span>
+<span class="codeline" id="line-1593"><code>			msg = "%s must be called"</code></span>
+<span class="codeline" id="line-1594"><code>			code = UncalledBuiltin</code></span>
+<span class="codeline" id="line-1595"><code>		case typexpr:</code></span>
+<span class="codeline" id="line-1596"><code>			msg = "%s is not an expression"</code></span>
+<span class="codeline" id="line-1597"><code>			code = NotAnExpr</code></span>
+<span class="codeline" id="line-1598"><code>		default:</code></span>
+<span class="codeline" id="line-1599"><code>			unreachable()</code></span>
+<span class="codeline" id="line-1600"><code>		}</code></span>
+<span class="codeline" id="line-1601"><code>		check.errorf(x, code, msg, x)</code></span>
+<span class="codeline" id="line-1602"><code>		x.mode = invalid</code></span>
+<span class="codeline" id="line-1603"><code>	}</code></span>
+<span class="codeline" id="line-1604"><code>}</code></span>
+<span class="codeline" id="line-1605"><code></code></span>
+<span class="codeline" id="line-1606"><code>// singleValue reports an error if x describes a tuple and sets x.mode to invalid.</code></span>
+<span class="codeline" id="line-1607"><code>func (check *Checker) singleValue(x *operand) {</code></span>
+<span class="codeline" id="line-1608"><code>	if x.mode == value {</code></span>
+<span class="codeline" id="line-1609"><code>		// tuple types are never named - no need for underlying type below</code></span>
+<span class="codeline" id="line-1610"><code>		if t, ok := x.typ.(*Tuple); ok {</code></span>
+<span class="codeline" id="line-1611"><code>			assert(t.Len() != 1)</code></span>
+<span class="codeline" id="line-1612"><code>			check.errorf(x, TooManyValues, "multiple-value %s in single-value context", x)</code></span>
+<span class="codeline" id="line-1613"><code>			x.mode = invalid</code></span>
+<span class="codeline" id="line-1614"><code>		}</code></span>
+<span class="codeline" id="line-1615"><code>	}</code></span>
+<span class="codeline" id="line-1616"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

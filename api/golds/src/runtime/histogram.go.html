@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: histogram.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	histogram.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2020 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-9"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-10"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>const (</code></span>
+<span class="codeline" id="line-14"><code>	// For the time histogram type, we use an HDR histogram.</code></span>
+<span class="codeline" id="line-15"><code>	// Values are placed in buckets based solely on the most</code></span>
+<span class="codeline" id="line-16"><code>	// significant set bit. Thus, buckets are power-of-2 sized.</code></span>
+<span class="codeline" id="line-17"><code>	// Values are then placed into sub-buckets based on the value of</code></span>
+<span class="codeline" id="line-18"><code>	// the next timeHistSubBucketBits most significant bits. Thus,</code></span>
+<span class="codeline" id="line-19"><code>	// sub-buckets are linear within a bucket.</code></span>
+<span class="codeline" id="line-20"><code>	//</code></span>
+<span class="codeline" id="line-21"><code>	// Therefore, the number of sub-buckets (timeHistNumSubBuckets)</code></span>
+<span class="codeline" id="line-22"><code>	// defines the error. This error may be computed as</code></span>
+<span class="codeline" id="line-23"><code>	// 1/timeHistNumSubBuckets*100%. For example, for 16 sub-buckets</code></span>
+<span class="codeline" id="line-24"><code>	// per bucket the error is approximately 6%.</code></span>
+<span class="codeline" id="line-25"><code>	//</code></span>
+<span class="codeline" id="line-26"><code>	// The number of buckets (timeHistNumBuckets), on the</code></span>
+<span class="codeline" id="line-27"><code>	// other hand, defines the range. To avoid producing a large number</code></span>
+<span class="codeline" id="line-28"><code>	// of buckets that are close together, especially for small numbers</code></span>
+<span class="codeline" id="line-29"><code>	// (e.g. 1, 2, 3, 4, 5 ns) that aren't very useful, timeHistNumBuckets</code></span>
+<span class="codeline" id="line-30"><code>	// is defined in terms of the least significant bit (timeHistMinBucketBits)</code></span>
+<span class="codeline" id="line-31"><code>	// that needs to be set before we start bucketing and the most</code></span>
+<span class="codeline" id="line-32"><code>	// significant bit (timeHistMaxBucketBits) that we bucket before we just</code></span>
+<span class="codeline" id="line-33"><code>	// dump it into a catch-all bucket.</code></span>
+<span class="codeline" id="line-34"><code>	//</code></span>
+<span class="codeline" id="line-35"><code>	// As an example, consider the configuration:</code></span>
+<span class="codeline" id="line-36"><code>	//</code></span>
+<span class="codeline" id="line-37"><code>	//    timeHistMinBucketBits = 9</code></span>
+<span class="codeline" id="line-38"><code>	//    timeHistMaxBucketBits = 48</code></span>
+<span class="codeline" id="line-39"><code>	//    timeHistSubBucketBits = 2</code></span>
+<span class="codeline" id="line-40"><code>	//</code></span>
+<span class="codeline" id="line-41"><code>	// Then:</code></span>
+<span class="codeline" id="line-42"><code>	//</code></span>
+<span class="codeline" id="line-43"><code>	//    011000001</code></span>
+<span class="codeline" id="line-44"><code>	//    ^--</code></span>
+<span class="codeline" id="line-45"><code>	//    │ ^</code></span>
+<span class="codeline" id="line-46"><code>	//    │ └---- Next 2 bits -&gt; sub-bucket 3</code></span>
+<span class="codeline" id="line-47"><code>	//    └------- Bit 9 unset -&gt; bucket 0</code></span>
+<span class="codeline" id="line-48"><code>	//</code></span>
+<span class="codeline" id="line-49"><code>	//    110000001</code></span>
+<span class="codeline" id="line-50"><code>	//    ^--</code></span>
+<span class="codeline" id="line-51"><code>	//    │ ^</code></span>
+<span class="codeline" id="line-52"><code>	//    │ └---- Next 2 bits -&gt; sub-bucket 2</code></span>
+<span class="codeline" id="line-53"><code>	//    └------- Bit 9 set -&gt; bucket 1</code></span>
+<span class="codeline" id="line-54"><code>	//</code></span>
+<span class="codeline" id="line-55"><code>	//    1000000010</code></span>
+<span class="codeline" id="line-56"><code>	//    ^-- ^</code></span>
+<span class="codeline" id="line-57"><code>	//    │ ^ └-- Lower bits ignored</code></span>
+<span class="codeline" id="line-58"><code>	//    │ └---- Next 2 bits -&gt; sub-bucket 0</code></span>
+<span class="codeline" id="line-59"><code>	//    └------- Bit 10 set -&gt; bucket 2</code></span>
+<span class="codeline" id="line-60"><code>	//</code></span>
+<span class="codeline" id="line-61"><code>	// Following this pattern, bucket 38 will have the bit 46 set. We don't</code></span>
+<span class="codeline" id="line-62"><code>	// have any buckets for higher values, so we spill the rest into an overflow</code></span>
+<span class="codeline" id="line-63"><code>	// bucket containing values of 2^47-1 nanoseconds or approx. 1 day or more.</code></span>
+<span class="codeline" id="line-64"><code>	// This range is more than enough to handle durations produced by the runtime.</code></span>
+<span class="codeline" id="line-65"><code>	timeHistMinBucketBits = 9</code></span>
+<span class="codeline" id="line-66"><code>	timeHistMaxBucketBits = 48 // Note that this is exclusive; 1 higher than the actual range.</code></span>
+<span class="codeline" id="line-67"><code>	timeHistSubBucketBits = 2</code></span>
+<span class="codeline" id="line-68"><code>	timeHistNumSubBuckets = 1 &lt;&lt; timeHistSubBucketBits</code></span>
+<span class="codeline" id="line-69"><code>	timeHistNumBuckets    = timeHistMaxBucketBits - timeHistMinBucketBits + 1</code></span>
+<span class="codeline" id="line-70"><code>	// Two extra buckets, one for underflow, one for overflow.</code></span>
+<span class="codeline" id="line-71"><code>	timeHistTotalBuckets = timeHistNumBuckets*timeHistNumSubBuckets + 2</code></span>
+<span class="codeline" id="line-72"><code>)</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>// timeHistogram represents a distribution of durations in</code></span>
+<span class="codeline" id="line-75"><code>// nanoseconds.</code></span>
+<span class="codeline" id="line-76"><code>//</code></span>
+<span class="codeline" id="line-77"><code>// The accuracy and range of the histogram is defined by the</code></span>
+<span class="codeline" id="line-78"><code>// timeHistSubBucketBits and timeHistNumBuckets constants.</code></span>
+<span class="codeline" id="line-79"><code>//</code></span>
+<span class="codeline" id="line-80"><code>// It is an HDR histogram with exponentially-distributed</code></span>
+<span class="codeline" id="line-81"><code>// buckets and linearly distributed sub-buckets.</code></span>
+<span class="codeline" id="line-82"><code>//</code></span>
+<span class="codeline" id="line-83"><code>// The histogram is safe for concurrent reads and writes.</code></span>
+<span class="codeline" id="line-84"><code>type timeHistogram struct {</code></span>
+<span class="codeline" id="line-85"><code>	counts [timeHistNumBuckets * timeHistNumSubBuckets]atomic.Uint64</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>	// underflow counts all the times we got a negative duration</code></span>
+<span class="codeline" id="line-88"><code>	// sample. Because of how time works on some platforms, it's</code></span>
+<span class="codeline" id="line-89"><code>	// possible to measure negative durations. We could ignore them,</code></span>
+<span class="codeline" id="line-90"><code>	// but we record them anyway because it's better to have some</code></span>
+<span class="codeline" id="line-91"><code>	// signal that it's happening than just missing samples.</code></span>
+<span class="codeline" id="line-92"><code>	underflow atomic.Uint64</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>	// overflow counts all the times we got a duration that exceeded</code></span>
+<span class="codeline" id="line-95"><code>	// the range counts represents.</code></span>
+<span class="codeline" id="line-96"><code>	overflow atomic.Uint64</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>// record adds the given duration to the distribution.</code></span>
+<span class="codeline" id="line-100"><code>//</code></span>
+<span class="codeline" id="line-101"><code>// Disallow preemptions and stack growths because this function</code></span>
+<span class="codeline" id="line-102"><code>// may run in sensitive locations.</code></span>
+<span class="codeline" id="line-103"><code>//</code></span>
+<span class="codeline" id="line-104"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-105"><code>func (h *timeHistogram) record(duration int64) {</code></span>
+<span class="codeline" id="line-106"><code>	// If the duration is negative, capture that in underflow.</code></span>
+<span class="codeline" id="line-107"><code>	if duration &lt; 0 {</code></span>
+<span class="codeline" id="line-108"><code>		h.underflow.Add(1)</code></span>
+<span class="codeline" id="line-109"><code>		return</code></span>
+<span class="codeline" id="line-110"><code>	}</code></span>
+<span class="codeline" id="line-111"><code>	// bucketBit is the target bit for the bucket which is usually the</code></span>
+<span class="codeline" id="line-112"><code>	// highest 1 bit, but if we're less than the minimum, is the highest</code></span>
+<span class="codeline" id="line-113"><code>	// 1 bit of the minimum (which will be zero in the duration).</code></span>
+<span class="codeline" id="line-114"><code>	//</code></span>
+<span class="codeline" id="line-115"><code>	// bucket is the bucket index, which is the bucketBit minus the</code></span>
+<span class="codeline" id="line-116"><code>	// highest bit of the minimum, plus one to leave room for the catch-all</code></span>
+<span class="codeline" id="line-117"><code>	// bucket for samples lower than the minimum.</code></span>
+<span class="codeline" id="line-118"><code>	var bucketBit, bucket uint</code></span>
+<span class="codeline" id="line-119"><code>	if l := sys.Len64(uint64(duration)); l &lt; timeHistMinBucketBits {</code></span>
+<span class="codeline" id="line-120"><code>		bucketBit = timeHistMinBucketBits</code></span>
+<span class="codeline" id="line-121"><code>		bucket = 0 // bucketBit - timeHistMinBucketBits</code></span>
+<span class="codeline" id="line-122"><code>	} else {</code></span>
+<span class="codeline" id="line-123"><code>		bucketBit = uint(l)</code></span>
+<span class="codeline" id="line-124"><code>		bucket = bucketBit - timeHistMinBucketBits + 1</code></span>
+<span class="codeline" id="line-125"><code>	}</code></span>
+<span class="codeline" id="line-126"><code>	// If the bucket we computed is greater than the number of buckets,</code></span>
+<span class="codeline" id="line-127"><code>	// count that in overflow.</code></span>
+<span class="codeline" id="line-128"><code>	if bucket &gt;= timeHistNumBuckets {</code></span>
+<span class="codeline" id="line-129"><code>		h.overflow.Add(1)</code></span>
+<span class="codeline" id="line-130"><code>		return</code></span>
+<span class="codeline" id="line-131"><code>	}</code></span>
+<span class="codeline" id="line-132"><code>	// The sub-bucket index is just next timeHistSubBucketBits after the bucketBit.</code></span>
+<span class="codeline" id="line-133"><code>	subBucket := uint(duration&gt;&gt;(bucketBit-1-timeHistSubBucketBits)) % timeHistNumSubBuckets</code></span>
+<span class="codeline" id="line-134"><code>	h.counts[bucket*timeHistNumSubBuckets+subBucket].Add(1)</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>// write dumps the histogram to the passed metricValue as a float64 histogram.</code></span>
+<span class="codeline" id="line-138"><code>func (h *timeHistogram) write(out *metricValue) {</code></span>
+<span class="codeline" id="line-139"><code>	hist := out.float64HistOrInit(timeHistBuckets)</code></span>
+<span class="codeline" id="line-140"><code>	// The bottom-most bucket, containing negative values, is tracked</code></span>
+<span class="codeline" id="line-141"><code>	// separately as underflow, so fill that in manually and then iterate</code></span>
+<span class="codeline" id="line-142"><code>	// over the rest.</code></span>
+<span class="codeline" id="line-143"><code>	hist.counts[0] = h.underflow.Load()</code></span>
+<span class="codeline" id="line-144"><code>	for i := range h.counts {</code></span>
+<span class="codeline" id="line-145"><code>		hist.counts[i+1] = h.counts[i].Load()</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	hist.counts[len(hist.counts)-1] = h.overflow.Load()</code></span>
+<span class="codeline" id="line-148"><code>}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>const (</code></span>
+<span class="codeline" id="line-151"><code>	fInf    = 0x7FF0000000000000</code></span>
+<span class="codeline" id="line-152"><code>	fNegInf = 0xFFF0000000000000</code></span>
+<span class="codeline" id="line-153"><code>)</code></span>
+<span class="codeline" id="line-154"><code></code></span>
+<span class="codeline" id="line-155"><code>func float64Inf() float64 {</code></span>
+<span class="codeline" id="line-156"><code>	inf := uint64(fInf)</code></span>
+<span class="codeline" id="line-157"><code>	return *(*float64)(unsafe.Pointer(&amp;inf))</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>func float64NegInf() float64 {</code></span>
+<span class="codeline" id="line-161"><code>	inf := uint64(fNegInf)</code></span>
+<span class="codeline" id="line-162"><code>	return *(*float64)(unsafe.Pointer(&amp;inf))</code></span>
+<span class="codeline" id="line-163"><code>}</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>// timeHistogramMetricsBuckets generates a slice of boundaries for</code></span>
+<span class="codeline" id="line-166"><code>// the timeHistogram. These boundaries are represented in seconds,</code></span>
+<span class="codeline" id="line-167"><code>// not nanoseconds like the timeHistogram represents durations.</code></span>
+<span class="codeline" id="line-168"><code>func timeHistogramMetricsBuckets() []float64 {</code></span>
+<span class="codeline" id="line-169"><code>	b := make([]float64, timeHistTotalBuckets+1)</code></span>
+<span class="codeline" id="line-170"><code>	// Underflow bucket.</code></span>
+<span class="codeline" id="line-171"><code>	b[0] = float64NegInf()</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>	for j := 0; j &lt; timeHistNumSubBuckets; j++ {</code></span>
+<span class="codeline" id="line-174"><code>		// No bucket bit for the first few buckets. Just sub-bucket bits after the</code></span>
+<span class="codeline" id="line-175"><code>		// min bucket bit.</code></span>
+<span class="codeline" id="line-176"><code>		bucketNanos := uint64(j) &lt;&lt; (timeHistMinBucketBits - 1 - timeHistSubBucketBits)</code></span>
+<span class="codeline" id="line-177"><code>		// Convert nanoseconds to seconds via a division.</code></span>
+<span class="codeline" id="line-178"><code>		// These values will all be exactly representable by a float64.</code></span>
+<span class="codeline" id="line-179"><code>		b[j+1] = float64(bucketNanos) / 1e9</code></span>
+<span class="codeline" id="line-180"><code>	}</code></span>
+<span class="codeline" id="line-181"><code>	// Generate the rest of the buckets. It's easier to reason</code></span>
+<span class="codeline" id="line-182"><code>	// about if we cut out the 0'th bucket.</code></span>
+<span class="codeline" id="line-183"><code>	for i := timeHistMinBucketBits; i &lt; timeHistMaxBucketBits; i++ {</code></span>
+<span class="codeline" id="line-184"><code>		for j := 0; j &lt; timeHistNumSubBuckets; j++ {</code></span>
+<span class="codeline" id="line-185"><code>			// Set the bucket bit.</code></span>
+<span class="codeline" id="line-186"><code>			bucketNanos := uint64(1) &lt;&lt; (i - 1)</code></span>
+<span class="codeline" id="line-187"><code>			// Set the sub-bucket bits.</code></span>
+<span class="codeline" id="line-188"><code>			bucketNanos |= uint64(j) &lt;&lt; (i - 1 - timeHistSubBucketBits)</code></span>
+<span class="codeline" id="line-189"><code>			// The index for this bucket is going to be the (i+1)'th bucket</code></span>
+<span class="codeline" id="line-190"><code>			// (note that we're starting from zero, but handled the first bucket</code></span>
+<span class="codeline" id="line-191"><code>			// earlier, so we need to compensate), and the j'th sub bucket.</code></span>
+<span class="codeline" id="line-192"><code>			// Add 1 because we left space for -Inf.</code></span>
+<span class="codeline" id="line-193"><code>			bucketIndex := (i-timeHistMinBucketBits+1)*timeHistNumSubBuckets + j + 1</code></span>
+<span class="codeline" id="line-194"><code>			// Convert nanoseconds to seconds via a division.</code></span>
+<span class="codeline" id="line-195"><code>			// These values will all be exactly representable by a float64.</code></span>
+<span class="codeline" id="line-196"><code>			b[bucketIndex] = float64(bucketNanos) / 1e9</code></span>
+<span class="codeline" id="line-197"><code>		}</code></span>
+<span class="codeline" id="line-198"><code>	}</code></span>
+<span class="codeline" id="line-199"><code>	// Overflow bucket.</code></span>
+<span class="codeline" id="line-200"><code>	b[len(b)-2] = float64(uint64(1)&lt;&lt;(timeHistMaxBucketBits-1)) / 1e9</code></span>
+<span class="codeline" id="line-201"><code>	b[len(b)-1] = float64Inf()</code></span>
+<span class="codeline" id="line-202"><code>	return b</code></span>
+<span class="codeline" id="line-203"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

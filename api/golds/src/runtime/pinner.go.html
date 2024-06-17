@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: pinner.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	pinner.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-9"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-10"><code>)</code></span>
+<span class="codeline" id="line-11"><code></code></span>
+<span class="codeline" id="line-12"><code>// A Pinner is a set of Go objects each pinned to a fixed location in memory. The</code></span>
+<span class="codeline" id="line-13"><code>// [Pinner.Pin] method pins one object, while [Pinner.Unpin] unpins all pinned</code></span>
+<span class="codeline" id="line-14"><code>// objects. See their comments for more information.</code></span>
+<span class="codeline" id="line-15"><code>type Pinner struct {</code></span>
+<span class="codeline" id="line-16"><code>	*pinner</code></span>
+<span class="codeline" id="line-17"><code>}</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// Pin pins a Go object, preventing it from being moved or freed by the garbage</code></span>
+<span class="codeline" id="line-20"><code>// collector until the [Pinner.Unpin] method has been called.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// A pointer to a pinned object can be directly stored in C memory or can be</code></span>
+<span class="codeline" id="line-23"><code>// contained in Go memory passed to C functions. If the pinned object itself</code></span>
+<span class="codeline" id="line-24"><code>// contains pointers to Go objects, these objects must be pinned separately if they</code></span>
+<span class="codeline" id="line-25"><code>// are going to be accessed from C code.</code></span>
+<span class="codeline" id="line-26"><code>//</code></span>
+<span class="codeline" id="line-27"><code>// The argument must be a pointer of any type or an [unsafe.Pointer].</code></span>
+<span class="codeline" id="line-28"><code>// It's safe to call Pin on non-Go pointers, in which case Pin will do nothing.</code></span>
+<span class="codeline" id="line-29"><code>func (p *Pinner) Pin(pointer any) {</code></span>
+<span class="codeline" id="line-30"><code>	if p.pinner == nil {</code></span>
+<span class="codeline" id="line-31"><code>		// Check the pinner cache first.</code></span>
+<span class="codeline" id="line-32"><code>		mp := acquirem()</code></span>
+<span class="codeline" id="line-33"><code>		if pp := mp.p.ptr(); pp != nil {</code></span>
+<span class="codeline" id="line-34"><code>			p.pinner = pp.pinnerCache</code></span>
+<span class="codeline" id="line-35"><code>			pp.pinnerCache = nil</code></span>
+<span class="codeline" id="line-36"><code>		}</code></span>
+<span class="codeline" id="line-37"><code>		releasem(mp)</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>		if p.pinner == nil {</code></span>
+<span class="codeline" id="line-40"><code>			// Didn't get anything from the pinner cache.</code></span>
+<span class="codeline" id="line-41"><code>			p.pinner = new(pinner)</code></span>
+<span class="codeline" id="line-42"><code>			p.refs = p.refStore[:0]</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>			// We set this finalizer once and never clear it. Thus, if the</code></span>
+<span class="codeline" id="line-45"><code>			// pinner gets cached, we'll reuse it, along with its finalizer.</code></span>
+<span class="codeline" id="line-46"><code>			// This lets us avoid the relatively expensive SetFinalizer call</code></span>
+<span class="codeline" id="line-47"><code>			// when reusing from the cache. The finalizer however has to be</code></span>
+<span class="codeline" id="line-48"><code>			// resilient to an empty pinner being finalized, which is done</code></span>
+<span class="codeline" id="line-49"><code>			// by checking p.refs' length.</code></span>
+<span class="codeline" id="line-50"><code>			SetFinalizer(p.pinner, func(i *pinner) {</code></span>
+<span class="codeline" id="line-51"><code>				if len(i.refs) != 0 {</code></span>
+<span class="codeline" id="line-52"><code>					i.unpin() // only required to make the test idempotent</code></span>
+<span class="codeline" id="line-53"><code>					pinnerLeakPanic()</code></span>
+<span class="codeline" id="line-54"><code>				}</code></span>
+<span class="codeline" id="line-55"><code>			})</code></span>
+<span class="codeline" id="line-56"><code>		}</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	ptr := pinnerGetPtr(&amp;pointer)</code></span>
+<span class="codeline" id="line-59"><code>	if setPinned(ptr, true) {</code></span>
+<span class="codeline" id="line-60"><code>		p.refs = append(p.refs, ptr)</code></span>
+<span class="codeline" id="line-61"><code>	}</code></span>
+<span class="codeline" id="line-62"><code>}</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>// Unpin unpins all pinned objects of the [Pinner].</code></span>
+<span class="codeline" id="line-65"><code>func (p *Pinner) Unpin() {</code></span>
+<span class="codeline" id="line-66"><code>	p.pinner.unpin()</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-69"><code>	if pp := mp.p.ptr(); pp != nil &amp;&amp; pp.pinnerCache == nil {</code></span>
+<span class="codeline" id="line-70"><code>		// Put the pinner back in the cache, but only if the</code></span>
+<span class="codeline" id="line-71"><code>		// cache is empty. If application code is reusing Pinners</code></span>
+<span class="codeline" id="line-72"><code>		// on its own, we want to leave the backing store in place</code></span>
+<span class="codeline" id="line-73"><code>		// so reuse is more efficient.</code></span>
+<span class="codeline" id="line-74"><code>		pp.pinnerCache = p.pinner</code></span>
+<span class="codeline" id="line-75"><code>		p.pinner = nil</code></span>
+<span class="codeline" id="line-76"><code>	}</code></span>
+<span class="codeline" id="line-77"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-78"><code>}</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>const (</code></span>
+<span class="codeline" id="line-81"><code>	pinnerSize         = 64</code></span>
+<span class="codeline" id="line-82"><code>	pinnerRefStoreSize = (pinnerSize - unsafe.Sizeof([]unsafe.Pointer{})) / unsafe.Sizeof(unsafe.Pointer(nil))</code></span>
+<span class="codeline" id="line-83"><code>)</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>type pinner struct {</code></span>
+<span class="codeline" id="line-86"><code>	refs     []unsafe.Pointer</code></span>
+<span class="codeline" id="line-87"><code>	refStore [pinnerRefStoreSize]unsafe.Pointer</code></span>
+<span class="codeline" id="line-88"><code>}</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>func (p *pinner) unpin() {</code></span>
+<span class="codeline" id="line-91"><code>	if p == nil || p.refs == nil {</code></span>
+<span class="codeline" id="line-92"><code>		return</code></span>
+<span class="codeline" id="line-93"><code>	}</code></span>
+<span class="codeline" id="line-94"><code>	for i := range p.refs {</code></span>
+<span class="codeline" id="line-95"><code>		setPinned(p.refs[i], false)</code></span>
+<span class="codeline" id="line-96"><code>	}</code></span>
+<span class="codeline" id="line-97"><code>	// The following two lines make all pointers to references</code></span>
+<span class="codeline" id="line-98"><code>	// in p.refs unreachable, either by deleting them or dropping</code></span>
+<span class="codeline" id="line-99"><code>	// p.refs' backing store (if it was not backed by refStore).</code></span>
+<span class="codeline" id="line-100"><code>	p.refStore = [pinnerRefStoreSize]unsafe.Pointer{}</code></span>
+<span class="codeline" id="line-101"><code>	p.refs = p.refStore[:0]</code></span>
+<span class="codeline" id="line-102"><code>}</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>func pinnerGetPtr(i *any) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-105"><code>	e := efaceOf(i)</code></span>
+<span class="codeline" id="line-106"><code>	etyp := e._type</code></span>
+<span class="codeline" id="line-107"><code>	if etyp == nil {</code></span>
+<span class="codeline" id="line-108"><code>		panic(errorString("runtime.Pinner: argument is nil"))</code></span>
+<span class="codeline" id="line-109"><code>	}</code></span>
+<span class="codeline" id="line-110"><code>	if kind := etyp.Kind_ &amp; kindMask; kind != kindPtr &amp;&amp; kind != kindUnsafePointer {</code></span>
+<span class="codeline" id="line-111"><code>		panic(errorString("runtime.Pinner: argument is not a pointer: " + toRType(etyp).string()))</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code>	if inUserArenaChunk(uintptr(e.data)) {</code></span>
+<span class="codeline" id="line-114"><code>		// Arena-allocated objects are not eligible for pinning.</code></span>
+<span class="codeline" id="line-115"><code>		panic(errorString("runtime.Pinner: object was allocated into an arena"))</code></span>
+<span class="codeline" id="line-116"><code>	}</code></span>
+<span class="codeline" id="line-117"><code>	return e.data</code></span>
+<span class="codeline" id="line-118"><code>}</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>// isPinned checks if a Go pointer is pinned.</code></span>
+<span class="codeline" id="line-121"><code>// nosplit, because it's called from nosplit code in cgocheck.</code></span>
+<span class="codeline" id="line-122"><code>//</code></span>
+<span class="codeline" id="line-123"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-124"><code>func isPinned(ptr unsafe.Pointer) bool {</code></span>
+<span class="codeline" id="line-125"><code>	span := spanOfHeap(uintptr(ptr))</code></span>
+<span class="codeline" id="line-126"><code>	if span == nil {</code></span>
+<span class="codeline" id="line-127"><code>		// this code is only called for Go pointer, so this must be a</code></span>
+<span class="codeline" id="line-128"><code>		// linker-allocated global object.</code></span>
+<span class="codeline" id="line-129"><code>		return true</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code>	pinnerBits := span.getPinnerBits()</code></span>
+<span class="codeline" id="line-132"><code>	// these pinnerBits might get unlinked by a concurrently running sweep, but</code></span>
+<span class="codeline" id="line-133"><code>	// that's OK because gcBits don't get cleared until the following GC cycle</code></span>
+<span class="codeline" id="line-134"><code>	// (nextMarkBitArenaEpoch)</code></span>
+<span class="codeline" id="line-135"><code>	if pinnerBits == nil {</code></span>
+<span class="codeline" id="line-136"><code>		return false</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code>	objIndex := span.objIndex(uintptr(ptr))</code></span>
+<span class="codeline" id="line-139"><code>	pinState := pinnerBits.ofObject(objIndex)</code></span>
+<span class="codeline" id="line-140"><code>	KeepAlive(ptr) // make sure ptr is alive until we are done so the span can't be freed</code></span>
+<span class="codeline" id="line-141"><code>	return pinState.isPinned()</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>// setPinned marks or unmarks a Go pointer as pinned, when the ptr is a Go pointer.</code></span>
+<span class="codeline" id="line-145"><code>// It will be ignored while try to pin a non-Go pointer,</code></span>
+<span class="codeline" id="line-146"><code>// and it will be panic while try to unpin a non-Go pointer,</code></span>
+<span class="codeline" id="line-147"><code>// which should not happen in normal usage.</code></span>
+<span class="codeline" id="line-148"><code>func setPinned(ptr unsafe.Pointer, pin bool) bool {</code></span>
+<span class="codeline" id="line-149"><code>	span := spanOfHeap(uintptr(ptr))</code></span>
+<span class="codeline" id="line-150"><code>	if span == nil {</code></span>
+<span class="codeline" id="line-151"><code>		if !pin {</code></span>
+<span class="codeline" id="line-152"><code>			panic(errorString("tried to unpin non-Go pointer"))</code></span>
+<span class="codeline" id="line-153"><code>		}</code></span>
+<span class="codeline" id="line-154"><code>		// This is a linker-allocated, zero size object or other object,</code></span>
+<span class="codeline" id="line-155"><code>		// nothing to do, silently ignore it.</code></span>
+<span class="codeline" id="line-156"><code>		return false</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>	// ensure that the span is swept, b/c sweeping accesses the specials list</code></span>
+<span class="codeline" id="line-160"><code>	// w/o locks.</code></span>
+<span class="codeline" id="line-161"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-162"><code>	span.ensureSwept()</code></span>
+<span class="codeline" id="line-163"><code>	KeepAlive(ptr) // make sure ptr is still alive after span is swept</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>	objIndex := span.objIndex(uintptr(ptr))</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>	lock(&amp;span.speciallock) // guard against concurrent calls of setPinned on same span</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>	pinnerBits := span.getPinnerBits()</code></span>
+<span class="codeline" id="line-170"><code>	if pinnerBits == nil {</code></span>
+<span class="codeline" id="line-171"><code>		pinnerBits = span.newPinnerBits()</code></span>
+<span class="codeline" id="line-172"><code>		span.setPinnerBits(pinnerBits)</code></span>
+<span class="codeline" id="line-173"><code>	}</code></span>
+<span class="codeline" id="line-174"><code>	pinState := pinnerBits.ofObject(objIndex)</code></span>
+<span class="codeline" id="line-175"><code>	if pin {</code></span>
+<span class="codeline" id="line-176"><code>		if pinState.isPinned() {</code></span>
+<span class="codeline" id="line-177"><code>			// multiple pins on same object, set multipin bit</code></span>
+<span class="codeline" id="line-178"><code>			pinState.setMultiPinned(true)</code></span>
+<span class="codeline" id="line-179"><code>			// and increase the pin counter</code></span>
+<span class="codeline" id="line-180"><code>			// TODO(mknyszek): investigate if systemstack is necessary here</code></span>
+<span class="codeline" id="line-181"><code>			systemstack(func() {</code></span>
+<span class="codeline" id="line-182"><code>				offset := objIndex * span.elemsize</code></span>
+<span class="codeline" id="line-183"><code>				span.incPinCounter(offset)</code></span>
+<span class="codeline" id="line-184"><code>			})</code></span>
+<span class="codeline" id="line-185"><code>		} else {</code></span>
+<span class="codeline" id="line-186"><code>			// set pin bit</code></span>
+<span class="codeline" id="line-187"><code>			pinState.setPinned(true)</code></span>
+<span class="codeline" id="line-188"><code>		}</code></span>
+<span class="codeline" id="line-189"><code>	} else {</code></span>
+<span class="codeline" id="line-190"><code>		// unpin</code></span>
+<span class="codeline" id="line-191"><code>		if pinState.isPinned() {</code></span>
+<span class="codeline" id="line-192"><code>			if pinState.isMultiPinned() {</code></span>
+<span class="codeline" id="line-193"><code>				var exists bool</code></span>
+<span class="codeline" id="line-194"><code>				// TODO(mknyszek): investigate if systemstack is necessary here</code></span>
+<span class="codeline" id="line-195"><code>				systemstack(func() {</code></span>
+<span class="codeline" id="line-196"><code>					offset := objIndex * span.elemsize</code></span>
+<span class="codeline" id="line-197"><code>					exists = span.decPinCounter(offset)</code></span>
+<span class="codeline" id="line-198"><code>				})</code></span>
+<span class="codeline" id="line-199"><code>				if !exists {</code></span>
+<span class="codeline" id="line-200"><code>					// counter is 0, clear multipin bit</code></span>
+<span class="codeline" id="line-201"><code>					pinState.setMultiPinned(false)</code></span>
+<span class="codeline" id="line-202"><code>				}</code></span>
+<span class="codeline" id="line-203"><code>			} else {</code></span>
+<span class="codeline" id="line-204"><code>				// no multipins recorded. unpin object.</code></span>
+<span class="codeline" id="line-205"><code>				pinState.setPinned(false)</code></span>
+<span class="codeline" id="line-206"><code>			}</code></span>
+<span class="codeline" id="line-207"><code>		} else {</code></span>
+<span class="codeline" id="line-208"><code>			// unpinning unpinned object, bail out</code></span>
+<span class="codeline" id="line-209"><code>			throw("runtime.Pinner: object already unpinned")</code></span>
+<span class="codeline" id="line-210"><code>		}</code></span>
+<span class="codeline" id="line-211"><code>	}</code></span>
+<span class="codeline" id="line-212"><code>	unlock(&amp;span.speciallock)</code></span>
+<span class="codeline" id="line-213"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-214"><code>	return true</code></span>
+<span class="codeline" id="line-215"><code>}</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>type pinState struct {</code></span>
+<span class="codeline" id="line-218"><code>	bytep   *uint8</code></span>
+<span class="codeline" id="line-219"><code>	byteVal uint8</code></span>
+<span class="codeline" id="line-220"><code>	mask    uint8</code></span>
+<span class="codeline" id="line-221"><code>}</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>// nosplit, because it's called by isPinned, which is nosplit</code></span>
+<span class="codeline" id="line-224"><code>//</code></span>
+<span class="codeline" id="line-225"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-226"><code>func (v *pinState) isPinned() bool {</code></span>
+<span class="codeline" id="line-227"><code>	return (v.byteVal &amp; v.mask) != 0</code></span>
+<span class="codeline" id="line-228"><code>}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>func (v *pinState) isMultiPinned() bool {</code></span>
+<span class="codeline" id="line-231"><code>	return (v.byteVal &amp; (v.mask &lt;&lt; 1)) != 0</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>func (v *pinState) setPinned(val bool) {</code></span>
+<span class="codeline" id="line-235"><code>	v.set(val, false)</code></span>
+<span class="codeline" id="line-236"><code>}</code></span>
+<span class="codeline" id="line-237"><code></code></span>
+<span class="codeline" id="line-238"><code>func (v *pinState) setMultiPinned(val bool) {</code></span>
+<span class="codeline" id="line-239"><code>	v.set(val, true)</code></span>
+<span class="codeline" id="line-240"><code>}</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>// set sets the pin bit of the pinState to val. If multipin is true, it</code></span>
+<span class="codeline" id="line-243"><code>// sets/unsets the multipin bit instead.</code></span>
+<span class="codeline" id="line-244"><code>func (v *pinState) set(val bool, multipin bool) {</code></span>
+<span class="codeline" id="line-245"><code>	mask := v.mask</code></span>
+<span class="codeline" id="line-246"><code>	if multipin {</code></span>
+<span class="codeline" id="line-247"><code>		mask &lt;&lt;= 1</code></span>
+<span class="codeline" id="line-248"><code>	}</code></span>
+<span class="codeline" id="line-249"><code>	if val {</code></span>
+<span class="codeline" id="line-250"><code>		atomic.Or8(v.bytep, mask)</code></span>
+<span class="codeline" id="line-251"><code>	} else {</code></span>
+<span class="codeline" id="line-252"><code>		atomic.And8(v.bytep, ^mask)</code></span>
+<span class="codeline" id="line-253"><code>	}</code></span>
+<span class="codeline" id="line-254"><code>}</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>// pinnerBits is the same type as gcBits but has different methods.</code></span>
+<span class="codeline" id="line-257"><code>type pinnerBits gcBits</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>// ofObject returns the pinState of the n'th object.</code></span>
+<span class="codeline" id="line-260"><code>// nosplit, because it's called by isPinned, which is nosplit</code></span>
+<span class="codeline" id="line-261"><code>//</code></span>
+<span class="codeline" id="line-262"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-263"><code>func (p *pinnerBits) ofObject(n uintptr) pinState {</code></span>
+<span class="codeline" id="line-264"><code>	bytep, mask := (*gcBits)(p).bitp(n * 2)</code></span>
+<span class="codeline" id="line-265"><code>	byteVal := atomic.Load8(bytep)</code></span>
+<span class="codeline" id="line-266"><code>	return pinState{bytep, byteVal, mask}</code></span>
+<span class="codeline" id="line-267"><code>}</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>func (s *mspan) pinnerBitSize() uintptr {</code></span>
+<span class="codeline" id="line-270"><code>	return divRoundUp(uintptr(s.nelems)*2, 8)</code></span>
+<span class="codeline" id="line-271"><code>}</code></span>
+<span class="codeline" id="line-272"><code></code></span>
+<span class="codeline" id="line-273"><code>// newPinnerBits returns a pointer to 8 byte aligned bytes to be used for this</code></span>
+<span class="codeline" id="line-274"><code>// span's pinner bits. newPinneBits is used to mark objects that are pinned.</code></span>
+<span class="codeline" id="line-275"><code>// They are copied when the span is swept.</code></span>
+<span class="codeline" id="line-276"><code>func (s *mspan) newPinnerBits() *pinnerBits {</code></span>
+<span class="codeline" id="line-277"><code>	return (*pinnerBits)(newMarkBits(uintptr(s.nelems) * 2))</code></span>
+<span class="codeline" id="line-278"><code>}</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>// nosplit, because it's called by isPinned, which is nosplit</code></span>
+<span class="codeline" id="line-281"><code>//</code></span>
+<span class="codeline" id="line-282"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-283"><code>func (s *mspan) getPinnerBits() *pinnerBits {</code></span>
+<span class="codeline" id="line-284"><code>	return (*pinnerBits)(atomic.Loadp(unsafe.Pointer(&amp;s.pinnerBits)))</code></span>
+<span class="codeline" id="line-285"><code>}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>func (s *mspan) setPinnerBits(p *pinnerBits) {</code></span>
+<span class="codeline" id="line-288"><code>	atomicstorep(unsafe.Pointer(&amp;s.pinnerBits), unsafe.Pointer(p))</code></span>
+<span class="codeline" id="line-289"><code>}</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>// refreshPinnerBits replaces pinnerBits with a fresh copy in the arenas for the</code></span>
+<span class="codeline" id="line-292"><code>// next GC cycle. If it does not contain any pinned objects, pinnerBits of the</code></span>
+<span class="codeline" id="line-293"><code>// span is set to nil.</code></span>
+<span class="codeline" id="line-294"><code>func (s *mspan) refreshPinnerBits() {</code></span>
+<span class="codeline" id="line-295"><code>	p := s.getPinnerBits()</code></span>
+<span class="codeline" id="line-296"><code>	if p == nil {</code></span>
+<span class="codeline" id="line-297"><code>		return</code></span>
+<span class="codeline" id="line-298"><code>	}</code></span>
+<span class="codeline" id="line-299"><code></code></span>
+<span class="codeline" id="line-300"><code>	hasPins := false</code></span>
+<span class="codeline" id="line-301"><code>	bytes := alignUp(s.pinnerBitSize(), 8)</code></span>
+<span class="codeline" id="line-302"><code></code></span>
+<span class="codeline" id="line-303"><code>	// Iterate over each 8-byte chunk and check for pins. Note that</code></span>
+<span class="codeline" id="line-304"><code>	// newPinnerBits guarantees that pinnerBits will be 8-byte aligned, so we</code></span>
+<span class="codeline" id="line-305"><code>	// don't have to worry about edge cases, irrelevant bits will simply be</code></span>
+<span class="codeline" id="line-306"><code>	// zero.</code></span>
+<span class="codeline" id="line-307"><code>	for _, x := range unsafe.Slice((*uint64)(unsafe.Pointer(&amp;p.x)), bytes/8) {</code></span>
+<span class="codeline" id="line-308"><code>		if x != 0 {</code></span>
+<span class="codeline" id="line-309"><code>			hasPins = true</code></span>
+<span class="codeline" id="line-310"><code>			break</code></span>
+<span class="codeline" id="line-311"><code>		}</code></span>
+<span class="codeline" id="line-312"><code>	}</code></span>
+<span class="codeline" id="line-313"><code></code></span>
+<span class="codeline" id="line-314"><code>	if hasPins {</code></span>
+<span class="codeline" id="line-315"><code>		newPinnerBits := s.newPinnerBits()</code></span>
+<span class="codeline" id="line-316"><code>		memmove(unsafe.Pointer(&amp;newPinnerBits.x), unsafe.Pointer(&amp;p.x), bytes)</code></span>
+<span class="codeline" id="line-317"><code>		s.setPinnerBits(newPinnerBits)</code></span>
+<span class="codeline" id="line-318"><code>	} else {</code></span>
+<span class="codeline" id="line-319"><code>		s.setPinnerBits(nil)</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code>}</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>// incPinCounter is only called for multiple pins of the same object and records</code></span>
+<span class="codeline" id="line-324"><code>// the _additional_ pins.</code></span>
+<span class="codeline" id="line-325"><code>func (span *mspan) incPinCounter(offset uintptr) {</code></span>
+<span class="codeline" id="line-326"><code>	var rec *specialPinCounter</code></span>
+<span class="codeline" id="line-327"><code>	ref, exists := span.specialFindSplicePoint(offset, _KindSpecialPinCounter)</code></span>
+<span class="codeline" id="line-328"><code>	if !exists {</code></span>
+<span class="codeline" id="line-329"><code>		lock(&amp;mheap_.speciallock)</code></span>
+<span class="codeline" id="line-330"><code>		rec = (*specialPinCounter)(mheap_.specialPinCounterAlloc.alloc())</code></span>
+<span class="codeline" id="line-331"><code>		unlock(&amp;mheap_.speciallock)</code></span>
+<span class="codeline" id="line-332"><code>		// splice in record, fill in offset.</code></span>
+<span class="codeline" id="line-333"><code>		rec.special.offset = uint16(offset)</code></span>
+<span class="codeline" id="line-334"><code>		rec.special.kind = _KindSpecialPinCounter</code></span>
+<span class="codeline" id="line-335"><code>		rec.special.next = *ref</code></span>
+<span class="codeline" id="line-336"><code>		*ref = (*special)(unsafe.Pointer(rec))</code></span>
+<span class="codeline" id="line-337"><code>		spanHasSpecials(span)</code></span>
+<span class="codeline" id="line-338"><code>	} else {</code></span>
+<span class="codeline" id="line-339"><code>		rec = (*specialPinCounter)(unsafe.Pointer(*ref))</code></span>
+<span class="codeline" id="line-340"><code>	}</code></span>
+<span class="codeline" id="line-341"><code>	rec.counter++</code></span>
+<span class="codeline" id="line-342"><code>}</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>// decPinCounter decreases the counter. If the counter reaches 0, the counter</code></span>
+<span class="codeline" id="line-345"><code>// special is deleted and false is returned. Otherwise true is returned.</code></span>
+<span class="codeline" id="line-346"><code>func (span *mspan) decPinCounter(offset uintptr) bool {</code></span>
+<span class="codeline" id="line-347"><code>	ref, exists := span.specialFindSplicePoint(offset, _KindSpecialPinCounter)</code></span>
+<span class="codeline" id="line-348"><code>	if !exists {</code></span>
+<span class="codeline" id="line-349"><code>		throw("runtime.Pinner: decreased non-existing pin counter")</code></span>
+<span class="codeline" id="line-350"><code>	}</code></span>
+<span class="codeline" id="line-351"><code>	counter := (*specialPinCounter)(unsafe.Pointer(*ref))</code></span>
+<span class="codeline" id="line-352"><code>	counter.counter--</code></span>
+<span class="codeline" id="line-353"><code>	if counter.counter == 0 {</code></span>
+<span class="codeline" id="line-354"><code>		*ref = counter.special.next</code></span>
+<span class="codeline" id="line-355"><code>		if span.specials == nil {</code></span>
+<span class="codeline" id="line-356"><code>			spanHasNoSpecials(span)</code></span>
+<span class="codeline" id="line-357"><code>		}</code></span>
+<span class="codeline" id="line-358"><code>		lock(&amp;mheap_.speciallock)</code></span>
+<span class="codeline" id="line-359"><code>		mheap_.specialPinCounterAlloc.free(unsafe.Pointer(counter))</code></span>
+<span class="codeline" id="line-360"><code>		unlock(&amp;mheap_.speciallock)</code></span>
+<span class="codeline" id="line-361"><code>		return false</code></span>
+<span class="codeline" id="line-362"><code>	}</code></span>
+<span class="codeline" id="line-363"><code>	return true</code></span>
+<span class="codeline" id="line-364"><code>}</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>// only for tests</code></span>
+<span class="codeline" id="line-367"><code>func pinnerGetPinCounter(addr unsafe.Pointer) *uintptr {</code></span>
+<span class="codeline" id="line-368"><code>	_, span, objIndex := findObject(uintptr(addr), 0, 0)</code></span>
+<span class="codeline" id="line-369"><code>	offset := objIndex * span.elemsize</code></span>
+<span class="codeline" id="line-370"><code>	t, exists := span.specialFindSplicePoint(offset, _KindSpecialPinCounter)</code></span>
+<span class="codeline" id="line-371"><code>	if !exists {</code></span>
+<span class="codeline" id="line-372"><code>		return nil</code></span>
+<span class="codeline" id="line-373"><code>	}</code></span>
+<span class="codeline" id="line-374"><code>	counter := (*specialPinCounter)(unsafe.Pointer(*t))</code></span>
+<span class="codeline" id="line-375"><code>	return &amp;counter.counter</code></span>
+<span class="codeline" id="line-376"><code>}</code></span>
+<span class="codeline" id="line-377"><code></code></span>
+<span class="codeline" id="line-378"><code>// to be able to test that the GC panics when a pinned pointer is leaking, this</code></span>
+<span class="codeline" id="line-379"><code>// panic function is a variable, that can be overwritten by a test.</code></span>
+<span class="codeline" id="line-380"><code>var pinnerLeakPanic = func() {</code></span>
+<span class="codeline" id="line-381"><code>	panic(errorString("runtime.Pinner: found leaking pinned pointer; forgot to call Unpin()?"))</code></span>
+<span class="codeline" id="line-382"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

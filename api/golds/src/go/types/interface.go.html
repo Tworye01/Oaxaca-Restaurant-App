@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: interface.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	interface.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package types</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-9"><code>	"go/token"</code></span>
+<span class="codeline" id="line-10"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// ----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-14"><code>// API</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// An Interface represents an interface type.</code></span>
+<span class="codeline" id="line-17"><code>type Interface struct {</code></span>
+<span class="codeline" id="line-18"><code>	check     *Checker     // for error reporting; nil once type set is computed</code></span>
+<span class="codeline" id="line-19"><code>	methods   []*Func      // ordered list of explicitly declared methods</code></span>
+<span class="codeline" id="line-20"><code>	embeddeds []Type       // ordered list of explicitly embedded elements</code></span>
+<span class="codeline" id="line-21"><code>	embedPos  *[]token.Pos // positions of embedded elements; or nil (for error messages) - use pointer to save space</code></span>
+<span class="codeline" id="line-22"><code>	implicit  bool         // interface is wrapper for type set literal (non-interface T, ~T, or A|B)</code></span>
+<span class="codeline" id="line-23"><code>	complete  bool         // indicates that obj, methods, and embeddeds are set and type set can be computed</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>	tset *_TypeSet // type set described by this interface, computed lazily</code></span>
+<span class="codeline" id="line-26"><code>}</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// typeSet returns the type set for interface t.</code></span>
+<span class="codeline" id="line-29"><code>func (t *Interface) typeSet() *_TypeSet { return computeInterfaceTypeSet(t.check, nopos, t) }</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>// emptyInterface represents the empty (completed) interface</code></span>
+<span class="codeline" id="line-32"><code>var emptyInterface = Interface{complete: true, tset: &amp;topTypeSet}</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>// NewInterface returns a new interface for the given methods and embedded types.</code></span>
+<span class="codeline" id="line-35"><code>// NewInterface takes ownership of the provided methods and may modify their types</code></span>
+<span class="codeline" id="line-36"><code>// by setting missing receivers.</code></span>
+<span class="codeline" id="line-37"><code>//</code></span>
+<span class="codeline" id="line-38"><code>// Deprecated: Use NewInterfaceType instead which allows arbitrary embedded types.</code></span>
+<span class="codeline" id="line-39"><code>func NewInterface(methods []*Func, embeddeds []*Named) *Interface {</code></span>
+<span class="codeline" id="line-40"><code>	tnames := make([]Type, len(embeddeds))</code></span>
+<span class="codeline" id="line-41"><code>	for i, t := range embeddeds {</code></span>
+<span class="codeline" id="line-42"><code>		tnames[i] = t</code></span>
+<span class="codeline" id="line-43"><code>	}</code></span>
+<span class="codeline" id="line-44"><code>	return NewInterfaceType(methods, tnames)</code></span>
+<span class="codeline" id="line-45"><code>}</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>// NewInterfaceType returns a new interface for the given methods and embedded</code></span>
+<span class="codeline" id="line-48"><code>// types. NewInterfaceType takes ownership of the provided methods and may</code></span>
+<span class="codeline" id="line-49"><code>// modify their types by setting missing receivers.</code></span>
+<span class="codeline" id="line-50"><code>//</code></span>
+<span class="codeline" id="line-51"><code>// To avoid race conditions, the interface's type set should be computed before</code></span>
+<span class="codeline" id="line-52"><code>// concurrent use of the interface, by explicitly calling Complete.</code></span>
+<span class="codeline" id="line-53"><code>func NewInterfaceType(methods []*Func, embeddeds []Type) *Interface {</code></span>
+<span class="codeline" id="line-54"><code>	if len(methods) == 0 &amp;&amp; len(embeddeds) == 0 {</code></span>
+<span class="codeline" id="line-55"><code>		return &amp;emptyInterface</code></span>
+<span class="codeline" id="line-56"><code>	}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>	// set method receivers if necessary</code></span>
+<span class="codeline" id="line-59"><code>	typ := (*Checker)(nil).newInterface()</code></span>
+<span class="codeline" id="line-60"><code>	for _, m := range methods {</code></span>
+<span class="codeline" id="line-61"><code>		if sig := m.typ.(*Signature); sig.recv == nil {</code></span>
+<span class="codeline" id="line-62"><code>			sig.recv = NewVar(m.pos, m.pkg, "", typ)</code></span>
+<span class="codeline" id="line-63"><code>		}</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>	// sort for API stability</code></span>
+<span class="codeline" id="line-67"><code>	sortMethods(methods)</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>	typ.methods = methods</code></span>
+<span class="codeline" id="line-70"><code>	typ.embeddeds = embeddeds</code></span>
+<span class="codeline" id="line-71"><code>	typ.complete = true</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>	return typ</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>// check may be nil</code></span>
+<span class="codeline" id="line-77"><code>func (check *Checker) newInterface() *Interface {</code></span>
+<span class="codeline" id="line-78"><code>	typ := &amp;Interface{check: check}</code></span>
+<span class="codeline" id="line-79"><code>	if check != nil {</code></span>
+<span class="codeline" id="line-80"><code>		check.needsCleanup(typ)</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code>	return typ</code></span>
+<span class="codeline" id="line-83"><code>}</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>// MarkImplicit marks the interface t as implicit, meaning this interface</code></span>
+<span class="codeline" id="line-86"><code>// corresponds to a constraint literal such as ~T or A|B without explicit</code></span>
+<span class="codeline" id="line-87"><code>// interface embedding. MarkImplicit should be called before any concurrent use</code></span>
+<span class="codeline" id="line-88"><code>// of implicit interfaces.</code></span>
+<span class="codeline" id="line-89"><code>func (t *Interface) MarkImplicit() {</code></span>
+<span class="codeline" id="line-90"><code>	t.implicit = true</code></span>
+<span class="codeline" id="line-91"><code>}</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>// NumExplicitMethods returns the number of explicitly declared methods of interface t.</code></span>
+<span class="codeline" id="line-94"><code>func (t *Interface) NumExplicitMethods() int { return len(t.methods) }</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// ExplicitMethod returns the i'th explicitly declared method of interface t for 0 &lt;= i &lt; t.NumExplicitMethods().</code></span>
+<span class="codeline" id="line-97"><code>// The methods are ordered by their unique [Id].</code></span>
+<span class="codeline" id="line-98"><code>func (t *Interface) ExplicitMethod(i int) *Func { return t.methods[i] }</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// NumEmbeddeds returns the number of embedded types in interface t.</code></span>
+<span class="codeline" id="line-101"><code>func (t *Interface) NumEmbeddeds() int { return len(t.embeddeds) }</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>// Embedded returns the i'th embedded defined (*[Named]) type of interface t for 0 &lt;= i &lt; t.NumEmbeddeds().</code></span>
+<span class="codeline" id="line-104"><code>// The result is nil if the i'th embedded type is not a defined type.</code></span>
+<span class="codeline" id="line-105"><code>//</code></span>
+<span class="codeline" id="line-106"><code>// Deprecated: Use [Interface.EmbeddedType] which is not restricted to defined (*[Named]) types.</code></span>
+<span class="codeline" id="line-107"><code>func (t *Interface) Embedded(i int) *Named { return asNamed(t.embeddeds[i]) }</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>// EmbeddedType returns the i'th embedded type of interface t for 0 &lt;= i &lt; t.NumEmbeddeds().</code></span>
+<span class="codeline" id="line-110"><code>func (t *Interface) EmbeddedType(i int) Type { return t.embeddeds[i] }</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>// NumMethods returns the total number of methods of interface t.</code></span>
+<span class="codeline" id="line-113"><code>func (t *Interface) NumMethods() int { return t.typeSet().NumMethods() }</code></span>
+<span class="codeline" id="line-114"><code></code></span>
+<span class="codeline" id="line-115"><code>// Method returns the i'th method of interface t for 0 &lt;= i &lt; t.NumMethods().</code></span>
+<span class="codeline" id="line-116"><code>// The methods are ordered by their unique Id.</code></span>
+<span class="codeline" id="line-117"><code>func (t *Interface) Method(i int) *Func { return t.typeSet().Method(i) }</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>// Empty reports whether t is the empty interface.</code></span>
+<span class="codeline" id="line-120"><code>func (t *Interface) Empty() bool { return t.typeSet().IsAll() }</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>// IsComparable reports whether each type in interface t's type set is comparable.</code></span>
+<span class="codeline" id="line-123"><code>func (t *Interface) IsComparable() bool { return t.typeSet().IsComparable(nil) }</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// IsMethodSet reports whether the interface t is fully described by its method</code></span>
+<span class="codeline" id="line-126"><code>// set.</code></span>
+<span class="codeline" id="line-127"><code>func (t *Interface) IsMethodSet() bool { return t.typeSet().IsMethodSet() }</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>// IsImplicit reports whether the interface t is a wrapper for a type set literal.</code></span>
+<span class="codeline" id="line-130"><code>func (t *Interface) IsImplicit() bool { return t.implicit }</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>// Complete computes the interface's type set. It must be called by users of</code></span>
+<span class="codeline" id="line-133"><code>// [NewInterfaceType] and [NewInterface] after the interface's embedded types are</code></span>
+<span class="codeline" id="line-134"><code>// fully defined and before using the interface type in any way other than to</code></span>
+<span class="codeline" id="line-135"><code>// form other types. The interface must not contain duplicate methods or a</code></span>
+<span class="codeline" id="line-136"><code>// panic occurs. Complete returns the receiver.</code></span>
+<span class="codeline" id="line-137"><code>//</code></span>
+<span class="codeline" id="line-138"><code>// Interface types that have been completed are safe for concurrent use.</code></span>
+<span class="codeline" id="line-139"><code>func (t *Interface) Complete() *Interface {</code></span>
+<span class="codeline" id="line-140"><code>	if !t.complete {</code></span>
+<span class="codeline" id="line-141"><code>		t.complete = true</code></span>
+<span class="codeline" id="line-142"><code>	}</code></span>
+<span class="codeline" id="line-143"><code>	t.typeSet() // checks if t.tset is already set</code></span>
+<span class="codeline" id="line-144"><code>	return t</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>func (t *Interface) Underlying() Type { return t }</code></span>
+<span class="codeline" id="line-148"><code>func (t *Interface) String() string   { return TypeString(t, nil) }</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// ----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-151"><code>// Implementation</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>func (t *Interface) cleanup() {</code></span>
+<span class="codeline" id="line-154"><code>	t.typeSet() // any interface that escapes type checking must be safe for concurrent use</code></span>
+<span class="codeline" id="line-155"><code>	t.check = nil</code></span>
+<span class="codeline" id="line-156"><code>	t.embedPos = nil</code></span>
+<span class="codeline" id="line-157"><code>}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, def *TypeName) {</code></span>
+<span class="codeline" id="line-160"><code>	addEmbedded := func(pos token.Pos, typ Type) {</code></span>
+<span class="codeline" id="line-161"><code>		ityp.embeddeds = append(ityp.embeddeds, typ)</code></span>
+<span class="codeline" id="line-162"><code>		if ityp.embedPos == nil {</code></span>
+<span class="codeline" id="line-163"><code>			ityp.embedPos = new([]token.Pos)</code></span>
+<span class="codeline" id="line-164"><code>		}</code></span>
+<span class="codeline" id="line-165"><code>		*ityp.embedPos = append(*ityp.embedPos, pos)</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>	for _, f := range iface.Methods.List {</code></span>
+<span class="codeline" id="line-169"><code>		if len(f.Names) == 0 {</code></span>
+<span class="codeline" id="line-170"><code>			addEmbedded(f.Type.Pos(), parseUnion(check, f.Type))</code></span>
+<span class="codeline" id="line-171"><code>			continue</code></span>
+<span class="codeline" id="line-172"><code>		}</code></span>
+<span class="codeline" id="line-173"><code>		// f.Name != nil</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>		// We have a method with name f.Names[0].</code></span>
+<span class="codeline" id="line-176"><code>		name := f.Names[0]</code></span>
+<span class="codeline" id="line-177"><code>		if name.Name == "_" {</code></span>
+<span class="codeline" id="line-178"><code>			check.error(name, BlankIfaceMethod, "methods must have a unique non-blank name")</code></span>
+<span class="codeline" id="line-179"><code>			continue // ignore</code></span>
+<span class="codeline" id="line-180"><code>		}</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>		typ := check.typ(f.Type)</code></span>
+<span class="codeline" id="line-183"><code>		sig, _ := typ.(*Signature)</code></span>
+<span class="codeline" id="line-184"><code>		if sig == nil {</code></span>
+<span class="codeline" id="line-185"><code>			if isValid(typ) {</code></span>
+<span class="codeline" id="line-186"><code>				check.errorf(f.Type, InvalidSyntaxTree, "%s is not a method signature", typ)</code></span>
+<span class="codeline" id="line-187"><code>			}</code></span>
+<span class="codeline" id="line-188"><code>			continue // ignore</code></span>
+<span class="codeline" id="line-189"><code>		}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>		// The go/parser doesn't accept method type parameters but an ast.FuncType may have them.</code></span>
+<span class="codeline" id="line-192"><code>		if sig.tparams != nil {</code></span>
+<span class="codeline" id="line-193"><code>			var at positioner = f.Type</code></span>
+<span class="codeline" id="line-194"><code>			if ftyp, _ := f.Type.(*ast.FuncType); ftyp != nil &amp;&amp; ftyp.TypeParams != nil {</code></span>
+<span class="codeline" id="line-195"><code>				at = ftyp.TypeParams</code></span>
+<span class="codeline" id="line-196"><code>			}</code></span>
+<span class="codeline" id="line-197"><code>			check.error(at, InvalidSyntaxTree, "methods cannot have type parameters")</code></span>
+<span class="codeline" id="line-198"><code>		}</code></span>
+<span class="codeline" id="line-199"><code></code></span>
+<span class="codeline" id="line-200"><code>		// use named receiver type if available (for better error messages)</code></span>
+<span class="codeline" id="line-201"><code>		var recvTyp Type = ityp</code></span>
+<span class="codeline" id="line-202"><code>		if def != nil {</code></span>
+<span class="codeline" id="line-203"><code>			if named := asNamed(def.typ); named != nil {</code></span>
+<span class="codeline" id="line-204"><code>				recvTyp = named</code></span>
+<span class="codeline" id="line-205"><code>			}</code></span>
+<span class="codeline" id="line-206"><code>		}</code></span>
+<span class="codeline" id="line-207"><code>		sig.recv = NewVar(name.Pos(), check.pkg, "", recvTyp)</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>		m := NewFunc(name.Pos(), check.pkg, name.Name, sig)</code></span>
+<span class="codeline" id="line-210"><code>		check.recordDef(name, m)</code></span>
+<span class="codeline" id="line-211"><code>		ityp.methods = append(ityp.methods, m)</code></span>
+<span class="codeline" id="line-212"><code>	}</code></span>
+<span class="codeline" id="line-213"><code></code></span>
+<span class="codeline" id="line-214"><code>	// All methods and embedded elements for this interface are collected;</code></span>
+<span class="codeline" id="line-215"><code>	// i.e., this interface may be used in a type set computation.</code></span>
+<span class="codeline" id="line-216"><code>	ityp.complete = true</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>	if len(ityp.methods) == 0 &amp;&amp; len(ityp.embeddeds) == 0 {</code></span>
+<span class="codeline" id="line-219"><code>		// empty interface</code></span>
+<span class="codeline" id="line-220"><code>		ityp.tset = &amp;topTypeSet</code></span>
+<span class="codeline" id="line-221"><code>		return</code></span>
+<span class="codeline" id="line-222"><code>	}</code></span>
+<span class="codeline" id="line-223"><code></code></span>
+<span class="codeline" id="line-224"><code>	// sort for API stability</code></span>
+<span class="codeline" id="line-225"><code>	sortMethods(ityp.methods)</code></span>
+<span class="codeline" id="line-226"><code>	// (don't sort embeddeds: they must correspond to *embedPos entries)</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>	// Compute type set as soon as possible to report any errors.</code></span>
+<span class="codeline" id="line-229"><code>	// Subsequent uses of type sets will use this computed type</code></span>
+<span class="codeline" id="line-230"><code>	// set and won't need to pass in a *Checker.</code></span>
+<span class="codeline" id="line-231"><code>	check.later(func() {</code></span>
+<span class="codeline" id="line-232"><code>		computeInterfaceTypeSet(check, iface.Pos(), ityp)</code></span>
+<span class="codeline" id="line-233"><code>	}).describef(iface, "compute type set for %s", ityp)</code></span>
+<span class="codeline" id="line-234"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: template.go in package html/template</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	template.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/html/template.html">html/template</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2011 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package template</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"fmt"</code></span>
+<span class="codeline" id="line-9"><code>	"io"</code></span>
+<span class="codeline" id="line-10"><code>	"io/fs"</code></span>
+<span class="codeline" id="line-11"><code>	"os"</code></span>
+<span class="codeline" id="line-12"><code>	"path"</code></span>
+<span class="codeline" id="line-13"><code>	"path/filepath"</code></span>
+<span class="codeline" id="line-14"><code>	"sync"</code></span>
+<span class="codeline" id="line-15"><code>	"text/template"</code></span>
+<span class="codeline" id="line-16"><code>	"text/template/parse"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// Template is a specialized Template from "text/template" that produces a safe</code></span>
+<span class="codeline" id="line-20"><code>// HTML document fragment.</code></span>
+<span class="codeline" id="line-21"><code>type Template struct {</code></span>
+<span class="codeline" id="line-22"><code>	// Sticky error if escaping fails, or escapeOK if succeeded.</code></span>
+<span class="codeline" id="line-23"><code>	escapeErr error</code></span>
+<span class="codeline" id="line-24"><code>	// We could embed the text/template field, but it's safer not to because</code></span>
+<span class="codeline" id="line-25"><code>	// we need to keep our version of the name space and the underlying</code></span>
+<span class="codeline" id="line-26"><code>	// template's in sync.</code></span>
+<span class="codeline" id="line-27"><code>	text *template.Template</code></span>
+<span class="codeline" id="line-28"><code>	// The underlying template's parse tree, updated to be HTML-safe.</code></span>
+<span class="codeline" id="line-29"><code>	Tree       *parse.Tree</code></span>
+<span class="codeline" id="line-30"><code>	*nameSpace // common to all associated templates</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>// escapeOK is a sentinel value used to indicate valid escaping.</code></span>
+<span class="codeline" id="line-34"><code>var escapeOK = fmt.Errorf("template escaped correctly")</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// nameSpace is the data structure shared by all templates in an association.</code></span>
+<span class="codeline" id="line-37"><code>type nameSpace struct {</code></span>
+<span class="codeline" id="line-38"><code>	mu      sync.Mutex</code></span>
+<span class="codeline" id="line-39"><code>	set     map[string]*Template</code></span>
+<span class="codeline" id="line-40"><code>	escaped bool</code></span>
+<span class="codeline" id="line-41"><code>	esc     escaper</code></span>
+<span class="codeline" id="line-42"><code>}</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>// Templates returns a slice of the templates associated with t, including t</code></span>
+<span class="codeline" id="line-45"><code>// itself.</code></span>
+<span class="codeline" id="line-46"><code>func (t *Template) Templates() []*Template {</code></span>
+<span class="codeline" id="line-47"><code>	ns := t.nameSpace</code></span>
+<span class="codeline" id="line-48"><code>	ns.mu.Lock()</code></span>
+<span class="codeline" id="line-49"><code>	defer ns.mu.Unlock()</code></span>
+<span class="codeline" id="line-50"><code>	// Return a slice so we don't expose the map.</code></span>
+<span class="codeline" id="line-51"><code>	m := make([]*Template, 0, len(ns.set))</code></span>
+<span class="codeline" id="line-52"><code>	for _, v := range ns.set {</code></span>
+<span class="codeline" id="line-53"><code>		m = append(m, v)</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code>	return m</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// Option sets options for the template. Options are described by</code></span>
+<span class="codeline" id="line-59"><code>// strings, either a simple string or "key=value". There can be at</code></span>
+<span class="codeline" id="line-60"><code>// most one equals sign in an option string. If the option string</code></span>
+<span class="codeline" id="line-61"><code>// is unrecognized or otherwise invalid, Option panics.</code></span>
+<span class="codeline" id="line-62"><code>//</code></span>
+<span class="codeline" id="line-63"><code>// Known options:</code></span>
+<span class="codeline" id="line-64"><code>//</code></span>
+<span class="codeline" id="line-65"><code>// missingkey: Control the behavior during execution if a map is</code></span>
+<span class="codeline" id="line-66"><code>// indexed with a key that is not present in the map.</code></span>
+<span class="codeline" id="line-67"><code>//</code></span>
+<span class="codeline" id="line-68"><code>//	"missingkey=default" or "missingkey=invalid"</code></span>
+<span class="codeline" id="line-69"><code>//		The default behavior: Do nothing and continue execution.</code></span>
+<span class="codeline" id="line-70"><code>//		If printed, the result of the index operation is the string</code></span>
+<span class="codeline" id="line-71"><code>//		"&lt;no value&gt;".</code></span>
+<span class="codeline" id="line-72"><code>//	"missingkey=zero"</code></span>
+<span class="codeline" id="line-73"><code>//		The operation returns the zero value for the map type's element.</code></span>
+<span class="codeline" id="line-74"><code>//	"missingkey=error"</code></span>
+<span class="codeline" id="line-75"><code>//		Execution stops immediately with an error.</code></span>
+<span class="codeline" id="line-76"><code>func (t *Template) Option(opt ...string) *Template {</code></span>
+<span class="codeline" id="line-77"><code>	t.text.Option(opt...)</code></span>
+<span class="codeline" id="line-78"><code>	return t</code></span>
+<span class="codeline" id="line-79"><code>}</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>// checkCanParse checks whether it is OK to parse templates.</code></span>
+<span class="codeline" id="line-82"><code>// If not, it returns an error.</code></span>
+<span class="codeline" id="line-83"><code>func (t *Template) checkCanParse() error {</code></span>
+<span class="codeline" id="line-84"><code>	if t == nil {</code></span>
+<span class="codeline" id="line-85"><code>		return nil</code></span>
+<span class="codeline" id="line-86"><code>	}</code></span>
+<span class="codeline" id="line-87"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-88"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-89"><code>	if t.nameSpace.escaped {</code></span>
+<span class="codeline" id="line-90"><code>		return fmt.Errorf("html/template: cannot Parse after Execute")</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code>	return nil</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>// escape escapes all associated templates.</code></span>
+<span class="codeline" id="line-96"><code>func (t *Template) escape() error {</code></span>
+<span class="codeline" id="line-97"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-98"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-99"><code>	t.nameSpace.escaped = true</code></span>
+<span class="codeline" id="line-100"><code>	if t.escapeErr == nil {</code></span>
+<span class="codeline" id="line-101"><code>		if t.Tree == nil {</code></span>
+<span class="codeline" id="line-102"><code>			return fmt.Errorf("template: %q is an incomplete or empty template", t.Name())</code></span>
+<span class="codeline" id="line-103"><code>		}</code></span>
+<span class="codeline" id="line-104"><code>		if err := escapeTemplate(t, t.text.Root, t.Name()); err != nil {</code></span>
+<span class="codeline" id="line-105"><code>			return err</code></span>
+<span class="codeline" id="line-106"><code>		}</code></span>
+<span class="codeline" id="line-107"><code>	} else if t.escapeErr != escapeOK {</code></span>
+<span class="codeline" id="line-108"><code>		return t.escapeErr</code></span>
+<span class="codeline" id="line-109"><code>	}</code></span>
+<span class="codeline" id="line-110"><code>	return nil</code></span>
+<span class="codeline" id="line-111"><code>}</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>// Execute applies a parsed template to the specified data object,</code></span>
+<span class="codeline" id="line-114"><code>// writing the output to wr.</code></span>
+<span class="codeline" id="line-115"><code>// If an error occurs executing the template or writing its output,</code></span>
+<span class="codeline" id="line-116"><code>// execution stops, but partial results may already have been written to</code></span>
+<span class="codeline" id="line-117"><code>// the output writer.</code></span>
+<span class="codeline" id="line-118"><code>// A template may be executed safely in parallel, although if parallel</code></span>
+<span class="codeline" id="line-119"><code>// executions share a Writer the output may be interleaved.</code></span>
+<span class="codeline" id="line-120"><code>func (t *Template) Execute(wr io.Writer, data any) error {</code></span>
+<span class="codeline" id="line-121"><code>	if err := t.escape(); err != nil {</code></span>
+<span class="codeline" id="line-122"><code>		return err</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	return t.text.Execute(wr, data)</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>// ExecuteTemplate applies the template associated with t that has the given</code></span>
+<span class="codeline" id="line-128"><code>// name to the specified data object and writes the output to wr.</code></span>
+<span class="codeline" id="line-129"><code>// If an error occurs executing the template or writing its output,</code></span>
+<span class="codeline" id="line-130"><code>// execution stops, but partial results may already have been written to</code></span>
+<span class="codeline" id="line-131"><code>// the output writer.</code></span>
+<span class="codeline" id="line-132"><code>// A template may be executed safely in parallel, although if parallel</code></span>
+<span class="codeline" id="line-133"><code>// executions share a Writer the output may be interleaved.</code></span>
+<span class="codeline" id="line-134"><code>func (t *Template) ExecuteTemplate(wr io.Writer, name string, data any) error {</code></span>
+<span class="codeline" id="line-135"><code>	tmpl, err := t.lookupAndEscapeTemplate(name)</code></span>
+<span class="codeline" id="line-136"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-137"><code>		return err</code></span>
+<span class="codeline" id="line-138"><code>	}</code></span>
+<span class="codeline" id="line-139"><code>	return tmpl.text.Execute(wr, data)</code></span>
+<span class="codeline" id="line-140"><code>}</code></span>
+<span class="codeline" id="line-141"><code></code></span>
+<span class="codeline" id="line-142"><code>// lookupAndEscapeTemplate guarantees that the template with the given name</code></span>
+<span class="codeline" id="line-143"><code>// is escaped, or returns an error if it cannot be. It returns the named</code></span>
+<span class="codeline" id="line-144"><code>// template.</code></span>
+<span class="codeline" id="line-145"><code>func (t *Template) lookupAndEscapeTemplate(name string) (tmpl *Template, err error) {</code></span>
+<span class="codeline" id="line-146"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-147"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-148"><code>	t.nameSpace.escaped = true</code></span>
+<span class="codeline" id="line-149"><code>	tmpl = t.set[name]</code></span>
+<span class="codeline" id="line-150"><code>	if tmpl == nil {</code></span>
+<span class="codeline" id="line-151"><code>		return nil, fmt.Errorf("html/template: %q is undefined", name)</code></span>
+<span class="codeline" id="line-152"><code>	}</code></span>
+<span class="codeline" id="line-153"><code>	if tmpl.escapeErr != nil &amp;&amp; tmpl.escapeErr != escapeOK {</code></span>
+<span class="codeline" id="line-154"><code>		return nil, tmpl.escapeErr</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code>	if tmpl.text.Tree == nil || tmpl.text.Root == nil {</code></span>
+<span class="codeline" id="line-157"><code>		return nil, fmt.Errorf("html/template: %q is an incomplete template", name)</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>	if t.text.Lookup(name) == nil {</code></span>
+<span class="codeline" id="line-160"><code>		panic("html/template internal error: template escaping out of sync")</code></span>
+<span class="codeline" id="line-161"><code>	}</code></span>
+<span class="codeline" id="line-162"><code>	if tmpl.escapeErr == nil {</code></span>
+<span class="codeline" id="line-163"><code>		err = escapeTemplate(tmpl, tmpl.text.Root, name)</code></span>
+<span class="codeline" id="line-164"><code>	}</code></span>
+<span class="codeline" id="line-165"><code>	return tmpl, err</code></span>
+<span class="codeline" id="line-166"><code>}</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>// DefinedTemplates returns a string listing the defined templates,</code></span>
+<span class="codeline" id="line-169"><code>// prefixed by the string "; defined templates are: ". If there are none,</code></span>
+<span class="codeline" id="line-170"><code>// it returns the empty string. Used to generate an error message.</code></span>
+<span class="codeline" id="line-171"><code>func (t *Template) DefinedTemplates() string {</code></span>
+<span class="codeline" id="line-172"><code>	return t.text.DefinedTemplates()</code></span>
+<span class="codeline" id="line-173"><code>}</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>// Parse parses text as a template body for t.</code></span>
+<span class="codeline" id="line-176"><code>// Named template definitions ({{define ...}} or {{block ...}} statements) in text</code></span>
+<span class="codeline" id="line-177"><code>// define additional templates associated with t and are removed from the</code></span>
+<span class="codeline" id="line-178"><code>// definition of t itself.</code></span>
+<span class="codeline" id="line-179"><code>//</code></span>
+<span class="codeline" id="line-180"><code>// Templates can be redefined in successive calls to Parse,</code></span>
+<span class="codeline" id="line-181"><code>// before the first use of Execute on t or any associated template.</code></span>
+<span class="codeline" id="line-182"><code>// A template definition with a body containing only white space and comments</code></span>
+<span class="codeline" id="line-183"><code>// is considered empty and will not replace an existing template's body.</code></span>
+<span class="codeline" id="line-184"><code>// This allows using Parse to add new named template definitions without</code></span>
+<span class="codeline" id="line-185"><code>// overwriting the main template body.</code></span>
+<span class="codeline" id="line-186"><code>func (t *Template) Parse(text string) (*Template, error) {</code></span>
+<span class="codeline" id="line-187"><code>	if err := t.checkCanParse(); err != nil {</code></span>
+<span class="codeline" id="line-188"><code>		return nil, err</code></span>
+<span class="codeline" id="line-189"><code>	}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>	ret, err := t.text.Parse(text)</code></span>
+<span class="codeline" id="line-192"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-193"><code>		return nil, err</code></span>
+<span class="codeline" id="line-194"><code>	}</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>	// In general, all the named templates might have changed underfoot.</code></span>
+<span class="codeline" id="line-197"><code>	// Regardless, some new ones may have been defined.</code></span>
+<span class="codeline" id="line-198"><code>	// The template.Template set has been updated; update ours.</code></span>
+<span class="codeline" id="line-199"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-200"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-201"><code>	for _, v := range ret.Templates() {</code></span>
+<span class="codeline" id="line-202"><code>		name := v.Name()</code></span>
+<span class="codeline" id="line-203"><code>		tmpl := t.set[name]</code></span>
+<span class="codeline" id="line-204"><code>		if tmpl == nil {</code></span>
+<span class="codeline" id="line-205"><code>			tmpl = t.new(name)</code></span>
+<span class="codeline" id="line-206"><code>		}</code></span>
+<span class="codeline" id="line-207"><code>		tmpl.text = v</code></span>
+<span class="codeline" id="line-208"><code>		tmpl.Tree = v.Tree</code></span>
+<span class="codeline" id="line-209"><code>	}</code></span>
+<span class="codeline" id="line-210"><code>	return t, nil</code></span>
+<span class="codeline" id="line-211"><code>}</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>// AddParseTree creates a new template with the name and parse tree</code></span>
+<span class="codeline" id="line-214"><code>// and associates it with t.</code></span>
+<span class="codeline" id="line-215"><code>//</code></span>
+<span class="codeline" id="line-216"><code>// It returns an error if t or any associated template has already been executed.</code></span>
+<span class="codeline" id="line-217"><code>func (t *Template) AddParseTree(name string, tree *parse.Tree) (*Template, error) {</code></span>
+<span class="codeline" id="line-218"><code>	if err := t.checkCanParse(); err != nil {</code></span>
+<span class="codeline" id="line-219"><code>		return nil, err</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-223"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-224"><code>	text, err := t.text.AddParseTree(name, tree)</code></span>
+<span class="codeline" id="line-225"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-226"><code>		return nil, err</code></span>
+<span class="codeline" id="line-227"><code>	}</code></span>
+<span class="codeline" id="line-228"><code>	ret := &amp;Template{</code></span>
+<span class="codeline" id="line-229"><code>		nil,</code></span>
+<span class="codeline" id="line-230"><code>		text,</code></span>
+<span class="codeline" id="line-231"><code>		text.Tree,</code></span>
+<span class="codeline" id="line-232"><code>		t.nameSpace,</code></span>
+<span class="codeline" id="line-233"><code>	}</code></span>
+<span class="codeline" id="line-234"><code>	t.set[name] = ret</code></span>
+<span class="codeline" id="line-235"><code>	return ret, nil</code></span>
+<span class="codeline" id="line-236"><code>}</code></span>
+<span class="codeline" id="line-237"><code></code></span>
+<span class="codeline" id="line-238"><code>// Clone returns a duplicate of the template, including all associated</code></span>
+<span class="codeline" id="line-239"><code>// templates. The actual representation is not copied, but the name space of</code></span>
+<span class="codeline" id="line-240"><code>// associated templates is, so further calls to Parse in the copy will add</code></span>
+<span class="codeline" id="line-241"><code>// templates to the copy but not to the original. Clone can be used to prepare</code></span>
+<span class="codeline" id="line-242"><code>// common templates and use them with variant definitions for other templates</code></span>
+<span class="codeline" id="line-243"><code>// by adding the variants after the clone is made.</code></span>
+<span class="codeline" id="line-244"><code>//</code></span>
+<span class="codeline" id="line-245"><code>// It returns an error if t has already been executed.</code></span>
+<span class="codeline" id="line-246"><code>func (t *Template) Clone() (*Template, error) {</code></span>
+<span class="codeline" id="line-247"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-248"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-249"><code>	if t.escapeErr != nil {</code></span>
+<span class="codeline" id="line-250"><code>		return nil, fmt.Errorf("html/template: cannot Clone %q after it has executed", t.Name())</code></span>
+<span class="codeline" id="line-251"><code>	}</code></span>
+<span class="codeline" id="line-252"><code>	textClone, err := t.text.Clone()</code></span>
+<span class="codeline" id="line-253"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-254"><code>		return nil, err</code></span>
+<span class="codeline" id="line-255"><code>	}</code></span>
+<span class="codeline" id="line-256"><code>	ns := &amp;nameSpace{set: make(map[string]*Template)}</code></span>
+<span class="codeline" id="line-257"><code>	ns.esc = makeEscaper(ns)</code></span>
+<span class="codeline" id="line-258"><code>	ret := &amp;Template{</code></span>
+<span class="codeline" id="line-259"><code>		nil,</code></span>
+<span class="codeline" id="line-260"><code>		textClone,</code></span>
+<span class="codeline" id="line-261"><code>		textClone.Tree,</code></span>
+<span class="codeline" id="line-262"><code>		ns,</code></span>
+<span class="codeline" id="line-263"><code>	}</code></span>
+<span class="codeline" id="line-264"><code>	ret.set[ret.Name()] = ret</code></span>
+<span class="codeline" id="line-265"><code>	for _, x := range textClone.Templates() {</code></span>
+<span class="codeline" id="line-266"><code>		name := x.Name()</code></span>
+<span class="codeline" id="line-267"><code>		src := t.set[name]</code></span>
+<span class="codeline" id="line-268"><code>		if src == nil || src.escapeErr != nil {</code></span>
+<span class="codeline" id="line-269"><code>			return nil, fmt.Errorf("html/template: cannot Clone %q after it has executed", t.Name())</code></span>
+<span class="codeline" id="line-270"><code>		}</code></span>
+<span class="codeline" id="line-271"><code>		x.Tree = x.Tree.Copy()</code></span>
+<span class="codeline" id="line-272"><code>		ret.set[name] = &amp;Template{</code></span>
+<span class="codeline" id="line-273"><code>			nil,</code></span>
+<span class="codeline" id="line-274"><code>			x,</code></span>
+<span class="codeline" id="line-275"><code>			x.Tree,</code></span>
+<span class="codeline" id="line-276"><code>			ret.nameSpace,</code></span>
+<span class="codeline" id="line-277"><code>		}</code></span>
+<span class="codeline" id="line-278"><code>	}</code></span>
+<span class="codeline" id="line-279"><code>	// Return the template associated with the name of this template.</code></span>
+<span class="codeline" id="line-280"><code>	return ret.set[ret.Name()], nil</code></span>
+<span class="codeline" id="line-281"><code>}</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>// New allocates a new HTML template with the given name.</code></span>
+<span class="codeline" id="line-284"><code>func New(name string) *Template {</code></span>
+<span class="codeline" id="line-285"><code>	ns := &amp;nameSpace{set: make(map[string]*Template)}</code></span>
+<span class="codeline" id="line-286"><code>	ns.esc = makeEscaper(ns)</code></span>
+<span class="codeline" id="line-287"><code>	tmpl := &amp;Template{</code></span>
+<span class="codeline" id="line-288"><code>		nil,</code></span>
+<span class="codeline" id="line-289"><code>		template.New(name),</code></span>
+<span class="codeline" id="line-290"><code>		nil,</code></span>
+<span class="codeline" id="line-291"><code>		ns,</code></span>
+<span class="codeline" id="line-292"><code>	}</code></span>
+<span class="codeline" id="line-293"><code>	tmpl.set[name] = tmpl</code></span>
+<span class="codeline" id="line-294"><code>	return tmpl</code></span>
+<span class="codeline" id="line-295"><code>}</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>// New allocates a new HTML template associated with the given one</code></span>
+<span class="codeline" id="line-298"><code>// and with the same delimiters. The association, which is transitive,</code></span>
+<span class="codeline" id="line-299"><code>// allows one template to invoke another with a {{template}} action.</code></span>
+<span class="codeline" id="line-300"><code>//</code></span>
+<span class="codeline" id="line-301"><code>// If a template with the given name already exists, the new HTML template</code></span>
+<span class="codeline" id="line-302"><code>// will replace it. The existing template will be reset and disassociated with</code></span>
+<span class="codeline" id="line-303"><code>// t.</code></span>
+<span class="codeline" id="line-304"><code>func (t *Template) New(name string) *Template {</code></span>
+<span class="codeline" id="line-305"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-306"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-307"><code>	return t.new(name)</code></span>
+<span class="codeline" id="line-308"><code>}</code></span>
+<span class="codeline" id="line-309"><code></code></span>
+<span class="codeline" id="line-310"><code>// new is the implementation of New, without the lock.</code></span>
+<span class="codeline" id="line-311"><code>func (t *Template) new(name string) *Template {</code></span>
+<span class="codeline" id="line-312"><code>	tmpl := &amp;Template{</code></span>
+<span class="codeline" id="line-313"><code>		nil,</code></span>
+<span class="codeline" id="line-314"><code>		t.text.New(name),</code></span>
+<span class="codeline" id="line-315"><code>		nil,</code></span>
+<span class="codeline" id="line-316"><code>		t.nameSpace,</code></span>
+<span class="codeline" id="line-317"><code>	}</code></span>
+<span class="codeline" id="line-318"><code>	if existing, ok := tmpl.set[name]; ok {</code></span>
+<span class="codeline" id="line-319"><code>		emptyTmpl := New(existing.Name())</code></span>
+<span class="codeline" id="line-320"><code>		*existing = *emptyTmpl</code></span>
+<span class="codeline" id="line-321"><code>	}</code></span>
+<span class="codeline" id="line-322"><code>	tmpl.set[name] = tmpl</code></span>
+<span class="codeline" id="line-323"><code>	return tmpl</code></span>
+<span class="codeline" id="line-324"><code>}</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>// Name returns the name of the template.</code></span>
+<span class="codeline" id="line-327"><code>func (t *Template) Name() string {</code></span>
+<span class="codeline" id="line-328"><code>	return t.text.Name()</code></span>
+<span class="codeline" id="line-329"><code>}</code></span>
+<span class="codeline" id="line-330"><code></code></span>
+<span class="codeline" id="line-331"><code>type FuncMap = template.FuncMap</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>// Funcs adds the elements of the argument map to the template's function map.</code></span>
+<span class="codeline" id="line-334"><code>// It must be called before the template is parsed.</code></span>
+<span class="codeline" id="line-335"><code>// It panics if a value in the map is not a function with appropriate return</code></span>
+<span class="codeline" id="line-336"><code>// type. However, it is legal to overwrite elements of the map. The return</code></span>
+<span class="codeline" id="line-337"><code>// value is the template, so calls can be chained.</code></span>
+<span class="codeline" id="line-338"><code>func (t *Template) Funcs(funcMap FuncMap) *Template {</code></span>
+<span class="codeline" id="line-339"><code>	t.text.Funcs(template.FuncMap(funcMap))</code></span>
+<span class="codeline" id="line-340"><code>	return t</code></span>
+<span class="codeline" id="line-341"><code>}</code></span>
+<span class="codeline" id="line-342"><code></code></span>
+<span class="codeline" id="line-343"><code>// Delims sets the action delimiters to the specified strings, to be used in</code></span>
+<span class="codeline" id="line-344"><code>// subsequent calls to Parse, ParseFiles, or ParseGlob. Nested template</code></span>
+<span class="codeline" id="line-345"><code>// definitions will inherit the settings. An empty delimiter stands for the</code></span>
+<span class="codeline" id="line-346"><code>// corresponding default: {{ or }}.</code></span>
+<span class="codeline" id="line-347"><code>// The return value is the template, so calls can be chained.</code></span>
+<span class="codeline" id="line-348"><code>func (t *Template) Delims(left, right string) *Template {</code></span>
+<span class="codeline" id="line-349"><code>	t.text.Delims(left, right)</code></span>
+<span class="codeline" id="line-350"><code>	return t</code></span>
+<span class="codeline" id="line-351"><code>}</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>// Lookup returns the template with the given name that is associated with t,</code></span>
+<span class="codeline" id="line-354"><code>// or nil if there is no such template.</code></span>
+<span class="codeline" id="line-355"><code>func (t *Template) Lookup(name string) *Template {</code></span>
+<span class="codeline" id="line-356"><code>	t.nameSpace.mu.Lock()</code></span>
+<span class="codeline" id="line-357"><code>	defer t.nameSpace.mu.Unlock()</code></span>
+<span class="codeline" id="line-358"><code>	return t.set[name]</code></span>
+<span class="codeline" id="line-359"><code>}</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>// Must is a helper that wraps a call to a function returning (*Template, error)</code></span>
+<span class="codeline" id="line-362"><code>// and panics if the error is non-nil. It is intended for use in variable initializations</code></span>
+<span class="codeline" id="line-363"><code>// such as</code></span>
+<span class="codeline" id="line-364"><code>//</code></span>
+<span class="codeline" id="line-365"><code>//	var t = template.Must(template.New("name").Parse("html"))</code></span>
+<span class="codeline" id="line-366"><code>func Must(t *Template, err error) *Template {</code></span>
+<span class="codeline" id="line-367"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-368"><code>		panic(err)</code></span>
+<span class="codeline" id="line-369"><code>	}</code></span>
+<span class="codeline" id="line-370"><code>	return t</code></span>
+<span class="codeline" id="line-371"><code>}</code></span>
+<span class="codeline" id="line-372"><code></code></span>
+<span class="codeline" id="line-373"><code>// ParseFiles creates a new Template and parses the template definitions from</code></span>
+<span class="codeline" id="line-374"><code>// the named files. The returned template's name will have the (base) name and</code></span>
+<span class="codeline" id="line-375"><code>// (parsed) contents of the first file. There must be at least one file.</code></span>
+<span class="codeline" id="line-376"><code>// If an error occurs, parsing stops and the returned *Template is nil.</code></span>
+<span class="codeline" id="line-377"><code>//</code></span>
+<span class="codeline" id="line-378"><code>// When parsing multiple files with the same name in different directories,</code></span>
+<span class="codeline" id="line-379"><code>// the last one mentioned will be the one that results.</code></span>
+<span class="codeline" id="line-380"><code>// For instance, ParseFiles("a/foo", "b/foo") stores "b/foo" as the template</code></span>
+<span class="codeline" id="line-381"><code>// named "foo", while "a/foo" is unavailable.</code></span>
+<span class="codeline" id="line-382"><code>func ParseFiles(filenames ...string) (*Template, error) {</code></span>
+<span class="codeline" id="line-383"><code>	return parseFiles(nil, readFileOS, filenames...)</code></span>
+<span class="codeline" id="line-384"><code>}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>// ParseFiles parses the named files and associates the resulting templates with</code></span>
+<span class="codeline" id="line-387"><code>// t. If an error occurs, parsing stops and the returned template is nil;</code></span>
+<span class="codeline" id="line-388"><code>// otherwise it is t. There must be at least one file.</code></span>
+<span class="codeline" id="line-389"><code>//</code></span>
+<span class="codeline" id="line-390"><code>// When parsing multiple files with the same name in different directories,</code></span>
+<span class="codeline" id="line-391"><code>// the last one mentioned will be the one that results.</code></span>
+<span class="codeline" id="line-392"><code>//</code></span>
+<span class="codeline" id="line-393"><code>// ParseFiles returns an error if t or any associated template has already been executed.</code></span>
+<span class="codeline" id="line-394"><code>func (t *Template) ParseFiles(filenames ...string) (*Template, error) {</code></span>
+<span class="codeline" id="line-395"><code>	return parseFiles(t, readFileOS, filenames...)</code></span>
+<span class="codeline" id="line-396"><code>}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>// parseFiles is the helper for the method and function. If the argument</code></span>
+<span class="codeline" id="line-399"><code>// template is nil, it is created from the first file.</code></span>
+<span class="codeline" id="line-400"><code>func parseFiles(t *Template, readFile func(string) (string, []byte, error), filenames ...string) (*Template, error) {</code></span>
+<span class="codeline" id="line-401"><code>	if err := t.checkCanParse(); err != nil {</code></span>
+<span class="codeline" id="line-402"><code>		return nil, err</code></span>
+<span class="codeline" id="line-403"><code>	}</code></span>
+<span class="codeline" id="line-404"><code></code></span>
+<span class="codeline" id="line-405"><code>	if len(filenames) == 0 {</code></span>
+<span class="codeline" id="line-406"><code>		// Not really a problem, but be consistent.</code></span>
+<span class="codeline" id="line-407"><code>		return nil, fmt.Errorf("html/template: no files named in call to ParseFiles")</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code>	for _, filename := range filenames {</code></span>
+<span class="codeline" id="line-410"><code>		name, b, err := readFile(filename)</code></span>
+<span class="codeline" id="line-411"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-412"><code>			return nil, err</code></span>
+<span class="codeline" id="line-413"><code>		}</code></span>
+<span class="codeline" id="line-414"><code>		s := string(b)</code></span>
+<span class="codeline" id="line-415"><code>		// First template becomes return value if not already defined,</code></span>
+<span class="codeline" id="line-416"><code>		// and we use that one for subsequent New calls to associate</code></span>
+<span class="codeline" id="line-417"><code>		// all the templates together. Also, if this file has the same name</code></span>
+<span class="codeline" id="line-418"><code>		// as t, this file becomes the contents of t, so</code></span>
+<span class="codeline" id="line-419"><code>		//  t, err := New(name).Funcs(xxx).ParseFiles(name)</code></span>
+<span class="codeline" id="line-420"><code>		// works. Otherwise we create a new template associated with t.</code></span>
+<span class="codeline" id="line-421"><code>		var tmpl *Template</code></span>
+<span class="codeline" id="line-422"><code>		if t == nil {</code></span>
+<span class="codeline" id="line-423"><code>			t = New(name)</code></span>
+<span class="codeline" id="line-424"><code>		}</code></span>
+<span class="codeline" id="line-425"><code>		if name == t.Name() {</code></span>
+<span class="codeline" id="line-426"><code>			tmpl = t</code></span>
+<span class="codeline" id="line-427"><code>		} else {</code></span>
+<span class="codeline" id="line-428"><code>			tmpl = t.New(name)</code></span>
+<span class="codeline" id="line-429"><code>		}</code></span>
+<span class="codeline" id="line-430"><code>		_, err = tmpl.Parse(s)</code></span>
+<span class="codeline" id="line-431"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-432"><code>			return nil, err</code></span>
+<span class="codeline" id="line-433"><code>		}</code></span>
+<span class="codeline" id="line-434"><code>	}</code></span>
+<span class="codeline" id="line-435"><code>	return t, nil</code></span>
+<span class="codeline" id="line-436"><code>}</code></span>
+<span class="codeline" id="line-437"><code></code></span>
+<span class="codeline" id="line-438"><code>// ParseGlob creates a new Template and parses the template definitions from</code></span>
+<span class="codeline" id="line-439"><code>// the files identified by the pattern. The files are matched according to the</code></span>
+<span class="codeline" id="line-440"><code>// semantics of filepath.Match, and the pattern must match at least one file.</code></span>
+<span class="codeline" id="line-441"><code>// The returned template will have the (base) name and (parsed) contents of the</code></span>
+<span class="codeline" id="line-442"><code>// first file matched by the pattern. ParseGlob is equivalent to calling</code></span>
+<span class="codeline" id="line-443"><code>// ParseFiles with the list of files matched by the pattern.</code></span>
+<span class="codeline" id="line-444"><code>//</code></span>
+<span class="codeline" id="line-445"><code>// When parsing multiple files with the same name in different directories,</code></span>
+<span class="codeline" id="line-446"><code>// the last one mentioned will be the one that results.</code></span>
+<span class="codeline" id="line-447"><code>func ParseGlob(pattern string) (*Template, error) {</code></span>
+<span class="codeline" id="line-448"><code>	return parseGlob(nil, pattern)</code></span>
+<span class="codeline" id="line-449"><code>}</code></span>
+<span class="codeline" id="line-450"><code></code></span>
+<span class="codeline" id="line-451"><code>// ParseGlob parses the template definitions in the files identified by the</code></span>
+<span class="codeline" id="line-452"><code>// pattern and associates the resulting templates with t. The files are matched</code></span>
+<span class="codeline" id="line-453"><code>// according to the semantics of filepath.Match, and the pattern must match at</code></span>
+<span class="codeline" id="line-454"><code>// least one file. ParseGlob is equivalent to calling t.ParseFiles with the</code></span>
+<span class="codeline" id="line-455"><code>// list of files matched by the pattern.</code></span>
+<span class="codeline" id="line-456"><code>//</code></span>
+<span class="codeline" id="line-457"><code>// When parsing multiple files with the same name in different directories,</code></span>
+<span class="codeline" id="line-458"><code>// the last one mentioned will be the one that results.</code></span>
+<span class="codeline" id="line-459"><code>//</code></span>
+<span class="codeline" id="line-460"><code>// ParseGlob returns an error if t or any associated template has already been executed.</code></span>
+<span class="codeline" id="line-461"><code>func (t *Template) ParseGlob(pattern string) (*Template, error) {</code></span>
+<span class="codeline" id="line-462"><code>	return parseGlob(t, pattern)</code></span>
+<span class="codeline" id="line-463"><code>}</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>// parseGlob is the implementation of the function and method ParseGlob.</code></span>
+<span class="codeline" id="line-466"><code>func parseGlob(t *Template, pattern string) (*Template, error) {</code></span>
+<span class="codeline" id="line-467"><code>	if err := t.checkCanParse(); err != nil {</code></span>
+<span class="codeline" id="line-468"><code>		return nil, err</code></span>
+<span class="codeline" id="line-469"><code>	}</code></span>
+<span class="codeline" id="line-470"><code>	filenames, err := filepath.Glob(pattern)</code></span>
+<span class="codeline" id="line-471"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-472"><code>		return nil, err</code></span>
+<span class="codeline" id="line-473"><code>	}</code></span>
+<span class="codeline" id="line-474"><code>	if len(filenames) == 0 {</code></span>
+<span class="codeline" id="line-475"><code>		return nil, fmt.Errorf("html/template: pattern matches no files: %#q", pattern)</code></span>
+<span class="codeline" id="line-476"><code>	}</code></span>
+<span class="codeline" id="line-477"><code>	return parseFiles(t, readFileOS, filenames...)</code></span>
+<span class="codeline" id="line-478"><code>}</code></span>
+<span class="codeline" id="line-479"><code></code></span>
+<span class="codeline" id="line-480"><code>// IsTrue reports whether the value is 'true', in the sense of not the zero of its type,</code></span>
+<span class="codeline" id="line-481"><code>// and whether the value has a meaningful truth value. This is the definition of</code></span>
+<span class="codeline" id="line-482"><code>// truth used by if and other such actions.</code></span>
+<span class="codeline" id="line-483"><code>func IsTrue(val any) (truth, ok bool) {</code></span>
+<span class="codeline" id="line-484"><code>	return template.IsTrue(val)</code></span>
+<span class="codeline" id="line-485"><code>}</code></span>
+<span class="codeline" id="line-486"><code></code></span>
+<span class="codeline" id="line-487"><code>// ParseFS is like ParseFiles or ParseGlob but reads from the file system fs</code></span>
+<span class="codeline" id="line-488"><code>// instead of the host operating system's file system.</code></span>
+<span class="codeline" id="line-489"><code>// It accepts a list of glob patterns.</code></span>
+<span class="codeline" id="line-490"><code>// (Note that most file names serve as glob patterns matching only themselves.)</code></span>
+<span class="codeline" id="line-491"><code>func ParseFS(fs fs.FS, patterns ...string) (*Template, error) {</code></span>
+<span class="codeline" id="line-492"><code>	return parseFS(nil, fs, patterns)</code></span>
+<span class="codeline" id="line-493"><code>}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>// ParseFS is like ParseFiles or ParseGlob but reads from the file system fs</code></span>
+<span class="codeline" id="line-496"><code>// instead of the host operating system's file system.</code></span>
+<span class="codeline" id="line-497"><code>// It accepts a list of glob patterns.</code></span>
+<span class="codeline" id="line-498"><code>// (Note that most file names serve as glob patterns matching only themselves.)</code></span>
+<span class="codeline" id="line-499"><code>func (t *Template) ParseFS(fs fs.FS, patterns ...string) (*Template, error) {</code></span>
+<span class="codeline" id="line-500"><code>	return parseFS(t, fs, patterns)</code></span>
+<span class="codeline" id="line-501"><code>}</code></span>
+<span class="codeline" id="line-502"><code></code></span>
+<span class="codeline" id="line-503"><code>func parseFS(t *Template, fsys fs.FS, patterns []string) (*Template, error) {</code></span>
+<span class="codeline" id="line-504"><code>	var filenames []string</code></span>
+<span class="codeline" id="line-505"><code>	for _, pattern := range patterns {</code></span>
+<span class="codeline" id="line-506"><code>		list, err := fs.Glob(fsys, pattern)</code></span>
+<span class="codeline" id="line-507"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-508"><code>			return nil, err</code></span>
+<span class="codeline" id="line-509"><code>		}</code></span>
+<span class="codeline" id="line-510"><code>		if len(list) == 0 {</code></span>
+<span class="codeline" id="line-511"><code>			return nil, fmt.Errorf("template: pattern matches no files: %#q", pattern)</code></span>
+<span class="codeline" id="line-512"><code>		}</code></span>
+<span class="codeline" id="line-513"><code>		filenames = append(filenames, list...)</code></span>
+<span class="codeline" id="line-514"><code>	}</code></span>
+<span class="codeline" id="line-515"><code>	return parseFiles(t, readFileFS(fsys), filenames...)</code></span>
+<span class="codeline" id="line-516"><code>}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>func readFileOS(file string) (name string, b []byte, err error) {</code></span>
+<span class="codeline" id="line-519"><code>	name = filepath.Base(file)</code></span>
+<span class="codeline" id="line-520"><code>	b, err = os.ReadFile(file)</code></span>
+<span class="codeline" id="line-521"><code>	return</code></span>
+<span class="codeline" id="line-522"><code>}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>func readFileFS(fsys fs.FS) func(string) (string, []byte, error) {</code></span>
+<span class="codeline" id="line-525"><code>	return func(file string) (name string, b []byte, err error) {</code></span>
+<span class="codeline" id="line-526"><code>		name = path.Base(file)</code></span>
+<span class="codeline" id="line-527"><code>		b, err = fs.ReadFile(fsys, file)</code></span>
+<span class="codeline" id="line-528"><code>		return</code></span>
+<span class="codeline" id="line-529"><code>	}</code></span>
+<span class="codeline" id="line-530"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

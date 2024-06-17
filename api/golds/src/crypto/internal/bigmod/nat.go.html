@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: nat.go in package crypto/internal/bigmod</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	nat.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/crypto/internal/bigmod.html">crypto/internal/bigmod</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package bigmod</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"encoding/binary"</code></span>
+<span class="codeline" id="line-9"><code>	"errors"</code></span>
+<span class="codeline" id="line-10"><code>	"math/big"</code></span>
+<span class="codeline" id="line-11"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>const (</code></span>
+<span class="codeline" id="line-15"><code>	// _W is the size in bits of our limbs.</code></span>
+<span class="codeline" id="line-16"><code>	_W = bits.UintSize</code></span>
+<span class="codeline" id="line-17"><code>	// _S is the size in bytes of our limbs.</code></span>
+<span class="codeline" id="line-18"><code>	_S = _W / 8</code></span>
+<span class="codeline" id="line-19"><code>)</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>// choice represents a constant-time boolean. The value of choice is always</code></span>
+<span class="codeline" id="line-22"><code>// either 1 or 0. We use an int instead of bool in order to make decisions in</code></span>
+<span class="codeline" id="line-23"><code>// constant time by turning it into a mask.</code></span>
+<span class="codeline" id="line-24"><code>type choice uint</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>func not(c choice) choice { return 1 ^ c }</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>const yes = choice(1)</code></span>
+<span class="codeline" id="line-29"><code>const no = choice(0)</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>// ctMask is all 1s if on is yes, and all 0s otherwise.</code></span>
+<span class="codeline" id="line-32"><code>func ctMask(on choice) uint { return -uint(on) }</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>// ctEq returns 1 if x == y, and 0 otherwise. The execution time of this</code></span>
+<span class="codeline" id="line-35"><code>// function does not depend on its inputs.</code></span>
+<span class="codeline" id="line-36"><code>func ctEq(x, y uint) choice {</code></span>
+<span class="codeline" id="line-37"><code>	// If x != y, then either x - y or y - x will generate a carry.</code></span>
+<span class="codeline" id="line-38"><code>	_, c1 := bits.Sub(x, y, 0)</code></span>
+<span class="codeline" id="line-39"><code>	_, c2 := bits.Sub(y, x, 0)</code></span>
+<span class="codeline" id="line-40"><code>	return not(choice(c1 | c2))</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>// ctGeq returns 1 if x &gt;= y, and 0 otherwise. The execution time of this</code></span>
+<span class="codeline" id="line-44"><code>// function does not depend on its inputs.</code></span>
+<span class="codeline" id="line-45"><code>func ctGeq(x, y uint) choice {</code></span>
+<span class="codeline" id="line-46"><code>	// If x &lt; y, then x - y generates a carry.</code></span>
+<span class="codeline" id="line-47"><code>	_, carry := bits.Sub(x, y, 0)</code></span>
+<span class="codeline" id="line-48"><code>	return not(choice(carry))</code></span>
+<span class="codeline" id="line-49"><code>}</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>// Nat represents an arbitrary natural number</code></span>
+<span class="codeline" id="line-52"><code>//</code></span>
+<span class="codeline" id="line-53"><code>// Each Nat has an announced length, which is the number of limbs it has stored.</code></span>
+<span class="codeline" id="line-54"><code>// Operations on this number are allowed to leak this length, but will not leak</code></span>
+<span class="codeline" id="line-55"><code>// any information about the values contained in those limbs.</code></span>
+<span class="codeline" id="line-56"><code>type Nat struct {</code></span>
+<span class="codeline" id="line-57"><code>	// limbs is little-endian in base 2^W with W = bits.UintSize.</code></span>
+<span class="codeline" id="line-58"><code>	limbs []uint</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>// preallocTarget is the size in bits of the numbers used to implement the most</code></span>
+<span class="codeline" id="line-62"><code>// common and most performant RSA key size. It's also enough to cover some of</code></span>
+<span class="codeline" id="line-63"><code>// the operations of key sizes up to 4096.</code></span>
+<span class="codeline" id="line-64"><code>const preallocTarget = 2048</code></span>
+<span class="codeline" id="line-65"><code>const preallocLimbs = (preallocTarget + _W - 1) / _W</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// NewNat returns a new nat with a size of zero, just like new(Nat), but with</code></span>
+<span class="codeline" id="line-68"><code>// the preallocated capacity to hold a number of up to preallocTarget bits.</code></span>
+<span class="codeline" id="line-69"><code>// NewNat inlines, so the allocation can live on the stack.</code></span>
+<span class="codeline" id="line-70"><code>func NewNat() *Nat {</code></span>
+<span class="codeline" id="line-71"><code>	limbs := make([]uint, 0, preallocLimbs)</code></span>
+<span class="codeline" id="line-72"><code>	return &amp;Nat{limbs}</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>// expand expands x to n limbs, leaving its value unchanged.</code></span>
+<span class="codeline" id="line-76"><code>func (x *Nat) expand(n int) *Nat {</code></span>
+<span class="codeline" id="line-77"><code>	if len(x.limbs) &gt; n {</code></span>
+<span class="codeline" id="line-78"><code>		panic("bigmod: internal error: shrinking nat")</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code>	if cap(x.limbs) &lt; n {</code></span>
+<span class="codeline" id="line-81"><code>		newLimbs := make([]uint, n)</code></span>
+<span class="codeline" id="line-82"><code>		copy(newLimbs, x.limbs)</code></span>
+<span class="codeline" id="line-83"><code>		x.limbs = newLimbs</code></span>
+<span class="codeline" id="line-84"><code>		return x</code></span>
+<span class="codeline" id="line-85"><code>	}</code></span>
+<span class="codeline" id="line-86"><code>	extraLimbs := x.limbs[len(x.limbs):n]</code></span>
+<span class="codeline" id="line-87"><code>	for i := range extraLimbs {</code></span>
+<span class="codeline" id="line-88"><code>		extraLimbs[i] = 0</code></span>
+<span class="codeline" id="line-89"><code>	}</code></span>
+<span class="codeline" id="line-90"><code>	x.limbs = x.limbs[:n]</code></span>
+<span class="codeline" id="line-91"><code>	return x</code></span>
+<span class="codeline" id="line-92"><code>}</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>// reset returns a zero nat of n limbs, reusing x's storage if n &lt;= cap(x.limbs).</code></span>
+<span class="codeline" id="line-95"><code>func (x *Nat) reset(n int) *Nat {</code></span>
+<span class="codeline" id="line-96"><code>	if cap(x.limbs) &lt; n {</code></span>
+<span class="codeline" id="line-97"><code>		x.limbs = make([]uint, n)</code></span>
+<span class="codeline" id="line-98"><code>		return x</code></span>
+<span class="codeline" id="line-99"><code>	}</code></span>
+<span class="codeline" id="line-100"><code>	for i := range x.limbs {</code></span>
+<span class="codeline" id="line-101"><code>		x.limbs[i] = 0</code></span>
+<span class="codeline" id="line-102"><code>	}</code></span>
+<span class="codeline" id="line-103"><code>	x.limbs = x.limbs[:n]</code></span>
+<span class="codeline" id="line-104"><code>	return x</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// set assigns x = y, optionally resizing x to the appropriate size.</code></span>
+<span class="codeline" id="line-108"><code>func (x *Nat) set(y *Nat) *Nat {</code></span>
+<span class="codeline" id="line-109"><code>	x.reset(len(y.limbs))</code></span>
+<span class="codeline" id="line-110"><code>	copy(x.limbs, y.limbs)</code></span>
+<span class="codeline" id="line-111"><code>	return x</code></span>
+<span class="codeline" id="line-112"><code>}</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>// setBig assigns x = n, optionally resizing n to the appropriate size.</code></span>
+<span class="codeline" id="line-115"><code>//</code></span>
+<span class="codeline" id="line-116"><code>// The announced length of x is set based on the actual bit size of the input,</code></span>
+<span class="codeline" id="line-117"><code>// ignoring leading zeroes.</code></span>
+<span class="codeline" id="line-118"><code>func (x *Nat) setBig(n *big.Int) *Nat {</code></span>
+<span class="codeline" id="line-119"><code>	limbs := n.Bits()</code></span>
+<span class="codeline" id="line-120"><code>	x.reset(len(limbs))</code></span>
+<span class="codeline" id="line-121"><code>	for i := range limbs {</code></span>
+<span class="codeline" id="line-122"><code>		x.limbs[i] = uint(limbs[i])</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	return x</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>// Bytes returns x as a zero-extended big-endian byte slice. The size of the</code></span>
+<span class="codeline" id="line-128"><code>// slice will match the size of m.</code></span>
+<span class="codeline" id="line-129"><code>//</code></span>
+<span class="codeline" id="line-130"><code>// x must have the same size as m and it must be reduced modulo m.</code></span>
+<span class="codeline" id="line-131"><code>func (x *Nat) Bytes(m *Modulus) []byte {</code></span>
+<span class="codeline" id="line-132"><code>	i := m.Size()</code></span>
+<span class="codeline" id="line-133"><code>	bytes := make([]byte, i)</code></span>
+<span class="codeline" id="line-134"><code>	for _, limb := range x.limbs {</code></span>
+<span class="codeline" id="line-135"><code>		for j := 0; j &lt; _S; j++ {</code></span>
+<span class="codeline" id="line-136"><code>			i--</code></span>
+<span class="codeline" id="line-137"><code>			if i &lt; 0 {</code></span>
+<span class="codeline" id="line-138"><code>				if limb == 0 {</code></span>
+<span class="codeline" id="line-139"><code>					break</code></span>
+<span class="codeline" id="line-140"><code>				}</code></span>
+<span class="codeline" id="line-141"><code>				panic("bigmod: modulus is smaller than nat")</code></span>
+<span class="codeline" id="line-142"><code>			}</code></span>
+<span class="codeline" id="line-143"><code>			bytes[i] = byte(limb)</code></span>
+<span class="codeline" id="line-144"><code>			limb &gt;&gt;= 8</code></span>
+<span class="codeline" id="line-145"><code>		}</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	return bytes</code></span>
+<span class="codeline" id="line-148"><code>}</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>// SetBytes assigns x = b, where b is a slice of big-endian bytes.</code></span>
+<span class="codeline" id="line-151"><code>// SetBytes returns an error if b &gt;= m.</code></span>
+<span class="codeline" id="line-152"><code>//</code></span>
+<span class="codeline" id="line-153"><code>// The output will be resized to the size of m and overwritten.</code></span>
+<span class="codeline" id="line-154"><code>func (x *Nat) SetBytes(b []byte, m *Modulus) (*Nat, error) {</code></span>
+<span class="codeline" id="line-155"><code>	if err := x.setBytes(b, m); err != nil {</code></span>
+<span class="codeline" id="line-156"><code>		return nil, err</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code>	if x.cmpGeq(m.nat) == yes {</code></span>
+<span class="codeline" id="line-159"><code>		return nil, errors.New("input overflows the modulus")</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code>	return x, nil</code></span>
+<span class="codeline" id="line-162"><code>}</code></span>
+<span class="codeline" id="line-163"><code></code></span>
+<span class="codeline" id="line-164"><code>// SetOverflowingBytes assigns x = b, where b is a slice of big-endian bytes.</code></span>
+<span class="codeline" id="line-165"><code>// SetOverflowingBytes returns an error if b has a longer bit length than m, but</code></span>
+<span class="codeline" id="line-166"><code>// reduces overflowing values up to 2^⌈log2(m)⌉ - 1.</code></span>
+<span class="codeline" id="line-167"><code>//</code></span>
+<span class="codeline" id="line-168"><code>// The output will be resized to the size of m and overwritten.</code></span>
+<span class="codeline" id="line-169"><code>func (x *Nat) SetOverflowingBytes(b []byte, m *Modulus) (*Nat, error) {</code></span>
+<span class="codeline" id="line-170"><code>	if err := x.setBytes(b, m); err != nil {</code></span>
+<span class="codeline" id="line-171"><code>		return nil, err</code></span>
+<span class="codeline" id="line-172"><code>	}</code></span>
+<span class="codeline" id="line-173"><code>	leading := _W - bitLen(x.limbs[len(x.limbs)-1])</code></span>
+<span class="codeline" id="line-174"><code>	if leading &lt; m.leading {</code></span>
+<span class="codeline" id="line-175"><code>		return nil, errors.New("input overflows the modulus size")</code></span>
+<span class="codeline" id="line-176"><code>	}</code></span>
+<span class="codeline" id="line-177"><code>	x.maybeSubtractModulus(no, m)</code></span>
+<span class="codeline" id="line-178"><code>	return x, nil</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>// bigEndianUint returns the contents of buf interpreted as a</code></span>
+<span class="codeline" id="line-182"><code>// big-endian encoded uint value.</code></span>
+<span class="codeline" id="line-183"><code>func bigEndianUint(buf []byte) uint {</code></span>
+<span class="codeline" id="line-184"><code>	if _W == 64 {</code></span>
+<span class="codeline" id="line-185"><code>		return uint(binary.BigEndian.Uint64(buf))</code></span>
+<span class="codeline" id="line-186"><code>	}</code></span>
+<span class="codeline" id="line-187"><code>	return uint(binary.BigEndian.Uint32(buf))</code></span>
+<span class="codeline" id="line-188"><code>}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>func (x *Nat) setBytes(b []byte, m *Modulus) error {</code></span>
+<span class="codeline" id="line-191"><code>	x.resetFor(m)</code></span>
+<span class="codeline" id="line-192"><code>	i, k := len(b), 0</code></span>
+<span class="codeline" id="line-193"><code>	for k &lt; len(x.limbs) &amp;&amp; i &gt;= _S {</code></span>
+<span class="codeline" id="line-194"><code>		x.limbs[k] = bigEndianUint(b[i-_S : i])</code></span>
+<span class="codeline" id="line-195"><code>		i -= _S</code></span>
+<span class="codeline" id="line-196"><code>		k++</code></span>
+<span class="codeline" id="line-197"><code>	}</code></span>
+<span class="codeline" id="line-198"><code>	for s := 0; s &lt; _W &amp;&amp; k &lt; len(x.limbs) &amp;&amp; i &gt; 0; s += 8 {</code></span>
+<span class="codeline" id="line-199"><code>		x.limbs[k] |= uint(b[i-1]) &lt;&lt; s</code></span>
+<span class="codeline" id="line-200"><code>		i--</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code>	if i &gt; 0 {</code></span>
+<span class="codeline" id="line-203"><code>		return errors.New("input overflows the modulus size")</code></span>
+<span class="codeline" id="line-204"><code>	}</code></span>
+<span class="codeline" id="line-205"><code>	return nil</code></span>
+<span class="codeline" id="line-206"><code>}</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>// Equal returns 1 if x == y, and 0 otherwise.</code></span>
+<span class="codeline" id="line-209"><code>//</code></span>
+<span class="codeline" id="line-210"><code>// Both operands must have the same announced length.</code></span>
+<span class="codeline" id="line-211"><code>func (x *Nat) Equal(y *Nat) choice {</code></span>
+<span class="codeline" id="line-212"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-213"><code>	size := len(x.limbs)</code></span>
+<span class="codeline" id="line-214"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-215"><code>	yLimbs := y.limbs[:size]</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>	equal := yes</code></span>
+<span class="codeline" id="line-218"><code>	for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-219"><code>		equal &amp;= ctEq(xLimbs[i], yLimbs[i])</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code>	return equal</code></span>
+<span class="codeline" id="line-222"><code>}</code></span>
+<span class="codeline" id="line-223"><code></code></span>
+<span class="codeline" id="line-224"><code>// IsZero returns 1 if x == 0, and 0 otherwise.</code></span>
+<span class="codeline" id="line-225"><code>func (x *Nat) IsZero() choice {</code></span>
+<span class="codeline" id="line-226"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-227"><code>	size := len(x.limbs)</code></span>
+<span class="codeline" id="line-228"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>	zero := yes</code></span>
+<span class="codeline" id="line-231"><code>	for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-232"><code>		zero &amp;= ctEq(xLimbs[i], 0)</code></span>
+<span class="codeline" id="line-233"><code>	}</code></span>
+<span class="codeline" id="line-234"><code>	return zero</code></span>
+<span class="codeline" id="line-235"><code>}</code></span>
+<span class="codeline" id="line-236"><code></code></span>
+<span class="codeline" id="line-237"><code>// cmpGeq returns 1 if x &gt;= y, and 0 otherwise.</code></span>
+<span class="codeline" id="line-238"><code>//</code></span>
+<span class="codeline" id="line-239"><code>// Both operands must have the same announced length.</code></span>
+<span class="codeline" id="line-240"><code>func (x *Nat) cmpGeq(y *Nat) choice {</code></span>
+<span class="codeline" id="line-241"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-242"><code>	size := len(x.limbs)</code></span>
+<span class="codeline" id="line-243"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-244"><code>	yLimbs := y.limbs[:size]</code></span>
+<span class="codeline" id="line-245"><code></code></span>
+<span class="codeline" id="line-246"><code>	var c uint</code></span>
+<span class="codeline" id="line-247"><code>	for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-248"><code>		_, c = bits.Sub(xLimbs[i], yLimbs[i], c)</code></span>
+<span class="codeline" id="line-249"><code>	}</code></span>
+<span class="codeline" id="line-250"><code>	// If there was a carry, then subtracting y underflowed, so</code></span>
+<span class="codeline" id="line-251"><code>	// x is not greater than or equal to y.</code></span>
+<span class="codeline" id="line-252"><code>	return not(choice(c))</code></span>
+<span class="codeline" id="line-253"><code>}</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>// assign sets x &lt;- y if on == 1, and does nothing otherwise.</code></span>
+<span class="codeline" id="line-256"><code>//</code></span>
+<span class="codeline" id="line-257"><code>// Both operands must have the same announced length.</code></span>
+<span class="codeline" id="line-258"><code>func (x *Nat) assign(on choice, y *Nat) *Nat {</code></span>
+<span class="codeline" id="line-259"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-260"><code>	size := len(x.limbs)</code></span>
+<span class="codeline" id="line-261"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-262"><code>	yLimbs := y.limbs[:size]</code></span>
+<span class="codeline" id="line-263"><code></code></span>
+<span class="codeline" id="line-264"><code>	mask := ctMask(on)</code></span>
+<span class="codeline" id="line-265"><code>	for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-266"><code>		xLimbs[i] ^= mask &amp; (xLimbs[i] ^ yLimbs[i])</code></span>
+<span class="codeline" id="line-267"><code>	}</code></span>
+<span class="codeline" id="line-268"><code>	return x</code></span>
+<span class="codeline" id="line-269"><code>}</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>// add computes x += y and returns the carry.</code></span>
+<span class="codeline" id="line-272"><code>//</code></span>
+<span class="codeline" id="line-273"><code>// Both operands must have the same announced length.</code></span>
+<span class="codeline" id="line-274"><code>func (x *Nat) add(y *Nat) (c uint) {</code></span>
+<span class="codeline" id="line-275"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-276"><code>	size := len(x.limbs)</code></span>
+<span class="codeline" id="line-277"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-278"><code>	yLimbs := y.limbs[:size]</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>	for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-281"><code>		xLimbs[i], c = bits.Add(xLimbs[i], yLimbs[i], c)</code></span>
+<span class="codeline" id="line-282"><code>	}</code></span>
+<span class="codeline" id="line-283"><code>	return</code></span>
+<span class="codeline" id="line-284"><code>}</code></span>
+<span class="codeline" id="line-285"><code></code></span>
+<span class="codeline" id="line-286"><code>// sub computes x -= y. It returns the borrow of the subtraction.</code></span>
+<span class="codeline" id="line-287"><code>//</code></span>
+<span class="codeline" id="line-288"><code>// Both operands must have the same announced length.</code></span>
+<span class="codeline" id="line-289"><code>func (x *Nat) sub(y *Nat) (c uint) {</code></span>
+<span class="codeline" id="line-290"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-291"><code>	size := len(x.limbs)</code></span>
+<span class="codeline" id="line-292"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-293"><code>	yLimbs := y.limbs[:size]</code></span>
+<span class="codeline" id="line-294"><code></code></span>
+<span class="codeline" id="line-295"><code>	for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-296"><code>		xLimbs[i], c = bits.Sub(xLimbs[i], yLimbs[i], c)</code></span>
+<span class="codeline" id="line-297"><code>	}</code></span>
+<span class="codeline" id="line-298"><code>	return</code></span>
+<span class="codeline" id="line-299"><code>}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>// Modulus is used for modular arithmetic, precomputing relevant constants.</code></span>
+<span class="codeline" id="line-302"><code>//</code></span>
+<span class="codeline" id="line-303"><code>// Moduli are assumed to be odd numbers. Moduli can also leak the exact</code></span>
+<span class="codeline" id="line-304"><code>// number of bits needed to store their value, and are stored without padding.</code></span>
+<span class="codeline" id="line-305"><code>//</code></span>
+<span class="codeline" id="line-306"><code>// Their actual value is still kept secret.</code></span>
+<span class="codeline" id="line-307"><code>type Modulus struct {</code></span>
+<span class="codeline" id="line-308"><code>	// The underlying natural number for this modulus.</code></span>
+<span class="codeline" id="line-309"><code>	//</code></span>
+<span class="codeline" id="line-310"><code>	// This will be stored without any padding, and shouldn't alias with any</code></span>
+<span class="codeline" id="line-311"><code>	// other natural number being used.</code></span>
+<span class="codeline" id="line-312"><code>	nat     *Nat</code></span>
+<span class="codeline" id="line-313"><code>	leading int  // number of leading zeros in the modulus</code></span>
+<span class="codeline" id="line-314"><code>	m0inv   uint // -nat.limbs[0]⁻¹ mod _W</code></span>
+<span class="codeline" id="line-315"><code>	rr      *Nat // R*R for montgomeryRepresentation</code></span>
+<span class="codeline" id="line-316"><code>}</code></span>
+<span class="codeline" id="line-317"><code></code></span>
+<span class="codeline" id="line-318"><code>// rr returns R*R with R = 2^(_W * n) and n = len(m.nat.limbs).</code></span>
+<span class="codeline" id="line-319"><code>func rr(m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-320"><code>	rr := NewNat().ExpandFor(m)</code></span>
+<span class="codeline" id="line-321"><code>	n := uint(len(rr.limbs))</code></span>
+<span class="codeline" id="line-322"><code>	mLen := uint(m.BitLen())</code></span>
+<span class="codeline" id="line-323"><code>	logR := _W * n</code></span>
+<span class="codeline" id="line-324"><code></code></span>
+<span class="codeline" id="line-325"><code>	// We start by computing R = 2^(_W * n) mod m. We can get pretty close, to</code></span>
+<span class="codeline" id="line-326"><code>	// 2^⌊log₂m⌋, by setting the highest bit we can without having to reduce.</code></span>
+<span class="codeline" id="line-327"><code>	rr.limbs[n-1] = 1 &lt;&lt; ((mLen - 1) % _W)</code></span>
+<span class="codeline" id="line-328"><code>	// Then we double until we reach 2^(_W * n).</code></span>
+<span class="codeline" id="line-329"><code>	for i := mLen - 1; i &lt; logR; i++ {</code></span>
+<span class="codeline" id="line-330"><code>		rr.Add(rr, m)</code></span>
+<span class="codeline" id="line-331"><code>	}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>	// Next we need to get from R to 2^(_W * n) R mod m (aka from one to R in</code></span>
+<span class="codeline" id="line-334"><code>	// the Montgomery domain, meaning we can use Montgomery multiplication now).</code></span>
+<span class="codeline" id="line-335"><code>	// We could do that by doubling _W * n times, or with a square-and-double</code></span>
+<span class="codeline" id="line-336"><code>	// chain log2(_W * n) long. Turns out the fastest thing is to start out with</code></span>
+<span class="codeline" id="line-337"><code>	// doublings, and switch to square-and-double once the exponent is large</code></span>
+<span class="codeline" id="line-338"><code>	// enough to justify the cost of the multiplications.</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>	// The threshold is selected experimentally as a linear function of n.</code></span>
+<span class="codeline" id="line-341"><code>	threshold := n / 4</code></span>
+<span class="codeline" id="line-342"><code></code></span>
+<span class="codeline" id="line-343"><code>	// We calculate how many of the most-significant bits of the exponent we can</code></span>
+<span class="codeline" id="line-344"><code>	// compute before crossing the threshold, and we do it with doublings.</code></span>
+<span class="codeline" id="line-345"><code>	i := bits.UintSize</code></span>
+<span class="codeline" id="line-346"><code>	for logR&gt;&gt;i &lt;= threshold {</code></span>
+<span class="codeline" id="line-347"><code>		i--</code></span>
+<span class="codeline" id="line-348"><code>	}</code></span>
+<span class="codeline" id="line-349"><code>	for k := uint(0); k &lt; logR&gt;&gt;i; k++ {</code></span>
+<span class="codeline" id="line-350"><code>		rr.Add(rr, m)</code></span>
+<span class="codeline" id="line-351"><code>	}</code></span>
+<span class="codeline" id="line-352"><code></code></span>
+<span class="codeline" id="line-353"><code>	// Then we process the remaining bits of the exponent with a</code></span>
+<span class="codeline" id="line-354"><code>	// square-and-double chain.</code></span>
+<span class="codeline" id="line-355"><code>	for i &gt; 0 {</code></span>
+<span class="codeline" id="line-356"><code>		rr.montgomeryMul(rr, rr, m)</code></span>
+<span class="codeline" id="line-357"><code>		i--</code></span>
+<span class="codeline" id="line-358"><code>		if logR&gt;&gt;i&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-359"><code>			rr.Add(rr, m)</code></span>
+<span class="codeline" id="line-360"><code>		}</code></span>
+<span class="codeline" id="line-361"><code>	}</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>	return rr</code></span>
+<span class="codeline" id="line-364"><code>}</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>// minusInverseModW computes -x⁻¹ mod _W with x odd.</code></span>
+<span class="codeline" id="line-367"><code>//</code></span>
+<span class="codeline" id="line-368"><code>// This operation is used to precompute a constant involved in Montgomery</code></span>
+<span class="codeline" id="line-369"><code>// multiplication.</code></span>
+<span class="codeline" id="line-370"><code>func minusInverseModW(x uint) uint {</code></span>
+<span class="codeline" id="line-371"><code>	// Every iteration of this loop doubles the least-significant bits of</code></span>
+<span class="codeline" id="line-372"><code>	// correct inverse in y. The first three bits are already correct (1⁻¹ = 1,</code></span>
+<span class="codeline" id="line-373"><code>	// 3⁻¹ = 3, 5⁻¹ = 5, and 7⁻¹ = 7 mod 8), so doubling five times is enough</code></span>
+<span class="codeline" id="line-374"><code>	// for 64 bits (and wastes only one iteration for 32 bits).</code></span>
+<span class="codeline" id="line-375"><code>	//</code></span>
+<span class="codeline" id="line-376"><code>	// See https://crypto.stackexchange.com/a/47496.</code></span>
+<span class="codeline" id="line-377"><code>	y := x</code></span>
+<span class="codeline" id="line-378"><code>	for i := 0; i &lt; 5; i++ {</code></span>
+<span class="codeline" id="line-379"><code>		y = y * (2 - x*y)</code></span>
+<span class="codeline" id="line-380"><code>	}</code></span>
+<span class="codeline" id="line-381"><code>	return -y</code></span>
+<span class="codeline" id="line-382"><code>}</code></span>
+<span class="codeline" id="line-383"><code></code></span>
+<span class="codeline" id="line-384"><code>// NewModulusFromBig creates a new Modulus from a [big.Int].</code></span>
+<span class="codeline" id="line-385"><code>//</code></span>
+<span class="codeline" id="line-386"><code>// The Int must be odd. The number of significant bits (and nothing else) is</code></span>
+<span class="codeline" id="line-387"><code>// leaked through timing side-channels.</code></span>
+<span class="codeline" id="line-388"><code>func NewModulusFromBig(n *big.Int) (*Modulus, error) {</code></span>
+<span class="codeline" id="line-389"><code>	if b := n.Bits(); len(b) == 0 {</code></span>
+<span class="codeline" id="line-390"><code>		return nil, errors.New("modulus must be &gt;= 0")</code></span>
+<span class="codeline" id="line-391"><code>	} else if b[0]&amp;1 != 1 {</code></span>
+<span class="codeline" id="line-392"><code>		return nil, errors.New("modulus must be odd")</code></span>
+<span class="codeline" id="line-393"><code>	}</code></span>
+<span class="codeline" id="line-394"><code>	m := &amp;Modulus{}</code></span>
+<span class="codeline" id="line-395"><code>	m.nat = NewNat().setBig(n)</code></span>
+<span class="codeline" id="line-396"><code>	m.leading = _W - bitLen(m.nat.limbs[len(m.nat.limbs)-1])</code></span>
+<span class="codeline" id="line-397"><code>	m.m0inv = minusInverseModW(m.nat.limbs[0])</code></span>
+<span class="codeline" id="line-398"><code>	m.rr = rr(m)</code></span>
+<span class="codeline" id="line-399"><code>	return m, nil</code></span>
+<span class="codeline" id="line-400"><code>}</code></span>
+<span class="codeline" id="line-401"><code></code></span>
+<span class="codeline" id="line-402"><code>// bitLen is a version of bits.Len that only leaks the bit length of n, but not</code></span>
+<span class="codeline" id="line-403"><code>// its value. bits.Len and bits.LeadingZeros use a lookup table for the</code></span>
+<span class="codeline" id="line-404"><code>// low-order bits on some architectures.</code></span>
+<span class="codeline" id="line-405"><code>func bitLen(n uint) int {</code></span>
+<span class="codeline" id="line-406"><code>	var len int</code></span>
+<span class="codeline" id="line-407"><code>	// We assume, here and elsewhere, that comparison to zero is constant time</code></span>
+<span class="codeline" id="line-408"><code>	// with respect to different non-zero values.</code></span>
+<span class="codeline" id="line-409"><code>	for n != 0 {</code></span>
+<span class="codeline" id="line-410"><code>		len++</code></span>
+<span class="codeline" id="line-411"><code>		n &gt;&gt;= 1</code></span>
+<span class="codeline" id="line-412"><code>	}</code></span>
+<span class="codeline" id="line-413"><code>	return len</code></span>
+<span class="codeline" id="line-414"><code>}</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>// Size returns the size of m in bytes.</code></span>
+<span class="codeline" id="line-417"><code>func (m *Modulus) Size() int {</code></span>
+<span class="codeline" id="line-418"><code>	return (m.BitLen() + 7) / 8</code></span>
+<span class="codeline" id="line-419"><code>}</code></span>
+<span class="codeline" id="line-420"><code></code></span>
+<span class="codeline" id="line-421"><code>// BitLen returns the size of m in bits.</code></span>
+<span class="codeline" id="line-422"><code>func (m *Modulus) BitLen() int {</code></span>
+<span class="codeline" id="line-423"><code>	return len(m.nat.limbs)*_W - int(m.leading)</code></span>
+<span class="codeline" id="line-424"><code>}</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>// Nat returns m as a Nat. The return value must not be written to.</code></span>
+<span class="codeline" id="line-427"><code>func (m *Modulus) Nat() *Nat {</code></span>
+<span class="codeline" id="line-428"><code>	return m.nat</code></span>
+<span class="codeline" id="line-429"><code>}</code></span>
+<span class="codeline" id="line-430"><code></code></span>
+<span class="codeline" id="line-431"><code>// shiftIn calculates x = x &lt;&lt; _W + y mod m.</code></span>
+<span class="codeline" id="line-432"><code>//</code></span>
+<span class="codeline" id="line-433"><code>// This assumes that x is already reduced mod m.</code></span>
+<span class="codeline" id="line-434"><code>func (x *Nat) shiftIn(y uint, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-435"><code>	d := NewNat().resetFor(m)</code></span>
+<span class="codeline" id="line-436"><code></code></span>
+<span class="codeline" id="line-437"><code>	// Eliminate bounds checks in the loop.</code></span>
+<span class="codeline" id="line-438"><code>	size := len(m.nat.limbs)</code></span>
+<span class="codeline" id="line-439"><code>	xLimbs := x.limbs[:size]</code></span>
+<span class="codeline" id="line-440"><code>	dLimbs := d.limbs[:size]</code></span>
+<span class="codeline" id="line-441"><code>	mLimbs := m.nat.limbs[:size]</code></span>
+<span class="codeline" id="line-442"><code></code></span>
+<span class="codeline" id="line-443"><code>	// Each iteration of this loop computes x = 2x + b mod m, where b is a bit</code></span>
+<span class="codeline" id="line-444"><code>	// from y. Effectively, it left-shifts x and adds y one bit at a time,</code></span>
+<span class="codeline" id="line-445"><code>	// reducing it every time.</code></span>
+<span class="codeline" id="line-446"><code>	//</code></span>
+<span class="codeline" id="line-447"><code>	// To do the reduction, each iteration computes both 2x + b and 2x + b - m.</code></span>
+<span class="codeline" id="line-448"><code>	// The next iteration (and finally the return line) will use either result</code></span>
+<span class="codeline" id="line-449"><code>	// based on whether 2x + b overflows m.</code></span>
+<span class="codeline" id="line-450"><code>	needSubtraction := no</code></span>
+<span class="codeline" id="line-451"><code>	for i := _W - 1; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-452"><code>		carry := (y &gt;&gt; i) &amp; 1</code></span>
+<span class="codeline" id="line-453"><code>		var borrow uint</code></span>
+<span class="codeline" id="line-454"><code>		mask := ctMask(needSubtraction)</code></span>
+<span class="codeline" id="line-455"><code>		for i := 0; i &lt; size; i++ {</code></span>
+<span class="codeline" id="line-456"><code>			l := xLimbs[i] ^ (mask &amp; (xLimbs[i] ^ dLimbs[i]))</code></span>
+<span class="codeline" id="line-457"><code>			xLimbs[i], carry = bits.Add(l, l, carry)</code></span>
+<span class="codeline" id="line-458"><code>			dLimbs[i], borrow = bits.Sub(xLimbs[i], mLimbs[i], borrow)</code></span>
+<span class="codeline" id="line-459"><code>		}</code></span>
+<span class="codeline" id="line-460"><code>		// Like in maybeSubtractModulus, we need the subtraction if either it</code></span>
+<span class="codeline" id="line-461"><code>		// didn't underflow (meaning 2x + b &gt; m) or if computing 2x + b</code></span>
+<span class="codeline" id="line-462"><code>		// overflowed (meaning 2x + b &gt; 2^_W*n &gt; m).</code></span>
+<span class="codeline" id="line-463"><code>		needSubtraction = not(choice(borrow)) | choice(carry)</code></span>
+<span class="codeline" id="line-464"><code>	}</code></span>
+<span class="codeline" id="line-465"><code>	return x.assign(needSubtraction, d)</code></span>
+<span class="codeline" id="line-466"><code>}</code></span>
+<span class="codeline" id="line-467"><code></code></span>
+<span class="codeline" id="line-468"><code>// Mod calculates out = x mod m.</code></span>
+<span class="codeline" id="line-469"><code>//</code></span>
+<span class="codeline" id="line-470"><code>// This works regardless how large the value of x is.</code></span>
+<span class="codeline" id="line-471"><code>//</code></span>
+<span class="codeline" id="line-472"><code>// The output will be resized to the size of m and overwritten.</code></span>
+<span class="codeline" id="line-473"><code>func (out *Nat) Mod(x *Nat, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-474"><code>	out.resetFor(m)</code></span>
+<span class="codeline" id="line-475"><code>	// Working our way from the most significant to the least significant limb,</code></span>
+<span class="codeline" id="line-476"><code>	// we can insert each limb at the least significant position, shifting all</code></span>
+<span class="codeline" id="line-477"><code>	// previous limbs left by _W. This way each limb will get shifted by the</code></span>
+<span class="codeline" id="line-478"><code>	// correct number of bits. We can insert at least N - 1 limbs without</code></span>
+<span class="codeline" id="line-479"><code>	// overflowing m. After that, we need to reduce every time we shift.</code></span>
+<span class="codeline" id="line-480"><code>	i := len(x.limbs) - 1</code></span>
+<span class="codeline" id="line-481"><code>	// For the first N - 1 limbs we can skip the actual shifting and position</code></span>
+<span class="codeline" id="line-482"><code>	// them at the shifted position, which starts at min(N - 2, i).</code></span>
+<span class="codeline" id="line-483"><code>	start := len(m.nat.limbs) - 2</code></span>
+<span class="codeline" id="line-484"><code>	if i &lt; start {</code></span>
+<span class="codeline" id="line-485"><code>		start = i</code></span>
+<span class="codeline" id="line-486"><code>	}</code></span>
+<span class="codeline" id="line-487"><code>	for j := start; j &gt;= 0; j-- {</code></span>
+<span class="codeline" id="line-488"><code>		out.limbs[j] = x.limbs[i]</code></span>
+<span class="codeline" id="line-489"><code>		i--</code></span>
+<span class="codeline" id="line-490"><code>	}</code></span>
+<span class="codeline" id="line-491"><code>	// We shift in the remaining limbs, reducing modulo m each time.</code></span>
+<span class="codeline" id="line-492"><code>	for i &gt;= 0 {</code></span>
+<span class="codeline" id="line-493"><code>		out.shiftIn(x.limbs[i], m)</code></span>
+<span class="codeline" id="line-494"><code>		i--</code></span>
+<span class="codeline" id="line-495"><code>	}</code></span>
+<span class="codeline" id="line-496"><code>	return out</code></span>
+<span class="codeline" id="line-497"><code>}</code></span>
+<span class="codeline" id="line-498"><code></code></span>
+<span class="codeline" id="line-499"><code>// ExpandFor ensures x has the right size to work with operations modulo m.</code></span>
+<span class="codeline" id="line-500"><code>//</code></span>
+<span class="codeline" id="line-501"><code>// The announced size of x must be smaller than or equal to that of m.</code></span>
+<span class="codeline" id="line-502"><code>func (x *Nat) ExpandFor(m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-503"><code>	return x.expand(len(m.nat.limbs))</code></span>
+<span class="codeline" id="line-504"><code>}</code></span>
+<span class="codeline" id="line-505"><code></code></span>
+<span class="codeline" id="line-506"><code>// resetFor ensures out has the right size to work with operations modulo m.</code></span>
+<span class="codeline" id="line-507"><code>//</code></span>
+<span class="codeline" id="line-508"><code>// out is zeroed and may start at any size.</code></span>
+<span class="codeline" id="line-509"><code>func (out *Nat) resetFor(m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-510"><code>	return out.reset(len(m.nat.limbs))</code></span>
+<span class="codeline" id="line-511"><code>}</code></span>
+<span class="codeline" id="line-512"><code></code></span>
+<span class="codeline" id="line-513"><code>// maybeSubtractModulus computes x -= m if and only if x &gt;= m or if "always" is yes.</code></span>
+<span class="codeline" id="line-514"><code>//</code></span>
+<span class="codeline" id="line-515"><code>// It can be used to reduce modulo m a value up to 2m - 1, which is a common</code></span>
+<span class="codeline" id="line-516"><code>// range for results computed by higher level operations.</code></span>
+<span class="codeline" id="line-517"><code>//</code></span>
+<span class="codeline" id="line-518"><code>// always is usually a carry that indicates that the operation that produced x</code></span>
+<span class="codeline" id="line-519"><code>// overflowed its size, meaning abstractly x &gt; 2^_W*n &gt; m even if x &lt; m.</code></span>
+<span class="codeline" id="line-520"><code>//</code></span>
+<span class="codeline" id="line-521"><code>// x and m operands must have the same announced length.</code></span>
+<span class="codeline" id="line-522"><code>func (x *Nat) maybeSubtractModulus(always choice, m *Modulus) {</code></span>
+<span class="codeline" id="line-523"><code>	t := NewNat().set(x)</code></span>
+<span class="codeline" id="line-524"><code>	underflow := t.sub(m.nat)</code></span>
+<span class="codeline" id="line-525"><code>	// We keep the result if x - m didn't underflow (meaning x &gt;= m)</code></span>
+<span class="codeline" id="line-526"><code>	// or if always was set.</code></span>
+<span class="codeline" id="line-527"><code>	keep := not(choice(underflow)) | choice(always)</code></span>
+<span class="codeline" id="line-528"><code>	x.assign(keep, t)</code></span>
+<span class="codeline" id="line-529"><code>}</code></span>
+<span class="codeline" id="line-530"><code></code></span>
+<span class="codeline" id="line-531"><code>// Sub computes x = x - y mod m.</code></span>
+<span class="codeline" id="line-532"><code>//</code></span>
+<span class="codeline" id="line-533"><code>// The length of both operands must be the same as the modulus. Both operands</code></span>
+<span class="codeline" id="line-534"><code>// must already be reduced modulo m.</code></span>
+<span class="codeline" id="line-535"><code>func (x *Nat) Sub(y *Nat, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-536"><code>	underflow := x.sub(y)</code></span>
+<span class="codeline" id="line-537"><code>	// If the subtraction underflowed, add m.</code></span>
+<span class="codeline" id="line-538"><code>	t := NewNat().set(x)</code></span>
+<span class="codeline" id="line-539"><code>	t.add(m.nat)</code></span>
+<span class="codeline" id="line-540"><code>	x.assign(choice(underflow), t)</code></span>
+<span class="codeline" id="line-541"><code>	return x</code></span>
+<span class="codeline" id="line-542"><code>}</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>// Add computes x = x + y mod m.</code></span>
+<span class="codeline" id="line-545"><code>//</code></span>
+<span class="codeline" id="line-546"><code>// The length of both operands must be the same as the modulus. Both operands</code></span>
+<span class="codeline" id="line-547"><code>// must already be reduced modulo m.</code></span>
+<span class="codeline" id="line-548"><code>func (x *Nat) Add(y *Nat, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-549"><code>	overflow := x.add(y)</code></span>
+<span class="codeline" id="line-550"><code>	x.maybeSubtractModulus(choice(overflow), m)</code></span>
+<span class="codeline" id="line-551"><code>	return x</code></span>
+<span class="codeline" id="line-552"><code>}</code></span>
+<span class="codeline" id="line-553"><code></code></span>
+<span class="codeline" id="line-554"><code>// montgomeryRepresentation calculates x = x * R mod m, with R = 2^(_W * n) and</code></span>
+<span class="codeline" id="line-555"><code>// n = len(m.nat.limbs).</code></span>
+<span class="codeline" id="line-556"><code>//</code></span>
+<span class="codeline" id="line-557"><code>// Faster Montgomery multiplication replaces standard modular multiplication for</code></span>
+<span class="codeline" id="line-558"><code>// numbers in this representation.</code></span>
+<span class="codeline" id="line-559"><code>//</code></span>
+<span class="codeline" id="line-560"><code>// This assumes that x is already reduced mod m.</code></span>
+<span class="codeline" id="line-561"><code>func (x *Nat) montgomeryRepresentation(m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-562"><code>	// A Montgomery multiplication (which computes a * b / R) by R * R works out</code></span>
+<span class="codeline" id="line-563"><code>	// to a multiplication by R, which takes the value out of the Montgomery domain.</code></span>
+<span class="codeline" id="line-564"><code>	return x.montgomeryMul(x, m.rr, m)</code></span>
+<span class="codeline" id="line-565"><code>}</code></span>
+<span class="codeline" id="line-566"><code></code></span>
+<span class="codeline" id="line-567"><code>// montgomeryReduction calculates x = x / R mod m, with R = 2^(_W * n) and</code></span>
+<span class="codeline" id="line-568"><code>// n = len(m.nat.limbs).</code></span>
+<span class="codeline" id="line-569"><code>//</code></span>
+<span class="codeline" id="line-570"><code>// This assumes that x is already reduced mod m.</code></span>
+<span class="codeline" id="line-571"><code>func (x *Nat) montgomeryReduction(m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-572"><code>	// By Montgomery multiplying with 1 not in Montgomery representation, we</code></span>
+<span class="codeline" id="line-573"><code>	// convert out back from Montgomery representation, because it works out to</code></span>
+<span class="codeline" id="line-574"><code>	// dividing by R.</code></span>
+<span class="codeline" id="line-575"><code>	one := NewNat().ExpandFor(m)</code></span>
+<span class="codeline" id="line-576"><code>	one.limbs[0] = 1</code></span>
+<span class="codeline" id="line-577"><code>	return x.montgomeryMul(x, one, m)</code></span>
+<span class="codeline" id="line-578"><code>}</code></span>
+<span class="codeline" id="line-579"><code></code></span>
+<span class="codeline" id="line-580"><code>// montgomeryMul calculates x = a * b / R mod m, with R = 2^(_W * n) and</code></span>
+<span class="codeline" id="line-581"><code>// n = len(m.nat.limbs), also known as a Montgomery multiplication.</code></span>
+<span class="codeline" id="line-582"><code>//</code></span>
+<span class="codeline" id="line-583"><code>// All inputs should be the same length and already reduced modulo m.</code></span>
+<span class="codeline" id="line-584"><code>// x will be resized to the size of m and overwritten.</code></span>
+<span class="codeline" id="line-585"><code>func (x *Nat) montgomeryMul(a *Nat, b *Nat, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-586"><code>	n := len(m.nat.limbs)</code></span>
+<span class="codeline" id="line-587"><code>	mLimbs := m.nat.limbs[:n]</code></span>
+<span class="codeline" id="line-588"><code>	aLimbs := a.limbs[:n]</code></span>
+<span class="codeline" id="line-589"><code>	bLimbs := b.limbs[:n]</code></span>
+<span class="codeline" id="line-590"><code></code></span>
+<span class="codeline" id="line-591"><code>	switch n {</code></span>
+<span class="codeline" id="line-592"><code>	default:</code></span>
+<span class="codeline" id="line-593"><code>		// Attempt to use a stack-allocated backing array.</code></span>
+<span class="codeline" id="line-594"><code>		T := make([]uint, 0, preallocLimbs*2)</code></span>
+<span class="codeline" id="line-595"><code>		if cap(T) &lt; n*2 {</code></span>
+<span class="codeline" id="line-596"><code>			T = make([]uint, 0, n*2)</code></span>
+<span class="codeline" id="line-597"><code>		}</code></span>
+<span class="codeline" id="line-598"><code>		T = T[:n*2]</code></span>
+<span class="codeline" id="line-599"><code></code></span>
+<span class="codeline" id="line-600"><code>		// This loop implements Word-by-Word Montgomery Multiplication, as</code></span>
+<span class="codeline" id="line-601"><code>		// described in Algorithm 4 (Fig. 3) of "Efficient Software</code></span>
+<span class="codeline" id="line-602"><code>		// Implementations of Modular Exponentiation" by Shay Gueron</code></span>
+<span class="codeline" id="line-603"><code>		// [https://eprint.iacr.org/2011/239.pdf].</code></span>
+<span class="codeline" id="line-604"><code>		var c uint</code></span>
+<span class="codeline" id="line-605"><code>		for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-606"><code>			_ = T[n+i] // bounds check elimination hint</code></span>
+<span class="codeline" id="line-607"><code></code></span>
+<span class="codeline" id="line-608"><code>			// Step 1 (T = a × b) is computed as a large pen-and-paper column</code></span>
+<span class="codeline" id="line-609"><code>			// multiplication of two numbers with n base-2^_W digits. If we just</code></span>
+<span class="codeline" id="line-610"><code>			// wanted to produce 2n-wide T, we would do</code></span>
+<span class="codeline" id="line-611"><code>			//</code></span>
+<span class="codeline" id="line-612"><code>			//   for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-613"><code>			//       d := bLimbs[i]</code></span>
+<span class="codeline" id="line-614"><code>			//       T[n+i] = addMulVVW(T[i:n+i], aLimbs, d)</code></span>
+<span class="codeline" id="line-615"><code>			//   }</code></span>
+<span class="codeline" id="line-616"><code>			//</code></span>
+<span class="codeline" id="line-617"><code>			// where d is a digit of the multiplier, T[i:n+i] is the shifted</code></span>
+<span class="codeline" id="line-618"><code>			// position of the product of that digit, and T[n+i] is the final carry.</code></span>
+<span class="codeline" id="line-619"><code>			// Note that T[i] isn't modified after processing the i-th digit.</code></span>
+<span class="codeline" id="line-620"><code>			//</code></span>
+<span class="codeline" id="line-621"><code>			// Instead of running two loops, one for Step 1 and one for Steps 2–6,</code></span>
+<span class="codeline" id="line-622"><code>			// the result of Step 1 is computed during the next loop. This is</code></span>
+<span class="codeline" id="line-623"><code>			// possible because each iteration only uses T[i] in Step 2 and then</code></span>
+<span class="codeline" id="line-624"><code>			// discards it in Step 6.</code></span>
+<span class="codeline" id="line-625"><code>			d := bLimbs[i]</code></span>
+<span class="codeline" id="line-626"><code>			c1 := addMulVVW(T[i:n+i], aLimbs, d)</code></span>
+<span class="codeline" id="line-627"><code></code></span>
+<span class="codeline" id="line-628"><code>			// Step 6 is replaced by shifting the virtual window we operate</code></span>
+<span class="codeline" id="line-629"><code>			// over: T of the algorithm is T[i:] for us. That means that T1 in</code></span>
+<span class="codeline" id="line-630"><code>			// Step 2 (T mod 2^_W) is simply T[i]. k0 in Step 3 is our m0inv.</code></span>
+<span class="codeline" id="line-631"><code>			Y := T[i] * m.m0inv</code></span>
+<span class="codeline" id="line-632"><code></code></span>
+<span class="codeline" id="line-633"><code>			// Step 4 and 5 add Y × m to T, which as mentioned above is stored</code></span>
+<span class="codeline" id="line-634"><code>			// at T[i:]. The two carries (from a × d and Y × m) are added up in</code></span>
+<span class="codeline" id="line-635"><code>			// the next word T[n+i], and the carry bit from that addition is</code></span>
+<span class="codeline" id="line-636"><code>			// brought forward to the next iteration.</code></span>
+<span class="codeline" id="line-637"><code>			c2 := addMulVVW(T[i:n+i], mLimbs, Y)</code></span>
+<span class="codeline" id="line-638"><code>			T[n+i], c = bits.Add(c1, c2, c)</code></span>
+<span class="codeline" id="line-639"><code>		}</code></span>
+<span class="codeline" id="line-640"><code></code></span>
+<span class="codeline" id="line-641"><code>		// Finally for Step 7 we copy the final T window into x, and subtract m</code></span>
+<span class="codeline" id="line-642"><code>		// if necessary (which as explained in maybeSubtractModulus can be the</code></span>
+<span class="codeline" id="line-643"><code>		// case both if x &gt;= m, or if x overflowed).</code></span>
+<span class="codeline" id="line-644"><code>		//</code></span>
+<span class="codeline" id="line-645"><code>		// The paper suggests in Section 4 that we can do an "Almost Montgomery</code></span>
+<span class="codeline" id="line-646"><code>		// Multiplication" by subtracting only in the overflow case, but the</code></span>
+<span class="codeline" id="line-647"><code>		// cost is very similar since the constant time subtraction tells us if</code></span>
+<span class="codeline" id="line-648"><code>		// x &gt;= m as a side effect, and taking care of the broken invariant is</code></span>
+<span class="codeline" id="line-649"><code>		// highly undesirable (see https://go.dev/issue/13907).</code></span>
+<span class="codeline" id="line-650"><code>		copy(x.reset(n).limbs, T[n:])</code></span>
+<span class="codeline" id="line-651"><code>		x.maybeSubtractModulus(choice(c), m)</code></span>
+<span class="codeline" id="line-652"><code></code></span>
+<span class="codeline" id="line-653"><code>	// The following specialized cases follow the exact same algorithm, but</code></span>
+<span class="codeline" id="line-654"><code>	// optimized for the sizes most used in RSA. addMulVVW is implemented in</code></span>
+<span class="codeline" id="line-655"><code>	// assembly with loop unrolling depending on the architecture and bounds</code></span>
+<span class="codeline" id="line-656"><code>	// checks are removed by the compiler thanks to the constant size.</code></span>
+<span class="codeline" id="line-657"><code>	case 1024 / _W:</code></span>
+<span class="codeline" id="line-658"><code>		const n = 1024 / _W // compiler hint</code></span>
+<span class="codeline" id="line-659"><code>		T := make([]uint, n*2)</code></span>
+<span class="codeline" id="line-660"><code>		var c uint</code></span>
+<span class="codeline" id="line-661"><code>		for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-662"><code>			d := bLimbs[i]</code></span>
+<span class="codeline" id="line-663"><code>			c1 := addMulVVW1024(&amp;T[i], &amp;aLimbs[0], d)</code></span>
+<span class="codeline" id="line-664"><code>			Y := T[i] * m.m0inv</code></span>
+<span class="codeline" id="line-665"><code>			c2 := addMulVVW1024(&amp;T[i], &amp;mLimbs[0], Y)</code></span>
+<span class="codeline" id="line-666"><code>			T[n+i], c = bits.Add(c1, c2, c)</code></span>
+<span class="codeline" id="line-667"><code>		}</code></span>
+<span class="codeline" id="line-668"><code>		copy(x.reset(n).limbs, T[n:])</code></span>
+<span class="codeline" id="line-669"><code>		x.maybeSubtractModulus(choice(c), m)</code></span>
+<span class="codeline" id="line-670"><code></code></span>
+<span class="codeline" id="line-671"><code>	case 1536 / _W:</code></span>
+<span class="codeline" id="line-672"><code>		const n = 1536 / _W // compiler hint</code></span>
+<span class="codeline" id="line-673"><code>		T := make([]uint, n*2)</code></span>
+<span class="codeline" id="line-674"><code>		var c uint</code></span>
+<span class="codeline" id="line-675"><code>		for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-676"><code>			d := bLimbs[i]</code></span>
+<span class="codeline" id="line-677"><code>			c1 := addMulVVW1536(&amp;T[i], &amp;aLimbs[0], d)</code></span>
+<span class="codeline" id="line-678"><code>			Y := T[i] * m.m0inv</code></span>
+<span class="codeline" id="line-679"><code>			c2 := addMulVVW1536(&amp;T[i], &amp;mLimbs[0], Y)</code></span>
+<span class="codeline" id="line-680"><code>			T[n+i], c = bits.Add(c1, c2, c)</code></span>
+<span class="codeline" id="line-681"><code>		}</code></span>
+<span class="codeline" id="line-682"><code>		copy(x.reset(n).limbs, T[n:])</code></span>
+<span class="codeline" id="line-683"><code>		x.maybeSubtractModulus(choice(c), m)</code></span>
+<span class="codeline" id="line-684"><code></code></span>
+<span class="codeline" id="line-685"><code>	case 2048 / _W:</code></span>
+<span class="codeline" id="line-686"><code>		const n = 2048 / _W // compiler hint</code></span>
+<span class="codeline" id="line-687"><code>		T := make([]uint, n*2)</code></span>
+<span class="codeline" id="line-688"><code>		var c uint</code></span>
+<span class="codeline" id="line-689"><code>		for i := 0; i &lt; n; i++ {</code></span>
+<span class="codeline" id="line-690"><code>			d := bLimbs[i]</code></span>
+<span class="codeline" id="line-691"><code>			c1 := addMulVVW2048(&amp;T[i], &amp;aLimbs[0], d)</code></span>
+<span class="codeline" id="line-692"><code>			Y := T[i] * m.m0inv</code></span>
+<span class="codeline" id="line-693"><code>			c2 := addMulVVW2048(&amp;T[i], &amp;mLimbs[0], Y)</code></span>
+<span class="codeline" id="line-694"><code>			T[n+i], c = bits.Add(c1, c2, c)</code></span>
+<span class="codeline" id="line-695"><code>		}</code></span>
+<span class="codeline" id="line-696"><code>		copy(x.reset(n).limbs, T[n:])</code></span>
+<span class="codeline" id="line-697"><code>		x.maybeSubtractModulus(choice(c), m)</code></span>
+<span class="codeline" id="line-698"><code>	}</code></span>
+<span class="codeline" id="line-699"><code></code></span>
+<span class="codeline" id="line-700"><code>	return x</code></span>
+<span class="codeline" id="line-701"><code>}</code></span>
+<span class="codeline" id="line-702"><code></code></span>
+<span class="codeline" id="line-703"><code>// addMulVVW multiplies the multi-word value x by the single-word value y,</code></span>
+<span class="codeline" id="line-704"><code>// adding the result to the multi-word value z and returning the final carry.</code></span>
+<span class="codeline" id="line-705"><code>// It can be thought of as one row of a pen-and-paper column multiplication.</code></span>
+<span class="codeline" id="line-706"><code>func addMulVVW(z, x []uint, y uint) (carry uint) {</code></span>
+<span class="codeline" id="line-707"><code>	_ = x[len(z)-1] // bounds check elimination hint</code></span>
+<span class="codeline" id="line-708"><code>	for i := range z {</code></span>
+<span class="codeline" id="line-709"><code>		hi, lo := bits.Mul(x[i], y)</code></span>
+<span class="codeline" id="line-710"><code>		lo, c := bits.Add(lo, z[i], 0)</code></span>
+<span class="codeline" id="line-711"><code>		// We use bits.Add with zero to get an add-with-carry instruction that</code></span>
+<span class="codeline" id="line-712"><code>		// absorbs the carry from the previous bits.Add.</code></span>
+<span class="codeline" id="line-713"><code>		hi, _ = bits.Add(hi, 0, c)</code></span>
+<span class="codeline" id="line-714"><code>		lo, c = bits.Add(lo, carry, 0)</code></span>
+<span class="codeline" id="line-715"><code>		hi, _ = bits.Add(hi, 0, c)</code></span>
+<span class="codeline" id="line-716"><code>		carry = hi</code></span>
+<span class="codeline" id="line-717"><code>		z[i] = lo</code></span>
+<span class="codeline" id="line-718"><code>	}</code></span>
+<span class="codeline" id="line-719"><code>	return carry</code></span>
+<span class="codeline" id="line-720"><code>}</code></span>
+<span class="codeline" id="line-721"><code></code></span>
+<span class="codeline" id="line-722"><code>// Mul calculates x = x * y mod m.</code></span>
+<span class="codeline" id="line-723"><code>//</code></span>
+<span class="codeline" id="line-724"><code>// The length of both operands must be the same as the modulus. Both operands</code></span>
+<span class="codeline" id="line-725"><code>// must already be reduced modulo m.</code></span>
+<span class="codeline" id="line-726"><code>func (x *Nat) Mul(y *Nat, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-727"><code>	// A Montgomery multiplication by a value out of the Montgomery domain</code></span>
+<span class="codeline" id="line-728"><code>	// takes the result out of Montgomery representation.</code></span>
+<span class="codeline" id="line-729"><code>	xR := NewNat().set(x).montgomeryRepresentation(m) // xR = x * R mod m</code></span>
+<span class="codeline" id="line-730"><code>	return x.montgomeryMul(xR, y, m)                  // x = xR * y / R mod m</code></span>
+<span class="codeline" id="line-731"><code>}</code></span>
+<span class="codeline" id="line-732"><code></code></span>
+<span class="codeline" id="line-733"><code>// Exp calculates out = x^e mod m.</code></span>
+<span class="codeline" id="line-734"><code>//</code></span>
+<span class="codeline" id="line-735"><code>// The exponent e is represented in big-endian order. The output will be resized</code></span>
+<span class="codeline" id="line-736"><code>// to the size of m and overwritten. x must already be reduced modulo m.</code></span>
+<span class="codeline" id="line-737"><code>func (out *Nat) Exp(x *Nat, e []byte, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-738"><code>	// We use a 4 bit window. For our RSA workload, 4 bit windows are faster</code></span>
+<span class="codeline" id="line-739"><code>	// than 2 bit windows, but use an extra 12 nats worth of scratch space.</code></span>
+<span class="codeline" id="line-740"><code>	// Using bit sizes that don't divide 8 are more complex to implement, but</code></span>
+<span class="codeline" id="line-741"><code>	// are likely to be more efficient if necessary.</code></span>
+<span class="codeline" id="line-742"><code></code></span>
+<span class="codeline" id="line-743"><code>	table := [(1 &lt;&lt; 4) - 1]*Nat{ // table[i] = x ^ (i+1)</code></span>
+<span class="codeline" id="line-744"><code>		// newNat calls are unrolled so they are allocated on the stack.</code></span>
+<span class="codeline" id="line-745"><code>		NewNat(), NewNat(), NewNat(), NewNat(), NewNat(),</code></span>
+<span class="codeline" id="line-746"><code>		NewNat(), NewNat(), NewNat(), NewNat(), NewNat(),</code></span>
+<span class="codeline" id="line-747"><code>		NewNat(), NewNat(), NewNat(), NewNat(), NewNat(),</code></span>
+<span class="codeline" id="line-748"><code>	}</code></span>
+<span class="codeline" id="line-749"><code>	table[0].set(x).montgomeryRepresentation(m)</code></span>
+<span class="codeline" id="line-750"><code>	for i := 1; i &lt; len(table); i++ {</code></span>
+<span class="codeline" id="line-751"><code>		table[i].montgomeryMul(table[i-1], table[0], m)</code></span>
+<span class="codeline" id="line-752"><code>	}</code></span>
+<span class="codeline" id="line-753"><code></code></span>
+<span class="codeline" id="line-754"><code>	out.resetFor(m)</code></span>
+<span class="codeline" id="line-755"><code>	out.limbs[0] = 1</code></span>
+<span class="codeline" id="line-756"><code>	out.montgomeryRepresentation(m)</code></span>
+<span class="codeline" id="line-757"><code>	tmp := NewNat().ExpandFor(m)</code></span>
+<span class="codeline" id="line-758"><code>	for _, b := range e {</code></span>
+<span class="codeline" id="line-759"><code>		for _, j := range []int{4, 0} {</code></span>
+<span class="codeline" id="line-760"><code>			// Square four times. Optimization note: this can be implemented</code></span>
+<span class="codeline" id="line-761"><code>			// more efficiently than with generic Montgomery multiplication.</code></span>
+<span class="codeline" id="line-762"><code>			out.montgomeryMul(out, out, m)</code></span>
+<span class="codeline" id="line-763"><code>			out.montgomeryMul(out, out, m)</code></span>
+<span class="codeline" id="line-764"><code>			out.montgomeryMul(out, out, m)</code></span>
+<span class="codeline" id="line-765"><code>			out.montgomeryMul(out, out, m)</code></span>
+<span class="codeline" id="line-766"><code></code></span>
+<span class="codeline" id="line-767"><code>			// Select x^k in constant time from the table.</code></span>
+<span class="codeline" id="line-768"><code>			k := uint((b &gt;&gt; j) &amp; 0b1111)</code></span>
+<span class="codeline" id="line-769"><code>			for i := range table {</code></span>
+<span class="codeline" id="line-770"><code>				tmp.assign(ctEq(k, uint(i+1)), table[i])</code></span>
+<span class="codeline" id="line-771"><code>			}</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>			// Multiply by x^k, discarding the result if k = 0.</code></span>
+<span class="codeline" id="line-774"><code>			tmp.montgomeryMul(out, tmp, m)</code></span>
+<span class="codeline" id="line-775"><code>			out.assign(not(ctEq(k, 0)), tmp)</code></span>
+<span class="codeline" id="line-776"><code>		}</code></span>
+<span class="codeline" id="line-777"><code>	}</code></span>
+<span class="codeline" id="line-778"><code></code></span>
+<span class="codeline" id="line-779"><code>	return out.montgomeryReduction(m)</code></span>
+<span class="codeline" id="line-780"><code>}</code></span>
+<span class="codeline" id="line-781"><code></code></span>
+<span class="codeline" id="line-782"><code>// ExpShortVarTime calculates out = x^e mod m.</code></span>
+<span class="codeline" id="line-783"><code>//</code></span>
+<span class="codeline" id="line-784"><code>// The output will be resized to the size of m and overwritten. x must already</code></span>
+<span class="codeline" id="line-785"><code>// be reduced modulo m. This leaks the exponent through timing side-channels.</code></span>
+<span class="codeline" id="line-786"><code>func (out *Nat) ExpShortVarTime(x *Nat, e uint, m *Modulus) *Nat {</code></span>
+<span class="codeline" id="line-787"><code>	// For short exponents, precomputing a table and using a window like in Exp</code></span>
+<span class="codeline" id="line-788"><code>	// doesn't pay off. Instead, we do a simple conditional square-and-multiply</code></span>
+<span class="codeline" id="line-789"><code>	// chain, skipping the initial run of zeroes.</code></span>
+<span class="codeline" id="line-790"><code>	xR := NewNat().set(x).montgomeryRepresentation(m)</code></span>
+<span class="codeline" id="line-791"><code>	out.set(xR)</code></span>
+<span class="codeline" id="line-792"><code>	for i := bits.UintSize - bitLen(e) + 1; i &lt; bits.UintSize; i++ {</code></span>
+<span class="codeline" id="line-793"><code>		out.montgomeryMul(out, out, m)</code></span>
+<span class="codeline" id="line-794"><code>		if k := (e &gt;&gt; (bits.UintSize - i - 1)) &amp; 1; k != 0 {</code></span>
+<span class="codeline" id="line-795"><code>			out.montgomeryMul(out, xR, m)</code></span>
+<span class="codeline" id="line-796"><code>		}</code></span>
+<span class="codeline" id="line-797"><code>	}</code></span>
+<span class="codeline" id="line-798"><code>	return out.montgomeryReduction(m)</code></span>
+<span class="codeline" id="line-799"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

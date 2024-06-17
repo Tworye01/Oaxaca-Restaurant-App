@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: escape.go in package html/template</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	escape.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/html/template.html">html/template</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2011 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package template</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bytes"</code></span>
+<span class="codeline" id="line-9"><code>	"fmt"</code></span>
+<span class="codeline" id="line-10"><code>	"html"</code></span>
+<span class="codeline" id="line-11"><code>	"internal/godebug"</code></span>
+<span class="codeline" id="line-12"><code>	"io"</code></span>
+<span class="codeline" id="line-13"><code>	"regexp"</code></span>
+<span class="codeline" id="line-14"><code>	"text/template"</code></span>
+<span class="codeline" id="line-15"><code>	"text/template/parse"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>// escapeTemplate rewrites the named template, which must be</code></span>
+<span class="codeline" id="line-19"><code>// associated with t, to guarantee that the output of any of the named</code></span>
+<span class="codeline" id="line-20"><code>// templates is properly escaped. If no error is returned, then the named templates have</code></span>
+<span class="codeline" id="line-21"><code>// been modified. Otherwise the named templates have been rendered</code></span>
+<span class="codeline" id="line-22"><code>// unusable.</code></span>
+<span class="codeline" id="line-23"><code>func escapeTemplate(tmpl *Template, node parse.Node, name string) error {</code></span>
+<span class="codeline" id="line-24"><code>	c, _ := tmpl.esc.escapeTree(context{}, node, name, 0)</code></span>
+<span class="codeline" id="line-25"><code>	var err error</code></span>
+<span class="codeline" id="line-26"><code>	if c.err != nil {</code></span>
+<span class="codeline" id="line-27"><code>		err, c.err.Name = c.err, name</code></span>
+<span class="codeline" id="line-28"><code>	} else if c.state != stateText {</code></span>
+<span class="codeline" id="line-29"><code>		err = &amp;Error{ErrEndContext, nil, name, 0, fmt.Sprintf("ends in a non-text context: %v", c)}</code></span>
+<span class="codeline" id="line-30"><code>	}</code></span>
+<span class="codeline" id="line-31"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-32"><code>		// Prevent execution of unsafe templates.</code></span>
+<span class="codeline" id="line-33"><code>		if t := tmpl.set[name]; t != nil {</code></span>
+<span class="codeline" id="line-34"><code>			t.escapeErr = err</code></span>
+<span class="codeline" id="line-35"><code>			t.text.Tree = nil</code></span>
+<span class="codeline" id="line-36"><code>			t.Tree = nil</code></span>
+<span class="codeline" id="line-37"><code>		}</code></span>
+<span class="codeline" id="line-38"><code>		return err</code></span>
+<span class="codeline" id="line-39"><code>	}</code></span>
+<span class="codeline" id="line-40"><code>	tmpl.esc.commit()</code></span>
+<span class="codeline" id="line-41"><code>	if t := tmpl.set[name]; t != nil {</code></span>
+<span class="codeline" id="line-42"><code>		t.escapeErr = escapeOK</code></span>
+<span class="codeline" id="line-43"><code>		t.Tree = t.text.Tree</code></span>
+<span class="codeline" id="line-44"><code>	}</code></span>
+<span class="codeline" id="line-45"><code>	return nil</code></span>
+<span class="codeline" id="line-46"><code>}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>// evalArgs formats the list of arguments into a string. It is equivalent to</code></span>
+<span class="codeline" id="line-49"><code>// fmt.Sprint(args...), except that it dereferences all pointers.</code></span>
+<span class="codeline" id="line-50"><code>func evalArgs(args ...any) string {</code></span>
+<span class="codeline" id="line-51"><code>	// Optimization for simple common case of a single string argument.</code></span>
+<span class="codeline" id="line-52"><code>	if len(args) == 1 {</code></span>
+<span class="codeline" id="line-53"><code>		if s, ok := args[0].(string); ok {</code></span>
+<span class="codeline" id="line-54"><code>			return s</code></span>
+<span class="codeline" id="line-55"><code>		}</code></span>
+<span class="codeline" id="line-56"><code>	}</code></span>
+<span class="codeline" id="line-57"><code>	for i, arg := range args {</code></span>
+<span class="codeline" id="line-58"><code>		args[i] = indirectToStringerOrError(arg)</code></span>
+<span class="codeline" id="line-59"><code>	}</code></span>
+<span class="codeline" id="line-60"><code>	return fmt.Sprint(args...)</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// funcMap maps command names to functions that render their inputs safe.</code></span>
+<span class="codeline" id="line-64"><code>var funcMap = template.FuncMap{</code></span>
+<span class="codeline" id="line-65"><code>	"_html_template_attrescaper":      attrEscaper,</code></span>
+<span class="codeline" id="line-66"><code>	"_html_template_commentescaper":   commentEscaper,</code></span>
+<span class="codeline" id="line-67"><code>	"_html_template_cssescaper":       cssEscaper,</code></span>
+<span class="codeline" id="line-68"><code>	"_html_template_cssvaluefilter":   cssValueFilter,</code></span>
+<span class="codeline" id="line-69"><code>	"_html_template_htmlnamefilter":   htmlNameFilter,</code></span>
+<span class="codeline" id="line-70"><code>	"_html_template_htmlescaper":      htmlEscaper,</code></span>
+<span class="codeline" id="line-71"><code>	"_html_template_jsregexpescaper":  jsRegexpEscaper,</code></span>
+<span class="codeline" id="line-72"><code>	"_html_template_jsstrescaper":     jsStrEscaper,</code></span>
+<span class="codeline" id="line-73"><code>	"_html_template_jstmpllitescaper": jsTmplLitEscaper,</code></span>
+<span class="codeline" id="line-74"><code>	"_html_template_jsvalescaper":     jsValEscaper,</code></span>
+<span class="codeline" id="line-75"><code>	"_html_template_nospaceescaper":   htmlNospaceEscaper,</code></span>
+<span class="codeline" id="line-76"><code>	"_html_template_rcdataescaper":    rcdataEscaper,</code></span>
+<span class="codeline" id="line-77"><code>	"_html_template_srcsetescaper":    srcsetFilterAndEscaper,</code></span>
+<span class="codeline" id="line-78"><code>	"_html_template_urlescaper":       urlEscaper,</code></span>
+<span class="codeline" id="line-79"><code>	"_html_template_urlfilter":        urlFilter,</code></span>
+<span class="codeline" id="line-80"><code>	"_html_template_urlnormalizer":    urlNormalizer,</code></span>
+<span class="codeline" id="line-81"><code>	"_eval_args_":                     evalArgs,</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// escaper collects type inferences about templates and changes needed to make</code></span>
+<span class="codeline" id="line-85"><code>// templates injection safe.</code></span>
+<span class="codeline" id="line-86"><code>type escaper struct {</code></span>
+<span class="codeline" id="line-87"><code>	// ns is the nameSpace that this escaper is associated with.</code></span>
+<span class="codeline" id="line-88"><code>	ns *nameSpace</code></span>
+<span class="codeline" id="line-89"><code>	// output[templateName] is the output context for a templateName that</code></span>
+<span class="codeline" id="line-90"><code>	// has been mangled to include its input context.</code></span>
+<span class="codeline" id="line-91"><code>	output map[string]context</code></span>
+<span class="codeline" id="line-92"><code>	// derived[c.mangle(name)] maps to a template derived from the template</code></span>
+<span class="codeline" id="line-93"><code>	// named name templateName for the start context c.</code></span>
+<span class="codeline" id="line-94"><code>	derived map[string]*template.Template</code></span>
+<span class="codeline" id="line-95"><code>	// called[templateName] is a set of called mangled template names.</code></span>
+<span class="codeline" id="line-96"><code>	called map[string]bool</code></span>
+<span class="codeline" id="line-97"><code>	// xxxNodeEdits are the accumulated edits to apply during commit.</code></span>
+<span class="codeline" id="line-98"><code>	// Such edits are not applied immediately in case a template set</code></span>
+<span class="codeline" id="line-99"><code>	// executes a given template in different escaping contexts.</code></span>
+<span class="codeline" id="line-100"><code>	actionNodeEdits   map[*parse.ActionNode][]string</code></span>
+<span class="codeline" id="line-101"><code>	templateNodeEdits map[*parse.TemplateNode]string</code></span>
+<span class="codeline" id="line-102"><code>	textNodeEdits     map[*parse.TextNode][]byte</code></span>
+<span class="codeline" id="line-103"><code>	// rangeContext holds context about the current range loop.</code></span>
+<span class="codeline" id="line-104"><code>	rangeContext *rangeContext</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// rangeContext holds information about the current range loop.</code></span>
+<span class="codeline" id="line-108"><code>type rangeContext struct {</code></span>
+<span class="codeline" id="line-109"><code>	outer     *rangeContext // outer loop</code></span>
+<span class="codeline" id="line-110"><code>	breaks    []context     // context at each break action</code></span>
+<span class="codeline" id="line-111"><code>	continues []context     // context at each continue action</code></span>
+<span class="codeline" id="line-112"><code>}</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>// makeEscaper creates a blank escaper for the given set.</code></span>
+<span class="codeline" id="line-115"><code>func makeEscaper(n *nameSpace) escaper {</code></span>
+<span class="codeline" id="line-116"><code>	return escaper{</code></span>
+<span class="codeline" id="line-117"><code>		n,</code></span>
+<span class="codeline" id="line-118"><code>		map[string]context{},</code></span>
+<span class="codeline" id="line-119"><code>		map[string]*template.Template{},</code></span>
+<span class="codeline" id="line-120"><code>		map[string]bool{},</code></span>
+<span class="codeline" id="line-121"><code>		map[*parse.ActionNode][]string{},</code></span>
+<span class="codeline" id="line-122"><code>		map[*parse.TemplateNode]string{},</code></span>
+<span class="codeline" id="line-123"><code>		map[*parse.TextNode][]byte{},</code></span>
+<span class="codeline" id="line-124"><code>		nil,</code></span>
+<span class="codeline" id="line-125"><code>	}</code></span>
+<span class="codeline" id="line-126"><code>}</code></span>
+<span class="codeline" id="line-127"><code></code></span>
+<span class="codeline" id="line-128"><code>// filterFailsafe is an innocuous word that is emitted in place of unsafe values</code></span>
+<span class="codeline" id="line-129"><code>// by sanitizer functions. It is not a keyword in any programming language,</code></span>
+<span class="codeline" id="line-130"><code>// contains no special characters, is not empty, and when it appears in output</code></span>
+<span class="codeline" id="line-131"><code>// it is distinct enough that a developer can find the source of the problem</code></span>
+<span class="codeline" id="line-132"><code>// via a search engine.</code></span>
+<span class="codeline" id="line-133"><code>const filterFailsafe = "ZgotmplZ"</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>// escape escapes a template node.</code></span>
+<span class="codeline" id="line-136"><code>func (e *escaper) escape(c context, n parse.Node) context {</code></span>
+<span class="codeline" id="line-137"><code>	switch n := n.(type) {</code></span>
+<span class="codeline" id="line-138"><code>	case *parse.ActionNode:</code></span>
+<span class="codeline" id="line-139"><code>		return e.escapeAction(c, n)</code></span>
+<span class="codeline" id="line-140"><code>	case *parse.BreakNode:</code></span>
+<span class="codeline" id="line-141"><code>		c.n = n</code></span>
+<span class="codeline" id="line-142"><code>		e.rangeContext.breaks = append(e.rangeContext.breaks, c)</code></span>
+<span class="codeline" id="line-143"><code>		return context{state: stateDead}</code></span>
+<span class="codeline" id="line-144"><code>	case *parse.CommentNode:</code></span>
+<span class="codeline" id="line-145"><code>		return c</code></span>
+<span class="codeline" id="line-146"><code>	case *parse.ContinueNode:</code></span>
+<span class="codeline" id="line-147"><code>		c.n = n</code></span>
+<span class="codeline" id="line-148"><code>		e.rangeContext.continues = append(e.rangeContext.breaks, c)</code></span>
+<span class="codeline" id="line-149"><code>		return context{state: stateDead}</code></span>
+<span class="codeline" id="line-150"><code>	case *parse.IfNode:</code></span>
+<span class="codeline" id="line-151"><code>		return e.escapeBranch(c, &amp;n.BranchNode, "if")</code></span>
+<span class="codeline" id="line-152"><code>	case *parse.ListNode:</code></span>
+<span class="codeline" id="line-153"><code>		return e.escapeList(c, n)</code></span>
+<span class="codeline" id="line-154"><code>	case *parse.RangeNode:</code></span>
+<span class="codeline" id="line-155"><code>		return e.escapeBranch(c, &amp;n.BranchNode, "range")</code></span>
+<span class="codeline" id="line-156"><code>	case *parse.TemplateNode:</code></span>
+<span class="codeline" id="line-157"><code>		return e.escapeTemplate(c, n)</code></span>
+<span class="codeline" id="line-158"><code>	case *parse.TextNode:</code></span>
+<span class="codeline" id="line-159"><code>		return e.escapeText(c, n)</code></span>
+<span class="codeline" id="line-160"><code>	case *parse.WithNode:</code></span>
+<span class="codeline" id="line-161"><code>		return e.escapeBranch(c, &amp;n.BranchNode, "with")</code></span>
+<span class="codeline" id="line-162"><code>	}</code></span>
+<span class="codeline" id="line-163"><code>	panic("escaping " + n.String() + " is unimplemented")</code></span>
+<span class="codeline" id="line-164"><code>}</code></span>
+<span class="codeline" id="line-165"><code></code></span>
+<span class="codeline" id="line-166"><code>var debugAllowActionJSTmpl = godebug.New("jstmpllitinterp")</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>// escapeAction escapes an action template node.</code></span>
+<span class="codeline" id="line-169"><code>func (e *escaper) escapeAction(c context, n *parse.ActionNode) context {</code></span>
+<span class="codeline" id="line-170"><code>	if len(n.Pipe.Decl) != 0 {</code></span>
+<span class="codeline" id="line-171"><code>		// A local variable assignment, not an interpolation.</code></span>
+<span class="codeline" id="line-172"><code>		return c</code></span>
+<span class="codeline" id="line-173"><code>	}</code></span>
+<span class="codeline" id="line-174"><code>	c = nudge(c)</code></span>
+<span class="codeline" id="line-175"><code>	// Check for disallowed use of predefined escapers in the pipeline.</code></span>
+<span class="codeline" id="line-176"><code>	for pos, idNode := range n.Pipe.Cmds {</code></span>
+<span class="codeline" id="line-177"><code>		node, ok := idNode.Args[0].(*parse.IdentifierNode)</code></span>
+<span class="codeline" id="line-178"><code>		if !ok {</code></span>
+<span class="codeline" id="line-179"><code>			// A predefined escaper "esc" will never be found as an identifier in a</code></span>
+<span class="codeline" id="line-180"><code>			// Chain or Field node, since:</code></span>
+<span class="codeline" id="line-181"><code>			// - "esc.x ..." is invalid, since predefined escapers return strings, and</code></span>
+<span class="codeline" id="line-182"><code>			//   strings do not have methods, keys or fields.</code></span>
+<span class="codeline" id="line-183"><code>			// - "... .esc" is invalid, since predefined escapers are global functions,</code></span>
+<span class="codeline" id="line-184"><code>			//   not methods or fields of any types.</code></span>
+<span class="codeline" id="line-185"><code>			// Therefore, it is safe to ignore these two node types.</code></span>
+<span class="codeline" id="line-186"><code>			continue</code></span>
+<span class="codeline" id="line-187"><code>		}</code></span>
+<span class="codeline" id="line-188"><code>		ident := node.Ident</code></span>
+<span class="codeline" id="line-189"><code>		if _, ok := predefinedEscapers[ident]; ok {</code></span>
+<span class="codeline" id="line-190"><code>			if pos &lt; len(n.Pipe.Cmds)-1 ||</code></span>
+<span class="codeline" id="line-191"><code>				c.state == stateAttr &amp;&amp; c.delim == delimSpaceOrTagEnd &amp;&amp; ident == "html" {</code></span>
+<span class="codeline" id="line-192"><code>				return context{</code></span>
+<span class="codeline" id="line-193"><code>					state: stateError,</code></span>
+<span class="codeline" id="line-194"><code>					err:   errorf(ErrPredefinedEscaper, n, n.Line, "predefined escaper %q disallowed in template", ident),</code></span>
+<span class="codeline" id="line-195"><code>				}</code></span>
+<span class="codeline" id="line-196"><code>			}</code></span>
+<span class="codeline" id="line-197"><code>		}</code></span>
+<span class="codeline" id="line-198"><code>	}</code></span>
+<span class="codeline" id="line-199"><code>	s := make([]string, 0, 3)</code></span>
+<span class="codeline" id="line-200"><code>	switch c.state {</code></span>
+<span class="codeline" id="line-201"><code>	case stateError:</code></span>
+<span class="codeline" id="line-202"><code>		return c</code></span>
+<span class="codeline" id="line-203"><code>	case stateURL, stateCSSDqStr, stateCSSSqStr, stateCSSDqURL, stateCSSSqURL, stateCSSURL:</code></span>
+<span class="codeline" id="line-204"><code>		switch c.urlPart {</code></span>
+<span class="codeline" id="line-205"><code>		case urlPartNone:</code></span>
+<span class="codeline" id="line-206"><code>			s = append(s, "_html_template_urlfilter")</code></span>
+<span class="codeline" id="line-207"><code>			fallthrough</code></span>
+<span class="codeline" id="line-208"><code>		case urlPartPreQuery:</code></span>
+<span class="codeline" id="line-209"><code>			switch c.state {</code></span>
+<span class="codeline" id="line-210"><code>			case stateCSSDqStr, stateCSSSqStr:</code></span>
+<span class="codeline" id="line-211"><code>				s = append(s, "_html_template_cssescaper")</code></span>
+<span class="codeline" id="line-212"><code>			default:</code></span>
+<span class="codeline" id="line-213"><code>				s = append(s, "_html_template_urlnormalizer")</code></span>
+<span class="codeline" id="line-214"><code>			}</code></span>
+<span class="codeline" id="line-215"><code>		case urlPartQueryOrFrag:</code></span>
+<span class="codeline" id="line-216"><code>			s = append(s, "_html_template_urlescaper")</code></span>
+<span class="codeline" id="line-217"><code>		case urlPartUnknown:</code></span>
+<span class="codeline" id="line-218"><code>			return context{</code></span>
+<span class="codeline" id="line-219"><code>				state: stateError,</code></span>
+<span class="codeline" id="line-220"><code>				err:   errorf(ErrAmbigContext, n, n.Line, "%s appears in an ambiguous context within a URL", n),</code></span>
+<span class="codeline" id="line-221"><code>			}</code></span>
+<span class="codeline" id="line-222"><code>		default:</code></span>
+<span class="codeline" id="line-223"><code>			panic(c.urlPart.String())</code></span>
+<span class="codeline" id="line-224"><code>		}</code></span>
+<span class="codeline" id="line-225"><code>	case stateJS:</code></span>
+<span class="codeline" id="line-226"><code>		s = append(s, "_html_template_jsvalescaper")</code></span>
+<span class="codeline" id="line-227"><code>		// A slash after a value starts a div operator.</code></span>
+<span class="codeline" id="line-228"><code>		c.jsCtx = jsCtxDivOp</code></span>
+<span class="codeline" id="line-229"><code>	case stateJSDqStr, stateJSSqStr:</code></span>
+<span class="codeline" id="line-230"><code>		s = append(s, "_html_template_jsstrescaper")</code></span>
+<span class="codeline" id="line-231"><code>	case stateJSTmplLit:</code></span>
+<span class="codeline" id="line-232"><code>		s = append(s, "_html_template_jstmpllitescaper")</code></span>
+<span class="codeline" id="line-233"><code>	case stateJSRegexp:</code></span>
+<span class="codeline" id="line-234"><code>		s = append(s, "_html_template_jsregexpescaper")</code></span>
+<span class="codeline" id="line-235"><code>	case stateCSS:</code></span>
+<span class="codeline" id="line-236"><code>		s = append(s, "_html_template_cssvaluefilter")</code></span>
+<span class="codeline" id="line-237"><code>	case stateText:</code></span>
+<span class="codeline" id="line-238"><code>		s = append(s, "_html_template_htmlescaper")</code></span>
+<span class="codeline" id="line-239"><code>	case stateRCDATA:</code></span>
+<span class="codeline" id="line-240"><code>		s = append(s, "_html_template_rcdataescaper")</code></span>
+<span class="codeline" id="line-241"><code>	case stateAttr:</code></span>
+<span class="codeline" id="line-242"><code>		// Handled below in delim check.</code></span>
+<span class="codeline" id="line-243"><code>	case stateAttrName, stateTag:</code></span>
+<span class="codeline" id="line-244"><code>		c.state = stateAttrName</code></span>
+<span class="codeline" id="line-245"><code>		s = append(s, "_html_template_htmlnamefilter")</code></span>
+<span class="codeline" id="line-246"><code>	case stateSrcset:</code></span>
+<span class="codeline" id="line-247"><code>		s = append(s, "_html_template_srcsetescaper")</code></span>
+<span class="codeline" id="line-248"><code>	default:</code></span>
+<span class="codeline" id="line-249"><code>		if isComment(c.state) {</code></span>
+<span class="codeline" id="line-250"><code>			s = append(s, "_html_template_commentescaper")</code></span>
+<span class="codeline" id="line-251"><code>		} else {</code></span>
+<span class="codeline" id="line-252"><code>			panic("unexpected state " + c.state.String())</code></span>
+<span class="codeline" id="line-253"><code>		}</code></span>
+<span class="codeline" id="line-254"><code>	}</code></span>
+<span class="codeline" id="line-255"><code>	switch c.delim {</code></span>
+<span class="codeline" id="line-256"><code>	case delimNone:</code></span>
+<span class="codeline" id="line-257"><code>		// No extra-escaping needed for raw text content.</code></span>
+<span class="codeline" id="line-258"><code>	case delimSpaceOrTagEnd:</code></span>
+<span class="codeline" id="line-259"><code>		s = append(s, "_html_template_nospaceescaper")</code></span>
+<span class="codeline" id="line-260"><code>	default:</code></span>
+<span class="codeline" id="line-261"><code>		s = append(s, "_html_template_attrescaper")</code></span>
+<span class="codeline" id="line-262"><code>	}</code></span>
+<span class="codeline" id="line-263"><code>	e.editActionNode(n, s)</code></span>
+<span class="codeline" id="line-264"><code>	return c</code></span>
+<span class="codeline" id="line-265"><code>}</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>// ensurePipelineContains ensures that the pipeline ends with the commands with</code></span>
+<span class="codeline" id="line-268"><code>// the identifiers in s in order. If the pipeline ends with a predefined escaper</code></span>
+<span class="codeline" id="line-269"><code>// (i.e. "html" or "urlquery"), merge it with the identifiers in s.</code></span>
+<span class="codeline" id="line-270"><code>func ensurePipelineContains(p *parse.PipeNode, s []string) {</code></span>
+<span class="codeline" id="line-271"><code>	if len(s) == 0 {</code></span>
+<span class="codeline" id="line-272"><code>		// Do not rewrite pipeline if we have no escapers to insert.</code></span>
+<span class="codeline" id="line-273"><code>		return</code></span>
+<span class="codeline" id="line-274"><code>	}</code></span>
+<span class="codeline" id="line-275"><code>	// Precondition: p.Cmds contains at most one predefined escaper and the</code></span>
+<span class="codeline" id="line-276"><code>	// escaper will be present at p.Cmds[len(p.Cmds)-1]. This precondition is</code></span>
+<span class="codeline" id="line-277"><code>	// always true because of the checks in escapeAction.</code></span>
+<span class="codeline" id="line-278"><code>	pipelineLen := len(p.Cmds)</code></span>
+<span class="codeline" id="line-279"><code>	if pipelineLen &gt; 0 {</code></span>
+<span class="codeline" id="line-280"><code>		lastCmd := p.Cmds[pipelineLen-1]</code></span>
+<span class="codeline" id="line-281"><code>		if idNode, ok := lastCmd.Args[0].(*parse.IdentifierNode); ok {</code></span>
+<span class="codeline" id="line-282"><code>			if esc := idNode.Ident; predefinedEscapers[esc] {</code></span>
+<span class="codeline" id="line-283"><code>				// Pipeline ends with a predefined escaper.</code></span>
+<span class="codeline" id="line-284"><code>				if len(p.Cmds) == 1 &amp;&amp; len(lastCmd.Args) &gt; 1 {</code></span>
+<span class="codeline" id="line-285"><code>					// Special case: pipeline is of the form {{ esc arg1 arg2 ... argN }},</code></span>
+<span class="codeline" id="line-286"><code>					// where esc is the predefined escaper, and arg1...argN are its arguments.</code></span>
+<span class="codeline" id="line-287"><code>					// Convert this into the equivalent form</code></span>
+<span class="codeline" id="line-288"><code>					// {{ _eval_args_ arg1 arg2 ... argN | esc }}, so that esc can be easily</code></span>
+<span class="codeline" id="line-289"><code>					// merged with the escapers in s.</code></span>
+<span class="codeline" id="line-290"><code>					lastCmd.Args[0] = parse.NewIdentifier("_eval_args_").SetTree(nil).SetPos(lastCmd.Args[0].Position())</code></span>
+<span class="codeline" id="line-291"><code>					p.Cmds = appendCmd(p.Cmds, newIdentCmd(esc, p.Position()))</code></span>
+<span class="codeline" id="line-292"><code>					pipelineLen++</code></span>
+<span class="codeline" id="line-293"><code>				}</code></span>
+<span class="codeline" id="line-294"><code>				// If any of the commands in s that we are about to insert is equivalent</code></span>
+<span class="codeline" id="line-295"><code>				// to the predefined escaper, use the predefined escaper instead.</code></span>
+<span class="codeline" id="line-296"><code>				dup := false</code></span>
+<span class="codeline" id="line-297"><code>				for i, escaper := range s {</code></span>
+<span class="codeline" id="line-298"><code>					if escFnsEq(esc, escaper) {</code></span>
+<span class="codeline" id="line-299"><code>						s[i] = idNode.Ident</code></span>
+<span class="codeline" id="line-300"><code>						dup = true</code></span>
+<span class="codeline" id="line-301"><code>					}</code></span>
+<span class="codeline" id="line-302"><code>				}</code></span>
+<span class="codeline" id="line-303"><code>				if dup {</code></span>
+<span class="codeline" id="line-304"><code>					// The predefined escaper will already be inserted along with the</code></span>
+<span class="codeline" id="line-305"><code>					// escapers in s, so do not copy it to the rewritten pipeline.</code></span>
+<span class="codeline" id="line-306"><code>					pipelineLen--</code></span>
+<span class="codeline" id="line-307"><code>				}</code></span>
+<span class="codeline" id="line-308"><code>			}</code></span>
+<span class="codeline" id="line-309"><code>		}</code></span>
+<span class="codeline" id="line-310"><code>	}</code></span>
+<span class="codeline" id="line-311"><code>	// Rewrite the pipeline, creating the escapers in s at the end of the pipeline.</code></span>
+<span class="codeline" id="line-312"><code>	newCmds := make([]*parse.CommandNode, pipelineLen, pipelineLen+len(s))</code></span>
+<span class="codeline" id="line-313"><code>	insertedIdents := make(map[string]bool)</code></span>
+<span class="codeline" id="line-314"><code>	for i := 0; i &lt; pipelineLen; i++ {</code></span>
+<span class="codeline" id="line-315"><code>		cmd := p.Cmds[i]</code></span>
+<span class="codeline" id="line-316"><code>		newCmds[i] = cmd</code></span>
+<span class="codeline" id="line-317"><code>		if idNode, ok := cmd.Args[0].(*parse.IdentifierNode); ok {</code></span>
+<span class="codeline" id="line-318"><code>			insertedIdents[normalizeEscFn(idNode.Ident)] = true</code></span>
+<span class="codeline" id="line-319"><code>		}</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code>	for _, name := range s {</code></span>
+<span class="codeline" id="line-322"><code>		if !insertedIdents[normalizeEscFn(name)] {</code></span>
+<span class="codeline" id="line-323"><code>			// When two templates share an underlying parse tree via the use of</code></span>
+<span class="codeline" id="line-324"><code>			// AddParseTree and one template is executed after the other, this check</code></span>
+<span class="codeline" id="line-325"><code>			// ensures that escapers that were already inserted into the pipeline on</code></span>
+<span class="codeline" id="line-326"><code>			// the first escaping pass do not get inserted again.</code></span>
+<span class="codeline" id="line-327"><code>			newCmds = appendCmd(newCmds, newIdentCmd(name, p.Position()))</code></span>
+<span class="codeline" id="line-328"><code>		}</code></span>
+<span class="codeline" id="line-329"><code>	}</code></span>
+<span class="codeline" id="line-330"><code>	p.Cmds = newCmds</code></span>
+<span class="codeline" id="line-331"><code>}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>// predefinedEscapers contains template predefined escapers that are equivalent</code></span>
+<span class="codeline" id="line-334"><code>// to some contextual escapers. Keep in sync with equivEscapers.</code></span>
+<span class="codeline" id="line-335"><code>var predefinedEscapers = map[string]bool{</code></span>
+<span class="codeline" id="line-336"><code>	"html":     true,</code></span>
+<span class="codeline" id="line-337"><code>	"urlquery": true,</code></span>
+<span class="codeline" id="line-338"><code>}</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>// equivEscapers matches contextual escapers to equivalent predefined</code></span>
+<span class="codeline" id="line-341"><code>// template escapers.</code></span>
+<span class="codeline" id="line-342"><code>var equivEscapers = map[string]string{</code></span>
+<span class="codeline" id="line-343"><code>	// The following pairs of HTML escapers provide equivalent security</code></span>
+<span class="codeline" id="line-344"><code>	// guarantees, since they all escape '\000', '\'', '"', '&amp;', '&lt;', and '&gt;'.</code></span>
+<span class="codeline" id="line-345"><code>	"_html_template_attrescaper":   "html",</code></span>
+<span class="codeline" id="line-346"><code>	"_html_template_htmlescaper":   "html",</code></span>
+<span class="codeline" id="line-347"><code>	"_html_template_rcdataescaper": "html",</code></span>
+<span class="codeline" id="line-348"><code>	// These two URL escapers produce URLs safe for embedding in a URL query by</code></span>
+<span class="codeline" id="line-349"><code>	// percent-encoding all the reserved characters specified in RFC 3986 Section</code></span>
+<span class="codeline" id="line-350"><code>	// 2.2</code></span>
+<span class="codeline" id="line-351"><code>	"_html_template_urlescaper": "urlquery",</code></span>
+<span class="codeline" id="line-352"><code>	// These two functions are not actually equivalent; urlquery is stricter as it</code></span>
+<span class="codeline" id="line-353"><code>	// escapes reserved characters (e.g. '#'), while _html_template_urlnormalizer</code></span>
+<span class="codeline" id="line-354"><code>	// does not. It is therefore only safe to replace _html_template_urlnormalizer</code></span>
+<span class="codeline" id="line-355"><code>	// with urlquery (this happens in ensurePipelineContains), but not the otherI've</code></span>
+<span class="codeline" id="line-356"><code>	// way around. We keep this entry around to preserve the behavior of templates</code></span>
+<span class="codeline" id="line-357"><code>	// written before Go 1.9, which might depend on this substitution taking place.</code></span>
+<span class="codeline" id="line-358"><code>	"_html_template_urlnormalizer": "urlquery",</code></span>
+<span class="codeline" id="line-359"><code>}</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>// escFnsEq reports whether the two escaping functions are equivalent.</code></span>
+<span class="codeline" id="line-362"><code>func escFnsEq(a, b string) bool {</code></span>
+<span class="codeline" id="line-363"><code>	return normalizeEscFn(a) == normalizeEscFn(b)</code></span>
+<span class="codeline" id="line-364"><code>}</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>// normalizeEscFn(a) is equal to normalizeEscFn(b) for any pair of names of</code></span>
+<span class="codeline" id="line-367"><code>// escaper functions a and b that are equivalent.</code></span>
+<span class="codeline" id="line-368"><code>func normalizeEscFn(e string) string {</code></span>
+<span class="codeline" id="line-369"><code>	if norm := equivEscapers[e]; norm != "" {</code></span>
+<span class="codeline" id="line-370"><code>		return norm</code></span>
+<span class="codeline" id="line-371"><code>	}</code></span>
+<span class="codeline" id="line-372"><code>	return e</code></span>
+<span class="codeline" id="line-373"><code>}</code></span>
+<span class="codeline" id="line-374"><code></code></span>
+<span class="codeline" id="line-375"><code>// redundantFuncs[a][b] implies that funcMap[b](funcMap[a](x)) == funcMap[a](x)</code></span>
+<span class="codeline" id="line-376"><code>// for all x.</code></span>
+<span class="codeline" id="line-377"><code>var redundantFuncs = map[string]map[string]bool{</code></span>
+<span class="codeline" id="line-378"><code>	"_html_template_commentescaper": {</code></span>
+<span class="codeline" id="line-379"><code>		"_html_template_attrescaper": true,</code></span>
+<span class="codeline" id="line-380"><code>		"_html_template_htmlescaper": true,</code></span>
+<span class="codeline" id="line-381"><code>	},</code></span>
+<span class="codeline" id="line-382"><code>	"_html_template_cssescaper": {</code></span>
+<span class="codeline" id="line-383"><code>		"_html_template_attrescaper": true,</code></span>
+<span class="codeline" id="line-384"><code>	},</code></span>
+<span class="codeline" id="line-385"><code>	"_html_template_jsregexpescaper": {</code></span>
+<span class="codeline" id="line-386"><code>		"_html_template_attrescaper": true,</code></span>
+<span class="codeline" id="line-387"><code>	},</code></span>
+<span class="codeline" id="line-388"><code>	"_html_template_jsstrescaper": {</code></span>
+<span class="codeline" id="line-389"><code>		"_html_template_attrescaper": true,</code></span>
+<span class="codeline" id="line-390"><code>	},</code></span>
+<span class="codeline" id="line-391"><code>	"_html_template_jstmpllitescaper": {</code></span>
+<span class="codeline" id="line-392"><code>		"_html_template_attrescaper": true,</code></span>
+<span class="codeline" id="line-393"><code>	},</code></span>
+<span class="codeline" id="line-394"><code>	"_html_template_urlescaper": {</code></span>
+<span class="codeline" id="line-395"><code>		"_html_template_urlnormalizer": true,</code></span>
+<span class="codeline" id="line-396"><code>	},</code></span>
+<span class="codeline" id="line-397"><code>}</code></span>
+<span class="codeline" id="line-398"><code></code></span>
+<span class="codeline" id="line-399"><code>// appendCmd appends the given command to the end of the command pipeline</code></span>
+<span class="codeline" id="line-400"><code>// unless it is redundant with the last command.</code></span>
+<span class="codeline" id="line-401"><code>func appendCmd(cmds []*parse.CommandNode, cmd *parse.CommandNode) []*parse.CommandNode {</code></span>
+<span class="codeline" id="line-402"><code>	if n := len(cmds); n != 0 {</code></span>
+<span class="codeline" id="line-403"><code>		last, okLast := cmds[n-1].Args[0].(*parse.IdentifierNode)</code></span>
+<span class="codeline" id="line-404"><code>		next, okNext := cmd.Args[0].(*parse.IdentifierNode)</code></span>
+<span class="codeline" id="line-405"><code>		if okLast &amp;&amp; okNext &amp;&amp; redundantFuncs[last.Ident][next.Ident] {</code></span>
+<span class="codeline" id="line-406"><code>			return cmds</code></span>
+<span class="codeline" id="line-407"><code>		}</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code>	return append(cmds, cmd)</code></span>
+<span class="codeline" id="line-410"><code>}</code></span>
+<span class="codeline" id="line-411"><code></code></span>
+<span class="codeline" id="line-412"><code>// newIdentCmd produces a command containing a single identifier node.</code></span>
+<span class="codeline" id="line-413"><code>func newIdentCmd(identifier string, pos parse.Pos) *parse.CommandNode {</code></span>
+<span class="codeline" id="line-414"><code>	return &amp;parse.CommandNode{</code></span>
+<span class="codeline" id="line-415"><code>		NodeType: parse.NodeCommand,</code></span>
+<span class="codeline" id="line-416"><code>		Args:     []parse.Node{parse.NewIdentifier(identifier).SetTree(nil).SetPos(pos)}, // TODO: SetTree.</code></span>
+<span class="codeline" id="line-417"><code>	}</code></span>
+<span class="codeline" id="line-418"><code>}</code></span>
+<span class="codeline" id="line-419"><code></code></span>
+<span class="codeline" id="line-420"><code>// nudge returns the context that would result from following empty string</code></span>
+<span class="codeline" id="line-421"><code>// transitions from the input context.</code></span>
+<span class="codeline" id="line-422"><code>// For example, parsing:</code></span>
+<span class="codeline" id="line-423"><code>//</code></span>
+<span class="codeline" id="line-424"><code>//	`&lt;a href=`</code></span>
+<span class="codeline" id="line-425"><code>//</code></span>
+<span class="codeline" id="line-426"><code>// will end in context{stateBeforeValue, attrURL}, but parsing one extra rune:</code></span>
+<span class="codeline" id="line-427"><code>//</code></span>
+<span class="codeline" id="line-428"><code>//	`&lt;a href=x`</code></span>
+<span class="codeline" id="line-429"><code>//</code></span>
+<span class="codeline" id="line-430"><code>// will end in context{stateURL, delimSpaceOrTagEnd, ...}.</code></span>
+<span class="codeline" id="line-431"><code>// There are two transitions that happen when the 'x' is seen:</code></span>
+<span class="codeline" id="line-432"><code>// (1) Transition from a before-value state to a start-of-value state without</code></span>
+<span class="codeline" id="line-433"><code>//</code></span>
+<span class="codeline" id="line-434"><code>//	consuming any character.</code></span>
+<span class="codeline" id="line-435"><code>//</code></span>
+<span class="codeline" id="line-436"><code>// (2) Consume 'x' and transition past the first value character.</code></span>
+<span class="codeline" id="line-437"><code>// In this case, nudging produces the context after (1) happens.</code></span>
+<span class="codeline" id="line-438"><code>func nudge(c context) context {</code></span>
+<span class="codeline" id="line-439"><code>	switch c.state {</code></span>
+<span class="codeline" id="line-440"><code>	case stateTag:</code></span>
+<span class="codeline" id="line-441"><code>		// In `&lt;foo {{.}}`, the action should emit an attribute.</code></span>
+<span class="codeline" id="line-442"><code>		c.state = stateAttrName</code></span>
+<span class="codeline" id="line-443"><code>	case stateBeforeValue:</code></span>
+<span class="codeline" id="line-444"><code>		// In `&lt;foo bar={{.}}`, the action is an undelimited value.</code></span>
+<span class="codeline" id="line-445"><code>		c.state, c.delim, c.attr = attrStartStates[c.attr], delimSpaceOrTagEnd, attrNone</code></span>
+<span class="codeline" id="line-446"><code>	case stateAfterName:</code></span>
+<span class="codeline" id="line-447"><code>		// In `&lt;foo bar {{.}}`, the action is an attribute name.</code></span>
+<span class="codeline" id="line-448"><code>		c.state, c.attr = stateAttrName, attrNone</code></span>
+<span class="codeline" id="line-449"><code>	}</code></span>
+<span class="codeline" id="line-450"><code>	return c</code></span>
+<span class="codeline" id="line-451"><code>}</code></span>
+<span class="codeline" id="line-452"><code></code></span>
+<span class="codeline" id="line-453"><code>// join joins the two contexts of a branch template node. The result is an</code></span>
+<span class="codeline" id="line-454"><code>// error context if either of the input contexts are error contexts, or if the</code></span>
+<span class="codeline" id="line-455"><code>// input contexts differ.</code></span>
+<span class="codeline" id="line-456"><code>func join(a, b context, node parse.Node, nodeName string) context {</code></span>
+<span class="codeline" id="line-457"><code>	if a.state == stateError {</code></span>
+<span class="codeline" id="line-458"><code>		return a</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	if b.state == stateError {</code></span>
+<span class="codeline" id="line-461"><code>		return b</code></span>
+<span class="codeline" id="line-462"><code>	}</code></span>
+<span class="codeline" id="line-463"><code>	if a.state == stateDead {</code></span>
+<span class="codeline" id="line-464"><code>		return b</code></span>
+<span class="codeline" id="line-465"><code>	}</code></span>
+<span class="codeline" id="line-466"><code>	if b.state == stateDead {</code></span>
+<span class="codeline" id="line-467"><code>		return a</code></span>
+<span class="codeline" id="line-468"><code>	}</code></span>
+<span class="codeline" id="line-469"><code>	if a.eq(b) {</code></span>
+<span class="codeline" id="line-470"><code>		return a</code></span>
+<span class="codeline" id="line-471"><code>	}</code></span>
+<span class="codeline" id="line-472"><code></code></span>
+<span class="codeline" id="line-473"><code>	c := a</code></span>
+<span class="codeline" id="line-474"><code>	c.urlPart = b.urlPart</code></span>
+<span class="codeline" id="line-475"><code>	if c.eq(b) {</code></span>
+<span class="codeline" id="line-476"><code>		// The contexts differ only by urlPart.</code></span>
+<span class="codeline" id="line-477"><code>		c.urlPart = urlPartUnknown</code></span>
+<span class="codeline" id="line-478"><code>		return c</code></span>
+<span class="codeline" id="line-479"><code>	}</code></span>
+<span class="codeline" id="line-480"><code></code></span>
+<span class="codeline" id="line-481"><code>	c = a</code></span>
+<span class="codeline" id="line-482"><code>	c.jsCtx = b.jsCtx</code></span>
+<span class="codeline" id="line-483"><code>	if c.eq(b) {</code></span>
+<span class="codeline" id="line-484"><code>		// The contexts differ only by jsCtx.</code></span>
+<span class="codeline" id="line-485"><code>		c.jsCtx = jsCtxUnknown</code></span>
+<span class="codeline" id="line-486"><code>		return c</code></span>
+<span class="codeline" id="line-487"><code>	}</code></span>
+<span class="codeline" id="line-488"><code></code></span>
+<span class="codeline" id="line-489"><code>	// Allow a nudged context to join with an unnudged one.</code></span>
+<span class="codeline" id="line-490"><code>	// This means that</code></span>
+<span class="codeline" id="line-491"><code>	//   &lt;p title={{if .C}}{{.}}{{end}}</code></span>
+<span class="codeline" id="line-492"><code>	// ends in an unquoted value state even though the else branch</code></span>
+<span class="codeline" id="line-493"><code>	// ends in stateBeforeValue.</code></span>
+<span class="codeline" id="line-494"><code>	if c, d := nudge(a), nudge(b); !(c.eq(a) &amp;&amp; d.eq(b)) {</code></span>
+<span class="codeline" id="line-495"><code>		if e := join(c, d, node, nodeName); e.state != stateError {</code></span>
+<span class="codeline" id="line-496"><code>			return e</code></span>
+<span class="codeline" id="line-497"><code>		}</code></span>
+<span class="codeline" id="line-498"><code>	}</code></span>
+<span class="codeline" id="line-499"><code></code></span>
+<span class="codeline" id="line-500"><code>	return context{</code></span>
+<span class="codeline" id="line-501"><code>		state: stateError,</code></span>
+<span class="codeline" id="line-502"><code>		err:   errorf(ErrBranchEnd, node, 0, "{{%s}} branches end in different contexts: %v, %v", nodeName, a, b),</code></span>
+<span class="codeline" id="line-503"><code>	}</code></span>
+<span class="codeline" id="line-504"><code>}</code></span>
+<span class="codeline" id="line-505"><code></code></span>
+<span class="codeline" id="line-506"><code>// escapeBranch escapes a branch template node: "if", "range" and "with".</code></span>
+<span class="codeline" id="line-507"><code>func (e *escaper) escapeBranch(c context, n *parse.BranchNode, nodeName string) context {</code></span>
+<span class="codeline" id="line-508"><code>	if nodeName == "range" {</code></span>
+<span class="codeline" id="line-509"><code>		e.rangeContext = &amp;rangeContext{outer: e.rangeContext}</code></span>
+<span class="codeline" id="line-510"><code>	}</code></span>
+<span class="codeline" id="line-511"><code>	c0 := e.escapeList(c, n.List)</code></span>
+<span class="codeline" id="line-512"><code>	if nodeName == "range" {</code></span>
+<span class="codeline" id="line-513"><code>		if c0.state != stateError {</code></span>
+<span class="codeline" id="line-514"><code>			c0 = joinRange(c0, e.rangeContext)</code></span>
+<span class="codeline" id="line-515"><code>		}</code></span>
+<span class="codeline" id="line-516"><code>		e.rangeContext = e.rangeContext.outer</code></span>
+<span class="codeline" id="line-517"><code>		if c0.state == stateError {</code></span>
+<span class="codeline" id="line-518"><code>			return c0</code></span>
+<span class="codeline" id="line-519"><code>		}</code></span>
+<span class="codeline" id="line-520"><code></code></span>
+<span class="codeline" id="line-521"><code>		// The "true" branch of a "range" node can execute multiple times.</code></span>
+<span class="codeline" id="line-522"><code>		// We check that executing n.List once results in the same context</code></span>
+<span class="codeline" id="line-523"><code>		// as executing n.List twice.</code></span>
+<span class="codeline" id="line-524"><code>		e.rangeContext = &amp;rangeContext{outer: e.rangeContext}</code></span>
+<span class="codeline" id="line-525"><code>		c1, _ := e.escapeListConditionally(c0, n.List, nil)</code></span>
+<span class="codeline" id="line-526"><code>		c0 = join(c0, c1, n, nodeName)</code></span>
+<span class="codeline" id="line-527"><code>		if c0.state == stateError {</code></span>
+<span class="codeline" id="line-528"><code>			e.rangeContext = e.rangeContext.outer</code></span>
+<span class="codeline" id="line-529"><code>			// Make clear that this is a problem on loop re-entry</code></span>
+<span class="codeline" id="line-530"><code>			// since developers tend to overlook that branch when</code></span>
+<span class="codeline" id="line-531"><code>			// debugging templates.</code></span>
+<span class="codeline" id="line-532"><code>			c0.err.Line = n.Line</code></span>
+<span class="codeline" id="line-533"><code>			c0.err.Description = "on range loop re-entry: " + c0.err.Description</code></span>
+<span class="codeline" id="line-534"><code>			return c0</code></span>
+<span class="codeline" id="line-535"><code>		}</code></span>
+<span class="codeline" id="line-536"><code>		c0 = joinRange(c0, e.rangeContext)</code></span>
+<span class="codeline" id="line-537"><code>		e.rangeContext = e.rangeContext.outer</code></span>
+<span class="codeline" id="line-538"><code>		if c0.state == stateError {</code></span>
+<span class="codeline" id="line-539"><code>			return c0</code></span>
+<span class="codeline" id="line-540"><code>		}</code></span>
+<span class="codeline" id="line-541"><code>	}</code></span>
+<span class="codeline" id="line-542"><code>	c1 := e.escapeList(c, n.ElseList)</code></span>
+<span class="codeline" id="line-543"><code>	return join(c0, c1, n, nodeName)</code></span>
+<span class="codeline" id="line-544"><code>}</code></span>
+<span class="codeline" id="line-545"><code></code></span>
+<span class="codeline" id="line-546"><code>func joinRange(c0 context, rc *rangeContext) context {</code></span>
+<span class="codeline" id="line-547"><code>	// Merge contexts at break and continue statements into overall body context.</code></span>
+<span class="codeline" id="line-548"><code>	// In theory we could treat breaks differently from continues, but for now it is</code></span>
+<span class="codeline" id="line-549"><code>	// enough to treat them both as going back to the start of the loop (which may then stop).</code></span>
+<span class="codeline" id="line-550"><code>	for _, c := range rc.breaks {</code></span>
+<span class="codeline" id="line-551"><code>		c0 = join(c0, c, c.n, "range")</code></span>
+<span class="codeline" id="line-552"><code>		if c0.state == stateError {</code></span>
+<span class="codeline" id="line-553"><code>			c0.err.Line = c.n.(*parse.BreakNode).Line</code></span>
+<span class="codeline" id="line-554"><code>			c0.err.Description = "at range loop break: " + c0.err.Description</code></span>
+<span class="codeline" id="line-555"><code>			return c0</code></span>
+<span class="codeline" id="line-556"><code>		}</code></span>
+<span class="codeline" id="line-557"><code>	}</code></span>
+<span class="codeline" id="line-558"><code>	for _, c := range rc.continues {</code></span>
+<span class="codeline" id="line-559"><code>		c0 = join(c0, c, c.n, "range")</code></span>
+<span class="codeline" id="line-560"><code>		if c0.state == stateError {</code></span>
+<span class="codeline" id="line-561"><code>			c0.err.Line = c.n.(*parse.ContinueNode).Line</code></span>
+<span class="codeline" id="line-562"><code>			c0.err.Description = "at range loop continue: " + c0.err.Description</code></span>
+<span class="codeline" id="line-563"><code>			return c0</code></span>
+<span class="codeline" id="line-564"><code>		}</code></span>
+<span class="codeline" id="line-565"><code>	}</code></span>
+<span class="codeline" id="line-566"><code>	return c0</code></span>
+<span class="codeline" id="line-567"><code>}</code></span>
+<span class="codeline" id="line-568"><code></code></span>
+<span class="codeline" id="line-569"><code>// escapeList escapes a list template node.</code></span>
+<span class="codeline" id="line-570"><code>func (e *escaper) escapeList(c context, n *parse.ListNode) context {</code></span>
+<span class="codeline" id="line-571"><code>	if n == nil {</code></span>
+<span class="codeline" id="line-572"><code>		return c</code></span>
+<span class="codeline" id="line-573"><code>	}</code></span>
+<span class="codeline" id="line-574"><code>	for _, m := range n.Nodes {</code></span>
+<span class="codeline" id="line-575"><code>		c = e.escape(c, m)</code></span>
+<span class="codeline" id="line-576"><code>		if c.state == stateDead {</code></span>
+<span class="codeline" id="line-577"><code>			break</code></span>
+<span class="codeline" id="line-578"><code>		}</code></span>
+<span class="codeline" id="line-579"><code>	}</code></span>
+<span class="codeline" id="line-580"><code>	return c</code></span>
+<span class="codeline" id="line-581"><code>}</code></span>
+<span class="codeline" id="line-582"><code></code></span>
+<span class="codeline" id="line-583"><code>// escapeListConditionally escapes a list node but only preserves edits and</code></span>
+<span class="codeline" id="line-584"><code>// inferences in e if the inferences and output context satisfy filter.</code></span>
+<span class="codeline" id="line-585"><code>// It returns the best guess at an output context, and the result of the filter</code></span>
+<span class="codeline" id="line-586"><code>// which is the same as whether e was updated.</code></span>
+<span class="codeline" id="line-587"><code>func (e *escaper) escapeListConditionally(c context, n *parse.ListNode, filter func(*escaper, context) bool) (context, bool) {</code></span>
+<span class="codeline" id="line-588"><code>	e1 := makeEscaper(e.ns)</code></span>
+<span class="codeline" id="line-589"><code>	e1.rangeContext = e.rangeContext</code></span>
+<span class="codeline" id="line-590"><code>	// Make type inferences available to f.</code></span>
+<span class="codeline" id="line-591"><code>	for k, v := range e.output {</code></span>
+<span class="codeline" id="line-592"><code>		e1.output[k] = v</code></span>
+<span class="codeline" id="line-593"><code>	}</code></span>
+<span class="codeline" id="line-594"><code>	c = e1.escapeList(c, n)</code></span>
+<span class="codeline" id="line-595"><code>	ok := filter != nil &amp;&amp; filter(&amp;e1, c)</code></span>
+<span class="codeline" id="line-596"><code>	if ok {</code></span>
+<span class="codeline" id="line-597"><code>		// Copy inferences and edits from e1 back into e.</code></span>
+<span class="codeline" id="line-598"><code>		for k, v := range e1.output {</code></span>
+<span class="codeline" id="line-599"><code>			e.output[k] = v</code></span>
+<span class="codeline" id="line-600"><code>		}</code></span>
+<span class="codeline" id="line-601"><code>		for k, v := range e1.derived {</code></span>
+<span class="codeline" id="line-602"><code>			e.derived[k] = v</code></span>
+<span class="codeline" id="line-603"><code>		}</code></span>
+<span class="codeline" id="line-604"><code>		for k, v := range e1.called {</code></span>
+<span class="codeline" id="line-605"><code>			e.called[k] = v</code></span>
+<span class="codeline" id="line-606"><code>		}</code></span>
+<span class="codeline" id="line-607"><code>		for k, v := range e1.actionNodeEdits {</code></span>
+<span class="codeline" id="line-608"><code>			e.editActionNode(k, v)</code></span>
+<span class="codeline" id="line-609"><code>		}</code></span>
+<span class="codeline" id="line-610"><code>		for k, v := range e1.templateNodeEdits {</code></span>
+<span class="codeline" id="line-611"><code>			e.editTemplateNode(k, v)</code></span>
+<span class="codeline" id="line-612"><code>		}</code></span>
+<span class="codeline" id="line-613"><code>		for k, v := range e1.textNodeEdits {</code></span>
+<span class="codeline" id="line-614"><code>			e.editTextNode(k, v)</code></span>
+<span class="codeline" id="line-615"><code>		}</code></span>
+<span class="codeline" id="line-616"><code>	}</code></span>
+<span class="codeline" id="line-617"><code>	return c, ok</code></span>
+<span class="codeline" id="line-618"><code>}</code></span>
+<span class="codeline" id="line-619"><code></code></span>
+<span class="codeline" id="line-620"><code>// escapeTemplate escapes a {{template}} call node.</code></span>
+<span class="codeline" id="line-621"><code>func (e *escaper) escapeTemplate(c context, n *parse.TemplateNode) context {</code></span>
+<span class="codeline" id="line-622"><code>	c, name := e.escapeTree(c, n, n.Name, n.Line)</code></span>
+<span class="codeline" id="line-623"><code>	if name != n.Name {</code></span>
+<span class="codeline" id="line-624"><code>		e.editTemplateNode(n, name)</code></span>
+<span class="codeline" id="line-625"><code>	}</code></span>
+<span class="codeline" id="line-626"><code>	return c</code></span>
+<span class="codeline" id="line-627"><code>}</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>// escapeTree escapes the named template starting in the given context as</code></span>
+<span class="codeline" id="line-630"><code>// necessary and returns its output context.</code></span>
+<span class="codeline" id="line-631"><code>func (e *escaper) escapeTree(c context, node parse.Node, name string, line int) (context, string) {</code></span>
+<span class="codeline" id="line-632"><code>	// Mangle the template name with the input context to produce a reliable</code></span>
+<span class="codeline" id="line-633"><code>	// identifier.</code></span>
+<span class="codeline" id="line-634"><code>	dname := c.mangle(name)</code></span>
+<span class="codeline" id="line-635"><code>	e.called[dname] = true</code></span>
+<span class="codeline" id="line-636"><code>	if out, ok := e.output[dname]; ok {</code></span>
+<span class="codeline" id="line-637"><code>		// Already escaped.</code></span>
+<span class="codeline" id="line-638"><code>		return out, dname</code></span>
+<span class="codeline" id="line-639"><code>	}</code></span>
+<span class="codeline" id="line-640"><code>	t := e.template(name)</code></span>
+<span class="codeline" id="line-641"><code>	if t == nil {</code></span>
+<span class="codeline" id="line-642"><code>		// Two cases: The template exists but is empty, or has never been mentioned at</code></span>
+<span class="codeline" id="line-643"><code>		// all. Distinguish the cases in the error messages.</code></span>
+<span class="codeline" id="line-644"><code>		if e.ns.set[name] != nil {</code></span>
+<span class="codeline" id="line-645"><code>			return context{</code></span>
+<span class="codeline" id="line-646"><code>				state: stateError,</code></span>
+<span class="codeline" id="line-647"><code>				err:   errorf(ErrNoSuchTemplate, node, line, "%q is an incomplete or empty template", name),</code></span>
+<span class="codeline" id="line-648"><code>			}, dname</code></span>
+<span class="codeline" id="line-649"><code>		}</code></span>
+<span class="codeline" id="line-650"><code>		return context{</code></span>
+<span class="codeline" id="line-651"><code>			state: stateError,</code></span>
+<span class="codeline" id="line-652"><code>			err:   errorf(ErrNoSuchTemplate, node, line, "no such template %q", name),</code></span>
+<span class="codeline" id="line-653"><code>		}, dname</code></span>
+<span class="codeline" id="line-654"><code>	}</code></span>
+<span class="codeline" id="line-655"><code>	if dname != name {</code></span>
+<span class="codeline" id="line-656"><code>		// Use any template derived during an earlier call to escapeTemplate</code></span>
+<span class="codeline" id="line-657"><code>		// with different top level templates, or clone if necessary.</code></span>
+<span class="codeline" id="line-658"><code>		dt := e.template(dname)</code></span>
+<span class="codeline" id="line-659"><code>		if dt == nil {</code></span>
+<span class="codeline" id="line-660"><code>			dt = template.New(dname)</code></span>
+<span class="codeline" id="line-661"><code>			dt.Tree = &amp;parse.Tree{Name: dname, Root: t.Root.CopyList()}</code></span>
+<span class="codeline" id="line-662"><code>			e.derived[dname] = dt</code></span>
+<span class="codeline" id="line-663"><code>		}</code></span>
+<span class="codeline" id="line-664"><code>		t = dt</code></span>
+<span class="codeline" id="line-665"><code>	}</code></span>
+<span class="codeline" id="line-666"><code>	return e.computeOutCtx(c, t), dname</code></span>
+<span class="codeline" id="line-667"><code>}</code></span>
+<span class="codeline" id="line-668"><code></code></span>
+<span class="codeline" id="line-669"><code>// computeOutCtx takes a template and its start context and computes the output</code></span>
+<span class="codeline" id="line-670"><code>// context while storing any inferences in e.</code></span>
+<span class="codeline" id="line-671"><code>func (e *escaper) computeOutCtx(c context, t *template.Template) context {</code></span>
+<span class="codeline" id="line-672"><code>	// Propagate context over the body.</code></span>
+<span class="codeline" id="line-673"><code>	c1, ok := e.escapeTemplateBody(c, t)</code></span>
+<span class="codeline" id="line-674"><code>	if !ok {</code></span>
+<span class="codeline" id="line-675"><code>		// Look for a fixed point by assuming c1 as the output context.</code></span>
+<span class="codeline" id="line-676"><code>		if c2, ok2 := e.escapeTemplateBody(c1, t); ok2 {</code></span>
+<span class="codeline" id="line-677"><code>			c1, ok = c2, true</code></span>
+<span class="codeline" id="line-678"><code>		}</code></span>
+<span class="codeline" id="line-679"><code>		// Use c1 as the error context if neither assumption worked.</code></span>
+<span class="codeline" id="line-680"><code>	}</code></span>
+<span class="codeline" id="line-681"><code>	if !ok &amp;&amp; c1.state != stateError {</code></span>
+<span class="codeline" id="line-682"><code>		return context{</code></span>
+<span class="codeline" id="line-683"><code>			state: stateError,</code></span>
+<span class="codeline" id="line-684"><code>			err:   errorf(ErrOutputContext, t.Tree.Root, 0, "cannot compute output context for template %s", t.Name()),</code></span>
+<span class="codeline" id="line-685"><code>		}</code></span>
+<span class="codeline" id="line-686"><code>	}</code></span>
+<span class="codeline" id="line-687"><code>	return c1</code></span>
+<span class="codeline" id="line-688"><code>}</code></span>
+<span class="codeline" id="line-689"><code></code></span>
+<span class="codeline" id="line-690"><code>// escapeTemplateBody escapes the given template assuming the given output</code></span>
+<span class="codeline" id="line-691"><code>// context, and returns the best guess at the output context and whether the</code></span>
+<span class="codeline" id="line-692"><code>// assumption was correct.</code></span>
+<span class="codeline" id="line-693"><code>func (e *escaper) escapeTemplateBody(c context, t *template.Template) (context, bool) {</code></span>
+<span class="codeline" id="line-694"><code>	filter := func(e1 *escaper, c1 context) bool {</code></span>
+<span class="codeline" id="line-695"><code>		if c1.state == stateError {</code></span>
+<span class="codeline" id="line-696"><code>			// Do not update the input escaper, e.</code></span>
+<span class="codeline" id="line-697"><code>			return false</code></span>
+<span class="codeline" id="line-698"><code>		}</code></span>
+<span class="codeline" id="line-699"><code>		if !e1.called[t.Name()] {</code></span>
+<span class="codeline" id="line-700"><code>			// If t is not recursively called, then c1 is an</code></span>
+<span class="codeline" id="line-701"><code>			// accurate output context.</code></span>
+<span class="codeline" id="line-702"><code>			return true</code></span>
+<span class="codeline" id="line-703"><code>		}</code></span>
+<span class="codeline" id="line-704"><code>		// c1 is accurate if it matches our assumed output context.</code></span>
+<span class="codeline" id="line-705"><code>		return c.eq(c1)</code></span>
+<span class="codeline" id="line-706"><code>	}</code></span>
+<span class="codeline" id="line-707"><code>	// We need to assume an output context so that recursive template calls</code></span>
+<span class="codeline" id="line-708"><code>	// take the fast path out of escapeTree instead of infinitely recurring.</code></span>
+<span class="codeline" id="line-709"><code>	// Naively assuming that the input context is the same as the output</code></span>
+<span class="codeline" id="line-710"><code>	// works &gt;90% of the time.</code></span>
+<span class="codeline" id="line-711"><code>	e.output[t.Name()] = c</code></span>
+<span class="codeline" id="line-712"><code>	return e.escapeListConditionally(c, t.Tree.Root, filter)</code></span>
+<span class="codeline" id="line-713"><code>}</code></span>
+<span class="codeline" id="line-714"><code></code></span>
+<span class="codeline" id="line-715"><code>// delimEnds maps each delim to a string of characters that terminate it.</code></span>
+<span class="codeline" id="line-716"><code>var delimEnds = [...]string{</code></span>
+<span class="codeline" id="line-717"><code>	delimDoubleQuote: `"`,</code></span>
+<span class="codeline" id="line-718"><code>	delimSingleQuote: "'",</code></span>
+<span class="codeline" id="line-719"><code>	// Determined empirically by running the below in various browsers.</code></span>
+<span class="codeline" id="line-720"><code>	// var div = document.createElement("DIV");</code></span>
+<span class="codeline" id="line-721"><code>	// for (var i = 0; i &lt; 0x10000; ++i) {</code></span>
+<span class="codeline" id="line-722"><code>	//   div.innerHTML = "&lt;span title=x" + String.fromCharCode(i) + "-bar&gt;";</code></span>
+<span class="codeline" id="line-723"><code>	//   if (div.getElementsByTagName("SPAN")[0].title.indexOf("bar") &lt; 0)</code></span>
+<span class="codeline" id="line-724"><code>	//     document.write("&lt;p&gt;U+" + i.toString(16));</code></span>
+<span class="codeline" id="line-725"><code>	// }</code></span>
+<span class="codeline" id="line-726"><code>	delimSpaceOrTagEnd: " \t\n\f\r&gt;",</code></span>
+<span class="codeline" id="line-727"><code>}</code></span>
+<span class="codeline" id="line-728"><code></code></span>
+<span class="codeline" id="line-729"><code>var (</code></span>
+<span class="codeline" id="line-730"><code>	// Per WHATWG HTML specification, section 4.12.1.3, there are extremely</code></span>
+<span class="codeline" id="line-731"><code>	// complicated rules for how to handle the set of opening tags &lt;!--,</code></span>
+<span class="codeline" id="line-732"><code>	// &lt;script, and &lt;/script when they appear in JS literals (i.e. strings,</code></span>
+<span class="codeline" id="line-733"><code>	// regexs, and comments). The specification suggests a simple solution,</code></span>
+<span class="codeline" id="line-734"><code>	// rather than implementing the arcane ABNF, which involves simply escaping</code></span>
+<span class="codeline" id="line-735"><code>	// the opening bracket with \x3C. We use the below regex for this, since it</code></span>
+<span class="codeline" id="line-736"><code>	// makes doing the case-insensitive find-replace much simpler.</code></span>
+<span class="codeline" id="line-737"><code>	specialScriptTagRE          = regexp.MustCompile("(?i)&lt;(script|/script|!--)")</code></span>
+<span class="codeline" id="line-738"><code>	specialScriptTagReplacement = []byte("\\x3C$1")</code></span>
+<span class="codeline" id="line-739"><code>)</code></span>
+<span class="codeline" id="line-740"><code></code></span>
+<span class="codeline" id="line-741"><code>func containsSpecialScriptTag(s []byte) bool {</code></span>
+<span class="codeline" id="line-742"><code>	return specialScriptTagRE.Match(s)</code></span>
+<span class="codeline" id="line-743"><code>}</code></span>
+<span class="codeline" id="line-744"><code></code></span>
+<span class="codeline" id="line-745"><code>func escapeSpecialScriptTags(s []byte) []byte {</code></span>
+<span class="codeline" id="line-746"><code>	return specialScriptTagRE.ReplaceAll(s, specialScriptTagReplacement)</code></span>
+<span class="codeline" id="line-747"><code>}</code></span>
+<span class="codeline" id="line-748"><code></code></span>
+<span class="codeline" id="line-749"><code>var doctypeBytes = []byte("&lt;!DOCTYPE")</code></span>
+<span class="codeline" id="line-750"><code></code></span>
+<span class="codeline" id="line-751"><code>// escapeText escapes a text template node.</code></span>
+<span class="codeline" id="line-752"><code>func (e *escaper) escapeText(c context, n *parse.TextNode) context {</code></span>
+<span class="codeline" id="line-753"><code>	s, written, i, b := n.Text, 0, 0, new(bytes.Buffer)</code></span>
+<span class="codeline" id="line-754"><code>	for i != len(s) {</code></span>
+<span class="codeline" id="line-755"><code>		c1, nread := contextAfterText(c, s[i:])</code></span>
+<span class="codeline" id="line-756"><code>		i1 := i + nread</code></span>
+<span class="codeline" id="line-757"><code>		if c.state == stateText || c.state == stateRCDATA {</code></span>
+<span class="codeline" id="line-758"><code>			end := i1</code></span>
+<span class="codeline" id="line-759"><code>			if c1.state != c.state {</code></span>
+<span class="codeline" id="line-760"><code>				for j := end - 1; j &gt;= i; j-- {</code></span>
+<span class="codeline" id="line-761"><code>					if s[j] == '&lt;' {</code></span>
+<span class="codeline" id="line-762"><code>						end = j</code></span>
+<span class="codeline" id="line-763"><code>						break</code></span>
+<span class="codeline" id="line-764"><code>					}</code></span>
+<span class="codeline" id="line-765"><code>				}</code></span>
+<span class="codeline" id="line-766"><code>			}</code></span>
+<span class="codeline" id="line-767"><code>			for j := i; j &lt; end; j++ {</code></span>
+<span class="codeline" id="line-768"><code>				if s[j] == '&lt;' &amp;&amp; !bytes.HasPrefix(bytes.ToUpper(s[j:]), doctypeBytes) {</code></span>
+<span class="codeline" id="line-769"><code>					b.Write(s[written:j])</code></span>
+<span class="codeline" id="line-770"><code>					b.WriteString("&amp;lt;")</code></span>
+<span class="codeline" id="line-771"><code>					written = j + 1</code></span>
+<span class="codeline" id="line-772"><code>				}</code></span>
+<span class="codeline" id="line-773"><code>			}</code></span>
+<span class="codeline" id="line-774"><code>		} else if isComment(c.state) &amp;&amp; c.delim == delimNone {</code></span>
+<span class="codeline" id="line-775"><code>			switch c.state {</code></span>
+<span class="codeline" id="line-776"><code>			case stateJSBlockCmt:</code></span>
+<span class="codeline" id="line-777"><code>				// https://es5.github.io/#x7.4:</code></span>
+<span class="codeline" id="line-778"><code>				// "Comments behave like white space and are</code></span>
+<span class="codeline" id="line-779"><code>				// discarded except that, if a MultiLineComment</code></span>
+<span class="codeline" id="line-780"><code>				// contains a line terminator character, then</code></span>
+<span class="codeline" id="line-781"><code>				// the entire comment is considered to be a</code></span>
+<span class="codeline" id="line-782"><code>				// LineTerminator for purposes of parsing by</code></span>
+<span class="codeline" id="line-783"><code>				// the syntactic grammar."</code></span>
+<span class="codeline" id="line-784"><code>				if bytes.ContainsAny(s[written:i1], "\n\r\u2028\u2029") {</code></span>
+<span class="codeline" id="line-785"><code>					b.WriteByte('\n')</code></span>
+<span class="codeline" id="line-786"><code>				} else {</code></span>
+<span class="codeline" id="line-787"><code>					b.WriteByte(' ')</code></span>
+<span class="codeline" id="line-788"><code>				}</code></span>
+<span class="codeline" id="line-789"><code>			case stateCSSBlockCmt:</code></span>
+<span class="codeline" id="line-790"><code>				b.WriteByte(' ')</code></span>
+<span class="codeline" id="line-791"><code>			}</code></span>
+<span class="codeline" id="line-792"><code>			written = i1</code></span>
+<span class="codeline" id="line-793"><code>		}</code></span>
+<span class="codeline" id="line-794"><code>		if c.state != c1.state &amp;&amp; isComment(c1.state) &amp;&amp; c1.delim == delimNone {</code></span>
+<span class="codeline" id="line-795"><code>			// Preserve the portion between written and the comment start.</code></span>
+<span class="codeline" id="line-796"><code>			cs := i1 - 2</code></span>
+<span class="codeline" id="line-797"><code>			if c1.state == stateHTMLCmt || c1.state == stateJSHTMLOpenCmt {</code></span>
+<span class="codeline" id="line-798"><code>				// "&lt;!--" instead of "/*" or "//"</code></span>
+<span class="codeline" id="line-799"><code>				cs -= 2</code></span>
+<span class="codeline" id="line-800"><code>			} else if c1.state == stateJSHTMLCloseCmt {</code></span>
+<span class="codeline" id="line-801"><code>				// "--&gt;" instead of "/*" or "//"</code></span>
+<span class="codeline" id="line-802"><code>				cs -= 1</code></span>
+<span class="codeline" id="line-803"><code>			}</code></span>
+<span class="codeline" id="line-804"><code>			b.Write(s[written:cs])</code></span>
+<span class="codeline" id="line-805"><code>			written = i1</code></span>
+<span class="codeline" id="line-806"><code>		}</code></span>
+<span class="codeline" id="line-807"><code>		if isInScriptLiteral(c.state) &amp;&amp; containsSpecialScriptTag(s[i:i1]) {</code></span>
+<span class="codeline" id="line-808"><code>			b.Write(s[written:i])</code></span>
+<span class="codeline" id="line-809"><code>			b.Write(escapeSpecialScriptTags(s[i:i1]))</code></span>
+<span class="codeline" id="line-810"><code>			written = i1</code></span>
+<span class="codeline" id="line-811"><code>		}</code></span>
+<span class="codeline" id="line-812"><code>		if i == i1 &amp;&amp; c.state == c1.state {</code></span>
+<span class="codeline" id="line-813"><code>			panic(fmt.Sprintf("infinite loop from %v to %v on %q..%q", c, c1, s[:i], s[i:]))</code></span>
+<span class="codeline" id="line-814"><code>		}</code></span>
+<span class="codeline" id="line-815"><code>		c, i = c1, i1</code></span>
+<span class="codeline" id="line-816"><code>	}</code></span>
+<span class="codeline" id="line-817"><code></code></span>
+<span class="codeline" id="line-818"><code>	if written != 0 &amp;&amp; c.state != stateError {</code></span>
+<span class="codeline" id="line-819"><code>		if !isComment(c.state) || c.delim != delimNone {</code></span>
+<span class="codeline" id="line-820"><code>			b.Write(n.Text[written:])</code></span>
+<span class="codeline" id="line-821"><code>		}</code></span>
+<span class="codeline" id="line-822"><code>		e.editTextNode(n, b.Bytes())</code></span>
+<span class="codeline" id="line-823"><code>	}</code></span>
+<span class="codeline" id="line-824"><code>	return c</code></span>
+<span class="codeline" id="line-825"><code>}</code></span>
+<span class="codeline" id="line-826"><code></code></span>
+<span class="codeline" id="line-827"><code>// contextAfterText starts in context c, consumes some tokens from the front of</code></span>
+<span class="codeline" id="line-828"><code>// s, then returns the context after those tokens and the unprocessed suffix.</code></span>
+<span class="codeline" id="line-829"><code>func contextAfterText(c context, s []byte) (context, int) {</code></span>
+<span class="codeline" id="line-830"><code>	if c.delim == delimNone {</code></span>
+<span class="codeline" id="line-831"><code>		c1, i := tSpecialTagEnd(c, s)</code></span>
+<span class="codeline" id="line-832"><code>		if i == 0 {</code></span>
+<span class="codeline" id="line-833"><code>			// A special end tag (`&lt;/script&gt;`) has been seen and</code></span>
+<span class="codeline" id="line-834"><code>			// all content preceding it has been consumed.</code></span>
+<span class="codeline" id="line-835"><code>			return c1, 0</code></span>
+<span class="codeline" id="line-836"><code>		}</code></span>
+<span class="codeline" id="line-837"><code>		// Consider all content up to any end tag.</code></span>
+<span class="codeline" id="line-838"><code>		return transitionFunc[c.state](c, s[:i])</code></span>
+<span class="codeline" id="line-839"><code>	}</code></span>
+<span class="codeline" id="line-840"><code></code></span>
+<span class="codeline" id="line-841"><code>	// We are at the beginning of an attribute value.</code></span>
+<span class="codeline" id="line-842"><code></code></span>
+<span class="codeline" id="line-843"><code>	i := bytes.IndexAny(s, delimEnds[c.delim])</code></span>
+<span class="codeline" id="line-844"><code>	if i == -1 {</code></span>
+<span class="codeline" id="line-845"><code>		i = len(s)</code></span>
+<span class="codeline" id="line-846"><code>	}</code></span>
+<span class="codeline" id="line-847"><code>	if c.delim == delimSpaceOrTagEnd {</code></span>
+<span class="codeline" id="line-848"><code>		// https://www.w3.org/TR/html5/syntax.html#attribute-value-(unquoted)-state</code></span>
+<span class="codeline" id="line-849"><code>		// lists the runes below as error characters.</code></span>
+<span class="codeline" id="line-850"><code>		// Error out because HTML parsers may differ on whether</code></span>
+<span class="codeline" id="line-851"><code>		// "&lt;a id= onclick=f("     ends inside id's or onclick's value,</code></span>
+<span class="codeline" id="line-852"><code>		// "&lt;a class=`foo "        ends inside a value,</code></span>
+<span class="codeline" id="line-853"><code>		// "&lt;a style=font:'Arial'" needs open-quote fixup.</code></span>
+<span class="codeline" id="line-854"><code>		// IE treats '`' as a quotation character.</code></span>
+<span class="codeline" id="line-855"><code>		if j := bytes.IndexAny(s[:i], "\"'&lt;=`"); j &gt;= 0 {</code></span>
+<span class="codeline" id="line-856"><code>			return context{</code></span>
+<span class="codeline" id="line-857"><code>				state: stateError,</code></span>
+<span class="codeline" id="line-858"><code>				err:   errorf(ErrBadHTML, nil, 0, "%q in unquoted attr: %q", s[j:j+1], s[:i]),</code></span>
+<span class="codeline" id="line-859"><code>			}, len(s)</code></span>
+<span class="codeline" id="line-860"><code>		}</code></span>
+<span class="codeline" id="line-861"><code>	}</code></span>
+<span class="codeline" id="line-862"><code>	if i == len(s) {</code></span>
+<span class="codeline" id="line-863"><code>		// Remain inside the attribute.</code></span>
+<span class="codeline" id="line-864"><code>		// Decode the value so non-HTML rules can easily handle</code></span>
+<span class="codeline" id="line-865"><code>		//     &lt;button onclick="alert(&amp;quot;Hi!&amp;quot;)"&gt;</code></span>
+<span class="codeline" id="line-866"><code>		// without having to entity decode token boundaries.</code></span>
+<span class="codeline" id="line-867"><code>		for u := []byte(html.UnescapeString(string(s))); len(u) != 0; {</code></span>
+<span class="codeline" id="line-868"><code>			c1, i1 := transitionFunc[c.state](c, u)</code></span>
+<span class="codeline" id="line-869"><code>			c, u = c1, u[i1:]</code></span>
+<span class="codeline" id="line-870"><code>		}</code></span>
+<span class="codeline" id="line-871"><code>		return c, len(s)</code></span>
+<span class="codeline" id="line-872"><code>	}</code></span>
+<span class="codeline" id="line-873"><code></code></span>
+<span class="codeline" id="line-874"><code>	element := c.element</code></span>
+<span class="codeline" id="line-875"><code></code></span>
+<span class="codeline" id="line-876"><code>	// If this is a non-JS "type" attribute inside "script" tag, do not treat the contents as JS.</code></span>
+<span class="codeline" id="line-877"><code>	if c.state == stateAttr &amp;&amp; c.element == elementScript &amp;&amp; c.attr == attrScriptType &amp;&amp; !isJSType(string(s[:i])) {</code></span>
+<span class="codeline" id="line-878"><code>		element = elementNone</code></span>
+<span class="codeline" id="line-879"><code>	}</code></span>
+<span class="codeline" id="line-880"><code></code></span>
+<span class="codeline" id="line-881"><code>	if c.delim != delimSpaceOrTagEnd {</code></span>
+<span class="codeline" id="line-882"><code>		// Consume any quote.</code></span>
+<span class="codeline" id="line-883"><code>		i++</code></span>
+<span class="codeline" id="line-884"><code>	}</code></span>
+<span class="codeline" id="line-885"><code>	// On exiting an attribute, we discard all state information</code></span>
+<span class="codeline" id="line-886"><code>	// except the state and element.</code></span>
+<span class="codeline" id="line-887"><code>	return context{state: stateTag, element: element}, i</code></span>
+<span class="codeline" id="line-888"><code>}</code></span>
+<span class="codeline" id="line-889"><code></code></span>
+<span class="codeline" id="line-890"><code>// editActionNode records a change to an action pipeline for later commit.</code></span>
+<span class="codeline" id="line-891"><code>func (e *escaper) editActionNode(n *parse.ActionNode, cmds []string) {</code></span>
+<span class="codeline" id="line-892"><code>	if _, ok := e.actionNodeEdits[n]; ok {</code></span>
+<span class="codeline" id="line-893"><code>		panic(fmt.Sprintf("node %s shared between templates", n))</code></span>
+<span class="codeline" id="line-894"><code>	}</code></span>
+<span class="codeline" id="line-895"><code>	e.actionNodeEdits[n] = cmds</code></span>
+<span class="codeline" id="line-896"><code>}</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>// editTemplateNode records a change to a {{template}} callee for later commit.</code></span>
+<span class="codeline" id="line-899"><code>func (e *escaper) editTemplateNode(n *parse.TemplateNode, callee string) {</code></span>
+<span class="codeline" id="line-900"><code>	if _, ok := e.templateNodeEdits[n]; ok {</code></span>
+<span class="codeline" id="line-901"><code>		panic(fmt.Sprintf("node %s shared between templates", n))</code></span>
+<span class="codeline" id="line-902"><code>	}</code></span>
+<span class="codeline" id="line-903"><code>	e.templateNodeEdits[n] = callee</code></span>
+<span class="codeline" id="line-904"><code>}</code></span>
+<span class="codeline" id="line-905"><code></code></span>
+<span class="codeline" id="line-906"><code>// editTextNode records a change to a text node for later commit.</code></span>
+<span class="codeline" id="line-907"><code>func (e *escaper) editTextNode(n *parse.TextNode, text []byte) {</code></span>
+<span class="codeline" id="line-908"><code>	if _, ok := e.textNodeEdits[n]; ok {</code></span>
+<span class="codeline" id="line-909"><code>		panic(fmt.Sprintf("node %s shared between templates", n))</code></span>
+<span class="codeline" id="line-910"><code>	}</code></span>
+<span class="codeline" id="line-911"><code>	e.textNodeEdits[n] = text</code></span>
+<span class="codeline" id="line-912"><code>}</code></span>
+<span class="codeline" id="line-913"><code></code></span>
+<span class="codeline" id="line-914"><code>// commit applies changes to actions and template calls needed to contextually</code></span>
+<span class="codeline" id="line-915"><code>// autoescape content and adds any derived templates to the set.</code></span>
+<span class="codeline" id="line-916"><code>func (e *escaper) commit() {</code></span>
+<span class="codeline" id="line-917"><code>	for name := range e.output {</code></span>
+<span class="codeline" id="line-918"><code>		e.template(name).Funcs(funcMap)</code></span>
+<span class="codeline" id="line-919"><code>	}</code></span>
+<span class="codeline" id="line-920"><code>	// Any template from the name space associated with this escaper can be used</code></span>
+<span class="codeline" id="line-921"><code>	// to add derived templates to the underlying text/template name space.</code></span>
+<span class="codeline" id="line-922"><code>	tmpl := e.arbitraryTemplate()</code></span>
+<span class="codeline" id="line-923"><code>	for _, t := range e.derived {</code></span>
+<span class="codeline" id="line-924"><code>		if _, err := tmpl.text.AddParseTree(t.Name(), t.Tree); err != nil {</code></span>
+<span class="codeline" id="line-925"><code>			panic("error adding derived template")</code></span>
+<span class="codeline" id="line-926"><code>		}</code></span>
+<span class="codeline" id="line-927"><code>	}</code></span>
+<span class="codeline" id="line-928"><code>	for n, s := range e.actionNodeEdits {</code></span>
+<span class="codeline" id="line-929"><code>		ensurePipelineContains(n.Pipe, s)</code></span>
+<span class="codeline" id="line-930"><code>	}</code></span>
+<span class="codeline" id="line-931"><code>	for n, name := range e.templateNodeEdits {</code></span>
+<span class="codeline" id="line-932"><code>		n.Name = name</code></span>
+<span class="codeline" id="line-933"><code>	}</code></span>
+<span class="codeline" id="line-934"><code>	for n, s := range e.textNodeEdits {</code></span>
+<span class="codeline" id="line-935"><code>		n.Text = s</code></span>
+<span class="codeline" id="line-936"><code>	}</code></span>
+<span class="codeline" id="line-937"><code>	// Reset state that is specific to this commit so that the same changes are</code></span>
+<span class="codeline" id="line-938"><code>	// not re-applied to the template on subsequent calls to commit.</code></span>
+<span class="codeline" id="line-939"><code>	e.called = make(map[string]bool)</code></span>
+<span class="codeline" id="line-940"><code>	e.actionNodeEdits = make(map[*parse.ActionNode][]string)</code></span>
+<span class="codeline" id="line-941"><code>	e.templateNodeEdits = make(map[*parse.TemplateNode]string)</code></span>
+<span class="codeline" id="line-942"><code>	e.textNodeEdits = make(map[*parse.TextNode][]byte)</code></span>
+<span class="codeline" id="line-943"><code>}</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>// template returns the named template given a mangled template name.</code></span>
+<span class="codeline" id="line-946"><code>func (e *escaper) template(name string) *template.Template {</code></span>
+<span class="codeline" id="line-947"><code>	// Any template from the name space associated with this escaper can be used</code></span>
+<span class="codeline" id="line-948"><code>	// to look up templates in the underlying text/template name space.</code></span>
+<span class="codeline" id="line-949"><code>	t := e.arbitraryTemplate().text.Lookup(name)</code></span>
+<span class="codeline" id="line-950"><code>	if t == nil {</code></span>
+<span class="codeline" id="line-951"><code>		t = e.derived[name]</code></span>
+<span class="codeline" id="line-952"><code>	}</code></span>
+<span class="codeline" id="line-953"><code>	return t</code></span>
+<span class="codeline" id="line-954"><code>}</code></span>
+<span class="codeline" id="line-955"><code></code></span>
+<span class="codeline" id="line-956"><code>// arbitraryTemplate returns an arbitrary template from the name space</code></span>
+<span class="codeline" id="line-957"><code>// associated with e and panics if no templates are found.</code></span>
+<span class="codeline" id="line-958"><code>func (e *escaper) arbitraryTemplate() *Template {</code></span>
+<span class="codeline" id="line-959"><code>	for _, t := range e.ns.set {</code></span>
+<span class="codeline" id="line-960"><code>		return t</code></span>
+<span class="codeline" id="line-961"><code>	}</code></span>
+<span class="codeline" id="line-962"><code>	panic("no templates in name space")</code></span>
+<span class="codeline" id="line-963"><code>}</code></span>
+<span class="codeline" id="line-964"><code></code></span>
+<span class="codeline" id="line-965"><code>// Forwarding functions so that clients need only import this package</code></span>
+<span class="codeline" id="line-966"><code>// to reach the general escaping functions of text/template.</code></span>
+<span class="codeline" id="line-967"><code></code></span>
+<span class="codeline" id="line-968"><code>// HTMLEscape writes to w the escaped HTML equivalent of the plain text data b.</code></span>
+<span class="codeline" id="line-969"><code>func HTMLEscape(w io.Writer, b []byte) {</code></span>
+<span class="codeline" id="line-970"><code>	template.HTMLEscape(w, b)</code></span>
+<span class="codeline" id="line-971"><code>}</code></span>
+<span class="codeline" id="line-972"><code></code></span>
+<span class="codeline" id="line-973"><code>// HTMLEscapeString returns the escaped HTML equivalent of the plain text data s.</code></span>
+<span class="codeline" id="line-974"><code>func HTMLEscapeString(s string) string {</code></span>
+<span class="codeline" id="line-975"><code>	return template.HTMLEscapeString(s)</code></span>
+<span class="codeline" id="line-976"><code>}</code></span>
+<span class="codeline" id="line-977"><code></code></span>
+<span class="codeline" id="line-978"><code>// HTMLEscaper returns the escaped HTML equivalent of the textual</code></span>
+<span class="codeline" id="line-979"><code>// representation of its arguments.</code></span>
+<span class="codeline" id="line-980"><code>func HTMLEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-981"><code>	return template.HTMLEscaper(args...)</code></span>
+<span class="codeline" id="line-982"><code>}</code></span>
+<span class="codeline" id="line-983"><code></code></span>
+<span class="codeline" id="line-984"><code>// JSEscape writes to w the escaped JavaScript equivalent of the plain text data b.</code></span>
+<span class="codeline" id="line-985"><code>func JSEscape(w io.Writer, b []byte) {</code></span>
+<span class="codeline" id="line-986"><code>	template.JSEscape(w, b)</code></span>
+<span class="codeline" id="line-987"><code>}</code></span>
+<span class="codeline" id="line-988"><code></code></span>
+<span class="codeline" id="line-989"><code>// JSEscapeString returns the escaped JavaScript equivalent of the plain text data s.</code></span>
+<span class="codeline" id="line-990"><code>func JSEscapeString(s string) string {</code></span>
+<span class="codeline" id="line-991"><code>	return template.JSEscapeString(s)</code></span>
+<span class="codeline" id="line-992"><code>}</code></span>
+<span class="codeline" id="line-993"><code></code></span>
+<span class="codeline" id="line-994"><code>// JSEscaper returns the escaped JavaScript equivalent of the textual</code></span>
+<span class="codeline" id="line-995"><code>// representation of its arguments.</code></span>
+<span class="codeline" id="line-996"><code>func JSEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-997"><code>	return template.JSEscaper(args...)</code></span>
+<span class="codeline" id="line-998"><code>}</code></span>
+<span class="codeline" id="line-999"><code></code></span>
+<span class="codeline" id="line-1000"><code>// URLQueryEscaper returns the escaped value of the textual representation of</code></span>
+<span class="codeline" id="line-1001"><code>// its arguments in a form suitable for embedding in a URL query.</code></span>
+<span class="codeline" id="line-1002"><code>func URLQueryEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-1003"><code>	return template.URLQueryEscaper(args...)</code></span>
+<span class="codeline" id="line-1004"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

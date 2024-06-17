@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: file_unix.go in package os</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	file_unix.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/os.html">os</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build unix || (js &amp;&amp; wasm) || wasip1</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package os</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"internal/poll"</code></span>
+<span class="codeline" id="line-11"><code>	"internal/syscall/unix"</code></span>
+<span class="codeline" id="line-12"><code>	"io/fs"</code></span>
+<span class="codeline" id="line-13"><code>	"runtime"</code></span>
+<span class="codeline" id="line-14"><code>	"syscall"</code></span>
+<span class="codeline" id="line-15"><code>	_ "unsafe" // for go:linkname</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>const _UTIME_OMIT = unix.UTIME_OMIT</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>// fixLongPath is a noop on non-Windows platforms.</code></span>
+<span class="codeline" id="line-21"><code>func fixLongPath(path string) string {</code></span>
+<span class="codeline" id="line-22"><code>	return path</code></span>
+<span class="codeline" id="line-23"><code>}</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>func rename(oldname, newname string) error {</code></span>
+<span class="codeline" id="line-26"><code>	fi, err := Lstat(newname)</code></span>
+<span class="codeline" id="line-27"><code>	if err == nil &amp;&amp; fi.IsDir() {</code></span>
+<span class="codeline" id="line-28"><code>		// There are two independent errors this function can return:</code></span>
+<span class="codeline" id="line-29"><code>		// one for a bad oldname, and one for a bad newname.</code></span>
+<span class="codeline" id="line-30"><code>		// At this point we've determined the newname is bad.</code></span>
+<span class="codeline" id="line-31"><code>		// But just in case oldname is also bad, prioritize returning</code></span>
+<span class="codeline" id="line-32"><code>		// the oldname error because that's what we did historically.</code></span>
+<span class="codeline" id="line-33"><code>		// However, if the old name and new name are not the same, yet</code></span>
+<span class="codeline" id="line-34"><code>		// they refer to the same file, it implies a case-only</code></span>
+<span class="codeline" id="line-35"><code>		// rename on a case-insensitive filesystem, which is ok.</code></span>
+<span class="codeline" id="line-36"><code>		if ofi, err := Lstat(oldname); err != nil {</code></span>
+<span class="codeline" id="line-37"><code>			if pe, ok := err.(*PathError); ok {</code></span>
+<span class="codeline" id="line-38"><code>				err = pe.Err</code></span>
+<span class="codeline" id="line-39"><code>			}</code></span>
+<span class="codeline" id="line-40"><code>			return &amp;LinkError{"rename", oldname, newname, err}</code></span>
+<span class="codeline" id="line-41"><code>		} else if newname == oldname || !SameFile(fi, ofi) {</code></span>
+<span class="codeline" id="line-42"><code>			return &amp;LinkError{"rename", oldname, newname, syscall.EEXIST}</code></span>
+<span class="codeline" id="line-43"><code>		}</code></span>
+<span class="codeline" id="line-44"><code>	}</code></span>
+<span class="codeline" id="line-45"><code>	err = ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-46"><code>		return syscall.Rename(oldname, newname)</code></span>
+<span class="codeline" id="line-47"><code>	})</code></span>
+<span class="codeline" id="line-48"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-49"><code>		return &amp;LinkError{"rename", oldname, newname, err}</code></span>
+<span class="codeline" id="line-50"><code>	}</code></span>
+<span class="codeline" id="line-51"><code>	return nil</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>// file is the real representation of *File.</code></span>
+<span class="codeline" id="line-55"><code>// The extra level of indirection ensures that no clients of os</code></span>
+<span class="codeline" id="line-56"><code>// can overwrite this data, which could cause the finalizer</code></span>
+<span class="codeline" id="line-57"><code>// to close the wrong file descriptor.</code></span>
+<span class="codeline" id="line-58"><code>type file struct {</code></span>
+<span class="codeline" id="line-59"><code>	pfd         poll.FD</code></span>
+<span class="codeline" id="line-60"><code>	name        string</code></span>
+<span class="codeline" id="line-61"><code>	dirinfo     *dirInfo // nil unless directory being read</code></span>
+<span class="codeline" id="line-62"><code>	nonblock    bool     // whether we set nonblocking mode</code></span>
+<span class="codeline" id="line-63"><code>	stdoutOrErr bool     // whether this is stdout or stderr</code></span>
+<span class="codeline" id="line-64"><code>	appendMode  bool     // whether file is opened for appending</code></span>
+<span class="codeline" id="line-65"><code>}</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>// Fd returns the integer Unix file descriptor referencing the open file.</code></span>
+<span class="codeline" id="line-68"><code>// If f is closed, the file descriptor becomes invalid.</code></span>
+<span class="codeline" id="line-69"><code>// If f is garbage collected, a finalizer may close the file descriptor,</code></span>
+<span class="codeline" id="line-70"><code>// making it invalid; see runtime.SetFinalizer for more information on when</code></span>
+<span class="codeline" id="line-71"><code>// a finalizer might be run. On Unix systems this will cause the SetDeadline</code></span>
+<span class="codeline" id="line-72"><code>// methods to stop working.</code></span>
+<span class="codeline" id="line-73"><code>// Because file descriptors can be reused, the returned file descriptor may</code></span>
+<span class="codeline" id="line-74"><code>// only be closed through the Close method of f, or by its finalizer during</code></span>
+<span class="codeline" id="line-75"><code>// garbage collection. Otherwise, during garbage collection the finalizer</code></span>
+<span class="codeline" id="line-76"><code>// may close an unrelated file descriptor with the same (reused) number.</code></span>
+<span class="codeline" id="line-77"><code>//</code></span>
+<span class="codeline" id="line-78"><code>// As an alternative, see the f.SyscallConn method.</code></span>
+<span class="codeline" id="line-79"><code>func (f *File) Fd() uintptr {</code></span>
+<span class="codeline" id="line-80"><code>	if f == nil {</code></span>
+<span class="codeline" id="line-81"><code>		return ^(uintptr(0))</code></span>
+<span class="codeline" id="line-82"><code>	}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>	// If we put the file descriptor into nonblocking mode,</code></span>
+<span class="codeline" id="line-85"><code>	// then set it to blocking mode before we return it,</code></span>
+<span class="codeline" id="line-86"><code>	// because historically we have always returned a descriptor</code></span>
+<span class="codeline" id="line-87"><code>	// opened in blocking mode. The File will continue to work,</code></span>
+<span class="codeline" id="line-88"><code>	// but any blocking operation will tie up a thread.</code></span>
+<span class="codeline" id="line-89"><code>	if f.nonblock {</code></span>
+<span class="codeline" id="line-90"><code>		f.pfd.SetBlocking()</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>	return uintptr(f.pfd.Sysfd)</code></span>
+<span class="codeline" id="line-94"><code>}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// NewFile returns a new File with the given file descriptor and</code></span>
+<span class="codeline" id="line-97"><code>// name. The returned value will be nil if fd is not a valid file</code></span>
+<span class="codeline" id="line-98"><code>// descriptor. On Unix systems, if the file descriptor is in</code></span>
+<span class="codeline" id="line-99"><code>// non-blocking mode, NewFile will attempt to return a pollable File</code></span>
+<span class="codeline" id="line-100"><code>// (one for which the SetDeadline methods work).</code></span>
+<span class="codeline" id="line-101"><code>//</code></span>
+<span class="codeline" id="line-102"><code>// After passing it to NewFile, fd may become invalid under the same</code></span>
+<span class="codeline" id="line-103"><code>// conditions described in the comments of the Fd method, and the same</code></span>
+<span class="codeline" id="line-104"><code>// constraints apply.</code></span>
+<span class="codeline" id="line-105"><code>func NewFile(fd uintptr, name string) *File {</code></span>
+<span class="codeline" id="line-106"><code>	fdi := int(fd)</code></span>
+<span class="codeline" id="line-107"><code>	if fdi &lt; 0 {</code></span>
+<span class="codeline" id="line-108"><code>		return nil</code></span>
+<span class="codeline" id="line-109"><code>	}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>	kind := kindNewFile</code></span>
+<span class="codeline" id="line-112"><code>	appendMode := false</code></span>
+<span class="codeline" id="line-113"><code>	if flags, err := unix.Fcntl(fdi, syscall.F_GETFL, 0); err == nil {</code></span>
+<span class="codeline" id="line-114"><code>		if unix.HasNonblockFlag(flags) {</code></span>
+<span class="codeline" id="line-115"><code>			kind = kindNonBlock</code></span>
+<span class="codeline" id="line-116"><code>		}</code></span>
+<span class="codeline" id="line-117"><code>		appendMode = flags&amp;syscall.O_APPEND != 0</code></span>
+<span class="codeline" id="line-118"><code>	}</code></span>
+<span class="codeline" id="line-119"><code>	f := newFile(fdi, name, kind)</code></span>
+<span class="codeline" id="line-120"><code>	f.appendMode = appendMode</code></span>
+<span class="codeline" id="line-121"><code>	return f</code></span>
+<span class="codeline" id="line-122"><code>}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>// net_newUnixFile is a hidden entry point called by net.conn.File.</code></span>
+<span class="codeline" id="line-125"><code>// This is used so that a nonblocking network connection will become</code></span>
+<span class="codeline" id="line-126"><code>// blocking if code calls the Fd method. We don't want that for direct</code></span>
+<span class="codeline" id="line-127"><code>// calls to NewFile: passing a nonblocking descriptor to NewFile should</code></span>
+<span class="codeline" id="line-128"><code>// remain nonblocking if you get it back using Fd. But for net.conn.File</code></span>
+<span class="codeline" id="line-129"><code>// the call to NewFile is hidden from the user. Historically in that case</code></span>
+<span class="codeline" id="line-130"><code>// the Fd method has returned a blocking descriptor, and we want to</code></span>
+<span class="codeline" id="line-131"><code>// retain that behavior because existing code expects it and depends on it.</code></span>
+<span class="codeline" id="line-132"><code>//</code></span>
+<span class="codeline" id="line-133"><code>//go:linkname net_newUnixFile net.newUnixFile</code></span>
+<span class="codeline" id="line-134"><code>func net_newUnixFile(fd int, name string) *File {</code></span>
+<span class="codeline" id="line-135"><code>	if fd &lt; 0 {</code></span>
+<span class="codeline" id="line-136"><code>		panic("invalid FD")</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	f := newFile(fd, name, kindNonBlock)</code></span>
+<span class="codeline" id="line-140"><code>	f.nonblock = true // tell Fd to return blocking descriptor</code></span>
+<span class="codeline" id="line-141"><code>	return f</code></span>
+<span class="codeline" id="line-142"><code>}</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>// newFileKind describes the kind of file to newFile.</code></span>
+<span class="codeline" id="line-145"><code>type newFileKind int</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>const (</code></span>
+<span class="codeline" id="line-148"><code>	// kindNewFile means that the descriptor was passed to us via NewFile.</code></span>
+<span class="codeline" id="line-149"><code>	kindNewFile newFileKind = iota</code></span>
+<span class="codeline" id="line-150"><code>	// kindOpenFile means that the descriptor was opened using</code></span>
+<span class="codeline" id="line-151"><code>	// Open, Create, or OpenFile (without O_NONBLOCK).</code></span>
+<span class="codeline" id="line-152"><code>	kindOpenFile</code></span>
+<span class="codeline" id="line-153"><code>	// kindPipe means that the descriptor was opened using Pipe.</code></span>
+<span class="codeline" id="line-154"><code>	kindPipe</code></span>
+<span class="codeline" id="line-155"><code>	// kindNonBlock means that the descriptor is already in</code></span>
+<span class="codeline" id="line-156"><code>	// non-blocking mode.</code></span>
+<span class="codeline" id="line-157"><code>	kindNonBlock</code></span>
+<span class="codeline" id="line-158"><code>	// kindNoPoll means that we should not put the descriptor into</code></span>
+<span class="codeline" id="line-159"><code>	// non-blocking mode, because we know it is not a pipe or FIFO.</code></span>
+<span class="codeline" id="line-160"><code>	// Used by openFdAt for directories.</code></span>
+<span class="codeline" id="line-161"><code>	kindNoPoll</code></span>
+<span class="codeline" id="line-162"><code>)</code></span>
+<span class="codeline" id="line-163"><code></code></span>
+<span class="codeline" id="line-164"><code>// newFile is like NewFile, but if called from OpenFile or Pipe</code></span>
+<span class="codeline" id="line-165"><code>// (as passed in the kind parameter) it tries to add the file to</code></span>
+<span class="codeline" id="line-166"><code>// the runtime poller.</code></span>
+<span class="codeline" id="line-167"><code>func newFile(fd int, name string, kind newFileKind) *File {</code></span>
+<span class="codeline" id="line-168"><code>	f := &amp;File{&amp;file{</code></span>
+<span class="codeline" id="line-169"><code>		pfd: poll.FD{</code></span>
+<span class="codeline" id="line-170"><code>			Sysfd:         fd,</code></span>
+<span class="codeline" id="line-171"><code>			IsStream:      true,</code></span>
+<span class="codeline" id="line-172"><code>			ZeroReadIsEOF: true,</code></span>
+<span class="codeline" id="line-173"><code>		},</code></span>
+<span class="codeline" id="line-174"><code>		name:        name,</code></span>
+<span class="codeline" id="line-175"><code>		stdoutOrErr: fd == 1 || fd == 2,</code></span>
+<span class="codeline" id="line-176"><code>	}}</code></span>
+<span class="codeline" id="line-177"><code></code></span>
+<span class="codeline" id="line-178"><code>	pollable := kind == kindOpenFile || kind == kindPipe || kind == kindNonBlock</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>	// If the caller passed a non-blocking filedes (kindNonBlock),</code></span>
+<span class="codeline" id="line-181"><code>	// we assume they know what they are doing so we allow it to be</code></span>
+<span class="codeline" id="line-182"><code>	// used with kqueue.</code></span>
+<span class="codeline" id="line-183"><code>	if kind == kindOpenFile {</code></span>
+<span class="codeline" id="line-184"><code>		switch runtime.GOOS {</code></span>
+<span class="codeline" id="line-185"><code>		case "darwin", "ios", "dragonfly", "freebsd", "netbsd", "openbsd":</code></span>
+<span class="codeline" id="line-186"><code>			var st syscall.Stat_t</code></span>
+<span class="codeline" id="line-187"><code>			err := ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-188"><code>				return syscall.Fstat(fd, &amp;st)</code></span>
+<span class="codeline" id="line-189"><code>			})</code></span>
+<span class="codeline" id="line-190"><code>			typ := st.Mode &amp; syscall.S_IFMT</code></span>
+<span class="codeline" id="line-191"><code>			// Don't try to use kqueue with regular files on *BSDs.</code></span>
+<span class="codeline" id="line-192"><code>			// On FreeBSD a regular file is always</code></span>
+<span class="codeline" id="line-193"><code>			// reported as ready for writing.</code></span>
+<span class="codeline" id="line-194"><code>			// On Dragonfly, NetBSD and OpenBSD the fd is signaled</code></span>
+<span class="codeline" id="line-195"><code>			// only once as ready (both read and write).</code></span>
+<span class="codeline" id="line-196"><code>			// Issue 19093.</code></span>
+<span class="codeline" id="line-197"><code>			// Also don't add directories to the netpoller.</code></span>
+<span class="codeline" id="line-198"><code>			if err == nil &amp;&amp; (typ == syscall.S_IFREG || typ == syscall.S_IFDIR) {</code></span>
+<span class="codeline" id="line-199"><code>				pollable = false</code></span>
+<span class="codeline" id="line-200"><code>			}</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>			// In addition to the behavior described above for regular files,</code></span>
+<span class="codeline" id="line-203"><code>			// on Darwin, kqueue does not work properly with fifos:</code></span>
+<span class="codeline" id="line-204"><code>			// closing the last writer does not cause a kqueue event</code></span>
+<span class="codeline" id="line-205"><code>			// for any readers. See issue #24164.</code></span>
+<span class="codeline" id="line-206"><code>			if (runtime.GOOS == "darwin" || runtime.GOOS == "ios") &amp;&amp; typ == syscall.S_IFIFO {</code></span>
+<span class="codeline" id="line-207"><code>				pollable = false</code></span>
+<span class="codeline" id="line-208"><code>			}</code></span>
+<span class="codeline" id="line-209"><code>		}</code></span>
+<span class="codeline" id="line-210"><code>	}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>	clearNonBlock := false</code></span>
+<span class="codeline" id="line-213"><code>	if pollable {</code></span>
+<span class="codeline" id="line-214"><code>		if kind == kindNonBlock {</code></span>
+<span class="codeline" id="line-215"><code>			// The descriptor is already in non-blocking mode.</code></span>
+<span class="codeline" id="line-216"><code>			// We only set f.nonblock if we put the file into</code></span>
+<span class="codeline" id="line-217"><code>			// non-blocking mode.</code></span>
+<span class="codeline" id="line-218"><code>		} else if err := syscall.SetNonblock(fd, true); err == nil {</code></span>
+<span class="codeline" id="line-219"><code>			f.nonblock = true</code></span>
+<span class="codeline" id="line-220"><code>			clearNonBlock = true</code></span>
+<span class="codeline" id="line-221"><code>		} else {</code></span>
+<span class="codeline" id="line-222"><code>			pollable = false</code></span>
+<span class="codeline" id="line-223"><code>		}</code></span>
+<span class="codeline" id="line-224"><code>	}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>	// An error here indicates a failure to register</code></span>
+<span class="codeline" id="line-227"><code>	// with the netpoll system. That can happen for</code></span>
+<span class="codeline" id="line-228"><code>	// a file descriptor that is not supported by</code></span>
+<span class="codeline" id="line-229"><code>	// epoll/kqueue; for example, disk files on</code></span>
+<span class="codeline" id="line-230"><code>	// Linux systems. We assume that any real error</code></span>
+<span class="codeline" id="line-231"><code>	// will show up in later I/O.</code></span>
+<span class="codeline" id="line-232"><code>	// We do restore the blocking behavior if it was set by us.</code></span>
+<span class="codeline" id="line-233"><code>	if pollErr := f.pfd.Init("file", pollable); pollErr != nil &amp;&amp; clearNonBlock {</code></span>
+<span class="codeline" id="line-234"><code>		if err := syscall.SetNonblock(fd, false); err == nil {</code></span>
+<span class="codeline" id="line-235"><code>			f.nonblock = false</code></span>
+<span class="codeline" id="line-236"><code>		}</code></span>
+<span class="codeline" id="line-237"><code>	}</code></span>
+<span class="codeline" id="line-238"><code></code></span>
+<span class="codeline" id="line-239"><code>	runtime.SetFinalizer(f.file, (*file).close)</code></span>
+<span class="codeline" id="line-240"><code>	return f</code></span>
+<span class="codeline" id="line-241"><code>}</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>func sigpipe() // implemented in package runtime</code></span>
+<span class="codeline" id="line-244"><code></code></span>
+<span class="codeline" id="line-245"><code>// epipecheck raises SIGPIPE if we get an EPIPE error on standard</code></span>
+<span class="codeline" id="line-246"><code>// output or standard error. See the SIGPIPE docs in os/signal, and</code></span>
+<span class="codeline" id="line-247"><code>// issue 11845.</code></span>
+<span class="codeline" id="line-248"><code>func epipecheck(file *File, e error) {</code></span>
+<span class="codeline" id="line-249"><code>	if e == syscall.EPIPE &amp;&amp; file.stdoutOrErr {</code></span>
+<span class="codeline" id="line-250"><code>		sigpipe()</code></span>
+<span class="codeline" id="line-251"><code>	}</code></span>
+<span class="codeline" id="line-252"><code>}</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>// DevNull is the name of the operating system's “null device.”</code></span>
+<span class="codeline" id="line-255"><code>// On Unix-like systems, it is "/dev/null"; on Windows, "NUL".</code></span>
+<span class="codeline" id="line-256"><code>const DevNull = "/dev/null"</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>// openFileNolog is the Unix implementation of OpenFile.</code></span>
+<span class="codeline" id="line-259"><code>// Changes here should be reflected in openFdAt, if relevant.</code></span>
+<span class="codeline" id="line-260"><code>func openFileNolog(name string, flag int, perm FileMode) (*File, error) {</code></span>
+<span class="codeline" id="line-261"><code>	setSticky := false</code></span>
+<span class="codeline" id="line-262"><code>	if !supportsCreateWithStickyBit &amp;&amp; flag&amp;O_CREATE != 0 &amp;&amp; perm&amp;ModeSticky != 0 {</code></span>
+<span class="codeline" id="line-263"><code>		if _, err := Stat(name); IsNotExist(err) {</code></span>
+<span class="codeline" id="line-264"><code>			setSticky = true</code></span>
+<span class="codeline" id="line-265"><code>		}</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>	var r int</code></span>
+<span class="codeline" id="line-269"><code>	var s poll.SysFile</code></span>
+<span class="codeline" id="line-270"><code>	for {</code></span>
+<span class="codeline" id="line-271"><code>		var e error</code></span>
+<span class="codeline" id="line-272"><code>		r, s, e = open(name, flag|syscall.O_CLOEXEC, syscallMode(perm))</code></span>
+<span class="codeline" id="line-273"><code>		if e == nil {</code></span>
+<span class="codeline" id="line-274"><code>			break</code></span>
+<span class="codeline" id="line-275"><code>		}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>		// We have to check EINTR here, per issues 11180 and 39237.</code></span>
+<span class="codeline" id="line-278"><code>		if e == syscall.EINTR {</code></span>
+<span class="codeline" id="line-279"><code>			continue</code></span>
+<span class="codeline" id="line-280"><code>		}</code></span>
+<span class="codeline" id="line-281"><code></code></span>
+<span class="codeline" id="line-282"><code>		return nil, &amp;PathError{Op: "open", Path: name, Err: e}</code></span>
+<span class="codeline" id="line-283"><code>	}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	// open(2) itself won't handle the sticky bit on *BSD and Solaris</code></span>
+<span class="codeline" id="line-286"><code>	if setSticky {</code></span>
+<span class="codeline" id="line-287"><code>		setStickyBit(name)</code></span>
+<span class="codeline" id="line-288"><code>	}</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	// There's a race here with fork/exec, which we are</code></span>
+<span class="codeline" id="line-291"><code>	// content to live with. See ../syscall/exec_unix.go.</code></span>
+<span class="codeline" id="line-292"><code>	if !supportsCloseOnExec {</code></span>
+<span class="codeline" id="line-293"><code>		syscall.CloseOnExec(r)</code></span>
+<span class="codeline" id="line-294"><code>	}</code></span>
+<span class="codeline" id="line-295"><code></code></span>
+<span class="codeline" id="line-296"><code>	kind := kindOpenFile</code></span>
+<span class="codeline" id="line-297"><code>	if unix.HasNonblockFlag(flag) {</code></span>
+<span class="codeline" id="line-298"><code>		kind = kindNonBlock</code></span>
+<span class="codeline" id="line-299"><code>	}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>	f := newFile(r, name, kind)</code></span>
+<span class="codeline" id="line-302"><code>	f.pfd.SysFile = s</code></span>
+<span class="codeline" id="line-303"><code>	return f, nil</code></span>
+<span class="codeline" id="line-304"><code>}</code></span>
+<span class="codeline" id="line-305"><code></code></span>
+<span class="codeline" id="line-306"><code>func (file *file) close() error {</code></span>
+<span class="codeline" id="line-307"><code>	if file == nil {</code></span>
+<span class="codeline" id="line-308"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-309"><code>	}</code></span>
+<span class="codeline" id="line-310"><code>	if file.dirinfo != nil {</code></span>
+<span class="codeline" id="line-311"><code>		file.dirinfo.close()</code></span>
+<span class="codeline" id="line-312"><code>		file.dirinfo = nil</code></span>
+<span class="codeline" id="line-313"><code>	}</code></span>
+<span class="codeline" id="line-314"><code>	var err error</code></span>
+<span class="codeline" id="line-315"><code>	if e := file.pfd.Close(); e != nil {</code></span>
+<span class="codeline" id="line-316"><code>		if e == poll.ErrFileClosing {</code></span>
+<span class="codeline" id="line-317"><code>			e = ErrClosed</code></span>
+<span class="codeline" id="line-318"><code>		}</code></span>
+<span class="codeline" id="line-319"><code>		err = &amp;PathError{Op: "close", Path: file.name, Err: e}</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>	// no need for a finalizer anymore</code></span>
+<span class="codeline" id="line-323"><code>	runtime.SetFinalizer(file, nil)</code></span>
+<span class="codeline" id="line-324"><code>	return err</code></span>
+<span class="codeline" id="line-325"><code>}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>// seek sets the offset for the next Read or Write on file to offset, interpreted</code></span>
+<span class="codeline" id="line-328"><code>// according to whence: 0 means relative to the origin of the file, 1 means</code></span>
+<span class="codeline" id="line-329"><code>// relative to the current offset, and 2 means relative to the end.</code></span>
+<span class="codeline" id="line-330"><code>// It returns the new offset and an error, if any.</code></span>
+<span class="codeline" id="line-331"><code>func (f *File) seek(offset int64, whence int) (ret int64, err error) {</code></span>
+<span class="codeline" id="line-332"><code>	if f.dirinfo != nil {</code></span>
+<span class="codeline" id="line-333"><code>		// Free cached dirinfo, so we allocate a new one if we</code></span>
+<span class="codeline" id="line-334"><code>		// access this file as a directory again. See #35767 and #37161.</code></span>
+<span class="codeline" id="line-335"><code>		f.dirinfo.close()</code></span>
+<span class="codeline" id="line-336"><code>		f.dirinfo = nil</code></span>
+<span class="codeline" id="line-337"><code>	}</code></span>
+<span class="codeline" id="line-338"><code>	ret, err = f.pfd.Seek(offset, whence)</code></span>
+<span class="codeline" id="line-339"><code>	runtime.KeepAlive(f)</code></span>
+<span class="codeline" id="line-340"><code>	return ret, err</code></span>
+<span class="codeline" id="line-341"><code>}</code></span>
+<span class="codeline" id="line-342"><code></code></span>
+<span class="codeline" id="line-343"><code>// Truncate changes the size of the named file.</code></span>
+<span class="codeline" id="line-344"><code>// If the file is a symbolic link, it changes the size of the link's target.</code></span>
+<span class="codeline" id="line-345"><code>// If there is an error, it will be of type *PathError.</code></span>
+<span class="codeline" id="line-346"><code>func Truncate(name string, size int64) error {</code></span>
+<span class="codeline" id="line-347"><code>	e := ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-348"><code>		return syscall.Truncate(name, size)</code></span>
+<span class="codeline" id="line-349"><code>	})</code></span>
+<span class="codeline" id="line-350"><code>	if e != nil {</code></span>
+<span class="codeline" id="line-351"><code>		return &amp;PathError{Op: "truncate", Path: name, Err: e}</code></span>
+<span class="codeline" id="line-352"><code>	}</code></span>
+<span class="codeline" id="line-353"><code>	return nil</code></span>
+<span class="codeline" id="line-354"><code>}</code></span>
+<span class="codeline" id="line-355"><code></code></span>
+<span class="codeline" id="line-356"><code>// Remove removes the named file or (empty) directory.</code></span>
+<span class="codeline" id="line-357"><code>// If there is an error, it will be of type *PathError.</code></span>
+<span class="codeline" id="line-358"><code>func Remove(name string) error {</code></span>
+<span class="codeline" id="line-359"><code>	// System call interface forces us to know</code></span>
+<span class="codeline" id="line-360"><code>	// whether name is a file or directory.</code></span>
+<span class="codeline" id="line-361"><code>	// Try both: it is cheaper on average than</code></span>
+<span class="codeline" id="line-362"><code>	// doing a Stat plus the right one.</code></span>
+<span class="codeline" id="line-363"><code>	e := ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-364"><code>		return syscall.Unlink(name)</code></span>
+<span class="codeline" id="line-365"><code>	})</code></span>
+<span class="codeline" id="line-366"><code>	if e == nil {</code></span>
+<span class="codeline" id="line-367"><code>		return nil</code></span>
+<span class="codeline" id="line-368"><code>	}</code></span>
+<span class="codeline" id="line-369"><code>	e1 := ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-370"><code>		return syscall.Rmdir(name)</code></span>
+<span class="codeline" id="line-371"><code>	})</code></span>
+<span class="codeline" id="line-372"><code>	if e1 == nil {</code></span>
+<span class="codeline" id="line-373"><code>		return nil</code></span>
+<span class="codeline" id="line-374"><code>	}</code></span>
+<span class="codeline" id="line-375"><code></code></span>
+<span class="codeline" id="line-376"><code>	// Both failed: figure out which error to return.</code></span>
+<span class="codeline" id="line-377"><code>	// OS X and Linux differ on whether unlink(dir)</code></span>
+<span class="codeline" id="line-378"><code>	// returns EISDIR, so can't use that. However,</code></span>
+<span class="codeline" id="line-379"><code>	// both agree that rmdir(file) returns ENOTDIR,</code></span>
+<span class="codeline" id="line-380"><code>	// so we can use that to decide which error is real.</code></span>
+<span class="codeline" id="line-381"><code>	// Rmdir might also return ENOTDIR if given a bad</code></span>
+<span class="codeline" id="line-382"><code>	// file path, like /etc/passwd/foo, but in that case,</code></span>
+<span class="codeline" id="line-383"><code>	// both errors will be ENOTDIR, so it's okay to</code></span>
+<span class="codeline" id="line-384"><code>	// use the error from unlink.</code></span>
+<span class="codeline" id="line-385"><code>	if e1 != syscall.ENOTDIR {</code></span>
+<span class="codeline" id="line-386"><code>		e = e1</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code>	return &amp;PathError{Op: "remove", Path: name, Err: e}</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>func tempDir() string {</code></span>
+<span class="codeline" id="line-392"><code>	dir := Getenv("TMPDIR")</code></span>
+<span class="codeline" id="line-393"><code>	if dir == "" {</code></span>
+<span class="codeline" id="line-394"><code>		if runtime.GOOS == "android" {</code></span>
+<span class="codeline" id="line-395"><code>			dir = "/data/local/tmp"</code></span>
+<span class="codeline" id="line-396"><code>		} else {</code></span>
+<span class="codeline" id="line-397"><code>			dir = "/tmp"</code></span>
+<span class="codeline" id="line-398"><code>		}</code></span>
+<span class="codeline" id="line-399"><code>	}</code></span>
+<span class="codeline" id="line-400"><code>	return dir</code></span>
+<span class="codeline" id="line-401"><code>}</code></span>
+<span class="codeline" id="line-402"><code></code></span>
+<span class="codeline" id="line-403"><code>// Link creates newname as a hard link to the oldname file.</code></span>
+<span class="codeline" id="line-404"><code>// If there is an error, it will be of type *LinkError.</code></span>
+<span class="codeline" id="line-405"><code>func Link(oldname, newname string) error {</code></span>
+<span class="codeline" id="line-406"><code>	e := ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-407"><code>		return syscall.Link(oldname, newname)</code></span>
+<span class="codeline" id="line-408"><code>	})</code></span>
+<span class="codeline" id="line-409"><code>	if e != nil {</code></span>
+<span class="codeline" id="line-410"><code>		return &amp;LinkError{"link", oldname, newname, e}</code></span>
+<span class="codeline" id="line-411"><code>	}</code></span>
+<span class="codeline" id="line-412"><code>	return nil</code></span>
+<span class="codeline" id="line-413"><code>}</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>// Symlink creates newname as a symbolic link to oldname.</code></span>
+<span class="codeline" id="line-416"><code>// On Windows, a symlink to a non-existent oldname creates a file symlink;</code></span>
+<span class="codeline" id="line-417"><code>// if oldname is later created as a directory the symlink will not work.</code></span>
+<span class="codeline" id="line-418"><code>// If there is an error, it will be of type *LinkError.</code></span>
+<span class="codeline" id="line-419"><code>func Symlink(oldname, newname string) error {</code></span>
+<span class="codeline" id="line-420"><code>	e := ignoringEINTR(func() error {</code></span>
+<span class="codeline" id="line-421"><code>		return syscall.Symlink(oldname, newname)</code></span>
+<span class="codeline" id="line-422"><code>	})</code></span>
+<span class="codeline" id="line-423"><code>	if e != nil {</code></span>
+<span class="codeline" id="line-424"><code>		return &amp;LinkError{"symlink", oldname, newname, e}</code></span>
+<span class="codeline" id="line-425"><code>	}</code></span>
+<span class="codeline" id="line-426"><code>	return nil</code></span>
+<span class="codeline" id="line-427"><code>}</code></span>
+<span class="codeline" id="line-428"><code></code></span>
+<span class="codeline" id="line-429"><code>func readlink(name string) (string, error) {</code></span>
+<span class="codeline" id="line-430"><code>	for len := 128; ; len *= 2 {</code></span>
+<span class="codeline" id="line-431"><code>		b := make([]byte, len)</code></span>
+<span class="codeline" id="line-432"><code>		var (</code></span>
+<span class="codeline" id="line-433"><code>			n int</code></span>
+<span class="codeline" id="line-434"><code>			e error</code></span>
+<span class="codeline" id="line-435"><code>		)</code></span>
+<span class="codeline" id="line-436"><code>		for {</code></span>
+<span class="codeline" id="line-437"><code>			n, e = fixCount(syscall.Readlink(name, b))</code></span>
+<span class="codeline" id="line-438"><code>			if e != syscall.EINTR {</code></span>
+<span class="codeline" id="line-439"><code>				break</code></span>
+<span class="codeline" id="line-440"><code>			}</code></span>
+<span class="codeline" id="line-441"><code>		}</code></span>
+<span class="codeline" id="line-442"><code>		// buffer too small</code></span>
+<span class="codeline" id="line-443"><code>		if (runtime.GOOS == "aix" || runtime.GOOS == "wasip1") &amp;&amp; e == syscall.ERANGE {</code></span>
+<span class="codeline" id="line-444"><code>			continue</code></span>
+<span class="codeline" id="line-445"><code>		}</code></span>
+<span class="codeline" id="line-446"><code>		if e != nil {</code></span>
+<span class="codeline" id="line-447"><code>			return "", &amp;PathError{Op: "readlink", Path: name, Err: e}</code></span>
+<span class="codeline" id="line-448"><code>		}</code></span>
+<span class="codeline" id="line-449"><code>		if n &lt; len {</code></span>
+<span class="codeline" id="line-450"><code>			return string(b[0:n]), nil</code></span>
+<span class="codeline" id="line-451"><code>		}</code></span>
+<span class="codeline" id="line-452"><code>	}</code></span>
+<span class="codeline" id="line-453"><code>}</code></span>
+<span class="codeline" id="line-454"><code></code></span>
+<span class="codeline" id="line-455"><code>type unixDirent struct {</code></span>
+<span class="codeline" id="line-456"><code>	parent string</code></span>
+<span class="codeline" id="line-457"><code>	name   string</code></span>
+<span class="codeline" id="line-458"><code>	typ    FileMode</code></span>
+<span class="codeline" id="line-459"><code>	info   FileInfo</code></span>
+<span class="codeline" id="line-460"><code>}</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>func (d *unixDirent) Name() string   { return d.name }</code></span>
+<span class="codeline" id="line-463"><code>func (d *unixDirent) IsDir() bool    { return d.typ.IsDir() }</code></span>
+<span class="codeline" id="line-464"><code>func (d *unixDirent) Type() FileMode { return d.typ }</code></span>
+<span class="codeline" id="line-465"><code></code></span>
+<span class="codeline" id="line-466"><code>func (d *unixDirent) Info() (FileInfo, error) {</code></span>
+<span class="codeline" id="line-467"><code>	if d.info != nil {</code></span>
+<span class="codeline" id="line-468"><code>		return d.info, nil</code></span>
+<span class="codeline" id="line-469"><code>	}</code></span>
+<span class="codeline" id="line-470"><code>	return lstat(d.parent + "/" + d.name)</code></span>
+<span class="codeline" id="line-471"><code>}</code></span>
+<span class="codeline" id="line-472"><code></code></span>
+<span class="codeline" id="line-473"><code>func (d *unixDirent) String() string {</code></span>
+<span class="codeline" id="line-474"><code>	return fs.FormatDirEntry(d)</code></span>
+<span class="codeline" id="line-475"><code>}</code></span>
+<span class="codeline" id="line-476"><code></code></span>
+<span class="codeline" id="line-477"><code>func newUnixDirent(parent, name string, typ FileMode) (DirEntry, error) {</code></span>
+<span class="codeline" id="line-478"><code>	ude := &amp;unixDirent{</code></span>
+<span class="codeline" id="line-479"><code>		parent: parent,</code></span>
+<span class="codeline" id="line-480"><code>		name:   name,</code></span>
+<span class="codeline" id="line-481"><code>		typ:    typ,</code></span>
+<span class="codeline" id="line-482"><code>	}</code></span>
+<span class="codeline" id="line-483"><code>	if typ != ^FileMode(0) &amp;&amp; !testingForceReadDirLstat {</code></span>
+<span class="codeline" id="line-484"><code>		return ude, nil</code></span>
+<span class="codeline" id="line-485"><code>	}</code></span>
+<span class="codeline" id="line-486"><code></code></span>
+<span class="codeline" id="line-487"><code>	info, err := lstat(parent + "/" + name)</code></span>
+<span class="codeline" id="line-488"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-489"><code>		return nil, err</code></span>
+<span class="codeline" id="line-490"><code>	}</code></span>
+<span class="codeline" id="line-491"><code></code></span>
+<span class="codeline" id="line-492"><code>	ude.typ = info.Mode().Type()</code></span>
+<span class="codeline" id="line-493"><code>	ude.info = info</code></span>
+<span class="codeline" id="line-494"><code>	return ude, nil</code></span>
+<span class="codeline" id="line-495"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

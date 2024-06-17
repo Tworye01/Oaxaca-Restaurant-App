@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: inflate.go in package compress/flate</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	inflate.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/compress/flate.html">compress/flate</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package flate implements the DEFLATE compressed data format, described in</code></span>
+<span class="codeline" id="line-6"><code>// RFC 1951.  The gzip and zlib packages implement access to DEFLATE-based file</code></span>
+<span class="codeline" id="line-7"><code>// formats.</code></span></div><span class="codeline" id="line-8"><code>package flate</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>import (</code></span>
+<span class="codeline" id="line-11"><code>	"bufio"</code></span>
+<span class="codeline" id="line-12"><code>	"io"</code></span>
+<span class="codeline" id="line-13"><code>	"math/bits"</code></span>
+<span class="codeline" id="line-14"><code>	"strconv"</code></span>
+<span class="codeline" id="line-15"><code>	"sync"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>const (</code></span>
+<span class="codeline" id="line-19"><code>	maxCodeLen = 16 // max length of Huffman code</code></span>
+<span class="codeline" id="line-20"><code>	// The next three numbers come from the RFC section 3.2.7, with the</code></span>
+<span class="codeline" id="line-21"><code>	// additional proviso in section 3.2.5 which implies that distance codes</code></span>
+<span class="codeline" id="line-22"><code>	// 30 and 31 should never occur in compressed data.</code></span>
+<span class="codeline" id="line-23"><code>	maxNumLit  = 286</code></span>
+<span class="codeline" id="line-24"><code>	maxNumDist = 30</code></span>
+<span class="codeline" id="line-25"><code>	numCodes   = 19 // number of codes in Huffman meta-code</code></span>
+<span class="codeline" id="line-26"><code>)</code></span>
+<span class="codeline" id="line-27"><code></code></span>
+<span class="codeline" id="line-28"><code>// Initialize the fixedHuffmanDecoder only once upon first use.</code></span>
+<span class="codeline" id="line-29"><code>var fixedOnce sync.Once</code></span>
+<span class="codeline" id="line-30"><code>var fixedHuffmanDecoder huffmanDecoder</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// A CorruptInputError reports the presence of corrupt input at a given offset.</code></span>
+<span class="codeline" id="line-33"><code>type CorruptInputError int64</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>func (e CorruptInputError) Error() string {</code></span>
+<span class="codeline" id="line-36"><code>	return "flate: corrupt input before offset " + strconv.FormatInt(int64(e), 10)</code></span>
+<span class="codeline" id="line-37"><code>}</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>// An InternalError reports an error in the flate code itself.</code></span>
+<span class="codeline" id="line-40"><code>type InternalError string</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>func (e InternalError) Error() string { return "flate: internal error: " + string(e) }</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>// A ReadError reports an error encountered while reading input.</code></span>
+<span class="codeline" id="line-45"><code>//</code></span>
+<span class="codeline" id="line-46"><code>// Deprecated: No longer returned.</code></span>
+<span class="codeline" id="line-47"><code>type ReadError struct {</code></span>
+<span class="codeline" id="line-48"><code>	Offset int64 // byte offset where error occurred</code></span>
+<span class="codeline" id="line-49"><code>	Err    error // error returned by underlying Read</code></span>
+<span class="codeline" id="line-50"><code>}</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>func (e *ReadError) Error() string {</code></span>
+<span class="codeline" id="line-53"><code>	return "flate: read error at offset " + strconv.FormatInt(e.Offset, 10) + ": " + e.Err.Error()</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>// A WriteError reports an error encountered while writing output.</code></span>
+<span class="codeline" id="line-57"><code>//</code></span>
+<span class="codeline" id="line-58"><code>// Deprecated: No longer returned.</code></span>
+<span class="codeline" id="line-59"><code>type WriteError struct {</code></span>
+<span class="codeline" id="line-60"><code>	Offset int64 // byte offset where error occurred</code></span>
+<span class="codeline" id="line-61"><code>	Err    error // error returned by underlying Write</code></span>
+<span class="codeline" id="line-62"><code>}</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>func (e *WriteError) Error() string {</code></span>
+<span class="codeline" id="line-65"><code>	return "flate: write error at offset " + strconv.FormatInt(e.Offset, 10) + ": " + e.Err.Error()</code></span>
+<span class="codeline" id="line-66"><code>}</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>// Resetter resets a ReadCloser returned by [NewReader] or [NewReaderDict]</code></span>
+<span class="codeline" id="line-69"><code>// to switch to a new underlying [Reader]. This permits reusing a ReadCloser</code></span>
+<span class="codeline" id="line-70"><code>// instead of allocating a new one.</code></span>
+<span class="codeline" id="line-71"><code>type Resetter interface {</code></span>
+<span class="codeline" id="line-72"><code>	// Reset discards any buffered data and resets the Resetter as if it was</code></span>
+<span class="codeline" id="line-73"><code>	// newly initialized with the given reader.</code></span>
+<span class="codeline" id="line-74"><code>	Reset(r io.Reader, dict []byte) error</code></span>
+<span class="codeline" id="line-75"><code>}</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>// The data structure for decoding Huffman tables is based on that of</code></span>
+<span class="codeline" id="line-78"><code>// zlib. There is a lookup table of a fixed bit width (huffmanChunkBits),</code></span>
+<span class="codeline" id="line-79"><code>// For codes smaller than the table width, there are multiple entries</code></span>
+<span class="codeline" id="line-80"><code>// (each combination of trailing bits has the same value). For codes</code></span>
+<span class="codeline" id="line-81"><code>// larger than the table width, the table contains a link to an overflow</code></span>
+<span class="codeline" id="line-82"><code>// table. The width of each entry in the link table is the maximum code</code></span>
+<span class="codeline" id="line-83"><code>// size minus the chunk width.</code></span>
+<span class="codeline" id="line-84"><code>//</code></span>
+<span class="codeline" id="line-85"><code>// Note that you can do a lookup in the table even without all bits</code></span>
+<span class="codeline" id="line-86"><code>// filled. Since the extra bits are zero, and the DEFLATE Huffman codes</code></span>
+<span class="codeline" id="line-87"><code>// have the property that shorter codes come before longer ones, the</code></span>
+<span class="codeline" id="line-88"><code>// bit length estimate in the result is a lower bound on the actual</code></span>
+<span class="codeline" id="line-89"><code>// number of bits.</code></span>
+<span class="codeline" id="line-90"><code>//</code></span>
+<span class="codeline" id="line-91"><code>// See the following:</code></span>
+<span class="codeline" id="line-92"><code>//	https://github.com/madler/zlib/raw/master/doc/algorithm.txt</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>// chunk &amp; 15 is number of bits</code></span>
+<span class="codeline" id="line-95"><code>// chunk &gt;&gt; 4 is value, including table link</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>const (</code></span>
+<span class="codeline" id="line-98"><code>	huffmanChunkBits  = 9</code></span>
+<span class="codeline" id="line-99"><code>	huffmanNumChunks  = 1 &lt;&lt; huffmanChunkBits</code></span>
+<span class="codeline" id="line-100"><code>	huffmanCountMask  = 15</code></span>
+<span class="codeline" id="line-101"><code>	huffmanValueShift = 4</code></span>
+<span class="codeline" id="line-102"><code>)</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>type huffmanDecoder struct {</code></span>
+<span class="codeline" id="line-105"><code>	min      int                      // the minimum code length</code></span>
+<span class="codeline" id="line-106"><code>	chunks   [huffmanNumChunks]uint32 // chunks as described above</code></span>
+<span class="codeline" id="line-107"><code>	links    [][]uint32               // overflow links</code></span>
+<span class="codeline" id="line-108"><code>	linkMask uint32                   // mask the width of the link table</code></span>
+<span class="codeline" id="line-109"><code>}</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>// Initialize Huffman decoding tables from array of code lengths.</code></span>
+<span class="codeline" id="line-112"><code>// Following this function, h is guaranteed to be initialized into a complete</code></span>
+<span class="codeline" id="line-113"><code>// tree (i.e., neither over-subscribed nor under-subscribed). The exception is a</code></span>
+<span class="codeline" id="line-114"><code>// degenerate case where the tree has only a single symbol with length 1. Empty</code></span>
+<span class="codeline" id="line-115"><code>// trees are permitted.</code></span>
+<span class="codeline" id="line-116"><code>func (h *huffmanDecoder) init(lengths []int) bool {</code></span>
+<span class="codeline" id="line-117"><code>	// Sanity enables additional runtime tests during Huffman</code></span>
+<span class="codeline" id="line-118"><code>	// table construction. It's intended to be used during</code></span>
+<span class="codeline" id="line-119"><code>	// development to supplement the currently ad-hoc unit tests.</code></span>
+<span class="codeline" id="line-120"><code>	const sanity = false</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	if h.min != 0 {</code></span>
+<span class="codeline" id="line-123"><code>		*h = huffmanDecoder{}</code></span>
+<span class="codeline" id="line-124"><code>	}</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	// Count number of codes of each length,</code></span>
+<span class="codeline" id="line-127"><code>	// compute min and max length.</code></span>
+<span class="codeline" id="line-128"><code>	var count [maxCodeLen]int</code></span>
+<span class="codeline" id="line-129"><code>	var min, max int</code></span>
+<span class="codeline" id="line-130"><code>	for _, n := range lengths {</code></span>
+<span class="codeline" id="line-131"><code>		if n == 0 {</code></span>
+<span class="codeline" id="line-132"><code>			continue</code></span>
+<span class="codeline" id="line-133"><code>		}</code></span>
+<span class="codeline" id="line-134"><code>		if min == 0 || n &lt; min {</code></span>
+<span class="codeline" id="line-135"><code>			min = n</code></span>
+<span class="codeline" id="line-136"><code>		}</code></span>
+<span class="codeline" id="line-137"><code>		if n &gt; max {</code></span>
+<span class="codeline" id="line-138"><code>			max = n</code></span>
+<span class="codeline" id="line-139"><code>		}</code></span>
+<span class="codeline" id="line-140"><code>		count[n]++</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>	// Empty tree. The decompressor.huffSym function will fail later if the tree</code></span>
+<span class="codeline" id="line-144"><code>	// is used. Technically, an empty tree is only valid for the HDIST tree and</code></span>
+<span class="codeline" id="line-145"><code>	// not the HCLEN and HLIT tree. However, a stream with an empty HCLEN tree</code></span>
+<span class="codeline" id="line-146"><code>	// is guaranteed to fail since it will attempt to use the tree to decode the</code></span>
+<span class="codeline" id="line-147"><code>	// codes for the HLIT and HDIST trees. Similarly, an empty HLIT tree is</code></span>
+<span class="codeline" id="line-148"><code>	// guaranteed to fail later since the compressed data section must be</code></span>
+<span class="codeline" id="line-149"><code>	// composed of at least one symbol (the end-of-block marker).</code></span>
+<span class="codeline" id="line-150"><code>	if max == 0 {</code></span>
+<span class="codeline" id="line-151"><code>		return true</code></span>
+<span class="codeline" id="line-152"><code>	}</code></span>
+<span class="codeline" id="line-153"><code></code></span>
+<span class="codeline" id="line-154"><code>	code := 0</code></span>
+<span class="codeline" id="line-155"><code>	var nextcode [maxCodeLen]int</code></span>
+<span class="codeline" id="line-156"><code>	for i := min; i &lt;= max; i++ {</code></span>
+<span class="codeline" id="line-157"><code>		code &lt;&lt;= 1</code></span>
+<span class="codeline" id="line-158"><code>		nextcode[i] = code</code></span>
+<span class="codeline" id="line-159"><code>		code += count[i]</code></span>
+<span class="codeline" id="line-160"><code>	}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>	// Check that the coding is complete (i.e., that we've</code></span>
+<span class="codeline" id="line-163"><code>	// assigned all 2-to-the-max possible bit sequences).</code></span>
+<span class="codeline" id="line-164"><code>	// Exception: To be compatible with zlib, we also need to</code></span>
+<span class="codeline" id="line-165"><code>	// accept degenerate single-code codings. See also</code></span>
+<span class="codeline" id="line-166"><code>	// TestDegenerateHuffmanCoding.</code></span>
+<span class="codeline" id="line-167"><code>	if code != 1&lt;&lt;uint(max) &amp;&amp; !(code == 1 &amp;&amp; max == 1) {</code></span>
+<span class="codeline" id="line-168"><code>		return false</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>	h.min = min</code></span>
+<span class="codeline" id="line-172"><code>	if max &gt; huffmanChunkBits {</code></span>
+<span class="codeline" id="line-173"><code>		numLinks := 1 &lt;&lt; (uint(max) - huffmanChunkBits)</code></span>
+<span class="codeline" id="line-174"><code>		h.linkMask = uint32(numLinks - 1)</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>		// create link tables</code></span>
+<span class="codeline" id="line-177"><code>		link := nextcode[huffmanChunkBits+1] &gt;&gt; 1</code></span>
+<span class="codeline" id="line-178"><code>		h.links = make([][]uint32, huffmanNumChunks-link)</code></span>
+<span class="codeline" id="line-179"><code>		for j := uint(link); j &lt; huffmanNumChunks; j++ {</code></span>
+<span class="codeline" id="line-180"><code>			reverse := int(bits.Reverse16(uint16(j)))</code></span>
+<span class="codeline" id="line-181"><code>			reverse &gt;&gt;= uint(16 - huffmanChunkBits)</code></span>
+<span class="codeline" id="line-182"><code>			off := j - uint(link)</code></span>
+<span class="codeline" id="line-183"><code>			if sanity &amp;&amp; h.chunks[reverse] != 0 {</code></span>
+<span class="codeline" id="line-184"><code>				panic("impossible: overwriting existing chunk")</code></span>
+<span class="codeline" id="line-185"><code>			}</code></span>
+<span class="codeline" id="line-186"><code>			h.chunks[reverse] = uint32(off&lt;&lt;huffmanValueShift | (huffmanChunkBits + 1))</code></span>
+<span class="codeline" id="line-187"><code>			h.links[off] = make([]uint32, numLinks)</code></span>
+<span class="codeline" id="line-188"><code>		}</code></span>
+<span class="codeline" id="line-189"><code>	}</code></span>
+<span class="codeline" id="line-190"><code></code></span>
+<span class="codeline" id="line-191"><code>	for i, n := range lengths {</code></span>
+<span class="codeline" id="line-192"><code>		if n == 0 {</code></span>
+<span class="codeline" id="line-193"><code>			continue</code></span>
+<span class="codeline" id="line-194"><code>		}</code></span>
+<span class="codeline" id="line-195"><code>		code := nextcode[n]</code></span>
+<span class="codeline" id="line-196"><code>		nextcode[n]++</code></span>
+<span class="codeline" id="line-197"><code>		chunk := uint32(i&lt;&lt;huffmanValueShift | n)</code></span>
+<span class="codeline" id="line-198"><code>		reverse := int(bits.Reverse16(uint16(code)))</code></span>
+<span class="codeline" id="line-199"><code>		reverse &gt;&gt;= uint(16 - n)</code></span>
+<span class="codeline" id="line-200"><code>		if n &lt;= huffmanChunkBits {</code></span>
+<span class="codeline" id="line-201"><code>			for off := reverse; off &lt; len(h.chunks); off += 1 &lt;&lt; uint(n) {</code></span>
+<span class="codeline" id="line-202"><code>				// We should never need to overwrite</code></span>
+<span class="codeline" id="line-203"><code>				// an existing chunk. Also, 0 is</code></span>
+<span class="codeline" id="line-204"><code>				// never a valid chunk, because the</code></span>
+<span class="codeline" id="line-205"><code>				// lower 4 "count" bits should be</code></span>
+<span class="codeline" id="line-206"><code>				// between 1 and 15.</code></span>
+<span class="codeline" id="line-207"><code>				if sanity &amp;&amp; h.chunks[off] != 0 {</code></span>
+<span class="codeline" id="line-208"><code>					panic("impossible: overwriting existing chunk")</code></span>
+<span class="codeline" id="line-209"><code>				}</code></span>
+<span class="codeline" id="line-210"><code>				h.chunks[off] = chunk</code></span>
+<span class="codeline" id="line-211"><code>			}</code></span>
+<span class="codeline" id="line-212"><code>		} else {</code></span>
+<span class="codeline" id="line-213"><code>			j := reverse &amp; (huffmanNumChunks - 1)</code></span>
+<span class="codeline" id="line-214"><code>			if sanity &amp;&amp; h.chunks[j]&amp;huffmanCountMask != huffmanChunkBits+1 {</code></span>
+<span class="codeline" id="line-215"><code>				// Longer codes should have been</code></span>
+<span class="codeline" id="line-216"><code>				// associated with a link table above.</code></span>
+<span class="codeline" id="line-217"><code>				panic("impossible: not an indirect chunk")</code></span>
+<span class="codeline" id="line-218"><code>			}</code></span>
+<span class="codeline" id="line-219"><code>			value := h.chunks[j] &gt;&gt; huffmanValueShift</code></span>
+<span class="codeline" id="line-220"><code>			linktab := h.links[value]</code></span>
+<span class="codeline" id="line-221"><code>			reverse &gt;&gt;= huffmanChunkBits</code></span>
+<span class="codeline" id="line-222"><code>			for off := reverse; off &lt; len(linktab); off += 1 &lt;&lt; uint(n-huffmanChunkBits) {</code></span>
+<span class="codeline" id="line-223"><code>				if sanity &amp;&amp; linktab[off] != 0 {</code></span>
+<span class="codeline" id="line-224"><code>					panic("impossible: overwriting existing chunk")</code></span>
+<span class="codeline" id="line-225"><code>				}</code></span>
+<span class="codeline" id="line-226"><code>				linktab[off] = chunk</code></span>
+<span class="codeline" id="line-227"><code>			}</code></span>
+<span class="codeline" id="line-228"><code>		}</code></span>
+<span class="codeline" id="line-229"><code>	}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>	if sanity {</code></span>
+<span class="codeline" id="line-232"><code>		// Above we've sanity checked that we never overwrote</code></span>
+<span class="codeline" id="line-233"><code>		// an existing entry. Here we additionally check that</code></span>
+<span class="codeline" id="line-234"><code>		// we filled the tables completely.</code></span>
+<span class="codeline" id="line-235"><code>		for i, chunk := range h.chunks {</code></span>
+<span class="codeline" id="line-236"><code>			if chunk == 0 {</code></span>
+<span class="codeline" id="line-237"><code>				// As an exception, in the degenerate</code></span>
+<span class="codeline" id="line-238"><code>				// single-code case, we allow odd</code></span>
+<span class="codeline" id="line-239"><code>				// chunks to be missing.</code></span>
+<span class="codeline" id="line-240"><code>				if code == 1 &amp;&amp; i%2 == 1 {</code></span>
+<span class="codeline" id="line-241"><code>					continue</code></span>
+<span class="codeline" id="line-242"><code>				}</code></span>
+<span class="codeline" id="line-243"><code>				panic("impossible: missing chunk")</code></span>
+<span class="codeline" id="line-244"><code>			}</code></span>
+<span class="codeline" id="line-245"><code>		}</code></span>
+<span class="codeline" id="line-246"><code>		for _, linktab := range h.links {</code></span>
+<span class="codeline" id="line-247"><code>			for _, chunk := range linktab {</code></span>
+<span class="codeline" id="line-248"><code>				if chunk == 0 {</code></span>
+<span class="codeline" id="line-249"><code>					panic("impossible: missing chunk")</code></span>
+<span class="codeline" id="line-250"><code>				}</code></span>
+<span class="codeline" id="line-251"><code>			}</code></span>
+<span class="codeline" id="line-252"><code>		}</code></span>
+<span class="codeline" id="line-253"><code>	}</code></span>
+<span class="codeline" id="line-254"><code></code></span>
+<span class="codeline" id="line-255"><code>	return true</code></span>
+<span class="codeline" id="line-256"><code>}</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>// The actual read interface needed by [NewReader].</code></span>
+<span class="codeline" id="line-259"><code>// If the passed in io.Reader does not also have ReadByte,</code></span>
+<span class="codeline" id="line-260"><code>// the [NewReader] will introduce its own buffering.</code></span>
+<span class="codeline" id="line-261"><code>type Reader interface {</code></span>
+<span class="codeline" id="line-262"><code>	io.Reader</code></span>
+<span class="codeline" id="line-263"><code>	io.ByteReader</code></span>
+<span class="codeline" id="line-264"><code>}</code></span>
+<span class="codeline" id="line-265"><code></code></span>
+<span class="codeline" id="line-266"><code>// Decompress state.</code></span>
+<span class="codeline" id="line-267"><code>type decompressor struct {</code></span>
+<span class="codeline" id="line-268"><code>	// Input source.</code></span>
+<span class="codeline" id="line-269"><code>	r       Reader</code></span>
+<span class="codeline" id="line-270"><code>	rBuf    *bufio.Reader // created if provided io.Reader does not implement io.ByteReader</code></span>
+<span class="codeline" id="line-271"><code>	roffset int64</code></span>
+<span class="codeline" id="line-272"><code></code></span>
+<span class="codeline" id="line-273"><code>	// Input bits, in top of b.</code></span>
+<span class="codeline" id="line-274"><code>	b  uint32</code></span>
+<span class="codeline" id="line-275"><code>	nb uint</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>	// Huffman decoders for literal/length, distance.</code></span>
+<span class="codeline" id="line-278"><code>	h1, h2 huffmanDecoder</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>	// Length arrays used to define Huffman codes.</code></span>
+<span class="codeline" id="line-281"><code>	bits     *[maxNumLit + maxNumDist]int</code></span>
+<span class="codeline" id="line-282"><code>	codebits *[numCodes]int</code></span>
+<span class="codeline" id="line-283"><code></code></span>
+<span class="codeline" id="line-284"><code>	// Output history, buffer.</code></span>
+<span class="codeline" id="line-285"><code>	dict dictDecoder</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>	// Temporary buffer (avoids repeated allocation).</code></span>
+<span class="codeline" id="line-288"><code>	buf [4]byte</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	// Next step in the decompression,</code></span>
+<span class="codeline" id="line-291"><code>	// and decompression state.</code></span>
+<span class="codeline" id="line-292"><code>	step      func(*decompressor)</code></span>
+<span class="codeline" id="line-293"><code>	stepState int</code></span>
+<span class="codeline" id="line-294"><code>	final     bool</code></span>
+<span class="codeline" id="line-295"><code>	err       error</code></span>
+<span class="codeline" id="line-296"><code>	toRead    []byte</code></span>
+<span class="codeline" id="line-297"><code>	hl, hd    *huffmanDecoder</code></span>
+<span class="codeline" id="line-298"><code>	copyLen   int</code></span>
+<span class="codeline" id="line-299"><code>	copyDist  int</code></span>
+<span class="codeline" id="line-300"><code>}</code></span>
+<span class="codeline" id="line-301"><code></code></span>
+<span class="codeline" id="line-302"><code>func (f *decompressor) nextBlock() {</code></span>
+<span class="codeline" id="line-303"><code>	for f.nb &lt; 1+2 {</code></span>
+<span class="codeline" id="line-304"><code>		if f.err = f.moreBits(); f.err != nil {</code></span>
+<span class="codeline" id="line-305"><code>			return</code></span>
+<span class="codeline" id="line-306"><code>		}</code></span>
+<span class="codeline" id="line-307"><code>	}</code></span>
+<span class="codeline" id="line-308"><code>	f.final = f.b&amp;1 == 1</code></span>
+<span class="codeline" id="line-309"><code>	f.b &gt;&gt;= 1</code></span>
+<span class="codeline" id="line-310"><code>	typ := f.b &amp; 3</code></span>
+<span class="codeline" id="line-311"><code>	f.b &gt;&gt;= 2</code></span>
+<span class="codeline" id="line-312"><code>	f.nb -= 1 + 2</code></span>
+<span class="codeline" id="line-313"><code>	switch typ {</code></span>
+<span class="codeline" id="line-314"><code>	case 0:</code></span>
+<span class="codeline" id="line-315"><code>		f.dataBlock()</code></span>
+<span class="codeline" id="line-316"><code>	case 1:</code></span>
+<span class="codeline" id="line-317"><code>		// compressed, fixed Huffman tables</code></span>
+<span class="codeline" id="line-318"><code>		f.hl = &amp;fixedHuffmanDecoder</code></span>
+<span class="codeline" id="line-319"><code>		f.hd = nil</code></span>
+<span class="codeline" id="line-320"><code>		f.huffmanBlock()</code></span>
+<span class="codeline" id="line-321"><code>	case 2:</code></span>
+<span class="codeline" id="line-322"><code>		// compressed, dynamic Huffman tables</code></span>
+<span class="codeline" id="line-323"><code>		if f.err = f.readHuffman(); f.err != nil {</code></span>
+<span class="codeline" id="line-324"><code>			break</code></span>
+<span class="codeline" id="line-325"><code>		}</code></span>
+<span class="codeline" id="line-326"><code>		f.hl = &amp;f.h1</code></span>
+<span class="codeline" id="line-327"><code>		f.hd = &amp;f.h2</code></span>
+<span class="codeline" id="line-328"><code>		f.huffmanBlock()</code></span>
+<span class="codeline" id="line-329"><code>	default:</code></span>
+<span class="codeline" id="line-330"><code>		// 3 is reserved.</code></span>
+<span class="codeline" id="line-331"><code>		f.err = CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-332"><code>	}</code></span>
+<span class="codeline" id="line-333"><code>}</code></span>
+<span class="codeline" id="line-334"><code></code></span>
+<span class="codeline" id="line-335"><code>func (f *decompressor) Read(b []byte) (int, error) {</code></span>
+<span class="codeline" id="line-336"><code>	for {</code></span>
+<span class="codeline" id="line-337"><code>		if len(f.toRead) &gt; 0 {</code></span>
+<span class="codeline" id="line-338"><code>			n := copy(b, f.toRead)</code></span>
+<span class="codeline" id="line-339"><code>			f.toRead = f.toRead[n:]</code></span>
+<span class="codeline" id="line-340"><code>			if len(f.toRead) == 0 {</code></span>
+<span class="codeline" id="line-341"><code>				return n, f.err</code></span>
+<span class="codeline" id="line-342"><code>			}</code></span>
+<span class="codeline" id="line-343"><code>			return n, nil</code></span>
+<span class="codeline" id="line-344"><code>		}</code></span>
+<span class="codeline" id="line-345"><code>		if f.err != nil {</code></span>
+<span class="codeline" id="line-346"><code>			return 0, f.err</code></span>
+<span class="codeline" id="line-347"><code>		}</code></span>
+<span class="codeline" id="line-348"><code>		f.step(f)</code></span>
+<span class="codeline" id="line-349"><code>		if f.err != nil &amp;&amp; len(f.toRead) == 0 {</code></span>
+<span class="codeline" id="line-350"><code>			f.toRead = f.dict.readFlush() // Flush what's left in case of error</code></span>
+<span class="codeline" id="line-351"><code>		}</code></span>
+<span class="codeline" id="line-352"><code>	}</code></span>
+<span class="codeline" id="line-353"><code>}</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>func (f *decompressor) Close() error {</code></span>
+<span class="codeline" id="line-356"><code>	if f.err == io.EOF {</code></span>
+<span class="codeline" id="line-357"><code>		return nil</code></span>
+<span class="codeline" id="line-358"><code>	}</code></span>
+<span class="codeline" id="line-359"><code>	return f.err</code></span>
+<span class="codeline" id="line-360"><code>}</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>// RFC 1951 section 3.2.7.</code></span>
+<span class="codeline" id="line-363"><code>// Compression with dynamic Huffman codes</code></span>
+<span class="codeline" id="line-364"><code></code></span>
+<span class="codeline" id="line-365"><code>var codeOrder = [...]int{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15}</code></span>
+<span class="codeline" id="line-366"><code></code></span>
+<span class="codeline" id="line-367"><code>func (f *decompressor) readHuffman() error {</code></span>
+<span class="codeline" id="line-368"><code>	// HLIT[5], HDIST[5], HCLEN[4].</code></span>
+<span class="codeline" id="line-369"><code>	for f.nb &lt; 5+5+4 {</code></span>
+<span class="codeline" id="line-370"><code>		if err := f.moreBits(); err != nil {</code></span>
+<span class="codeline" id="line-371"><code>			return err</code></span>
+<span class="codeline" id="line-372"><code>		}</code></span>
+<span class="codeline" id="line-373"><code>	}</code></span>
+<span class="codeline" id="line-374"><code>	nlit := int(f.b&amp;0x1F) + 257</code></span>
+<span class="codeline" id="line-375"><code>	if nlit &gt; maxNumLit {</code></span>
+<span class="codeline" id="line-376"><code>		return CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-377"><code>	}</code></span>
+<span class="codeline" id="line-378"><code>	f.b &gt;&gt;= 5</code></span>
+<span class="codeline" id="line-379"><code>	ndist := int(f.b&amp;0x1F) + 1</code></span>
+<span class="codeline" id="line-380"><code>	if ndist &gt; maxNumDist {</code></span>
+<span class="codeline" id="line-381"><code>		return CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-382"><code>	}</code></span>
+<span class="codeline" id="line-383"><code>	f.b &gt;&gt;= 5</code></span>
+<span class="codeline" id="line-384"><code>	nclen := int(f.b&amp;0xF) + 4</code></span>
+<span class="codeline" id="line-385"><code>	// numCodes is 19, so nclen is always valid.</code></span>
+<span class="codeline" id="line-386"><code>	f.b &gt;&gt;= 4</code></span>
+<span class="codeline" id="line-387"><code>	f.nb -= 5 + 5 + 4</code></span>
+<span class="codeline" id="line-388"><code></code></span>
+<span class="codeline" id="line-389"><code>	// (HCLEN+4)*3 bits: code lengths in the magic codeOrder order.</code></span>
+<span class="codeline" id="line-390"><code>	for i := 0; i &lt; nclen; i++ {</code></span>
+<span class="codeline" id="line-391"><code>		for f.nb &lt; 3 {</code></span>
+<span class="codeline" id="line-392"><code>			if err := f.moreBits(); err != nil {</code></span>
+<span class="codeline" id="line-393"><code>				return err</code></span>
+<span class="codeline" id="line-394"><code>			}</code></span>
+<span class="codeline" id="line-395"><code>		}</code></span>
+<span class="codeline" id="line-396"><code>		f.codebits[codeOrder[i]] = int(f.b &amp; 0x7)</code></span>
+<span class="codeline" id="line-397"><code>		f.b &gt;&gt;= 3</code></span>
+<span class="codeline" id="line-398"><code>		f.nb -= 3</code></span>
+<span class="codeline" id="line-399"><code>	}</code></span>
+<span class="codeline" id="line-400"><code>	for i := nclen; i &lt; len(codeOrder); i++ {</code></span>
+<span class="codeline" id="line-401"><code>		f.codebits[codeOrder[i]] = 0</code></span>
+<span class="codeline" id="line-402"><code>	}</code></span>
+<span class="codeline" id="line-403"><code>	if !f.h1.init(f.codebits[0:]) {</code></span>
+<span class="codeline" id="line-404"><code>		return CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-405"><code>	}</code></span>
+<span class="codeline" id="line-406"><code></code></span>
+<span class="codeline" id="line-407"><code>	// HLIT + 257 code lengths, HDIST + 1 code lengths,</code></span>
+<span class="codeline" id="line-408"><code>	// using the code length Huffman code.</code></span>
+<span class="codeline" id="line-409"><code>	for i, n := 0, nlit+ndist; i &lt; n; {</code></span>
+<span class="codeline" id="line-410"><code>		x, err := f.huffSym(&amp;f.h1)</code></span>
+<span class="codeline" id="line-411"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-412"><code>			return err</code></span>
+<span class="codeline" id="line-413"><code>		}</code></span>
+<span class="codeline" id="line-414"><code>		if x &lt; 16 {</code></span>
+<span class="codeline" id="line-415"><code>			// Actual length.</code></span>
+<span class="codeline" id="line-416"><code>			f.bits[i] = x</code></span>
+<span class="codeline" id="line-417"><code>			i++</code></span>
+<span class="codeline" id="line-418"><code>			continue</code></span>
+<span class="codeline" id="line-419"><code>		}</code></span>
+<span class="codeline" id="line-420"><code>		// Repeat previous length or zero.</code></span>
+<span class="codeline" id="line-421"><code>		var rep int</code></span>
+<span class="codeline" id="line-422"><code>		var nb uint</code></span>
+<span class="codeline" id="line-423"><code>		var b int</code></span>
+<span class="codeline" id="line-424"><code>		switch x {</code></span>
+<span class="codeline" id="line-425"><code>		default:</code></span>
+<span class="codeline" id="line-426"><code>			return InternalError("unexpected length code")</code></span>
+<span class="codeline" id="line-427"><code>		case 16:</code></span>
+<span class="codeline" id="line-428"><code>			rep = 3</code></span>
+<span class="codeline" id="line-429"><code>			nb = 2</code></span>
+<span class="codeline" id="line-430"><code>			if i == 0 {</code></span>
+<span class="codeline" id="line-431"><code>				return CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-432"><code>			}</code></span>
+<span class="codeline" id="line-433"><code>			b = f.bits[i-1]</code></span>
+<span class="codeline" id="line-434"><code>		case 17:</code></span>
+<span class="codeline" id="line-435"><code>			rep = 3</code></span>
+<span class="codeline" id="line-436"><code>			nb = 3</code></span>
+<span class="codeline" id="line-437"><code>			b = 0</code></span>
+<span class="codeline" id="line-438"><code>		case 18:</code></span>
+<span class="codeline" id="line-439"><code>			rep = 11</code></span>
+<span class="codeline" id="line-440"><code>			nb = 7</code></span>
+<span class="codeline" id="line-441"><code>			b = 0</code></span>
+<span class="codeline" id="line-442"><code>		}</code></span>
+<span class="codeline" id="line-443"><code>		for f.nb &lt; nb {</code></span>
+<span class="codeline" id="line-444"><code>			if err := f.moreBits(); err != nil {</code></span>
+<span class="codeline" id="line-445"><code>				return err</code></span>
+<span class="codeline" id="line-446"><code>			}</code></span>
+<span class="codeline" id="line-447"><code>		}</code></span>
+<span class="codeline" id="line-448"><code>		rep += int(f.b &amp; uint32(1&lt;&lt;nb-1))</code></span>
+<span class="codeline" id="line-449"><code>		f.b &gt;&gt;= nb</code></span>
+<span class="codeline" id="line-450"><code>		f.nb -= nb</code></span>
+<span class="codeline" id="line-451"><code>		if i+rep &gt; n {</code></span>
+<span class="codeline" id="line-452"><code>			return CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-453"><code>		}</code></span>
+<span class="codeline" id="line-454"><code>		for j := 0; j &lt; rep; j++ {</code></span>
+<span class="codeline" id="line-455"><code>			f.bits[i] = b</code></span>
+<span class="codeline" id="line-456"><code>			i++</code></span>
+<span class="codeline" id="line-457"><code>		}</code></span>
+<span class="codeline" id="line-458"><code>	}</code></span>
+<span class="codeline" id="line-459"><code></code></span>
+<span class="codeline" id="line-460"><code>	if !f.h1.init(f.bits[0:nlit]) || !f.h2.init(f.bits[nlit:nlit+ndist]) {</code></span>
+<span class="codeline" id="line-461"><code>		return CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-462"><code>	}</code></span>
+<span class="codeline" id="line-463"><code></code></span>
+<span class="codeline" id="line-464"><code>	// As an optimization, we can initialize the min bits to read at a time</code></span>
+<span class="codeline" id="line-465"><code>	// for the HLIT tree to the length of the EOB marker since we know that</code></span>
+<span class="codeline" id="line-466"><code>	// every block must terminate with one. This preserves the property that</code></span>
+<span class="codeline" id="line-467"><code>	// we never read any extra bytes after the end of the DEFLATE stream.</code></span>
+<span class="codeline" id="line-468"><code>	if f.h1.min &lt; f.bits[endBlockMarker] {</code></span>
+<span class="codeline" id="line-469"><code>		f.h1.min = f.bits[endBlockMarker]</code></span>
+<span class="codeline" id="line-470"><code>	}</code></span>
+<span class="codeline" id="line-471"><code></code></span>
+<span class="codeline" id="line-472"><code>	return nil</code></span>
+<span class="codeline" id="line-473"><code>}</code></span>
+<span class="codeline" id="line-474"><code></code></span>
+<span class="codeline" id="line-475"><code>// Decode a single Huffman block from f.</code></span>
+<span class="codeline" id="line-476"><code>// hl and hd are the Huffman states for the lit/length values</code></span>
+<span class="codeline" id="line-477"><code>// and the distance values, respectively. If hd == nil, using the</code></span>
+<span class="codeline" id="line-478"><code>// fixed distance encoding associated with fixed Huffman blocks.</code></span>
+<span class="codeline" id="line-479"><code>func (f *decompressor) huffmanBlock() {</code></span>
+<span class="codeline" id="line-480"><code>	const (</code></span>
+<span class="codeline" id="line-481"><code>		stateInit = iota // Zero value must be stateInit</code></span>
+<span class="codeline" id="line-482"><code>		stateDict</code></span>
+<span class="codeline" id="line-483"><code>	)</code></span>
+<span class="codeline" id="line-484"><code></code></span>
+<span class="codeline" id="line-485"><code>	switch f.stepState {</code></span>
+<span class="codeline" id="line-486"><code>	case stateInit:</code></span>
+<span class="codeline" id="line-487"><code>		goto readLiteral</code></span>
+<span class="codeline" id="line-488"><code>	case stateDict:</code></span>
+<span class="codeline" id="line-489"><code>		goto copyHistory</code></span>
+<span class="codeline" id="line-490"><code>	}</code></span>
+<span class="codeline" id="line-491"><code></code></span>
+<span class="codeline" id="line-492"><code>readLiteral:</code></span>
+<span class="codeline" id="line-493"><code>	// Read literal and/or (length, distance) according to RFC section 3.2.3.</code></span>
+<span class="codeline" id="line-494"><code>	{</code></span>
+<span class="codeline" id="line-495"><code>		v, err := f.huffSym(f.hl)</code></span>
+<span class="codeline" id="line-496"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-497"><code>			f.err = err</code></span>
+<span class="codeline" id="line-498"><code>			return</code></span>
+<span class="codeline" id="line-499"><code>		}</code></span>
+<span class="codeline" id="line-500"><code>		var n uint // number of bits extra</code></span>
+<span class="codeline" id="line-501"><code>		var length int</code></span>
+<span class="codeline" id="line-502"><code>		switch {</code></span>
+<span class="codeline" id="line-503"><code>		case v &lt; 256:</code></span>
+<span class="codeline" id="line-504"><code>			f.dict.writeByte(byte(v))</code></span>
+<span class="codeline" id="line-505"><code>			if f.dict.availWrite() == 0 {</code></span>
+<span class="codeline" id="line-506"><code>				f.toRead = f.dict.readFlush()</code></span>
+<span class="codeline" id="line-507"><code>				f.step = (*decompressor).huffmanBlock</code></span>
+<span class="codeline" id="line-508"><code>				f.stepState = stateInit</code></span>
+<span class="codeline" id="line-509"><code>				return</code></span>
+<span class="codeline" id="line-510"><code>			}</code></span>
+<span class="codeline" id="line-511"><code>			goto readLiteral</code></span>
+<span class="codeline" id="line-512"><code>		case v == 256:</code></span>
+<span class="codeline" id="line-513"><code>			f.finishBlock()</code></span>
+<span class="codeline" id="line-514"><code>			return</code></span>
+<span class="codeline" id="line-515"><code>		// otherwise, reference to older data</code></span>
+<span class="codeline" id="line-516"><code>		case v &lt; 265:</code></span>
+<span class="codeline" id="line-517"><code>			length = v - (257 - 3)</code></span>
+<span class="codeline" id="line-518"><code>			n = 0</code></span>
+<span class="codeline" id="line-519"><code>		case v &lt; 269:</code></span>
+<span class="codeline" id="line-520"><code>			length = v*2 - (265*2 - 11)</code></span>
+<span class="codeline" id="line-521"><code>			n = 1</code></span>
+<span class="codeline" id="line-522"><code>		case v &lt; 273:</code></span>
+<span class="codeline" id="line-523"><code>			length = v*4 - (269*4 - 19)</code></span>
+<span class="codeline" id="line-524"><code>			n = 2</code></span>
+<span class="codeline" id="line-525"><code>		case v &lt; 277:</code></span>
+<span class="codeline" id="line-526"><code>			length = v*8 - (273*8 - 35)</code></span>
+<span class="codeline" id="line-527"><code>			n = 3</code></span>
+<span class="codeline" id="line-528"><code>		case v &lt; 281:</code></span>
+<span class="codeline" id="line-529"><code>			length = v*16 - (277*16 - 67)</code></span>
+<span class="codeline" id="line-530"><code>			n = 4</code></span>
+<span class="codeline" id="line-531"><code>		case v &lt; 285:</code></span>
+<span class="codeline" id="line-532"><code>			length = v*32 - (281*32 - 131)</code></span>
+<span class="codeline" id="line-533"><code>			n = 5</code></span>
+<span class="codeline" id="line-534"><code>		case v &lt; maxNumLit:</code></span>
+<span class="codeline" id="line-535"><code>			length = 258</code></span>
+<span class="codeline" id="line-536"><code>			n = 0</code></span>
+<span class="codeline" id="line-537"><code>		default:</code></span>
+<span class="codeline" id="line-538"><code>			f.err = CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-539"><code>			return</code></span>
+<span class="codeline" id="line-540"><code>		}</code></span>
+<span class="codeline" id="line-541"><code>		if n &gt; 0 {</code></span>
+<span class="codeline" id="line-542"><code>			for f.nb &lt; n {</code></span>
+<span class="codeline" id="line-543"><code>				if err = f.moreBits(); err != nil {</code></span>
+<span class="codeline" id="line-544"><code>					f.err = err</code></span>
+<span class="codeline" id="line-545"><code>					return</code></span>
+<span class="codeline" id="line-546"><code>				}</code></span>
+<span class="codeline" id="line-547"><code>			}</code></span>
+<span class="codeline" id="line-548"><code>			length += int(f.b &amp; uint32(1&lt;&lt;n-1))</code></span>
+<span class="codeline" id="line-549"><code>			f.b &gt;&gt;= n</code></span>
+<span class="codeline" id="line-550"><code>			f.nb -= n</code></span>
+<span class="codeline" id="line-551"><code>		}</code></span>
+<span class="codeline" id="line-552"><code></code></span>
+<span class="codeline" id="line-553"><code>		var dist int</code></span>
+<span class="codeline" id="line-554"><code>		if f.hd == nil {</code></span>
+<span class="codeline" id="line-555"><code>			for f.nb &lt; 5 {</code></span>
+<span class="codeline" id="line-556"><code>				if err = f.moreBits(); err != nil {</code></span>
+<span class="codeline" id="line-557"><code>					f.err = err</code></span>
+<span class="codeline" id="line-558"><code>					return</code></span>
+<span class="codeline" id="line-559"><code>				}</code></span>
+<span class="codeline" id="line-560"><code>			}</code></span>
+<span class="codeline" id="line-561"><code>			dist = int(bits.Reverse8(uint8(f.b &amp; 0x1F &lt;&lt; 3)))</code></span>
+<span class="codeline" id="line-562"><code>			f.b &gt;&gt;= 5</code></span>
+<span class="codeline" id="line-563"><code>			f.nb -= 5</code></span>
+<span class="codeline" id="line-564"><code>		} else {</code></span>
+<span class="codeline" id="line-565"><code>			if dist, err = f.huffSym(f.hd); err != nil {</code></span>
+<span class="codeline" id="line-566"><code>				f.err = err</code></span>
+<span class="codeline" id="line-567"><code>				return</code></span>
+<span class="codeline" id="line-568"><code>			}</code></span>
+<span class="codeline" id="line-569"><code>		}</code></span>
+<span class="codeline" id="line-570"><code></code></span>
+<span class="codeline" id="line-571"><code>		switch {</code></span>
+<span class="codeline" id="line-572"><code>		case dist &lt; 4:</code></span>
+<span class="codeline" id="line-573"><code>			dist++</code></span>
+<span class="codeline" id="line-574"><code>		case dist &lt; maxNumDist:</code></span>
+<span class="codeline" id="line-575"><code>			nb := uint(dist-2) &gt;&gt; 1</code></span>
+<span class="codeline" id="line-576"><code>			// have 1 bit in bottom of dist, need nb more.</code></span>
+<span class="codeline" id="line-577"><code>			extra := (dist &amp; 1) &lt;&lt; nb</code></span>
+<span class="codeline" id="line-578"><code>			for f.nb &lt; nb {</code></span>
+<span class="codeline" id="line-579"><code>				if err = f.moreBits(); err != nil {</code></span>
+<span class="codeline" id="line-580"><code>					f.err = err</code></span>
+<span class="codeline" id="line-581"><code>					return</code></span>
+<span class="codeline" id="line-582"><code>				}</code></span>
+<span class="codeline" id="line-583"><code>			}</code></span>
+<span class="codeline" id="line-584"><code>			extra |= int(f.b &amp; uint32(1&lt;&lt;nb-1))</code></span>
+<span class="codeline" id="line-585"><code>			f.b &gt;&gt;= nb</code></span>
+<span class="codeline" id="line-586"><code>			f.nb -= nb</code></span>
+<span class="codeline" id="line-587"><code>			dist = 1&lt;&lt;(nb+1) + 1 + extra</code></span>
+<span class="codeline" id="line-588"><code>		default:</code></span>
+<span class="codeline" id="line-589"><code>			f.err = CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-590"><code>			return</code></span>
+<span class="codeline" id="line-591"><code>		}</code></span>
+<span class="codeline" id="line-592"><code></code></span>
+<span class="codeline" id="line-593"><code>		// No check on length; encoding can be prescient.</code></span>
+<span class="codeline" id="line-594"><code>		if dist &gt; f.dict.histSize() {</code></span>
+<span class="codeline" id="line-595"><code>			f.err = CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-596"><code>			return</code></span>
+<span class="codeline" id="line-597"><code>		}</code></span>
+<span class="codeline" id="line-598"><code></code></span>
+<span class="codeline" id="line-599"><code>		f.copyLen, f.copyDist = length, dist</code></span>
+<span class="codeline" id="line-600"><code>		goto copyHistory</code></span>
+<span class="codeline" id="line-601"><code>	}</code></span>
+<span class="codeline" id="line-602"><code></code></span>
+<span class="codeline" id="line-603"><code>copyHistory:</code></span>
+<span class="codeline" id="line-604"><code>	// Perform a backwards copy according to RFC section 3.2.3.</code></span>
+<span class="codeline" id="line-605"><code>	{</code></span>
+<span class="codeline" id="line-606"><code>		cnt := f.dict.tryWriteCopy(f.copyDist, f.copyLen)</code></span>
+<span class="codeline" id="line-607"><code>		if cnt == 0 {</code></span>
+<span class="codeline" id="line-608"><code>			cnt = f.dict.writeCopy(f.copyDist, f.copyLen)</code></span>
+<span class="codeline" id="line-609"><code>		}</code></span>
+<span class="codeline" id="line-610"><code>		f.copyLen -= cnt</code></span>
+<span class="codeline" id="line-611"><code></code></span>
+<span class="codeline" id="line-612"><code>		if f.dict.availWrite() == 0 || f.copyLen &gt; 0 {</code></span>
+<span class="codeline" id="line-613"><code>			f.toRead = f.dict.readFlush()</code></span>
+<span class="codeline" id="line-614"><code>			f.step = (*decompressor).huffmanBlock // We need to continue this work</code></span>
+<span class="codeline" id="line-615"><code>			f.stepState = stateDict</code></span>
+<span class="codeline" id="line-616"><code>			return</code></span>
+<span class="codeline" id="line-617"><code>		}</code></span>
+<span class="codeline" id="line-618"><code>		goto readLiteral</code></span>
+<span class="codeline" id="line-619"><code>	}</code></span>
+<span class="codeline" id="line-620"><code>}</code></span>
+<span class="codeline" id="line-621"><code></code></span>
+<span class="codeline" id="line-622"><code>// Copy a single uncompressed data block from input to output.</code></span>
+<span class="codeline" id="line-623"><code>func (f *decompressor) dataBlock() {</code></span>
+<span class="codeline" id="line-624"><code>	// Uncompressed.</code></span>
+<span class="codeline" id="line-625"><code>	// Discard current half-byte.</code></span>
+<span class="codeline" id="line-626"><code>	f.nb = 0</code></span>
+<span class="codeline" id="line-627"><code>	f.b = 0</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>	// Length then ones-complement of length.</code></span>
+<span class="codeline" id="line-630"><code>	nr, err := io.ReadFull(f.r, f.buf[0:4])</code></span>
+<span class="codeline" id="line-631"><code>	f.roffset += int64(nr)</code></span>
+<span class="codeline" id="line-632"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-633"><code>		f.err = noEOF(err)</code></span>
+<span class="codeline" id="line-634"><code>		return</code></span>
+<span class="codeline" id="line-635"><code>	}</code></span>
+<span class="codeline" id="line-636"><code>	n := int(f.buf[0]) | int(f.buf[1])&lt;&lt;8</code></span>
+<span class="codeline" id="line-637"><code>	nn := int(f.buf[2]) | int(f.buf[3])&lt;&lt;8</code></span>
+<span class="codeline" id="line-638"><code>	if uint16(nn) != uint16(^n) {</code></span>
+<span class="codeline" id="line-639"><code>		f.err = CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-640"><code>		return</code></span>
+<span class="codeline" id="line-641"><code>	}</code></span>
+<span class="codeline" id="line-642"><code></code></span>
+<span class="codeline" id="line-643"><code>	if n == 0 {</code></span>
+<span class="codeline" id="line-644"><code>		f.toRead = f.dict.readFlush()</code></span>
+<span class="codeline" id="line-645"><code>		f.finishBlock()</code></span>
+<span class="codeline" id="line-646"><code>		return</code></span>
+<span class="codeline" id="line-647"><code>	}</code></span>
+<span class="codeline" id="line-648"><code></code></span>
+<span class="codeline" id="line-649"><code>	f.copyLen = n</code></span>
+<span class="codeline" id="line-650"><code>	f.copyData()</code></span>
+<span class="codeline" id="line-651"><code>}</code></span>
+<span class="codeline" id="line-652"><code></code></span>
+<span class="codeline" id="line-653"><code>// copyData copies f.copyLen bytes from the underlying reader into f.hist.</code></span>
+<span class="codeline" id="line-654"><code>// It pauses for reads when f.hist is full.</code></span>
+<span class="codeline" id="line-655"><code>func (f *decompressor) copyData() {</code></span>
+<span class="codeline" id="line-656"><code>	buf := f.dict.writeSlice()</code></span>
+<span class="codeline" id="line-657"><code>	if len(buf) &gt; f.copyLen {</code></span>
+<span class="codeline" id="line-658"><code>		buf = buf[:f.copyLen]</code></span>
+<span class="codeline" id="line-659"><code>	}</code></span>
+<span class="codeline" id="line-660"><code></code></span>
+<span class="codeline" id="line-661"><code>	cnt, err := io.ReadFull(f.r, buf)</code></span>
+<span class="codeline" id="line-662"><code>	f.roffset += int64(cnt)</code></span>
+<span class="codeline" id="line-663"><code>	f.copyLen -= cnt</code></span>
+<span class="codeline" id="line-664"><code>	f.dict.writeMark(cnt)</code></span>
+<span class="codeline" id="line-665"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-666"><code>		f.err = noEOF(err)</code></span>
+<span class="codeline" id="line-667"><code>		return</code></span>
+<span class="codeline" id="line-668"><code>	}</code></span>
+<span class="codeline" id="line-669"><code></code></span>
+<span class="codeline" id="line-670"><code>	if f.dict.availWrite() == 0 || f.copyLen &gt; 0 {</code></span>
+<span class="codeline" id="line-671"><code>		f.toRead = f.dict.readFlush()</code></span>
+<span class="codeline" id="line-672"><code>		f.step = (*decompressor).copyData</code></span>
+<span class="codeline" id="line-673"><code>		return</code></span>
+<span class="codeline" id="line-674"><code>	}</code></span>
+<span class="codeline" id="line-675"><code>	f.finishBlock()</code></span>
+<span class="codeline" id="line-676"><code>}</code></span>
+<span class="codeline" id="line-677"><code></code></span>
+<span class="codeline" id="line-678"><code>func (f *decompressor) finishBlock() {</code></span>
+<span class="codeline" id="line-679"><code>	if f.final {</code></span>
+<span class="codeline" id="line-680"><code>		if f.dict.availRead() &gt; 0 {</code></span>
+<span class="codeline" id="line-681"><code>			f.toRead = f.dict.readFlush()</code></span>
+<span class="codeline" id="line-682"><code>		}</code></span>
+<span class="codeline" id="line-683"><code>		f.err = io.EOF</code></span>
+<span class="codeline" id="line-684"><code>	}</code></span>
+<span class="codeline" id="line-685"><code>	f.step = (*decompressor).nextBlock</code></span>
+<span class="codeline" id="line-686"><code>}</code></span>
+<span class="codeline" id="line-687"><code></code></span>
+<span class="codeline" id="line-688"><code>// noEOF returns err, unless err == io.EOF, in which case it returns io.ErrUnexpectedEOF.</code></span>
+<span class="codeline" id="line-689"><code>func noEOF(e error) error {</code></span>
+<span class="codeline" id="line-690"><code>	if e == io.EOF {</code></span>
+<span class="codeline" id="line-691"><code>		return io.ErrUnexpectedEOF</code></span>
+<span class="codeline" id="line-692"><code>	}</code></span>
+<span class="codeline" id="line-693"><code>	return e</code></span>
+<span class="codeline" id="line-694"><code>}</code></span>
+<span class="codeline" id="line-695"><code></code></span>
+<span class="codeline" id="line-696"><code>func (f *decompressor) moreBits() error {</code></span>
+<span class="codeline" id="line-697"><code>	c, err := f.r.ReadByte()</code></span>
+<span class="codeline" id="line-698"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-699"><code>		return noEOF(err)</code></span>
+<span class="codeline" id="line-700"><code>	}</code></span>
+<span class="codeline" id="line-701"><code>	f.roffset++</code></span>
+<span class="codeline" id="line-702"><code>	f.b |= uint32(c) &lt;&lt; f.nb</code></span>
+<span class="codeline" id="line-703"><code>	f.nb += 8</code></span>
+<span class="codeline" id="line-704"><code>	return nil</code></span>
+<span class="codeline" id="line-705"><code>}</code></span>
+<span class="codeline" id="line-706"><code></code></span>
+<span class="codeline" id="line-707"><code>// Read the next Huffman-encoded symbol from f according to h.</code></span>
+<span class="codeline" id="line-708"><code>func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {</code></span>
+<span class="codeline" id="line-709"><code>	// Since a huffmanDecoder can be empty or be composed of a degenerate tree</code></span>
+<span class="codeline" id="line-710"><code>	// with single element, huffSym must error on these two edge cases. In both</code></span>
+<span class="codeline" id="line-711"><code>	// cases, the chunks slice will be 0 for the invalid sequence, leading it</code></span>
+<span class="codeline" id="line-712"><code>	// satisfy the n == 0 check below.</code></span>
+<span class="codeline" id="line-713"><code>	n := uint(h.min)</code></span>
+<span class="codeline" id="line-714"><code>	// Optimization. Compiler isn't smart enough to keep f.b,f.nb in registers,</code></span>
+<span class="codeline" id="line-715"><code>	// but is smart enough to keep local variables in registers, so use nb and b,</code></span>
+<span class="codeline" id="line-716"><code>	// inline call to moreBits and reassign b,nb back to f on return.</code></span>
+<span class="codeline" id="line-717"><code>	nb, b := f.nb, f.b</code></span>
+<span class="codeline" id="line-718"><code>	for {</code></span>
+<span class="codeline" id="line-719"><code>		for nb &lt; n {</code></span>
+<span class="codeline" id="line-720"><code>			c, err := f.r.ReadByte()</code></span>
+<span class="codeline" id="line-721"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-722"><code>				f.b = b</code></span>
+<span class="codeline" id="line-723"><code>				f.nb = nb</code></span>
+<span class="codeline" id="line-724"><code>				return 0, noEOF(err)</code></span>
+<span class="codeline" id="line-725"><code>			}</code></span>
+<span class="codeline" id="line-726"><code>			f.roffset++</code></span>
+<span class="codeline" id="line-727"><code>			b |= uint32(c) &lt;&lt; (nb &amp; 31)</code></span>
+<span class="codeline" id="line-728"><code>			nb += 8</code></span>
+<span class="codeline" id="line-729"><code>		}</code></span>
+<span class="codeline" id="line-730"><code>		chunk := h.chunks[b&amp;(huffmanNumChunks-1)]</code></span>
+<span class="codeline" id="line-731"><code>		n = uint(chunk &amp; huffmanCountMask)</code></span>
+<span class="codeline" id="line-732"><code>		if n &gt; huffmanChunkBits {</code></span>
+<span class="codeline" id="line-733"><code>			chunk = h.links[chunk&gt;&gt;huffmanValueShift][(b&gt;&gt;huffmanChunkBits)&amp;h.linkMask]</code></span>
+<span class="codeline" id="line-734"><code>			n = uint(chunk &amp; huffmanCountMask)</code></span>
+<span class="codeline" id="line-735"><code>		}</code></span>
+<span class="codeline" id="line-736"><code>		if n &lt;= nb {</code></span>
+<span class="codeline" id="line-737"><code>			if n == 0 {</code></span>
+<span class="codeline" id="line-738"><code>				f.b = b</code></span>
+<span class="codeline" id="line-739"><code>				f.nb = nb</code></span>
+<span class="codeline" id="line-740"><code>				f.err = CorruptInputError(f.roffset)</code></span>
+<span class="codeline" id="line-741"><code>				return 0, f.err</code></span>
+<span class="codeline" id="line-742"><code>			}</code></span>
+<span class="codeline" id="line-743"><code>			f.b = b &gt;&gt; (n &amp; 31)</code></span>
+<span class="codeline" id="line-744"><code>			f.nb = nb - n</code></span>
+<span class="codeline" id="line-745"><code>			return int(chunk &gt;&gt; huffmanValueShift), nil</code></span>
+<span class="codeline" id="line-746"><code>		}</code></span>
+<span class="codeline" id="line-747"><code>	}</code></span>
+<span class="codeline" id="line-748"><code>}</code></span>
+<span class="codeline" id="line-749"><code></code></span>
+<span class="codeline" id="line-750"><code>func (f *decompressor) makeReader(r io.Reader) {</code></span>
+<span class="codeline" id="line-751"><code>	if rr, ok := r.(Reader); ok {</code></span>
+<span class="codeline" id="line-752"><code>		f.rBuf = nil</code></span>
+<span class="codeline" id="line-753"><code>		f.r = rr</code></span>
+<span class="codeline" id="line-754"><code>		return</code></span>
+<span class="codeline" id="line-755"><code>	}</code></span>
+<span class="codeline" id="line-756"><code>	// Reuse rBuf if possible. Invariant: rBuf is always created (and owned) by decompressor.</code></span>
+<span class="codeline" id="line-757"><code>	if f.rBuf != nil {</code></span>
+<span class="codeline" id="line-758"><code>		f.rBuf.Reset(r)</code></span>
+<span class="codeline" id="line-759"><code>	} else {</code></span>
+<span class="codeline" id="line-760"><code>		// bufio.NewReader will not return r, as r does not implement flate.Reader, so it is not bufio.Reader.</code></span>
+<span class="codeline" id="line-761"><code>		f.rBuf = bufio.NewReader(r)</code></span>
+<span class="codeline" id="line-762"><code>	}</code></span>
+<span class="codeline" id="line-763"><code>	f.r = f.rBuf</code></span>
+<span class="codeline" id="line-764"><code>}</code></span>
+<span class="codeline" id="line-765"><code></code></span>
+<span class="codeline" id="line-766"><code>func fixedHuffmanDecoderInit() {</code></span>
+<span class="codeline" id="line-767"><code>	fixedOnce.Do(func() {</code></span>
+<span class="codeline" id="line-768"><code>		// These come from the RFC section 3.2.6.</code></span>
+<span class="codeline" id="line-769"><code>		var bits [288]int</code></span>
+<span class="codeline" id="line-770"><code>		for i := 0; i &lt; 144; i++ {</code></span>
+<span class="codeline" id="line-771"><code>			bits[i] = 8</code></span>
+<span class="codeline" id="line-772"><code>		}</code></span>
+<span class="codeline" id="line-773"><code>		for i := 144; i &lt; 256; i++ {</code></span>
+<span class="codeline" id="line-774"><code>			bits[i] = 9</code></span>
+<span class="codeline" id="line-775"><code>		}</code></span>
+<span class="codeline" id="line-776"><code>		for i := 256; i &lt; 280; i++ {</code></span>
+<span class="codeline" id="line-777"><code>			bits[i] = 7</code></span>
+<span class="codeline" id="line-778"><code>		}</code></span>
+<span class="codeline" id="line-779"><code>		for i := 280; i &lt; 288; i++ {</code></span>
+<span class="codeline" id="line-780"><code>			bits[i] = 8</code></span>
+<span class="codeline" id="line-781"><code>		}</code></span>
+<span class="codeline" id="line-782"><code>		fixedHuffmanDecoder.init(bits[:])</code></span>
+<span class="codeline" id="line-783"><code>	})</code></span>
+<span class="codeline" id="line-784"><code>}</code></span>
+<span class="codeline" id="line-785"><code></code></span>
+<span class="codeline" id="line-786"><code>func (f *decompressor) Reset(r io.Reader, dict []byte) error {</code></span>
+<span class="codeline" id="line-787"><code>	*f = decompressor{</code></span>
+<span class="codeline" id="line-788"><code>		rBuf:     f.rBuf,</code></span>
+<span class="codeline" id="line-789"><code>		bits:     f.bits,</code></span>
+<span class="codeline" id="line-790"><code>		codebits: f.codebits,</code></span>
+<span class="codeline" id="line-791"><code>		dict:     f.dict,</code></span>
+<span class="codeline" id="line-792"><code>		step:     (*decompressor).nextBlock,</code></span>
+<span class="codeline" id="line-793"><code>	}</code></span>
+<span class="codeline" id="line-794"><code>	f.makeReader(r)</code></span>
+<span class="codeline" id="line-795"><code>	f.dict.init(maxMatchOffset, dict)</code></span>
+<span class="codeline" id="line-796"><code>	return nil</code></span>
+<span class="codeline" id="line-797"><code>}</code></span>
+<span class="codeline" id="line-798"><code></code></span>
+<span class="codeline" id="line-799"><code>// NewReader returns a new ReadCloser that can be used</code></span>
+<span class="codeline" id="line-800"><code>// to read the uncompressed version of r.</code></span>
+<span class="codeline" id="line-801"><code>// If r does not also implement [io.ByteReader],</code></span>
+<span class="codeline" id="line-802"><code>// the decompressor may read more data than necessary from r.</code></span>
+<span class="codeline" id="line-803"><code>// The reader returns [io.EOF] after the final block in the DEFLATE stream has</code></span>
+<span class="codeline" id="line-804"><code>// been encountered. Any trailing data after the final block is ignored.</code></span>
+<span class="codeline" id="line-805"><code>//</code></span>
+<span class="codeline" id="line-806"><code>// The [io.ReadCloser] returned by NewReader also implements [Resetter].</code></span>
+<span class="codeline" id="line-807"><code>func NewReader(r io.Reader) io.ReadCloser {</code></span>
+<span class="codeline" id="line-808"><code>	fixedHuffmanDecoderInit()</code></span>
+<span class="codeline" id="line-809"><code></code></span>
+<span class="codeline" id="line-810"><code>	var f decompressor</code></span>
+<span class="codeline" id="line-811"><code>	f.makeReader(r)</code></span>
+<span class="codeline" id="line-812"><code>	f.bits = new([maxNumLit + maxNumDist]int)</code></span>
+<span class="codeline" id="line-813"><code>	f.codebits = new([numCodes]int)</code></span>
+<span class="codeline" id="line-814"><code>	f.step = (*decompressor).nextBlock</code></span>
+<span class="codeline" id="line-815"><code>	f.dict.init(maxMatchOffset, nil)</code></span>
+<span class="codeline" id="line-816"><code>	return &amp;f</code></span>
+<span class="codeline" id="line-817"><code>}</code></span>
+<span class="codeline" id="line-818"><code></code></span>
+<span class="codeline" id="line-819"><code>// NewReaderDict is like [NewReader] but initializes the reader</code></span>
+<span class="codeline" id="line-820"><code>// with a preset dictionary. The returned [Reader] behaves as if</code></span>
+<span class="codeline" id="line-821"><code>// the uncompressed data stream started with the given dictionary,</code></span>
+<span class="codeline" id="line-822"><code>// which has already been read. NewReaderDict is typically used</code></span>
+<span class="codeline" id="line-823"><code>// to read data compressed by NewWriterDict.</code></span>
+<span class="codeline" id="line-824"><code>//</code></span>
+<span class="codeline" id="line-825"><code>// The ReadCloser returned by NewReaderDict also implements [Resetter].</code></span>
+<span class="codeline" id="line-826"><code>func NewReaderDict(r io.Reader, dict []byte) io.ReadCloser {</code></span>
+<span class="codeline" id="line-827"><code>	fixedHuffmanDecoderInit()</code></span>
+<span class="codeline" id="line-828"><code></code></span>
+<span class="codeline" id="line-829"><code>	var f decompressor</code></span>
+<span class="codeline" id="line-830"><code>	f.makeReader(r)</code></span>
+<span class="codeline" id="line-831"><code>	f.bits = new([maxNumLit + maxNumDist]int)</code></span>
+<span class="codeline" id="line-832"><code>	f.codebits = new([numCodes]int)</code></span>
+<span class="codeline" id="line-833"><code>	f.step = (*decompressor).nextBlock</code></span>
+<span class="codeline" id="line-834"><code>	f.dict.init(maxMatchOffset, dict)</code></span>
+<span class="codeline" id="line-835"><code>	return &amp;f</code></span>
+<span class="codeline" id="line-836"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

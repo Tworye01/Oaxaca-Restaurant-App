@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: node.go in package text/template/parse</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	node.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/text/template/parse.html">text/template/parse</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2011 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// Parse nodes.</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package parse</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"fmt"</code></span>
+<span class="codeline" id="line-11"><code>	"strconv"</code></span>
+<span class="codeline" id="line-12"><code>	"strings"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>var textFormat = "%s" // Changed to "%q" in tests for better error messages.</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>// A Node is an element in the parse tree. The interface is trivial.</code></span>
+<span class="codeline" id="line-18"><code>// The interface contains an unexported method so that only</code></span>
+<span class="codeline" id="line-19"><code>// types local to this package can satisfy it.</code></span>
+<span class="codeline" id="line-20"><code>type Node interface {</code></span>
+<span class="codeline" id="line-21"><code>	Type() NodeType</code></span>
+<span class="codeline" id="line-22"><code>	String() string</code></span>
+<span class="codeline" id="line-23"><code>	// Copy does a deep copy of the Node and all its components.</code></span>
+<span class="codeline" id="line-24"><code>	// To avoid type assertions, some XxxNodes also have specialized</code></span>
+<span class="codeline" id="line-25"><code>	// CopyXxx methods that return *XxxNode.</code></span>
+<span class="codeline" id="line-26"><code>	Copy() Node</code></span>
+<span class="codeline" id="line-27"><code>	Position() Pos // byte position of start of node in full original input string</code></span>
+<span class="codeline" id="line-28"><code>	// tree returns the containing *Tree.</code></span>
+<span class="codeline" id="line-29"><code>	// It is unexported so all implementations of Node are in this package.</code></span>
+<span class="codeline" id="line-30"><code>	tree() *Tree</code></span>
+<span class="codeline" id="line-31"><code>	// writeTo writes the String output to the builder.</code></span>
+<span class="codeline" id="line-32"><code>	writeTo(*strings.Builder)</code></span>
+<span class="codeline" id="line-33"><code>}</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>// NodeType identifies the type of a parse tree node.</code></span>
+<span class="codeline" id="line-36"><code>type NodeType int</code></span>
+<span class="codeline" id="line-37"><code></code></span>
+<span class="codeline" id="line-38"><code>// Pos represents a byte position in the original input text from which</code></span>
+<span class="codeline" id="line-39"><code>// this template was parsed.</code></span>
+<span class="codeline" id="line-40"><code>type Pos int</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>func (p Pos) Position() Pos {</code></span>
+<span class="codeline" id="line-43"><code>	return p</code></span>
+<span class="codeline" id="line-44"><code>}</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>// Type returns itself and provides an easy default implementation</code></span>
+<span class="codeline" id="line-47"><code>// for embedding in a Node. Embedded in all non-trivial Nodes.</code></span>
+<span class="codeline" id="line-48"><code>func (t NodeType) Type() NodeType {</code></span>
+<span class="codeline" id="line-49"><code>	return t</code></span>
+<span class="codeline" id="line-50"><code>}</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>const (</code></span>
+<span class="codeline" id="line-53"><code>	NodeText       NodeType = iota // Plain text.</code></span>
+<span class="codeline" id="line-54"><code>	NodeAction                     // A non-control action such as a field evaluation.</code></span>
+<span class="codeline" id="line-55"><code>	NodeBool                       // A boolean constant.</code></span>
+<span class="codeline" id="line-56"><code>	NodeChain                      // A sequence of field accesses.</code></span>
+<span class="codeline" id="line-57"><code>	NodeCommand                    // An element of a pipeline.</code></span>
+<span class="codeline" id="line-58"><code>	NodeDot                        // The cursor, dot.</code></span>
+<span class="codeline" id="line-59"><code>	nodeElse                       // An else action. Not added to tree.</code></span>
+<span class="codeline" id="line-60"><code>	nodeEnd                        // An end action. Not added to tree.</code></span>
+<span class="codeline" id="line-61"><code>	NodeField                      // A field or method name.</code></span>
+<span class="codeline" id="line-62"><code>	NodeIdentifier                 // An identifier; always a function name.</code></span>
+<span class="codeline" id="line-63"><code>	NodeIf                         // An if action.</code></span>
+<span class="codeline" id="line-64"><code>	NodeList                       // A list of Nodes.</code></span>
+<span class="codeline" id="line-65"><code>	NodeNil                        // An untyped nil constant.</code></span>
+<span class="codeline" id="line-66"><code>	NodeNumber                     // A numerical constant.</code></span>
+<span class="codeline" id="line-67"><code>	NodePipe                       // A pipeline of commands.</code></span>
+<span class="codeline" id="line-68"><code>	NodeRange                      // A range action.</code></span>
+<span class="codeline" id="line-69"><code>	NodeString                     // A string constant.</code></span>
+<span class="codeline" id="line-70"><code>	NodeTemplate                   // A template invocation action.</code></span>
+<span class="codeline" id="line-71"><code>	NodeVariable                   // A $ variable.</code></span>
+<span class="codeline" id="line-72"><code>	NodeWith                       // A with action.</code></span>
+<span class="codeline" id="line-73"><code>	NodeComment                    // A comment.</code></span>
+<span class="codeline" id="line-74"><code>	NodeBreak                      // A break action.</code></span>
+<span class="codeline" id="line-75"><code>	NodeContinue                   // A continue action.</code></span>
+<span class="codeline" id="line-76"><code>)</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>// Nodes.</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>// ListNode holds a sequence of nodes.</code></span>
+<span class="codeline" id="line-81"><code>type ListNode struct {</code></span>
+<span class="codeline" id="line-82"><code>	NodeType</code></span>
+<span class="codeline" id="line-83"><code>	Pos</code></span>
+<span class="codeline" id="line-84"><code>	tr    *Tree</code></span>
+<span class="codeline" id="line-85"><code>	Nodes []Node // The element nodes in lexical order.</code></span>
+<span class="codeline" id="line-86"><code>}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>func (t *Tree) newList(pos Pos) *ListNode {</code></span>
+<span class="codeline" id="line-89"><code>	return &amp;ListNode{tr: t, NodeType: NodeList, Pos: pos}</code></span>
+<span class="codeline" id="line-90"><code>}</code></span>
+<span class="codeline" id="line-91"><code></code></span>
+<span class="codeline" id="line-92"><code>func (l *ListNode) append(n Node) {</code></span>
+<span class="codeline" id="line-93"><code>	l.Nodes = append(l.Nodes, n)</code></span>
+<span class="codeline" id="line-94"><code>}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>func (l *ListNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-97"><code>	return l.tr</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>func (l *ListNode) String() string {</code></span>
+<span class="codeline" id="line-101"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-102"><code>	l.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-103"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>func (l *ListNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-107"><code>	for _, n := range l.Nodes {</code></span>
+<span class="codeline" id="line-108"><code>		n.writeTo(sb)</code></span>
+<span class="codeline" id="line-109"><code>	}</code></span>
+<span class="codeline" id="line-110"><code>}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>func (l *ListNode) CopyList() *ListNode {</code></span>
+<span class="codeline" id="line-113"><code>	if l == nil {</code></span>
+<span class="codeline" id="line-114"><code>		return l</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	n := l.tr.newList(l.Pos)</code></span>
+<span class="codeline" id="line-117"><code>	for _, elem := range l.Nodes {</code></span>
+<span class="codeline" id="line-118"><code>		n.append(elem.Copy())</code></span>
+<span class="codeline" id="line-119"><code>	}</code></span>
+<span class="codeline" id="line-120"><code>	return n</code></span>
+<span class="codeline" id="line-121"><code>}</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>func (l *ListNode) Copy() Node {</code></span>
+<span class="codeline" id="line-124"><code>	return l.CopyList()</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>// TextNode holds plain text.</code></span>
+<span class="codeline" id="line-128"><code>type TextNode struct {</code></span>
+<span class="codeline" id="line-129"><code>	NodeType</code></span>
+<span class="codeline" id="line-130"><code>	Pos</code></span>
+<span class="codeline" id="line-131"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-132"><code>	Text []byte // The text; may span newlines.</code></span>
+<span class="codeline" id="line-133"><code>}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>func (t *Tree) newText(pos Pos, text string) *TextNode {</code></span>
+<span class="codeline" id="line-136"><code>	return &amp;TextNode{tr: t, NodeType: NodeText, Pos: pos, Text: []byte(text)}</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>func (t *TextNode) String() string {</code></span>
+<span class="codeline" id="line-140"><code>	return fmt.Sprintf(textFormat, t.Text)</code></span>
+<span class="codeline" id="line-141"><code>}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>func (t *TextNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-144"><code>	sb.WriteString(t.String())</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>func (t *TextNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-148"><code>	return t.tr</code></span>
+<span class="codeline" id="line-149"><code>}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>func (t *TextNode) Copy() Node {</code></span>
+<span class="codeline" id="line-152"><code>	return &amp;TextNode{tr: t.tr, NodeType: NodeText, Pos: t.Pos, Text: append([]byte{}, t.Text...)}</code></span>
+<span class="codeline" id="line-153"><code>}</code></span>
+<span class="codeline" id="line-154"><code></code></span>
+<span class="codeline" id="line-155"><code>// CommentNode holds a comment.</code></span>
+<span class="codeline" id="line-156"><code>type CommentNode struct {</code></span>
+<span class="codeline" id="line-157"><code>	NodeType</code></span>
+<span class="codeline" id="line-158"><code>	Pos</code></span>
+<span class="codeline" id="line-159"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-160"><code>	Text string // Comment text.</code></span>
+<span class="codeline" id="line-161"><code>}</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>func (t *Tree) newComment(pos Pos, text string) *CommentNode {</code></span>
+<span class="codeline" id="line-164"><code>	return &amp;CommentNode{tr: t, NodeType: NodeComment, Pos: pos, Text: text}</code></span>
+<span class="codeline" id="line-165"><code>}</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>func (c *CommentNode) String() string {</code></span>
+<span class="codeline" id="line-168"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-169"><code>	c.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-170"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>func (c *CommentNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-174"><code>	sb.WriteString("{{")</code></span>
+<span class="codeline" id="line-175"><code>	sb.WriteString(c.Text)</code></span>
+<span class="codeline" id="line-176"><code>	sb.WriteString("}}")</code></span>
+<span class="codeline" id="line-177"><code>}</code></span>
+<span class="codeline" id="line-178"><code></code></span>
+<span class="codeline" id="line-179"><code>func (c *CommentNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-180"><code>	return c.tr</code></span>
+<span class="codeline" id="line-181"><code>}</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>func (c *CommentNode) Copy() Node {</code></span>
+<span class="codeline" id="line-184"><code>	return &amp;CommentNode{tr: c.tr, NodeType: NodeComment, Pos: c.Pos, Text: c.Text}</code></span>
+<span class="codeline" id="line-185"><code>}</code></span>
+<span class="codeline" id="line-186"><code></code></span>
+<span class="codeline" id="line-187"><code>// PipeNode holds a pipeline with optional declaration</code></span>
+<span class="codeline" id="line-188"><code>type PipeNode struct {</code></span>
+<span class="codeline" id="line-189"><code>	NodeType</code></span>
+<span class="codeline" id="line-190"><code>	Pos</code></span>
+<span class="codeline" id="line-191"><code>	tr       *Tree</code></span>
+<span class="codeline" id="line-192"><code>	Line     int             // The line number in the input. Deprecated: Kept for compatibility.</code></span>
+<span class="codeline" id="line-193"><code>	IsAssign bool            // The variables are being assigned, not declared.</code></span>
+<span class="codeline" id="line-194"><code>	Decl     []*VariableNode // Variables in lexical order.</code></span>
+<span class="codeline" id="line-195"><code>	Cmds     []*CommandNode  // The commands in lexical order.</code></span>
+<span class="codeline" id="line-196"><code>}</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>func (t *Tree) newPipeline(pos Pos, line int, vars []*VariableNode) *PipeNode {</code></span>
+<span class="codeline" id="line-199"><code>	return &amp;PipeNode{tr: t, NodeType: NodePipe, Pos: pos, Line: line, Decl: vars}</code></span>
+<span class="codeline" id="line-200"><code>}</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>func (p *PipeNode) append(command *CommandNode) {</code></span>
+<span class="codeline" id="line-203"><code>	p.Cmds = append(p.Cmds, command)</code></span>
+<span class="codeline" id="line-204"><code>}</code></span>
+<span class="codeline" id="line-205"><code></code></span>
+<span class="codeline" id="line-206"><code>func (p *PipeNode) String() string {</code></span>
+<span class="codeline" id="line-207"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-208"><code>	p.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-209"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-210"><code>}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>func (p *PipeNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-213"><code>	if len(p.Decl) &gt; 0 {</code></span>
+<span class="codeline" id="line-214"><code>		for i, v := range p.Decl {</code></span>
+<span class="codeline" id="line-215"><code>			if i &gt; 0 {</code></span>
+<span class="codeline" id="line-216"><code>				sb.WriteString(", ")</code></span>
+<span class="codeline" id="line-217"><code>			}</code></span>
+<span class="codeline" id="line-218"><code>			v.writeTo(sb)</code></span>
+<span class="codeline" id="line-219"><code>		}</code></span>
+<span class="codeline" id="line-220"><code>		sb.WriteString(" := ")</code></span>
+<span class="codeline" id="line-221"><code>	}</code></span>
+<span class="codeline" id="line-222"><code>	for i, c := range p.Cmds {</code></span>
+<span class="codeline" id="line-223"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-224"><code>			sb.WriteString(" | ")</code></span>
+<span class="codeline" id="line-225"><code>		}</code></span>
+<span class="codeline" id="line-226"><code>		c.writeTo(sb)</code></span>
+<span class="codeline" id="line-227"><code>	}</code></span>
+<span class="codeline" id="line-228"><code>}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>func (p *PipeNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-231"><code>	return p.tr</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>func (p *PipeNode) CopyPipe() *PipeNode {</code></span>
+<span class="codeline" id="line-235"><code>	if p == nil {</code></span>
+<span class="codeline" id="line-236"><code>		return p</code></span>
+<span class="codeline" id="line-237"><code>	}</code></span>
+<span class="codeline" id="line-238"><code>	vars := make([]*VariableNode, len(p.Decl))</code></span>
+<span class="codeline" id="line-239"><code>	for i, d := range p.Decl {</code></span>
+<span class="codeline" id="line-240"><code>		vars[i] = d.Copy().(*VariableNode)</code></span>
+<span class="codeline" id="line-241"><code>	}</code></span>
+<span class="codeline" id="line-242"><code>	n := p.tr.newPipeline(p.Pos, p.Line, vars)</code></span>
+<span class="codeline" id="line-243"><code>	n.IsAssign = p.IsAssign</code></span>
+<span class="codeline" id="line-244"><code>	for _, c := range p.Cmds {</code></span>
+<span class="codeline" id="line-245"><code>		n.append(c.Copy().(*CommandNode))</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code>	return n</code></span>
+<span class="codeline" id="line-248"><code>}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>func (p *PipeNode) Copy() Node {</code></span>
+<span class="codeline" id="line-251"><code>	return p.CopyPipe()</code></span>
+<span class="codeline" id="line-252"><code>}</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>// ActionNode holds an action (something bounded by delimiters).</code></span>
+<span class="codeline" id="line-255"><code>// Control actions have their own nodes; ActionNode represents simple</code></span>
+<span class="codeline" id="line-256"><code>// ones such as field evaluations and parenthesized pipelines.</code></span>
+<span class="codeline" id="line-257"><code>type ActionNode struct {</code></span>
+<span class="codeline" id="line-258"><code>	NodeType</code></span>
+<span class="codeline" id="line-259"><code>	Pos</code></span>
+<span class="codeline" id="line-260"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-261"><code>	Line int       // The line number in the input. Deprecated: Kept for compatibility.</code></span>
+<span class="codeline" id="line-262"><code>	Pipe *PipeNode // The pipeline in the action.</code></span>
+<span class="codeline" id="line-263"><code>}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>func (t *Tree) newAction(pos Pos, line int, pipe *PipeNode) *ActionNode {</code></span>
+<span class="codeline" id="line-266"><code>	return &amp;ActionNode{tr: t, NodeType: NodeAction, Pos: pos, Line: line, Pipe: pipe}</code></span>
+<span class="codeline" id="line-267"><code>}</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>func (a *ActionNode) String() string {</code></span>
+<span class="codeline" id="line-270"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-271"><code>	a.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-272"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-273"><code>}</code></span>
+<span class="codeline" id="line-274"><code></code></span>
+<span class="codeline" id="line-275"><code>func (a *ActionNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-276"><code>	sb.WriteString("{{")</code></span>
+<span class="codeline" id="line-277"><code>	a.Pipe.writeTo(sb)</code></span>
+<span class="codeline" id="line-278"><code>	sb.WriteString("}}")</code></span>
+<span class="codeline" id="line-279"><code>}</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>func (a *ActionNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-282"><code>	return a.tr</code></span>
+<span class="codeline" id="line-283"><code>}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>func (a *ActionNode) Copy() Node {</code></span>
+<span class="codeline" id="line-286"><code>	return a.tr.newAction(a.Pos, a.Line, a.Pipe.CopyPipe())</code></span>
+<span class="codeline" id="line-287"><code>}</code></span>
+<span class="codeline" id="line-288"><code></code></span>
+<span class="codeline" id="line-289"><code>// CommandNode holds a command (a pipeline inside an evaluating action).</code></span>
+<span class="codeline" id="line-290"><code>type CommandNode struct {</code></span>
+<span class="codeline" id="line-291"><code>	NodeType</code></span>
+<span class="codeline" id="line-292"><code>	Pos</code></span>
+<span class="codeline" id="line-293"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-294"><code>	Args []Node // Arguments in lexical order: Identifier, field, or constant.</code></span>
+<span class="codeline" id="line-295"><code>}</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>func (t *Tree) newCommand(pos Pos) *CommandNode {</code></span>
+<span class="codeline" id="line-298"><code>	return &amp;CommandNode{tr: t, NodeType: NodeCommand, Pos: pos}</code></span>
+<span class="codeline" id="line-299"><code>}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>func (c *CommandNode) append(arg Node) {</code></span>
+<span class="codeline" id="line-302"><code>	c.Args = append(c.Args, arg)</code></span>
+<span class="codeline" id="line-303"><code>}</code></span>
+<span class="codeline" id="line-304"><code></code></span>
+<span class="codeline" id="line-305"><code>func (c *CommandNode) String() string {</code></span>
+<span class="codeline" id="line-306"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-307"><code>	c.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-308"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-309"><code>}</code></span>
+<span class="codeline" id="line-310"><code></code></span>
+<span class="codeline" id="line-311"><code>func (c *CommandNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-312"><code>	for i, arg := range c.Args {</code></span>
+<span class="codeline" id="line-313"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-314"><code>			sb.WriteByte(' ')</code></span>
+<span class="codeline" id="line-315"><code>		}</code></span>
+<span class="codeline" id="line-316"><code>		if arg, ok := arg.(*PipeNode); ok {</code></span>
+<span class="codeline" id="line-317"><code>			sb.WriteByte('(')</code></span>
+<span class="codeline" id="line-318"><code>			arg.writeTo(sb)</code></span>
+<span class="codeline" id="line-319"><code>			sb.WriteByte(')')</code></span>
+<span class="codeline" id="line-320"><code>			continue</code></span>
+<span class="codeline" id="line-321"><code>		}</code></span>
+<span class="codeline" id="line-322"><code>		arg.writeTo(sb)</code></span>
+<span class="codeline" id="line-323"><code>	}</code></span>
+<span class="codeline" id="line-324"><code>}</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>func (c *CommandNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-327"><code>	return c.tr</code></span>
+<span class="codeline" id="line-328"><code>}</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>func (c *CommandNode) Copy() Node {</code></span>
+<span class="codeline" id="line-331"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-332"><code>		return c</code></span>
+<span class="codeline" id="line-333"><code>	}</code></span>
+<span class="codeline" id="line-334"><code>	n := c.tr.newCommand(c.Pos)</code></span>
+<span class="codeline" id="line-335"><code>	for _, c := range c.Args {</code></span>
+<span class="codeline" id="line-336"><code>		n.append(c.Copy())</code></span>
+<span class="codeline" id="line-337"><code>	}</code></span>
+<span class="codeline" id="line-338"><code>	return n</code></span>
+<span class="codeline" id="line-339"><code>}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>// IdentifierNode holds an identifier.</code></span>
+<span class="codeline" id="line-342"><code>type IdentifierNode struct {</code></span>
+<span class="codeline" id="line-343"><code>	NodeType</code></span>
+<span class="codeline" id="line-344"><code>	Pos</code></span>
+<span class="codeline" id="line-345"><code>	tr    *Tree</code></span>
+<span class="codeline" id="line-346"><code>	Ident string // The identifier's name.</code></span>
+<span class="codeline" id="line-347"><code>}</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>// NewIdentifier returns a new IdentifierNode with the given identifier name.</code></span>
+<span class="codeline" id="line-350"><code>func NewIdentifier(ident string) *IdentifierNode {</code></span>
+<span class="codeline" id="line-351"><code>	return &amp;IdentifierNode{NodeType: NodeIdentifier, Ident: ident}</code></span>
+<span class="codeline" id="line-352"><code>}</code></span>
+<span class="codeline" id="line-353"><code></code></span>
+<span class="codeline" id="line-354"><code>// SetPos sets the position. NewIdentifier is a public method so we can't modify its signature.</code></span>
+<span class="codeline" id="line-355"><code>// Chained for convenience.</code></span>
+<span class="codeline" id="line-356"><code>// TODO: fix one day?</code></span>
+<span class="codeline" id="line-357"><code>func (i *IdentifierNode) SetPos(pos Pos) *IdentifierNode {</code></span>
+<span class="codeline" id="line-358"><code>	i.Pos = pos</code></span>
+<span class="codeline" id="line-359"><code>	return i</code></span>
+<span class="codeline" id="line-360"><code>}</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>// SetTree sets the parent tree for the node. NewIdentifier is a public method so we can't modify its signature.</code></span>
+<span class="codeline" id="line-363"><code>// Chained for convenience.</code></span>
+<span class="codeline" id="line-364"><code>// TODO: fix one day?</code></span>
+<span class="codeline" id="line-365"><code>func (i *IdentifierNode) SetTree(t *Tree) *IdentifierNode {</code></span>
+<span class="codeline" id="line-366"><code>	i.tr = t</code></span>
+<span class="codeline" id="line-367"><code>	return i</code></span>
+<span class="codeline" id="line-368"><code>}</code></span>
+<span class="codeline" id="line-369"><code></code></span>
+<span class="codeline" id="line-370"><code>func (i *IdentifierNode) String() string {</code></span>
+<span class="codeline" id="line-371"><code>	return i.Ident</code></span>
+<span class="codeline" id="line-372"><code>}</code></span>
+<span class="codeline" id="line-373"><code></code></span>
+<span class="codeline" id="line-374"><code>func (i *IdentifierNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-375"><code>	sb.WriteString(i.String())</code></span>
+<span class="codeline" id="line-376"><code>}</code></span>
+<span class="codeline" id="line-377"><code></code></span>
+<span class="codeline" id="line-378"><code>func (i *IdentifierNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-379"><code>	return i.tr</code></span>
+<span class="codeline" id="line-380"><code>}</code></span>
+<span class="codeline" id="line-381"><code></code></span>
+<span class="codeline" id="line-382"><code>func (i *IdentifierNode) Copy() Node {</code></span>
+<span class="codeline" id="line-383"><code>	return NewIdentifier(i.Ident).SetTree(i.tr).SetPos(i.Pos)</code></span>
+<span class="codeline" id="line-384"><code>}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>// VariableNode holds a list of variable names, possibly with chained field</code></span>
+<span class="codeline" id="line-387"><code>// accesses. The dollar sign is part of the (first) name.</code></span>
+<span class="codeline" id="line-388"><code>type VariableNode struct {</code></span>
+<span class="codeline" id="line-389"><code>	NodeType</code></span>
+<span class="codeline" id="line-390"><code>	Pos</code></span>
+<span class="codeline" id="line-391"><code>	tr    *Tree</code></span>
+<span class="codeline" id="line-392"><code>	Ident []string // Variable name and fields in lexical order.</code></span>
+<span class="codeline" id="line-393"><code>}</code></span>
+<span class="codeline" id="line-394"><code></code></span>
+<span class="codeline" id="line-395"><code>func (t *Tree) newVariable(pos Pos, ident string) *VariableNode {</code></span>
+<span class="codeline" id="line-396"><code>	return &amp;VariableNode{tr: t, NodeType: NodeVariable, Pos: pos, Ident: strings.Split(ident, ".")}</code></span>
+<span class="codeline" id="line-397"><code>}</code></span>
+<span class="codeline" id="line-398"><code></code></span>
+<span class="codeline" id="line-399"><code>func (v *VariableNode) String() string {</code></span>
+<span class="codeline" id="line-400"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-401"><code>	v.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-402"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-403"><code>}</code></span>
+<span class="codeline" id="line-404"><code></code></span>
+<span class="codeline" id="line-405"><code>func (v *VariableNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-406"><code>	for i, id := range v.Ident {</code></span>
+<span class="codeline" id="line-407"><code>		if i &gt; 0 {</code></span>
+<span class="codeline" id="line-408"><code>			sb.WriteByte('.')</code></span>
+<span class="codeline" id="line-409"><code>		}</code></span>
+<span class="codeline" id="line-410"><code>		sb.WriteString(id)</code></span>
+<span class="codeline" id="line-411"><code>	}</code></span>
+<span class="codeline" id="line-412"><code>}</code></span>
+<span class="codeline" id="line-413"><code></code></span>
+<span class="codeline" id="line-414"><code>func (v *VariableNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-415"><code>	return v.tr</code></span>
+<span class="codeline" id="line-416"><code>}</code></span>
+<span class="codeline" id="line-417"><code></code></span>
+<span class="codeline" id="line-418"><code>func (v *VariableNode) Copy() Node {</code></span>
+<span class="codeline" id="line-419"><code>	return &amp;VariableNode{tr: v.tr, NodeType: NodeVariable, Pos: v.Pos, Ident: append([]string{}, v.Ident...)}</code></span>
+<span class="codeline" id="line-420"><code>}</code></span>
+<span class="codeline" id="line-421"><code></code></span>
+<span class="codeline" id="line-422"><code>// DotNode holds the special identifier '.'.</code></span>
+<span class="codeline" id="line-423"><code>type DotNode struct {</code></span>
+<span class="codeline" id="line-424"><code>	NodeType</code></span>
+<span class="codeline" id="line-425"><code>	Pos</code></span>
+<span class="codeline" id="line-426"><code>	tr *Tree</code></span>
+<span class="codeline" id="line-427"><code>}</code></span>
+<span class="codeline" id="line-428"><code></code></span>
+<span class="codeline" id="line-429"><code>func (t *Tree) newDot(pos Pos) *DotNode {</code></span>
+<span class="codeline" id="line-430"><code>	return &amp;DotNode{tr: t, NodeType: NodeDot, Pos: pos}</code></span>
+<span class="codeline" id="line-431"><code>}</code></span>
+<span class="codeline" id="line-432"><code></code></span>
+<span class="codeline" id="line-433"><code>func (d *DotNode) Type() NodeType {</code></span>
+<span class="codeline" id="line-434"><code>	// Override method on embedded NodeType for API compatibility.</code></span>
+<span class="codeline" id="line-435"><code>	// TODO: Not really a problem; could change API without effect but</code></span>
+<span class="codeline" id="line-436"><code>	// api tool complains.</code></span>
+<span class="codeline" id="line-437"><code>	return NodeDot</code></span>
+<span class="codeline" id="line-438"><code>}</code></span>
+<span class="codeline" id="line-439"><code></code></span>
+<span class="codeline" id="line-440"><code>func (d *DotNode) String() string {</code></span>
+<span class="codeline" id="line-441"><code>	return "."</code></span>
+<span class="codeline" id="line-442"><code>}</code></span>
+<span class="codeline" id="line-443"><code></code></span>
+<span class="codeline" id="line-444"><code>func (d *DotNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-445"><code>	sb.WriteString(d.String())</code></span>
+<span class="codeline" id="line-446"><code>}</code></span>
+<span class="codeline" id="line-447"><code></code></span>
+<span class="codeline" id="line-448"><code>func (d *DotNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-449"><code>	return d.tr</code></span>
+<span class="codeline" id="line-450"><code>}</code></span>
+<span class="codeline" id="line-451"><code></code></span>
+<span class="codeline" id="line-452"><code>func (d *DotNode) Copy() Node {</code></span>
+<span class="codeline" id="line-453"><code>	return d.tr.newDot(d.Pos)</code></span>
+<span class="codeline" id="line-454"><code>}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>// NilNode holds the special identifier 'nil' representing an untyped nil constant.</code></span>
+<span class="codeline" id="line-457"><code>type NilNode struct {</code></span>
+<span class="codeline" id="line-458"><code>	NodeType</code></span>
+<span class="codeline" id="line-459"><code>	Pos</code></span>
+<span class="codeline" id="line-460"><code>	tr *Tree</code></span>
+<span class="codeline" id="line-461"><code>}</code></span>
+<span class="codeline" id="line-462"><code></code></span>
+<span class="codeline" id="line-463"><code>func (t *Tree) newNil(pos Pos) *NilNode {</code></span>
+<span class="codeline" id="line-464"><code>	return &amp;NilNode{tr: t, NodeType: NodeNil, Pos: pos}</code></span>
+<span class="codeline" id="line-465"><code>}</code></span>
+<span class="codeline" id="line-466"><code></code></span>
+<span class="codeline" id="line-467"><code>func (n *NilNode) Type() NodeType {</code></span>
+<span class="codeline" id="line-468"><code>	// Override method on embedded NodeType for API compatibility.</code></span>
+<span class="codeline" id="line-469"><code>	// TODO: Not really a problem; could change API without effect but</code></span>
+<span class="codeline" id="line-470"><code>	// api tool complains.</code></span>
+<span class="codeline" id="line-471"><code>	return NodeNil</code></span>
+<span class="codeline" id="line-472"><code>}</code></span>
+<span class="codeline" id="line-473"><code></code></span>
+<span class="codeline" id="line-474"><code>func (n *NilNode) String() string {</code></span>
+<span class="codeline" id="line-475"><code>	return "nil"</code></span>
+<span class="codeline" id="line-476"><code>}</code></span>
+<span class="codeline" id="line-477"><code></code></span>
+<span class="codeline" id="line-478"><code>func (n *NilNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-479"><code>	sb.WriteString(n.String())</code></span>
+<span class="codeline" id="line-480"><code>}</code></span>
+<span class="codeline" id="line-481"><code></code></span>
+<span class="codeline" id="line-482"><code>func (n *NilNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-483"><code>	return n.tr</code></span>
+<span class="codeline" id="line-484"><code>}</code></span>
+<span class="codeline" id="line-485"><code></code></span>
+<span class="codeline" id="line-486"><code>func (n *NilNode) Copy() Node {</code></span>
+<span class="codeline" id="line-487"><code>	return n.tr.newNil(n.Pos)</code></span>
+<span class="codeline" id="line-488"><code>}</code></span>
+<span class="codeline" id="line-489"><code></code></span>
+<span class="codeline" id="line-490"><code>// FieldNode holds a field (identifier starting with '.').</code></span>
+<span class="codeline" id="line-491"><code>// The names may be chained ('.x.y').</code></span>
+<span class="codeline" id="line-492"><code>// The period is dropped from each ident.</code></span>
+<span class="codeline" id="line-493"><code>type FieldNode struct {</code></span>
+<span class="codeline" id="line-494"><code>	NodeType</code></span>
+<span class="codeline" id="line-495"><code>	Pos</code></span>
+<span class="codeline" id="line-496"><code>	tr    *Tree</code></span>
+<span class="codeline" id="line-497"><code>	Ident []string // The identifiers in lexical order.</code></span>
+<span class="codeline" id="line-498"><code>}</code></span>
+<span class="codeline" id="line-499"><code></code></span>
+<span class="codeline" id="line-500"><code>func (t *Tree) newField(pos Pos, ident string) *FieldNode {</code></span>
+<span class="codeline" id="line-501"><code>	return &amp;FieldNode{tr: t, NodeType: NodeField, Pos: pos, Ident: strings.Split(ident[1:], ".")} // [1:] to drop leading period</code></span>
+<span class="codeline" id="line-502"><code>}</code></span>
+<span class="codeline" id="line-503"><code></code></span>
+<span class="codeline" id="line-504"><code>func (f *FieldNode) String() string {</code></span>
+<span class="codeline" id="line-505"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-506"><code>	f.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-507"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-508"><code>}</code></span>
+<span class="codeline" id="line-509"><code></code></span>
+<span class="codeline" id="line-510"><code>func (f *FieldNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-511"><code>	for _, id := range f.Ident {</code></span>
+<span class="codeline" id="line-512"><code>		sb.WriteByte('.')</code></span>
+<span class="codeline" id="line-513"><code>		sb.WriteString(id)</code></span>
+<span class="codeline" id="line-514"><code>	}</code></span>
+<span class="codeline" id="line-515"><code>}</code></span>
+<span class="codeline" id="line-516"><code></code></span>
+<span class="codeline" id="line-517"><code>func (f *FieldNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-518"><code>	return f.tr</code></span>
+<span class="codeline" id="line-519"><code>}</code></span>
+<span class="codeline" id="line-520"><code></code></span>
+<span class="codeline" id="line-521"><code>func (f *FieldNode) Copy() Node {</code></span>
+<span class="codeline" id="line-522"><code>	return &amp;FieldNode{tr: f.tr, NodeType: NodeField, Pos: f.Pos, Ident: append([]string{}, f.Ident...)}</code></span>
+<span class="codeline" id="line-523"><code>}</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>// ChainNode holds a term followed by a chain of field accesses (identifier starting with '.').</code></span>
+<span class="codeline" id="line-526"><code>// The names may be chained ('.x.y').</code></span>
+<span class="codeline" id="line-527"><code>// The periods are dropped from each ident.</code></span>
+<span class="codeline" id="line-528"><code>type ChainNode struct {</code></span>
+<span class="codeline" id="line-529"><code>	NodeType</code></span>
+<span class="codeline" id="line-530"><code>	Pos</code></span>
+<span class="codeline" id="line-531"><code>	tr    *Tree</code></span>
+<span class="codeline" id="line-532"><code>	Node  Node</code></span>
+<span class="codeline" id="line-533"><code>	Field []string // The identifiers in lexical order.</code></span>
+<span class="codeline" id="line-534"><code>}</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>func (t *Tree) newChain(pos Pos, node Node) *ChainNode {</code></span>
+<span class="codeline" id="line-537"><code>	return &amp;ChainNode{tr: t, NodeType: NodeChain, Pos: pos, Node: node}</code></span>
+<span class="codeline" id="line-538"><code>}</code></span>
+<span class="codeline" id="line-539"><code></code></span>
+<span class="codeline" id="line-540"><code>// Add adds the named field (which should start with a period) to the end of the chain.</code></span>
+<span class="codeline" id="line-541"><code>func (c *ChainNode) Add(field string) {</code></span>
+<span class="codeline" id="line-542"><code>	if len(field) == 0 || field[0] != '.' {</code></span>
+<span class="codeline" id="line-543"><code>		panic("no dot in field")</code></span>
+<span class="codeline" id="line-544"><code>	}</code></span>
+<span class="codeline" id="line-545"><code>	field = field[1:] // Remove leading dot.</code></span>
+<span class="codeline" id="line-546"><code>	if field == "" {</code></span>
+<span class="codeline" id="line-547"><code>		panic("empty field")</code></span>
+<span class="codeline" id="line-548"><code>	}</code></span>
+<span class="codeline" id="line-549"><code>	c.Field = append(c.Field, field)</code></span>
+<span class="codeline" id="line-550"><code>}</code></span>
+<span class="codeline" id="line-551"><code></code></span>
+<span class="codeline" id="line-552"><code>func (c *ChainNode) String() string {</code></span>
+<span class="codeline" id="line-553"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-554"><code>	c.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-555"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-556"><code>}</code></span>
+<span class="codeline" id="line-557"><code></code></span>
+<span class="codeline" id="line-558"><code>func (c *ChainNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-559"><code>	if _, ok := c.Node.(*PipeNode); ok {</code></span>
+<span class="codeline" id="line-560"><code>		sb.WriteByte('(')</code></span>
+<span class="codeline" id="line-561"><code>		c.Node.writeTo(sb)</code></span>
+<span class="codeline" id="line-562"><code>		sb.WriteByte(')')</code></span>
+<span class="codeline" id="line-563"><code>	} else {</code></span>
+<span class="codeline" id="line-564"><code>		c.Node.writeTo(sb)</code></span>
+<span class="codeline" id="line-565"><code>	}</code></span>
+<span class="codeline" id="line-566"><code>	for _, field := range c.Field {</code></span>
+<span class="codeline" id="line-567"><code>		sb.WriteByte('.')</code></span>
+<span class="codeline" id="line-568"><code>		sb.WriteString(field)</code></span>
+<span class="codeline" id="line-569"><code>	}</code></span>
+<span class="codeline" id="line-570"><code>}</code></span>
+<span class="codeline" id="line-571"><code></code></span>
+<span class="codeline" id="line-572"><code>func (c *ChainNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-573"><code>	return c.tr</code></span>
+<span class="codeline" id="line-574"><code>}</code></span>
+<span class="codeline" id="line-575"><code></code></span>
+<span class="codeline" id="line-576"><code>func (c *ChainNode) Copy() Node {</code></span>
+<span class="codeline" id="line-577"><code>	return &amp;ChainNode{tr: c.tr, NodeType: NodeChain, Pos: c.Pos, Node: c.Node, Field: append([]string{}, c.Field...)}</code></span>
+<span class="codeline" id="line-578"><code>}</code></span>
+<span class="codeline" id="line-579"><code></code></span>
+<span class="codeline" id="line-580"><code>// BoolNode holds a boolean constant.</code></span>
+<span class="codeline" id="line-581"><code>type BoolNode struct {</code></span>
+<span class="codeline" id="line-582"><code>	NodeType</code></span>
+<span class="codeline" id="line-583"><code>	Pos</code></span>
+<span class="codeline" id="line-584"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-585"><code>	True bool // The value of the boolean constant.</code></span>
+<span class="codeline" id="line-586"><code>}</code></span>
+<span class="codeline" id="line-587"><code></code></span>
+<span class="codeline" id="line-588"><code>func (t *Tree) newBool(pos Pos, true bool) *BoolNode {</code></span>
+<span class="codeline" id="line-589"><code>	return &amp;BoolNode{tr: t, NodeType: NodeBool, Pos: pos, True: true}</code></span>
+<span class="codeline" id="line-590"><code>}</code></span>
+<span class="codeline" id="line-591"><code></code></span>
+<span class="codeline" id="line-592"><code>func (b *BoolNode) String() string {</code></span>
+<span class="codeline" id="line-593"><code>	if b.True {</code></span>
+<span class="codeline" id="line-594"><code>		return "true"</code></span>
+<span class="codeline" id="line-595"><code>	}</code></span>
+<span class="codeline" id="line-596"><code>	return "false"</code></span>
+<span class="codeline" id="line-597"><code>}</code></span>
+<span class="codeline" id="line-598"><code></code></span>
+<span class="codeline" id="line-599"><code>func (b *BoolNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-600"><code>	sb.WriteString(b.String())</code></span>
+<span class="codeline" id="line-601"><code>}</code></span>
+<span class="codeline" id="line-602"><code></code></span>
+<span class="codeline" id="line-603"><code>func (b *BoolNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-604"><code>	return b.tr</code></span>
+<span class="codeline" id="line-605"><code>}</code></span>
+<span class="codeline" id="line-606"><code></code></span>
+<span class="codeline" id="line-607"><code>func (b *BoolNode) Copy() Node {</code></span>
+<span class="codeline" id="line-608"><code>	return b.tr.newBool(b.Pos, b.True)</code></span>
+<span class="codeline" id="line-609"><code>}</code></span>
+<span class="codeline" id="line-610"><code></code></span>
+<span class="codeline" id="line-611"><code>// NumberNode holds a number: signed or unsigned integer, float, or complex.</code></span>
+<span class="codeline" id="line-612"><code>// The value is parsed and stored under all the types that can represent the value.</code></span>
+<span class="codeline" id="line-613"><code>// This simulates in a small amount of code the behavior of Go's ideal constants.</code></span>
+<span class="codeline" id="line-614"><code>type NumberNode struct {</code></span>
+<span class="codeline" id="line-615"><code>	NodeType</code></span>
+<span class="codeline" id="line-616"><code>	Pos</code></span>
+<span class="codeline" id="line-617"><code>	tr         *Tree</code></span>
+<span class="codeline" id="line-618"><code>	IsInt      bool       // Number has an integral value.</code></span>
+<span class="codeline" id="line-619"><code>	IsUint     bool       // Number has an unsigned integral value.</code></span>
+<span class="codeline" id="line-620"><code>	IsFloat    bool       // Number has a floating-point value.</code></span>
+<span class="codeline" id="line-621"><code>	IsComplex  bool       // Number is complex.</code></span>
+<span class="codeline" id="line-622"><code>	Int64      int64      // The signed integer value.</code></span>
+<span class="codeline" id="line-623"><code>	Uint64     uint64     // The unsigned integer value.</code></span>
+<span class="codeline" id="line-624"><code>	Float64    float64    // The floating-point value.</code></span>
+<span class="codeline" id="line-625"><code>	Complex128 complex128 // The complex value.</code></span>
+<span class="codeline" id="line-626"><code>	Text       string     // The original textual representation from the input.</code></span>
+<span class="codeline" id="line-627"><code>}</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>func (t *Tree) newNumber(pos Pos, text string, typ itemType) (*NumberNode, error) {</code></span>
+<span class="codeline" id="line-630"><code>	n := &amp;NumberNode{tr: t, NodeType: NodeNumber, Pos: pos, Text: text}</code></span>
+<span class="codeline" id="line-631"><code>	switch typ {</code></span>
+<span class="codeline" id="line-632"><code>	case itemCharConstant:</code></span>
+<span class="codeline" id="line-633"><code>		rune, _, tail, err := strconv.UnquoteChar(text[1:], text[0])</code></span>
+<span class="codeline" id="line-634"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-635"><code>			return nil, err</code></span>
+<span class="codeline" id="line-636"><code>		}</code></span>
+<span class="codeline" id="line-637"><code>		if tail != "'" {</code></span>
+<span class="codeline" id="line-638"><code>			return nil, fmt.Errorf("malformed character constant: %s", text)</code></span>
+<span class="codeline" id="line-639"><code>		}</code></span>
+<span class="codeline" id="line-640"><code>		n.Int64 = int64(rune)</code></span>
+<span class="codeline" id="line-641"><code>		n.IsInt = true</code></span>
+<span class="codeline" id="line-642"><code>		n.Uint64 = uint64(rune)</code></span>
+<span class="codeline" id="line-643"><code>		n.IsUint = true</code></span>
+<span class="codeline" id="line-644"><code>		n.Float64 = float64(rune) // odd but those are the rules.</code></span>
+<span class="codeline" id="line-645"><code>		n.IsFloat = true</code></span>
+<span class="codeline" id="line-646"><code>		return n, nil</code></span>
+<span class="codeline" id="line-647"><code>	case itemComplex:</code></span>
+<span class="codeline" id="line-648"><code>		// fmt.Sscan can parse the pair, so let it do the work.</code></span>
+<span class="codeline" id="line-649"><code>		if _, err := fmt.Sscan(text, &amp;n.Complex128); err != nil {</code></span>
+<span class="codeline" id="line-650"><code>			return nil, err</code></span>
+<span class="codeline" id="line-651"><code>		}</code></span>
+<span class="codeline" id="line-652"><code>		n.IsComplex = true</code></span>
+<span class="codeline" id="line-653"><code>		n.simplifyComplex()</code></span>
+<span class="codeline" id="line-654"><code>		return n, nil</code></span>
+<span class="codeline" id="line-655"><code>	}</code></span>
+<span class="codeline" id="line-656"><code>	// Imaginary constants can only be complex unless they are zero.</code></span>
+<span class="codeline" id="line-657"><code>	if len(text) &gt; 0 &amp;&amp; text[len(text)-1] == 'i' {</code></span>
+<span class="codeline" id="line-658"><code>		f, err := strconv.ParseFloat(text[:len(text)-1], 64)</code></span>
+<span class="codeline" id="line-659"><code>		if err == nil {</code></span>
+<span class="codeline" id="line-660"><code>			n.IsComplex = true</code></span>
+<span class="codeline" id="line-661"><code>			n.Complex128 = complex(0, f)</code></span>
+<span class="codeline" id="line-662"><code>			n.simplifyComplex()</code></span>
+<span class="codeline" id="line-663"><code>			return n, nil</code></span>
+<span class="codeline" id="line-664"><code>		}</code></span>
+<span class="codeline" id="line-665"><code>	}</code></span>
+<span class="codeline" id="line-666"><code>	// Do integer test first so we get 0x123 etc.</code></span>
+<span class="codeline" id="line-667"><code>	u, err := strconv.ParseUint(text, 0, 64) // will fail for -0; fixed below.</code></span>
+<span class="codeline" id="line-668"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-669"><code>		n.IsUint = true</code></span>
+<span class="codeline" id="line-670"><code>		n.Uint64 = u</code></span>
+<span class="codeline" id="line-671"><code>	}</code></span>
+<span class="codeline" id="line-672"><code>	i, err := strconv.ParseInt(text, 0, 64)</code></span>
+<span class="codeline" id="line-673"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-674"><code>		n.IsInt = true</code></span>
+<span class="codeline" id="line-675"><code>		n.Int64 = i</code></span>
+<span class="codeline" id="line-676"><code>		if i == 0 {</code></span>
+<span class="codeline" id="line-677"><code>			n.IsUint = true // in case of -0.</code></span>
+<span class="codeline" id="line-678"><code>			n.Uint64 = u</code></span>
+<span class="codeline" id="line-679"><code>		}</code></span>
+<span class="codeline" id="line-680"><code>	}</code></span>
+<span class="codeline" id="line-681"><code>	// If an integer extraction succeeded, promote the float.</code></span>
+<span class="codeline" id="line-682"><code>	if n.IsInt {</code></span>
+<span class="codeline" id="line-683"><code>		n.IsFloat = true</code></span>
+<span class="codeline" id="line-684"><code>		n.Float64 = float64(n.Int64)</code></span>
+<span class="codeline" id="line-685"><code>	} else if n.IsUint {</code></span>
+<span class="codeline" id="line-686"><code>		n.IsFloat = true</code></span>
+<span class="codeline" id="line-687"><code>		n.Float64 = float64(n.Uint64)</code></span>
+<span class="codeline" id="line-688"><code>	} else {</code></span>
+<span class="codeline" id="line-689"><code>		f, err := strconv.ParseFloat(text, 64)</code></span>
+<span class="codeline" id="line-690"><code>		if err == nil {</code></span>
+<span class="codeline" id="line-691"><code>			// If we parsed it as a float but it looks like an integer,</code></span>
+<span class="codeline" id="line-692"><code>			// it's a huge number too large to fit in an int. Reject it.</code></span>
+<span class="codeline" id="line-693"><code>			if !strings.ContainsAny(text, ".eEpP") {</code></span>
+<span class="codeline" id="line-694"><code>				return nil, fmt.Errorf("integer overflow: %q", text)</code></span>
+<span class="codeline" id="line-695"><code>			}</code></span>
+<span class="codeline" id="line-696"><code>			n.IsFloat = true</code></span>
+<span class="codeline" id="line-697"><code>			n.Float64 = f</code></span>
+<span class="codeline" id="line-698"><code>			// If a floating-point extraction succeeded, extract the int if needed.</code></span>
+<span class="codeline" id="line-699"><code>			if !n.IsInt &amp;&amp; float64(int64(f)) == f {</code></span>
+<span class="codeline" id="line-700"><code>				n.IsInt = true</code></span>
+<span class="codeline" id="line-701"><code>				n.Int64 = int64(f)</code></span>
+<span class="codeline" id="line-702"><code>			}</code></span>
+<span class="codeline" id="line-703"><code>			if !n.IsUint &amp;&amp; float64(uint64(f)) == f {</code></span>
+<span class="codeline" id="line-704"><code>				n.IsUint = true</code></span>
+<span class="codeline" id="line-705"><code>				n.Uint64 = uint64(f)</code></span>
+<span class="codeline" id="line-706"><code>			}</code></span>
+<span class="codeline" id="line-707"><code>		}</code></span>
+<span class="codeline" id="line-708"><code>	}</code></span>
+<span class="codeline" id="line-709"><code>	if !n.IsInt &amp;&amp; !n.IsUint &amp;&amp; !n.IsFloat {</code></span>
+<span class="codeline" id="line-710"><code>		return nil, fmt.Errorf("illegal number syntax: %q", text)</code></span>
+<span class="codeline" id="line-711"><code>	}</code></span>
+<span class="codeline" id="line-712"><code>	return n, nil</code></span>
+<span class="codeline" id="line-713"><code>}</code></span>
+<span class="codeline" id="line-714"><code></code></span>
+<span class="codeline" id="line-715"><code>// simplifyComplex pulls out any other types that are represented by the complex number.</code></span>
+<span class="codeline" id="line-716"><code>// These all require that the imaginary part be zero.</code></span>
+<span class="codeline" id="line-717"><code>func (n *NumberNode) simplifyComplex() {</code></span>
+<span class="codeline" id="line-718"><code>	n.IsFloat = imag(n.Complex128) == 0</code></span>
+<span class="codeline" id="line-719"><code>	if n.IsFloat {</code></span>
+<span class="codeline" id="line-720"><code>		n.Float64 = real(n.Complex128)</code></span>
+<span class="codeline" id="line-721"><code>		n.IsInt = float64(int64(n.Float64)) == n.Float64</code></span>
+<span class="codeline" id="line-722"><code>		if n.IsInt {</code></span>
+<span class="codeline" id="line-723"><code>			n.Int64 = int64(n.Float64)</code></span>
+<span class="codeline" id="line-724"><code>		}</code></span>
+<span class="codeline" id="line-725"><code>		n.IsUint = float64(uint64(n.Float64)) == n.Float64</code></span>
+<span class="codeline" id="line-726"><code>		if n.IsUint {</code></span>
+<span class="codeline" id="line-727"><code>			n.Uint64 = uint64(n.Float64)</code></span>
+<span class="codeline" id="line-728"><code>		}</code></span>
+<span class="codeline" id="line-729"><code>	}</code></span>
+<span class="codeline" id="line-730"><code>}</code></span>
+<span class="codeline" id="line-731"><code></code></span>
+<span class="codeline" id="line-732"><code>func (n *NumberNode) String() string {</code></span>
+<span class="codeline" id="line-733"><code>	return n.Text</code></span>
+<span class="codeline" id="line-734"><code>}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>func (n *NumberNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-737"><code>	sb.WriteString(n.String())</code></span>
+<span class="codeline" id="line-738"><code>}</code></span>
+<span class="codeline" id="line-739"><code></code></span>
+<span class="codeline" id="line-740"><code>func (n *NumberNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-741"><code>	return n.tr</code></span>
+<span class="codeline" id="line-742"><code>}</code></span>
+<span class="codeline" id="line-743"><code></code></span>
+<span class="codeline" id="line-744"><code>func (n *NumberNode) Copy() Node {</code></span>
+<span class="codeline" id="line-745"><code>	nn := new(NumberNode)</code></span>
+<span class="codeline" id="line-746"><code>	*nn = *n // Easy, fast, correct.</code></span>
+<span class="codeline" id="line-747"><code>	return nn</code></span>
+<span class="codeline" id="line-748"><code>}</code></span>
+<span class="codeline" id="line-749"><code></code></span>
+<span class="codeline" id="line-750"><code>// StringNode holds a string constant. The value has been "unquoted".</code></span>
+<span class="codeline" id="line-751"><code>type StringNode struct {</code></span>
+<span class="codeline" id="line-752"><code>	NodeType</code></span>
+<span class="codeline" id="line-753"><code>	Pos</code></span>
+<span class="codeline" id="line-754"><code>	tr     *Tree</code></span>
+<span class="codeline" id="line-755"><code>	Quoted string // The original text of the string, with quotes.</code></span>
+<span class="codeline" id="line-756"><code>	Text   string // The string, after quote processing.</code></span>
+<span class="codeline" id="line-757"><code>}</code></span>
+<span class="codeline" id="line-758"><code></code></span>
+<span class="codeline" id="line-759"><code>func (t *Tree) newString(pos Pos, orig, text string) *StringNode {</code></span>
+<span class="codeline" id="line-760"><code>	return &amp;StringNode{tr: t, NodeType: NodeString, Pos: pos, Quoted: orig, Text: text}</code></span>
+<span class="codeline" id="line-761"><code>}</code></span>
+<span class="codeline" id="line-762"><code></code></span>
+<span class="codeline" id="line-763"><code>func (s *StringNode) String() string {</code></span>
+<span class="codeline" id="line-764"><code>	return s.Quoted</code></span>
+<span class="codeline" id="line-765"><code>}</code></span>
+<span class="codeline" id="line-766"><code></code></span>
+<span class="codeline" id="line-767"><code>func (s *StringNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-768"><code>	sb.WriteString(s.String())</code></span>
+<span class="codeline" id="line-769"><code>}</code></span>
+<span class="codeline" id="line-770"><code></code></span>
+<span class="codeline" id="line-771"><code>func (s *StringNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-772"><code>	return s.tr</code></span>
+<span class="codeline" id="line-773"><code>}</code></span>
+<span class="codeline" id="line-774"><code></code></span>
+<span class="codeline" id="line-775"><code>func (s *StringNode) Copy() Node {</code></span>
+<span class="codeline" id="line-776"><code>	return s.tr.newString(s.Pos, s.Quoted, s.Text)</code></span>
+<span class="codeline" id="line-777"><code>}</code></span>
+<span class="codeline" id="line-778"><code></code></span>
+<span class="codeline" id="line-779"><code>// endNode represents an {{end}} action.</code></span>
+<span class="codeline" id="line-780"><code>// It does not appear in the final parse tree.</code></span>
+<span class="codeline" id="line-781"><code>type endNode struct {</code></span>
+<span class="codeline" id="line-782"><code>	NodeType</code></span>
+<span class="codeline" id="line-783"><code>	Pos</code></span>
+<span class="codeline" id="line-784"><code>	tr *Tree</code></span>
+<span class="codeline" id="line-785"><code>}</code></span>
+<span class="codeline" id="line-786"><code></code></span>
+<span class="codeline" id="line-787"><code>func (t *Tree) newEnd(pos Pos) *endNode {</code></span>
+<span class="codeline" id="line-788"><code>	return &amp;endNode{tr: t, NodeType: nodeEnd, Pos: pos}</code></span>
+<span class="codeline" id="line-789"><code>}</code></span>
+<span class="codeline" id="line-790"><code></code></span>
+<span class="codeline" id="line-791"><code>func (e *endNode) String() string {</code></span>
+<span class="codeline" id="line-792"><code>	return "{{end}}"</code></span>
+<span class="codeline" id="line-793"><code>}</code></span>
+<span class="codeline" id="line-794"><code></code></span>
+<span class="codeline" id="line-795"><code>func (e *endNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-796"><code>	sb.WriteString(e.String())</code></span>
+<span class="codeline" id="line-797"><code>}</code></span>
+<span class="codeline" id="line-798"><code></code></span>
+<span class="codeline" id="line-799"><code>func (e *endNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-800"><code>	return e.tr</code></span>
+<span class="codeline" id="line-801"><code>}</code></span>
+<span class="codeline" id="line-802"><code></code></span>
+<span class="codeline" id="line-803"><code>func (e *endNode) Copy() Node {</code></span>
+<span class="codeline" id="line-804"><code>	return e.tr.newEnd(e.Pos)</code></span>
+<span class="codeline" id="line-805"><code>}</code></span>
+<span class="codeline" id="line-806"><code></code></span>
+<span class="codeline" id="line-807"><code>// elseNode represents an {{else}} action. Does not appear in the final tree.</code></span>
+<span class="codeline" id="line-808"><code>type elseNode struct {</code></span>
+<span class="codeline" id="line-809"><code>	NodeType</code></span>
+<span class="codeline" id="line-810"><code>	Pos</code></span>
+<span class="codeline" id="line-811"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-812"><code>	Line int // The line number in the input. Deprecated: Kept for compatibility.</code></span>
+<span class="codeline" id="line-813"><code>}</code></span>
+<span class="codeline" id="line-814"><code></code></span>
+<span class="codeline" id="line-815"><code>func (t *Tree) newElse(pos Pos, line int) *elseNode {</code></span>
+<span class="codeline" id="line-816"><code>	return &amp;elseNode{tr: t, NodeType: nodeElse, Pos: pos, Line: line}</code></span>
+<span class="codeline" id="line-817"><code>}</code></span>
+<span class="codeline" id="line-818"><code></code></span>
+<span class="codeline" id="line-819"><code>func (e *elseNode) Type() NodeType {</code></span>
+<span class="codeline" id="line-820"><code>	return nodeElse</code></span>
+<span class="codeline" id="line-821"><code>}</code></span>
+<span class="codeline" id="line-822"><code></code></span>
+<span class="codeline" id="line-823"><code>func (e *elseNode) String() string {</code></span>
+<span class="codeline" id="line-824"><code>	return "{{else}}"</code></span>
+<span class="codeline" id="line-825"><code>}</code></span>
+<span class="codeline" id="line-826"><code></code></span>
+<span class="codeline" id="line-827"><code>func (e *elseNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-828"><code>	sb.WriteString(e.String())</code></span>
+<span class="codeline" id="line-829"><code>}</code></span>
+<span class="codeline" id="line-830"><code></code></span>
+<span class="codeline" id="line-831"><code>func (e *elseNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-832"><code>	return e.tr</code></span>
+<span class="codeline" id="line-833"><code>}</code></span>
+<span class="codeline" id="line-834"><code></code></span>
+<span class="codeline" id="line-835"><code>func (e *elseNode) Copy() Node {</code></span>
+<span class="codeline" id="line-836"><code>	return e.tr.newElse(e.Pos, e.Line)</code></span>
+<span class="codeline" id="line-837"><code>}</code></span>
+<span class="codeline" id="line-838"><code></code></span>
+<span class="codeline" id="line-839"><code>// BranchNode is the common representation of if, range, and with.</code></span>
+<span class="codeline" id="line-840"><code>type BranchNode struct {</code></span>
+<span class="codeline" id="line-841"><code>	NodeType</code></span>
+<span class="codeline" id="line-842"><code>	Pos</code></span>
+<span class="codeline" id="line-843"><code>	tr       *Tree</code></span>
+<span class="codeline" id="line-844"><code>	Line     int       // The line number in the input. Deprecated: Kept for compatibility.</code></span>
+<span class="codeline" id="line-845"><code>	Pipe     *PipeNode // The pipeline to be evaluated.</code></span>
+<span class="codeline" id="line-846"><code>	List     *ListNode // What to execute if the value is non-empty.</code></span>
+<span class="codeline" id="line-847"><code>	ElseList *ListNode // What to execute if the value is empty (nil if absent).</code></span>
+<span class="codeline" id="line-848"><code>}</code></span>
+<span class="codeline" id="line-849"><code></code></span>
+<span class="codeline" id="line-850"><code>func (b *BranchNode) String() string {</code></span>
+<span class="codeline" id="line-851"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-852"><code>	b.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-853"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-854"><code>}</code></span>
+<span class="codeline" id="line-855"><code></code></span>
+<span class="codeline" id="line-856"><code>func (b *BranchNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-857"><code>	name := ""</code></span>
+<span class="codeline" id="line-858"><code>	switch b.NodeType {</code></span>
+<span class="codeline" id="line-859"><code>	case NodeIf:</code></span>
+<span class="codeline" id="line-860"><code>		name = "if"</code></span>
+<span class="codeline" id="line-861"><code>	case NodeRange:</code></span>
+<span class="codeline" id="line-862"><code>		name = "range"</code></span>
+<span class="codeline" id="line-863"><code>	case NodeWith:</code></span>
+<span class="codeline" id="line-864"><code>		name = "with"</code></span>
+<span class="codeline" id="line-865"><code>	default:</code></span>
+<span class="codeline" id="line-866"><code>		panic("unknown branch type")</code></span>
+<span class="codeline" id="line-867"><code>	}</code></span>
+<span class="codeline" id="line-868"><code>	sb.WriteString("{{")</code></span>
+<span class="codeline" id="line-869"><code>	sb.WriteString(name)</code></span>
+<span class="codeline" id="line-870"><code>	sb.WriteByte(' ')</code></span>
+<span class="codeline" id="line-871"><code>	b.Pipe.writeTo(sb)</code></span>
+<span class="codeline" id="line-872"><code>	sb.WriteString("}}")</code></span>
+<span class="codeline" id="line-873"><code>	b.List.writeTo(sb)</code></span>
+<span class="codeline" id="line-874"><code>	if b.ElseList != nil {</code></span>
+<span class="codeline" id="line-875"><code>		sb.WriteString("{{else}}")</code></span>
+<span class="codeline" id="line-876"><code>		b.ElseList.writeTo(sb)</code></span>
+<span class="codeline" id="line-877"><code>	}</code></span>
+<span class="codeline" id="line-878"><code>	sb.WriteString("{{end}}")</code></span>
+<span class="codeline" id="line-879"><code>}</code></span>
+<span class="codeline" id="line-880"><code></code></span>
+<span class="codeline" id="line-881"><code>func (b *BranchNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-882"><code>	return b.tr</code></span>
+<span class="codeline" id="line-883"><code>}</code></span>
+<span class="codeline" id="line-884"><code></code></span>
+<span class="codeline" id="line-885"><code>func (b *BranchNode) Copy() Node {</code></span>
+<span class="codeline" id="line-886"><code>	switch b.NodeType {</code></span>
+<span class="codeline" id="line-887"><code>	case NodeIf:</code></span>
+<span class="codeline" id="line-888"><code>		return b.tr.newIf(b.Pos, b.Line, b.Pipe, b.List, b.ElseList)</code></span>
+<span class="codeline" id="line-889"><code>	case NodeRange:</code></span>
+<span class="codeline" id="line-890"><code>		return b.tr.newRange(b.Pos, b.Line, b.Pipe, b.List, b.ElseList)</code></span>
+<span class="codeline" id="line-891"><code>	case NodeWith:</code></span>
+<span class="codeline" id="line-892"><code>		return b.tr.newWith(b.Pos, b.Line, b.Pipe, b.List, b.ElseList)</code></span>
+<span class="codeline" id="line-893"><code>	default:</code></span>
+<span class="codeline" id="line-894"><code>		panic("unknown branch type")</code></span>
+<span class="codeline" id="line-895"><code>	}</code></span>
+<span class="codeline" id="line-896"><code>}</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>// IfNode represents an {{if}} action and its commands.</code></span>
+<span class="codeline" id="line-899"><code>type IfNode struct {</code></span>
+<span class="codeline" id="line-900"><code>	BranchNode</code></span>
+<span class="codeline" id="line-901"><code>}</code></span>
+<span class="codeline" id="line-902"><code></code></span>
+<span class="codeline" id="line-903"><code>func (t *Tree) newIf(pos Pos, line int, pipe *PipeNode, list, elseList *ListNode) *IfNode {</code></span>
+<span class="codeline" id="line-904"><code>	return &amp;IfNode{BranchNode{tr: t, NodeType: NodeIf, Pos: pos, Line: line, Pipe: pipe, List: list, ElseList: elseList}}</code></span>
+<span class="codeline" id="line-905"><code>}</code></span>
+<span class="codeline" id="line-906"><code></code></span>
+<span class="codeline" id="line-907"><code>func (i *IfNode) Copy() Node {</code></span>
+<span class="codeline" id="line-908"><code>	return i.tr.newIf(i.Pos, i.Line, i.Pipe.CopyPipe(), i.List.CopyList(), i.ElseList.CopyList())</code></span>
+<span class="codeline" id="line-909"><code>}</code></span>
+<span class="codeline" id="line-910"><code></code></span>
+<span class="codeline" id="line-911"><code>// BreakNode represents a {{break}} action.</code></span>
+<span class="codeline" id="line-912"><code>type BreakNode struct {</code></span>
+<span class="codeline" id="line-913"><code>	tr *Tree</code></span>
+<span class="codeline" id="line-914"><code>	NodeType</code></span>
+<span class="codeline" id="line-915"><code>	Pos</code></span>
+<span class="codeline" id="line-916"><code>	Line int</code></span>
+<span class="codeline" id="line-917"><code>}</code></span>
+<span class="codeline" id="line-918"><code></code></span>
+<span class="codeline" id="line-919"><code>func (t *Tree) newBreak(pos Pos, line int) *BreakNode {</code></span>
+<span class="codeline" id="line-920"><code>	return &amp;BreakNode{tr: t, NodeType: NodeBreak, Pos: pos, Line: line}</code></span>
+<span class="codeline" id="line-921"><code>}</code></span>
+<span class="codeline" id="line-922"><code></code></span>
+<span class="codeline" id="line-923"><code>func (b *BreakNode) Copy() Node                  { return b.tr.newBreak(b.Pos, b.Line) }</code></span>
+<span class="codeline" id="line-924"><code>func (b *BreakNode) String() string              { return "{{break}}" }</code></span>
+<span class="codeline" id="line-925"><code>func (b *BreakNode) tree() *Tree                 { return b.tr }</code></span>
+<span class="codeline" id="line-926"><code>func (b *BreakNode) writeTo(sb *strings.Builder) { sb.WriteString("{{break}}") }</code></span>
+<span class="codeline" id="line-927"><code></code></span>
+<span class="codeline" id="line-928"><code>// ContinueNode represents a {{continue}} action.</code></span>
+<span class="codeline" id="line-929"><code>type ContinueNode struct {</code></span>
+<span class="codeline" id="line-930"><code>	tr *Tree</code></span>
+<span class="codeline" id="line-931"><code>	NodeType</code></span>
+<span class="codeline" id="line-932"><code>	Pos</code></span>
+<span class="codeline" id="line-933"><code>	Line int</code></span>
+<span class="codeline" id="line-934"><code>}</code></span>
+<span class="codeline" id="line-935"><code></code></span>
+<span class="codeline" id="line-936"><code>func (t *Tree) newContinue(pos Pos, line int) *ContinueNode {</code></span>
+<span class="codeline" id="line-937"><code>	return &amp;ContinueNode{tr: t, NodeType: NodeContinue, Pos: pos, Line: line}</code></span>
+<span class="codeline" id="line-938"><code>}</code></span>
+<span class="codeline" id="line-939"><code></code></span>
+<span class="codeline" id="line-940"><code>func (c *ContinueNode) Copy() Node                  { return c.tr.newContinue(c.Pos, c.Line) }</code></span>
+<span class="codeline" id="line-941"><code>func (c *ContinueNode) String() string              { return "{{continue}}" }</code></span>
+<span class="codeline" id="line-942"><code>func (c *ContinueNode) tree() *Tree                 { return c.tr }</code></span>
+<span class="codeline" id="line-943"><code>func (c *ContinueNode) writeTo(sb *strings.Builder) { sb.WriteString("{{continue}}") }</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>// RangeNode represents a {{range}} action and its commands.</code></span>
+<span class="codeline" id="line-946"><code>type RangeNode struct {</code></span>
+<span class="codeline" id="line-947"><code>	BranchNode</code></span>
+<span class="codeline" id="line-948"><code>}</code></span>
+<span class="codeline" id="line-949"><code></code></span>
+<span class="codeline" id="line-950"><code>func (t *Tree) newRange(pos Pos, line int, pipe *PipeNode, list, elseList *ListNode) *RangeNode {</code></span>
+<span class="codeline" id="line-951"><code>	return &amp;RangeNode{BranchNode{tr: t, NodeType: NodeRange, Pos: pos, Line: line, Pipe: pipe, List: list, ElseList: elseList}}</code></span>
+<span class="codeline" id="line-952"><code>}</code></span>
+<span class="codeline" id="line-953"><code></code></span>
+<span class="codeline" id="line-954"><code>func (r *RangeNode) Copy() Node {</code></span>
+<span class="codeline" id="line-955"><code>	return r.tr.newRange(r.Pos, r.Line, r.Pipe.CopyPipe(), r.List.CopyList(), r.ElseList.CopyList())</code></span>
+<span class="codeline" id="line-956"><code>}</code></span>
+<span class="codeline" id="line-957"><code></code></span>
+<span class="codeline" id="line-958"><code>// WithNode represents a {{with}} action and its commands.</code></span>
+<span class="codeline" id="line-959"><code>type WithNode struct {</code></span>
+<span class="codeline" id="line-960"><code>	BranchNode</code></span>
+<span class="codeline" id="line-961"><code>}</code></span>
+<span class="codeline" id="line-962"><code></code></span>
+<span class="codeline" id="line-963"><code>func (t *Tree) newWith(pos Pos, line int, pipe *PipeNode, list, elseList *ListNode) *WithNode {</code></span>
+<span class="codeline" id="line-964"><code>	return &amp;WithNode{BranchNode{tr: t, NodeType: NodeWith, Pos: pos, Line: line, Pipe: pipe, List: list, ElseList: elseList}}</code></span>
+<span class="codeline" id="line-965"><code>}</code></span>
+<span class="codeline" id="line-966"><code></code></span>
+<span class="codeline" id="line-967"><code>func (w *WithNode) Copy() Node {</code></span>
+<span class="codeline" id="line-968"><code>	return w.tr.newWith(w.Pos, w.Line, w.Pipe.CopyPipe(), w.List.CopyList(), w.ElseList.CopyList())</code></span>
+<span class="codeline" id="line-969"><code>}</code></span>
+<span class="codeline" id="line-970"><code></code></span>
+<span class="codeline" id="line-971"><code>// TemplateNode represents a {{template}} action.</code></span>
+<span class="codeline" id="line-972"><code>type TemplateNode struct {</code></span>
+<span class="codeline" id="line-973"><code>	NodeType</code></span>
+<span class="codeline" id="line-974"><code>	Pos</code></span>
+<span class="codeline" id="line-975"><code>	tr   *Tree</code></span>
+<span class="codeline" id="line-976"><code>	Line int       // The line number in the input. Deprecated: Kept for compatibility.</code></span>
+<span class="codeline" id="line-977"><code>	Name string    // The name of the template (unquoted).</code></span>
+<span class="codeline" id="line-978"><code>	Pipe *PipeNode // The command to evaluate as dot for the template.</code></span>
+<span class="codeline" id="line-979"><code>}</code></span>
+<span class="codeline" id="line-980"><code></code></span>
+<span class="codeline" id="line-981"><code>func (t *Tree) newTemplate(pos Pos, line int, name string, pipe *PipeNode) *TemplateNode {</code></span>
+<span class="codeline" id="line-982"><code>	return &amp;TemplateNode{tr: t, NodeType: NodeTemplate, Pos: pos, Line: line, Name: name, Pipe: pipe}</code></span>
+<span class="codeline" id="line-983"><code>}</code></span>
+<span class="codeline" id="line-984"><code></code></span>
+<span class="codeline" id="line-985"><code>func (t *TemplateNode) String() string {</code></span>
+<span class="codeline" id="line-986"><code>	var sb strings.Builder</code></span>
+<span class="codeline" id="line-987"><code>	t.writeTo(&amp;sb)</code></span>
+<span class="codeline" id="line-988"><code>	return sb.String()</code></span>
+<span class="codeline" id="line-989"><code>}</code></span>
+<span class="codeline" id="line-990"><code></code></span>
+<span class="codeline" id="line-991"><code>func (t *TemplateNode) writeTo(sb *strings.Builder) {</code></span>
+<span class="codeline" id="line-992"><code>	sb.WriteString("{{template ")</code></span>
+<span class="codeline" id="line-993"><code>	sb.WriteString(strconv.Quote(t.Name))</code></span>
+<span class="codeline" id="line-994"><code>	if t.Pipe != nil {</code></span>
+<span class="codeline" id="line-995"><code>		sb.WriteByte(' ')</code></span>
+<span class="codeline" id="line-996"><code>		t.Pipe.writeTo(sb)</code></span>
+<span class="codeline" id="line-997"><code>	}</code></span>
+<span class="codeline" id="line-998"><code>	sb.WriteString("}}")</code></span>
+<span class="codeline" id="line-999"><code>}</code></span>
+<span class="codeline" id="line-1000"><code></code></span>
+<span class="codeline" id="line-1001"><code>func (t *TemplateNode) tree() *Tree {</code></span>
+<span class="codeline" id="line-1002"><code>	return t.tr</code></span>
+<span class="codeline" id="line-1003"><code>}</code></span>
+<span class="codeline" id="line-1004"><code></code></span>
+<span class="codeline" id="line-1005"><code>func (t *TemplateNode) Copy() Node {</code></span>
+<span class="codeline" id="line-1006"><code>	return t.tr.newTemplate(t.Pos, t.Line, t.Name, t.Pipe.CopyPipe())</code></span>
+<span class="codeline" id="line-1007"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

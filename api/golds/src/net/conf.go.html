@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: conf.go in package net</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	conf.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/net.html">net</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2015 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package net</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"errors"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/bytealg"</code></span>
+<span class="codeline" id="line-10"><code>	"internal/godebug"</code></span>
+<span class="codeline" id="line-11"><code>	"io/fs"</code></span>
+<span class="codeline" id="line-12"><code>	"os"</code></span>
+<span class="codeline" id="line-13"><code>	"runtime"</code></span>
+<span class="codeline" id="line-14"><code>	"sync"</code></span>
+<span class="codeline" id="line-15"><code>	"syscall"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>// The net package's name resolution is rather complicated.</code></span>
+<span class="codeline" id="line-19"><code>// There are two main approaches, go and cgo.</code></span>
+<span class="codeline" id="line-20"><code>// The cgo resolver uses C functions like getaddrinfo.</code></span>
+<span class="codeline" id="line-21"><code>// The go resolver reads system files directly and</code></span>
+<span class="codeline" id="line-22"><code>// sends DNS packets directly to servers.</code></span>
+<span class="codeline" id="line-23"><code>//</code></span>
+<span class="codeline" id="line-24"><code>// The netgo build tag prefers the go resolver.</code></span>
+<span class="codeline" id="line-25"><code>// The netcgo build tag prefers the cgo resolver.</code></span>
+<span class="codeline" id="line-26"><code>//</code></span>
+<span class="codeline" id="line-27"><code>// The netgo build tag also prohibits the use of the cgo tool.</code></span>
+<span class="codeline" id="line-28"><code>// However, on Darwin, Plan 9, and Windows the cgo resolver is still available.</code></span>
+<span class="codeline" id="line-29"><code>// On those systems the cgo resolver does not require the cgo tool.</code></span>
+<span class="codeline" id="line-30"><code>// (The term "cgo resolver" was locked in by GODEBUG settings</code></span>
+<span class="codeline" id="line-31"><code>// at a time when the cgo resolver did require the cgo tool.)</code></span>
+<span class="codeline" id="line-32"><code>//</code></span>
+<span class="codeline" id="line-33"><code>// Adding netdns=go to GODEBUG will prefer the go resolver.</code></span>
+<span class="codeline" id="line-34"><code>// Adding netdns=cgo to GODEBUG will prefer the cgo resolver.</code></span>
+<span class="codeline" id="line-35"><code>//</code></span>
+<span class="codeline" id="line-36"><code>// The Resolver struct has a PreferGo field that user code</code></span>
+<span class="codeline" id="line-37"><code>// may set to prefer the go resolver. It is documented as being</code></span>
+<span class="codeline" id="line-38"><code>// equivalent to adding netdns=go to GODEBUG.</code></span>
+<span class="codeline" id="line-39"><code>//</code></span>
+<span class="codeline" id="line-40"><code>// When deciding which resolver to use, we first check the PreferGo field.</code></span>
+<span class="codeline" id="line-41"><code>// If that is not set, we check the GODEBUG setting.</code></span>
+<span class="codeline" id="line-42"><code>// If that is not set, we check the netgo or netcgo build tag.</code></span>
+<span class="codeline" id="line-43"><code>// If none of those are set, we normally prefer the go resolver by default.</code></span>
+<span class="codeline" id="line-44"><code>// However, if the cgo resolver is available,</code></span>
+<span class="codeline" id="line-45"><code>// there is a complex set of conditions for which we prefer the cgo resolver.</code></span>
+<span class="codeline" id="line-46"><code>//</code></span>
+<span class="codeline" id="line-47"><code>// Other files define the netGoBuildTag, netCgoBuildTag, and cgoAvailable</code></span>
+<span class="codeline" id="line-48"><code>// constants.</code></span>
+<span class="codeline" id="line-49"><code></code></span>
+<span class="codeline" id="line-50"><code>// conf is used to determine name resolution configuration.</code></span>
+<span class="codeline" id="line-51"><code>type conf struct {</code></span>
+<span class="codeline" id="line-52"><code>	netGo  bool // prefer go approach, based on build tag and GODEBUG</code></span>
+<span class="codeline" id="line-53"><code>	netCgo bool // prefer cgo approach, based on build tag and GODEBUG</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>	dnsDebugLevel int // from GODEBUG</code></span>
+<span class="codeline" id="line-56"><code></code></span>
+<span class="codeline" id="line-57"><code>	preferCgo bool // if no explicit preference, use cgo</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>	goos     string   // copy of runtime.GOOS, used for testing</code></span>
+<span class="codeline" id="line-60"><code>	mdnsTest mdnsTest // assume /etc/mdns.allow exists, for testing</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// mdnsTest is for testing only.</code></span>
+<span class="codeline" id="line-64"><code>type mdnsTest int</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>const (</code></span>
+<span class="codeline" id="line-67"><code>	mdnsFromSystem mdnsTest = iota</code></span>
+<span class="codeline" id="line-68"><code>	mdnsAssumeExists</code></span>
+<span class="codeline" id="line-69"><code>	mdnsAssumeDoesNotExist</code></span>
+<span class="codeline" id="line-70"><code>)</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>var (</code></span>
+<span class="codeline" id="line-73"><code>	confOnce sync.Once // guards init of confVal via initConfVal</code></span>
+<span class="codeline" id="line-74"><code>	confVal  = &amp;conf{goos: runtime.GOOS}</code></span>
+<span class="codeline" id="line-75"><code>)</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>// systemConf returns the machine's network configuration.</code></span>
+<span class="codeline" id="line-78"><code>func systemConf() *conf {</code></span>
+<span class="codeline" id="line-79"><code>	confOnce.Do(initConfVal)</code></span>
+<span class="codeline" id="line-80"><code>	return confVal</code></span>
+<span class="codeline" id="line-81"><code>}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>// initConfVal initializes confVal based on the environment</code></span>
+<span class="codeline" id="line-84"><code>// that will not change during program execution.</code></span>
+<span class="codeline" id="line-85"><code>func initConfVal() {</code></span>
+<span class="codeline" id="line-86"><code>	dnsMode, debugLevel := goDebugNetDNS()</code></span>
+<span class="codeline" id="line-87"><code>	confVal.netGo = netGoBuildTag || dnsMode == "go"</code></span>
+<span class="codeline" id="line-88"><code>	confVal.netCgo = netCgoBuildTag || dnsMode == "cgo"</code></span>
+<span class="codeline" id="line-89"><code>	confVal.dnsDebugLevel = debugLevel</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>	if confVal.dnsDebugLevel &gt; 0 {</code></span>
+<span class="codeline" id="line-92"><code>		defer func() {</code></span>
+<span class="codeline" id="line-93"><code>			if confVal.dnsDebugLevel &gt; 1 {</code></span>
+<span class="codeline" id="line-94"><code>				println("go package net: confVal.netCgo =", confVal.netCgo, " netGo =", confVal.netGo)</code></span>
+<span class="codeline" id="line-95"><code>			}</code></span>
+<span class="codeline" id="line-96"><code>			switch {</code></span>
+<span class="codeline" id="line-97"><code>			case confVal.netGo:</code></span>
+<span class="codeline" id="line-98"><code>				if netGoBuildTag {</code></span>
+<span class="codeline" id="line-99"><code>					println("go package net: built with netgo build tag; using Go's DNS resolver")</code></span>
+<span class="codeline" id="line-100"><code>				} else {</code></span>
+<span class="codeline" id="line-101"><code>					println("go package net: GODEBUG setting forcing use of Go's resolver")</code></span>
+<span class="codeline" id="line-102"><code>				}</code></span>
+<span class="codeline" id="line-103"><code>			case !cgoAvailable:</code></span>
+<span class="codeline" id="line-104"><code>				println("go package net: cgo resolver not supported; using Go's DNS resolver")</code></span>
+<span class="codeline" id="line-105"><code>			case confVal.netCgo || confVal.preferCgo:</code></span>
+<span class="codeline" id="line-106"><code>				println("go package net: using cgo DNS resolver")</code></span>
+<span class="codeline" id="line-107"><code>			default:</code></span>
+<span class="codeline" id="line-108"><code>				println("go package net: dynamic selection of DNS resolver")</code></span>
+<span class="codeline" id="line-109"><code>			}</code></span>
+<span class="codeline" id="line-110"><code>		}()</code></span>
+<span class="codeline" id="line-111"><code>	}</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>	// The remainder of this function sets preferCgo based on</code></span>
+<span class="codeline" id="line-114"><code>	// conditions that will not change during program execution.</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	// By default, prefer the go resolver.</code></span>
+<span class="codeline" id="line-117"><code>	confVal.preferCgo = false</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>	// If the cgo resolver is not available, we can't prefer it.</code></span>
+<span class="codeline" id="line-120"><code>	if !cgoAvailable {</code></span>
+<span class="codeline" id="line-121"><code>		return</code></span>
+<span class="codeline" id="line-122"><code>	}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>	// Some operating systems always prefer the cgo resolver.</code></span>
+<span class="codeline" id="line-125"><code>	if goosPrefersCgo() {</code></span>
+<span class="codeline" id="line-126"><code>		confVal.preferCgo = true</code></span>
+<span class="codeline" id="line-127"><code>		return</code></span>
+<span class="codeline" id="line-128"><code>	}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>	// The remaining checks are specific to Unix systems.</code></span>
+<span class="codeline" id="line-131"><code>	switch runtime.GOOS {</code></span>
+<span class="codeline" id="line-132"><code>	case "plan9", "windows", "js", "wasip1":</code></span>
+<span class="codeline" id="line-133"><code>		return</code></span>
+<span class="codeline" id="line-134"><code>	}</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>	// If any environment-specified resolver options are specified,</code></span>
+<span class="codeline" id="line-137"><code>	// prefer the cgo resolver.</code></span>
+<span class="codeline" id="line-138"><code>	// Note that LOCALDOMAIN can change behavior merely by being</code></span>
+<span class="codeline" id="line-139"><code>	// specified with the empty string.</code></span>
+<span class="codeline" id="line-140"><code>	_, localDomainDefined := syscall.Getenv("LOCALDOMAIN")</code></span>
+<span class="codeline" id="line-141"><code>	if localDomainDefined || os.Getenv("RES_OPTIONS") != "" || os.Getenv("HOSTALIASES") != "" {</code></span>
+<span class="codeline" id="line-142"><code>		confVal.preferCgo = true</code></span>
+<span class="codeline" id="line-143"><code>		return</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	// OpenBSD apparently lets you override the location of resolv.conf</code></span>
+<span class="codeline" id="line-147"><code>	// with ASR_CONFIG. If we notice that, defer to libc.</code></span>
+<span class="codeline" id="line-148"><code>	if runtime.GOOS == "openbsd" &amp;&amp; os.Getenv("ASR_CONFIG") != "" {</code></span>
+<span class="codeline" id="line-149"><code>		confVal.preferCgo = true</code></span>
+<span class="codeline" id="line-150"><code>		return</code></span>
+<span class="codeline" id="line-151"><code>	}</code></span>
+<span class="codeline" id="line-152"><code>}</code></span>
+<span class="codeline" id="line-153"><code></code></span>
+<span class="codeline" id="line-154"><code>// goosPrefersCgo reports whether the GOOS value passed in prefers</code></span>
+<span class="codeline" id="line-155"><code>// the cgo resolver.</code></span>
+<span class="codeline" id="line-156"><code>func goosPrefersCgo() bool {</code></span>
+<span class="codeline" id="line-157"><code>	switch runtime.GOOS {</code></span>
+<span class="codeline" id="line-158"><code>	// Historically on Windows and Plan 9 we prefer the</code></span>
+<span class="codeline" id="line-159"><code>	// cgo resolver (which doesn't use the cgo tool) rather than</code></span>
+<span class="codeline" id="line-160"><code>	// the go resolver. This is because originally these</code></span>
+<span class="codeline" id="line-161"><code>	// systems did not support the go resolver.</code></span>
+<span class="codeline" id="line-162"><code>	// Keep it this way for better compatibility.</code></span>
+<span class="codeline" id="line-163"><code>	// Perhaps we can revisit this some day.</code></span>
+<span class="codeline" id="line-164"><code>	case "windows", "plan9":</code></span>
+<span class="codeline" id="line-165"><code>		return true</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>	// Darwin pops up annoying dialog boxes if programs try to</code></span>
+<span class="codeline" id="line-168"><code>	// do their own DNS requests, so prefer cgo.</code></span>
+<span class="codeline" id="line-169"><code>	case "darwin", "ios":</code></span>
+<span class="codeline" id="line-170"><code>		return true</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>	// DNS requests don't work on Android, so prefer the cgo resolver.</code></span>
+<span class="codeline" id="line-173"><code>	// Issue #10714.</code></span>
+<span class="codeline" id="line-174"><code>	case "android":</code></span>
+<span class="codeline" id="line-175"><code>		return true</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>	default:</code></span>
+<span class="codeline" id="line-178"><code>		return false</code></span>
+<span class="codeline" id="line-179"><code>	}</code></span>
+<span class="codeline" id="line-180"><code>}</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>// mustUseGoResolver reports whether a DNS lookup of any sort is</code></span>
+<span class="codeline" id="line-183"><code>// required to use the go resolver. The provided Resolver is optional.</code></span>
+<span class="codeline" id="line-184"><code>// This will report true if the cgo resolver is not available.</code></span>
+<span class="codeline" id="line-185"><code>func (c *conf) mustUseGoResolver(r *Resolver) bool {</code></span>
+<span class="codeline" id="line-186"><code>	if !cgoAvailable {</code></span>
+<span class="codeline" id="line-187"><code>		return true</code></span>
+<span class="codeline" id="line-188"><code>	}</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>	if runtime.GOOS == "plan9" {</code></span>
+<span class="codeline" id="line-191"><code>		// TODO(bradfitz): for now we only permit use of the PreferGo</code></span>
+<span class="codeline" id="line-192"><code>		// implementation when there's a non-nil Resolver with a</code></span>
+<span class="codeline" id="line-193"><code>		// non-nil Dialer. This is a sign that they the code is trying</code></span>
+<span class="codeline" id="line-194"><code>		// to use their DNS-speaking net.Conn (such as an in-memory</code></span>
+<span class="codeline" id="line-195"><code>		// DNS cache) and they don't want to actually hit the network.</code></span>
+<span class="codeline" id="line-196"><code>		// Once we add support for looking the default DNS servers</code></span>
+<span class="codeline" id="line-197"><code>		// from plan9, though, then we can relax this.</code></span>
+<span class="codeline" id="line-198"><code>		if r == nil || r.Dial == nil {</code></span>
+<span class="codeline" id="line-199"><code>			return false</code></span>
+<span class="codeline" id="line-200"><code>		}</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>	return c.netGo || r.preferGo()</code></span>
+<span class="codeline" id="line-204"><code>}</code></span>
+<span class="codeline" id="line-205"><code></code></span>
+<span class="codeline" id="line-206"><code>// addrLookupOrder determines which strategy to use to resolve addresses.</code></span>
+<span class="codeline" id="line-207"><code>// The provided Resolver is optional. nil means to not consider its options.</code></span>
+<span class="codeline" id="line-208"><code>// It also returns dnsConfig when it was used to determine the lookup order.</code></span>
+<span class="codeline" id="line-209"><code>func (c *conf) addrLookupOrder(r *Resolver, addr string) (ret hostLookupOrder, dnsConf *dnsConfig) {</code></span>
+<span class="codeline" id="line-210"><code>	if c.dnsDebugLevel &gt; 1 {</code></span>
+<span class="codeline" id="line-211"><code>		defer func() {</code></span>
+<span class="codeline" id="line-212"><code>			print("go package net: addrLookupOrder(", addr, ") = ", ret.String(), "\n")</code></span>
+<span class="codeline" id="line-213"><code>		}()</code></span>
+<span class="codeline" id="line-214"><code>	}</code></span>
+<span class="codeline" id="line-215"><code>	return c.lookupOrder(r, "")</code></span>
+<span class="codeline" id="line-216"><code>}</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>// hostLookupOrder determines which strategy to use to resolve hostname.</code></span>
+<span class="codeline" id="line-219"><code>// The provided Resolver is optional. nil means to not consider its options.</code></span>
+<span class="codeline" id="line-220"><code>// It also returns dnsConfig when it was used to determine the lookup order.</code></span>
+<span class="codeline" id="line-221"><code>func (c *conf) hostLookupOrder(r *Resolver, hostname string) (ret hostLookupOrder, dnsConf *dnsConfig) {</code></span>
+<span class="codeline" id="line-222"><code>	if c.dnsDebugLevel &gt; 1 {</code></span>
+<span class="codeline" id="line-223"><code>		defer func() {</code></span>
+<span class="codeline" id="line-224"><code>			print("go package net: hostLookupOrder(", hostname, ") = ", ret.String(), "\n")</code></span>
+<span class="codeline" id="line-225"><code>		}()</code></span>
+<span class="codeline" id="line-226"><code>	}</code></span>
+<span class="codeline" id="line-227"><code>	return c.lookupOrder(r, hostname)</code></span>
+<span class="codeline" id="line-228"><code>}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>func (c *conf) lookupOrder(r *Resolver, hostname string) (ret hostLookupOrder, dnsConf *dnsConfig) {</code></span>
+<span class="codeline" id="line-231"><code>	// fallbackOrder is the order we return if we can't figure it out.</code></span>
+<span class="codeline" id="line-232"><code>	var fallbackOrder hostLookupOrder</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>	var canUseCgo bool</code></span>
+<span class="codeline" id="line-235"><code>	if c.mustUseGoResolver(r) {</code></span>
+<span class="codeline" id="line-236"><code>		// Go resolver was explicitly requested</code></span>
+<span class="codeline" id="line-237"><code>		// or cgo resolver is not available.</code></span>
+<span class="codeline" id="line-238"><code>		// Figure out the order below.</code></span>
+<span class="codeline" id="line-239"><code>		fallbackOrder = hostLookupFilesDNS</code></span>
+<span class="codeline" id="line-240"><code>		canUseCgo = false</code></span>
+<span class="codeline" id="line-241"><code>	} else if c.netCgo {</code></span>
+<span class="codeline" id="line-242"><code>		// Cgo resolver was explicitly requested.</code></span>
+<span class="codeline" id="line-243"><code>		return hostLookupCgo, nil</code></span>
+<span class="codeline" id="line-244"><code>	} else if c.preferCgo {</code></span>
+<span class="codeline" id="line-245"><code>		// Given a choice, we prefer the cgo resolver.</code></span>
+<span class="codeline" id="line-246"><code>		return hostLookupCgo, nil</code></span>
+<span class="codeline" id="line-247"><code>	} else {</code></span>
+<span class="codeline" id="line-248"><code>		// Neither resolver was explicitly requested</code></span>
+<span class="codeline" id="line-249"><code>		// and we have no preference.</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>		if bytealg.IndexByteString(hostname, '\\') != -1 || bytealg.IndexByteString(hostname, '%') != -1 {</code></span>
+<span class="codeline" id="line-252"><code>			// Don't deal with special form hostnames</code></span>
+<span class="codeline" id="line-253"><code>			// with backslashes or '%'.</code></span>
+<span class="codeline" id="line-254"><code>			return hostLookupCgo, nil</code></span>
+<span class="codeline" id="line-255"><code>		}</code></span>
+<span class="codeline" id="line-256"><code></code></span>
+<span class="codeline" id="line-257"><code>		// If something is unrecognized, use cgo.</code></span>
+<span class="codeline" id="line-258"><code>		fallbackOrder = hostLookupCgo</code></span>
+<span class="codeline" id="line-259"><code>		canUseCgo = true</code></span>
+<span class="codeline" id="line-260"><code>	}</code></span>
+<span class="codeline" id="line-261"><code></code></span>
+<span class="codeline" id="line-262"><code>	// On systems that don't use /etc/resolv.conf or /etc/nsswitch.conf, we are done.</code></span>
+<span class="codeline" id="line-263"><code>	switch c.goos {</code></span>
+<span class="codeline" id="line-264"><code>	case "windows", "plan9", "android", "ios":</code></span>
+<span class="codeline" id="line-265"><code>		return fallbackOrder, nil</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>	// Try to figure out the order to use for searches.</code></span>
+<span class="codeline" id="line-269"><code>	// If we don't recognize something, use fallbackOrder.</code></span>
+<span class="codeline" id="line-270"><code>	// That will use cgo unless the Go resolver was explicitly requested.</code></span>
+<span class="codeline" id="line-271"><code>	// If we do figure out the order, return something other</code></span>
+<span class="codeline" id="line-272"><code>	// than fallbackOrder to use the Go resolver with that order.</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>	dnsConf = getSystemDNSConfig()</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>	if canUseCgo &amp;&amp; dnsConf.err != nil &amp;&amp; !errors.Is(dnsConf.err, fs.ErrNotExist) &amp;&amp; !errors.Is(dnsConf.err, fs.ErrPermission) {</code></span>
+<span class="codeline" id="line-277"><code>		// We can't read the resolv.conf file, so use cgo if we can.</code></span>
+<span class="codeline" id="line-278"><code>		return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-279"><code>	}</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	if canUseCgo &amp;&amp; dnsConf.unknownOpt {</code></span>
+<span class="codeline" id="line-282"><code>		// We didn't recognize something in resolv.conf,</code></span>
+<span class="codeline" id="line-283"><code>		// so use cgo if we can.</code></span>
+<span class="codeline" id="line-284"><code>		return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-285"><code>	}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>	// OpenBSD is unique and doesn't use nsswitch.conf.</code></span>
+<span class="codeline" id="line-288"><code>	// It also doesn't support mDNS.</code></span>
+<span class="codeline" id="line-289"><code>	if c.goos == "openbsd" {</code></span>
+<span class="codeline" id="line-290"><code>		// OpenBSD's resolv.conf manpage says that a</code></span>
+<span class="codeline" id="line-291"><code>		// non-existent resolv.conf means "lookup" defaults</code></span>
+<span class="codeline" id="line-292"><code>		// to only "files", without DNS lookups.</code></span>
+<span class="codeline" id="line-293"><code>		if errors.Is(dnsConf.err, fs.ErrNotExist) {</code></span>
+<span class="codeline" id="line-294"><code>			return hostLookupFiles, dnsConf</code></span>
+<span class="codeline" id="line-295"><code>		}</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>		lookup := dnsConf.lookup</code></span>
+<span class="codeline" id="line-298"><code>		if len(lookup) == 0 {</code></span>
+<span class="codeline" id="line-299"><code>			// https://www.openbsd.org/cgi-bin/man.cgi/OpenBSD-current/man5/resolv.conf.5</code></span>
+<span class="codeline" id="line-300"><code>			// "If the lookup keyword is not used in the</code></span>
+<span class="codeline" id="line-301"><code>			// system's resolv.conf file then the assumed</code></span>
+<span class="codeline" id="line-302"><code>			// order is 'bind file'"</code></span>
+<span class="codeline" id="line-303"><code>			return hostLookupDNSFiles, dnsConf</code></span>
+<span class="codeline" id="line-304"><code>		}</code></span>
+<span class="codeline" id="line-305"><code>		if len(lookup) &lt; 1 || len(lookup) &gt; 2 {</code></span>
+<span class="codeline" id="line-306"><code>			// We don't recognize this format.</code></span>
+<span class="codeline" id="line-307"><code>			return fallbackOrder, dnsConf</code></span>
+<span class="codeline" id="line-308"><code>		}</code></span>
+<span class="codeline" id="line-309"><code>		switch lookup[0] {</code></span>
+<span class="codeline" id="line-310"><code>		case "bind":</code></span>
+<span class="codeline" id="line-311"><code>			if len(lookup) == 2 {</code></span>
+<span class="codeline" id="line-312"><code>				if lookup[1] == "file" {</code></span>
+<span class="codeline" id="line-313"><code>					return hostLookupDNSFiles, dnsConf</code></span>
+<span class="codeline" id="line-314"><code>				}</code></span>
+<span class="codeline" id="line-315"><code>				// Unrecognized.</code></span>
+<span class="codeline" id="line-316"><code>				return fallbackOrder, dnsConf</code></span>
+<span class="codeline" id="line-317"><code>			}</code></span>
+<span class="codeline" id="line-318"><code>			return hostLookupDNS, dnsConf</code></span>
+<span class="codeline" id="line-319"><code>		case "file":</code></span>
+<span class="codeline" id="line-320"><code>			if len(lookup) == 2 {</code></span>
+<span class="codeline" id="line-321"><code>				if lookup[1] == "bind" {</code></span>
+<span class="codeline" id="line-322"><code>					return hostLookupFilesDNS, dnsConf</code></span>
+<span class="codeline" id="line-323"><code>				}</code></span>
+<span class="codeline" id="line-324"><code>				// Unrecognized.</code></span>
+<span class="codeline" id="line-325"><code>				return fallbackOrder, dnsConf</code></span>
+<span class="codeline" id="line-326"><code>			}</code></span>
+<span class="codeline" id="line-327"><code>			return hostLookupFiles, dnsConf</code></span>
+<span class="codeline" id="line-328"><code>		default:</code></span>
+<span class="codeline" id="line-329"><code>			// Unrecognized.</code></span>
+<span class="codeline" id="line-330"><code>			return fallbackOrder, dnsConf</code></span>
+<span class="codeline" id="line-331"><code>		}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>		// We always return before this point.</code></span>
+<span class="codeline" id="line-334"><code>		// The code below is for non-OpenBSD.</code></span>
+<span class="codeline" id="line-335"><code>	}</code></span>
+<span class="codeline" id="line-336"><code></code></span>
+<span class="codeline" id="line-337"><code>	// Canonicalize the hostname by removing any trailing dot.</code></span>
+<span class="codeline" id="line-338"><code>	if stringsHasSuffix(hostname, ".") {</code></span>
+<span class="codeline" id="line-339"><code>		hostname = hostname[:len(hostname)-1]</code></span>
+<span class="codeline" id="line-340"><code>	}</code></span>
+<span class="codeline" id="line-341"><code>	if canUseCgo &amp;&amp; stringsHasSuffixFold(hostname, ".local") {</code></span>
+<span class="codeline" id="line-342"><code>		// Per RFC 6762, the ".local" TLD is special. And</code></span>
+<span class="codeline" id="line-343"><code>		// because Go's native resolver doesn't do mDNS or</code></span>
+<span class="codeline" id="line-344"><code>		// similar local resolution mechanisms, assume that</code></span>
+<span class="codeline" id="line-345"><code>		// libc might (via Avahi, etc) and use cgo.</code></span>
+<span class="codeline" id="line-346"><code>		return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-347"><code>	}</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>	nss := getSystemNSS()</code></span>
+<span class="codeline" id="line-350"><code>	srcs := nss.sources["hosts"]</code></span>
+<span class="codeline" id="line-351"><code>	// If /etc/nsswitch.conf doesn't exist or doesn't specify any</code></span>
+<span class="codeline" id="line-352"><code>	// sources for "hosts", assume Go's DNS will work fine.</code></span>
+<span class="codeline" id="line-353"><code>	if errors.Is(nss.err, fs.ErrNotExist) || (nss.err == nil &amp;&amp; len(srcs) == 0) {</code></span>
+<span class="codeline" id="line-354"><code>		if canUseCgo &amp;&amp; c.goos == "solaris" {</code></span>
+<span class="codeline" id="line-355"><code>			// illumos defaults to</code></span>
+<span class="codeline" id="line-356"><code>			// "nis [NOTFOUND=return] files",</code></span>
+<span class="codeline" id="line-357"><code>			// which the go resolver doesn't support.</code></span>
+<span class="codeline" id="line-358"><code>			return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-359"><code>		}</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>		return hostLookupFilesDNS, dnsConf</code></span>
+<span class="codeline" id="line-362"><code>	}</code></span>
+<span class="codeline" id="line-363"><code>	if nss.err != nil {</code></span>
+<span class="codeline" id="line-364"><code>		// We failed to parse or open nsswitch.conf, so</code></span>
+<span class="codeline" id="line-365"><code>		// we have nothing to base an order on.</code></span>
+<span class="codeline" id="line-366"><code>		return fallbackOrder, dnsConf</code></span>
+<span class="codeline" id="line-367"><code>	}</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>	var hasDNSSource bool</code></span>
+<span class="codeline" id="line-370"><code>	var hasDNSSourceChecked bool</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>	var filesSource, dnsSource bool</code></span>
+<span class="codeline" id="line-373"><code>	var first string</code></span>
+<span class="codeline" id="line-374"><code>	for i, src := range srcs {</code></span>
+<span class="codeline" id="line-375"><code>		if src.source == "files" || src.source == "dns" {</code></span>
+<span class="codeline" id="line-376"><code>			if canUseCgo &amp;&amp; !src.standardCriteria() {</code></span>
+<span class="codeline" id="line-377"><code>				// non-standard; let libc deal with it.</code></span>
+<span class="codeline" id="line-378"><code>				return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-379"><code>			}</code></span>
+<span class="codeline" id="line-380"><code>			if src.source == "files" {</code></span>
+<span class="codeline" id="line-381"><code>				filesSource = true</code></span>
+<span class="codeline" id="line-382"><code>			} else {</code></span>
+<span class="codeline" id="line-383"><code>				hasDNSSource = true</code></span>
+<span class="codeline" id="line-384"><code>				hasDNSSourceChecked = true</code></span>
+<span class="codeline" id="line-385"><code>				dnsSource = true</code></span>
+<span class="codeline" id="line-386"><code>			}</code></span>
+<span class="codeline" id="line-387"><code>			if first == "" {</code></span>
+<span class="codeline" id="line-388"><code>				first = src.source</code></span>
+<span class="codeline" id="line-389"><code>			}</code></span>
+<span class="codeline" id="line-390"><code>			continue</code></span>
+<span class="codeline" id="line-391"><code>		}</code></span>
+<span class="codeline" id="line-392"><code></code></span>
+<span class="codeline" id="line-393"><code>		if canUseCgo {</code></span>
+<span class="codeline" id="line-394"><code>			switch {</code></span>
+<span class="codeline" id="line-395"><code>			case hostname != "" &amp;&amp; src.source == "myhostname":</code></span>
+<span class="codeline" id="line-396"><code>				// Let the cgo resolver handle myhostname</code></span>
+<span class="codeline" id="line-397"><code>				// if we are looking up the local hostname.</code></span>
+<span class="codeline" id="line-398"><code>				if isLocalhost(hostname) || isGateway(hostname) || isOutbound(hostname) {</code></span>
+<span class="codeline" id="line-399"><code>					return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-400"><code>				}</code></span>
+<span class="codeline" id="line-401"><code>				hn, err := getHostname()</code></span>
+<span class="codeline" id="line-402"><code>				if err != nil || stringsEqualFold(hostname, hn) {</code></span>
+<span class="codeline" id="line-403"><code>					return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-404"><code>				}</code></span>
+<span class="codeline" id="line-405"><code>				continue</code></span>
+<span class="codeline" id="line-406"><code>			case hostname != "" &amp;&amp; stringsHasPrefix(src.source, "mdns"):</code></span>
+<span class="codeline" id="line-407"><code>				// e.g. "mdns4", "mdns4_minimal"</code></span>
+<span class="codeline" id="line-408"><code>				// We already returned true before if it was *.local.</code></span>
+<span class="codeline" id="line-409"><code>				// libc wouldn't have found a hit on this anyway.</code></span>
+<span class="codeline" id="line-410"><code></code></span>
+<span class="codeline" id="line-411"><code>				// We don't parse mdns.allow files. They're rare. If one</code></span>
+<span class="codeline" id="line-412"><code>				// exists, it might list other TLDs (besides .local) or even</code></span>
+<span class="codeline" id="line-413"><code>				// '*', so just let libc deal with it.</code></span>
+<span class="codeline" id="line-414"><code>				var haveMDNSAllow bool</code></span>
+<span class="codeline" id="line-415"><code>				switch c.mdnsTest {</code></span>
+<span class="codeline" id="line-416"><code>				case mdnsFromSystem:</code></span>
+<span class="codeline" id="line-417"><code>					_, err := os.Stat("/etc/mdns.allow")</code></span>
+<span class="codeline" id="line-418"><code>					if err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {</code></span>
+<span class="codeline" id="line-419"><code>						// Let libc figure out what is going on.</code></span>
+<span class="codeline" id="line-420"><code>						return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-421"><code>					}</code></span>
+<span class="codeline" id="line-422"><code>					haveMDNSAllow = err == nil</code></span>
+<span class="codeline" id="line-423"><code>				case mdnsAssumeExists:</code></span>
+<span class="codeline" id="line-424"><code>					haveMDNSAllow = true</code></span>
+<span class="codeline" id="line-425"><code>				case mdnsAssumeDoesNotExist:</code></span>
+<span class="codeline" id="line-426"><code>					haveMDNSAllow = false</code></span>
+<span class="codeline" id="line-427"><code>				}</code></span>
+<span class="codeline" id="line-428"><code>				if haveMDNSAllow {</code></span>
+<span class="codeline" id="line-429"><code>					return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-430"><code>				}</code></span>
+<span class="codeline" id="line-431"><code>				continue</code></span>
+<span class="codeline" id="line-432"><code>			default:</code></span>
+<span class="codeline" id="line-433"><code>				// Some source we don't know how to deal with.</code></span>
+<span class="codeline" id="line-434"><code>				return hostLookupCgo, dnsConf</code></span>
+<span class="codeline" id="line-435"><code>			}</code></span>
+<span class="codeline" id="line-436"><code>		}</code></span>
+<span class="codeline" id="line-437"><code></code></span>
+<span class="codeline" id="line-438"><code>		if !hasDNSSourceChecked {</code></span>
+<span class="codeline" id="line-439"><code>			hasDNSSourceChecked = true</code></span>
+<span class="codeline" id="line-440"><code>			for _, v := range srcs[i+1:] {</code></span>
+<span class="codeline" id="line-441"><code>				if v.source == "dns" {</code></span>
+<span class="codeline" id="line-442"><code>					hasDNSSource = true</code></span>
+<span class="codeline" id="line-443"><code>					break</code></span>
+<span class="codeline" id="line-444"><code>				}</code></span>
+<span class="codeline" id="line-445"><code>			}</code></span>
+<span class="codeline" id="line-446"><code>		}</code></span>
+<span class="codeline" id="line-447"><code></code></span>
+<span class="codeline" id="line-448"><code>		// If we saw a source we don't recognize, which can only</code></span>
+<span class="codeline" id="line-449"><code>		// happen if we can't use the cgo resolver, treat it as DNS,</code></span>
+<span class="codeline" id="line-450"><code>		// but only when there is no dns in all other sources.</code></span>
+<span class="codeline" id="line-451"><code>		if !hasDNSSource {</code></span>
+<span class="codeline" id="line-452"><code>			dnsSource = true</code></span>
+<span class="codeline" id="line-453"><code>			if first == "" {</code></span>
+<span class="codeline" id="line-454"><code>				first = "dns"</code></span>
+<span class="codeline" id="line-455"><code>			}</code></span>
+<span class="codeline" id="line-456"><code>		}</code></span>
+<span class="codeline" id="line-457"><code>	}</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>	// Cases where Go can handle it without cgo and C thread overhead,</code></span>
+<span class="codeline" id="line-460"><code>	// or where the Go resolver has been forced.</code></span>
+<span class="codeline" id="line-461"><code>	switch {</code></span>
+<span class="codeline" id="line-462"><code>	case filesSource &amp;&amp; dnsSource:</code></span>
+<span class="codeline" id="line-463"><code>		if first == "files" {</code></span>
+<span class="codeline" id="line-464"><code>			return hostLookupFilesDNS, dnsConf</code></span>
+<span class="codeline" id="line-465"><code>		} else {</code></span>
+<span class="codeline" id="line-466"><code>			return hostLookupDNSFiles, dnsConf</code></span>
+<span class="codeline" id="line-467"><code>		}</code></span>
+<span class="codeline" id="line-468"><code>	case filesSource:</code></span>
+<span class="codeline" id="line-469"><code>		return hostLookupFiles, dnsConf</code></span>
+<span class="codeline" id="line-470"><code>	case dnsSource:</code></span>
+<span class="codeline" id="line-471"><code>		return hostLookupDNS, dnsConf</code></span>
+<span class="codeline" id="line-472"><code>	}</code></span>
+<span class="codeline" id="line-473"><code></code></span>
+<span class="codeline" id="line-474"><code>	// Something weird. Fallback to the default.</code></span>
+<span class="codeline" id="line-475"><code>	return fallbackOrder, dnsConf</code></span>
+<span class="codeline" id="line-476"><code>}</code></span>
+<span class="codeline" id="line-477"><code></code></span>
+<span class="codeline" id="line-478"><code>var netdns = godebug.New("netdns")</code></span>
+<span class="codeline" id="line-479"><code></code></span>
+<span class="codeline" id="line-480"><code>// goDebugNetDNS parses the value of the GODEBUG "netdns" value.</code></span>
+<span class="codeline" id="line-481"><code>// The netdns value can be of the form:</code></span>
+<span class="codeline" id="line-482"><code>//</code></span>
+<span class="codeline" id="line-483"><code>//	1       // debug level 1</code></span>
+<span class="codeline" id="line-484"><code>//	2       // debug level 2</code></span>
+<span class="codeline" id="line-485"><code>//	cgo     // use cgo for DNS lookups</code></span>
+<span class="codeline" id="line-486"><code>//	go      // use go for DNS lookups</code></span>
+<span class="codeline" id="line-487"><code>//	cgo+1   // use cgo for DNS lookups + debug level 1</code></span>
+<span class="codeline" id="line-488"><code>//	1+cgo   // same</code></span>
+<span class="codeline" id="line-489"><code>//	cgo+2   // same, but debug level 2</code></span>
+<span class="codeline" id="line-490"><code>//</code></span>
+<span class="codeline" id="line-491"><code>// etc.</code></span>
+<span class="codeline" id="line-492"><code>func goDebugNetDNS() (dnsMode string, debugLevel int) {</code></span>
+<span class="codeline" id="line-493"><code>	goDebug := netdns.Value()</code></span>
+<span class="codeline" id="line-494"><code>	parsePart := func(s string) {</code></span>
+<span class="codeline" id="line-495"><code>		if s == "" {</code></span>
+<span class="codeline" id="line-496"><code>			return</code></span>
+<span class="codeline" id="line-497"><code>		}</code></span>
+<span class="codeline" id="line-498"><code>		if '0' &lt;= s[0] &amp;&amp; s[0] &lt;= '9' {</code></span>
+<span class="codeline" id="line-499"><code>			debugLevel, _, _ = dtoi(s)</code></span>
+<span class="codeline" id="line-500"><code>		} else {</code></span>
+<span class="codeline" id="line-501"><code>			dnsMode = s</code></span>
+<span class="codeline" id="line-502"><code>		}</code></span>
+<span class="codeline" id="line-503"><code>	}</code></span>
+<span class="codeline" id="line-504"><code>	if i := bytealg.IndexByteString(goDebug, '+'); i != -1 {</code></span>
+<span class="codeline" id="line-505"><code>		parsePart(goDebug[:i])</code></span>
+<span class="codeline" id="line-506"><code>		parsePart(goDebug[i+1:])</code></span>
+<span class="codeline" id="line-507"><code>		return</code></span>
+<span class="codeline" id="line-508"><code>	}</code></span>
+<span class="codeline" id="line-509"><code>	parsePart(goDebug)</code></span>
+<span class="codeline" id="line-510"><code>	return</code></span>
+<span class="codeline" id="line-511"><code>}</code></span>
+<span class="codeline" id="line-512"><code></code></span>
+<span class="codeline" id="line-513"><code>// isLocalhost reports whether h should be considered a "localhost"</code></span>
+<span class="codeline" id="line-514"><code>// name for the myhostname NSS module.</code></span>
+<span class="codeline" id="line-515"><code>func isLocalhost(h string) bool {</code></span>
+<span class="codeline" id="line-516"><code>	return stringsEqualFold(h, "localhost") || stringsEqualFold(h, "localhost.localdomain") || stringsHasSuffixFold(h, ".localhost") || stringsHasSuffixFold(h, ".localhost.localdomain")</code></span>
+<span class="codeline" id="line-517"><code>}</code></span>
+<span class="codeline" id="line-518"><code></code></span>
+<span class="codeline" id="line-519"><code>// isGateway reports whether h should be considered a "gateway"</code></span>
+<span class="codeline" id="line-520"><code>// name for the myhostname NSS module.</code></span>
+<span class="codeline" id="line-521"><code>func isGateway(h string) bool {</code></span>
+<span class="codeline" id="line-522"><code>	return stringsEqualFold(h, "_gateway")</code></span>
+<span class="codeline" id="line-523"><code>}</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>// isOutbound reports whether h should be considered an "outbound"</code></span>
+<span class="codeline" id="line-526"><code>// name for the myhostname NSS module.</code></span>
+<span class="codeline" id="line-527"><code>func isOutbound(h string) bool {</code></span>
+<span class="codeline" id="line-528"><code>	return stringsEqualFold(h, "_outbound")</code></span>
+<span class="codeline" id="line-529"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

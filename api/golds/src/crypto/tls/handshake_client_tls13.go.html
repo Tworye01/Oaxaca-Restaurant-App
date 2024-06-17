@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: handshake_client_tls13.go in package crypto/tls</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	handshake_client_tls13.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/crypto/tls.html">crypto/tls</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2018 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package tls</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bytes"</code></span>
+<span class="codeline" id="line-9"><code>	"context"</code></span>
+<span class="codeline" id="line-10"><code>	"crypto"</code></span>
+<span class="codeline" id="line-11"><code>	"crypto/ecdh"</code></span>
+<span class="codeline" id="line-12"><code>	"crypto/hmac"</code></span>
+<span class="codeline" id="line-13"><code>	"crypto/rsa"</code></span>
+<span class="codeline" id="line-14"><code>	"errors"</code></span>
+<span class="codeline" id="line-15"><code>	"hash"</code></span>
+<span class="codeline" id="line-16"><code>	"time"</code></span>
+<span class="codeline" id="line-17"><code>)</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>type clientHandshakeStateTLS13 struct {</code></span>
+<span class="codeline" id="line-20"><code>	c           *Conn</code></span>
+<span class="codeline" id="line-21"><code>	ctx         context.Context</code></span>
+<span class="codeline" id="line-22"><code>	serverHello *serverHelloMsg</code></span>
+<span class="codeline" id="line-23"><code>	hello       *clientHelloMsg</code></span>
+<span class="codeline" id="line-24"><code>	ecdheKey    *ecdh.PrivateKey</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>	session     *SessionState</code></span>
+<span class="codeline" id="line-27"><code>	earlySecret []byte</code></span>
+<span class="codeline" id="line-28"><code>	binderKey   []byte</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>	certReq       *certificateRequestMsgTLS13</code></span>
+<span class="codeline" id="line-31"><code>	usingPSK      bool</code></span>
+<span class="codeline" id="line-32"><code>	sentDummyCCS  bool</code></span>
+<span class="codeline" id="line-33"><code>	suite         *cipherSuiteTLS13</code></span>
+<span class="codeline" id="line-34"><code>	transcript    hash.Hash</code></span>
+<span class="codeline" id="line-35"><code>	masterSecret  []byte</code></span>
+<span class="codeline" id="line-36"><code>	trafficSecret []byte // client_application_traffic_secret_0</code></span>
+<span class="codeline" id="line-37"><code>}</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>// handshake requires hs.c, hs.hello, hs.serverHello, hs.ecdheKey, and,</code></span>
+<span class="codeline" id="line-40"><code>// optionally, hs.session, hs.earlySecret and hs.binderKey to be set.</code></span>
+<span class="codeline" id="line-41"><code>func (hs *clientHandshakeStateTLS13) handshake() error {</code></span>
+<span class="codeline" id="line-42"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>	if needFIPS() {</code></span>
+<span class="codeline" id="line-45"><code>		return errors.New("tls: internal error: TLS 1.3 reached in FIPS mode")</code></span>
+<span class="codeline" id="line-46"><code>	}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>	// The server must not select TLS 1.3 in a renegotiation. See RFC 8446,</code></span>
+<span class="codeline" id="line-49"><code>	// sections 4.1.2 and 4.1.3.</code></span>
+<span class="codeline" id="line-50"><code>	if c.handshakes &gt; 0 {</code></span>
+<span class="codeline" id="line-51"><code>		c.sendAlert(alertProtocolVersion)</code></span>
+<span class="codeline" id="line-52"><code>		return errors.New("tls: server selected TLS 1.3 in a renegotiation")</code></span>
+<span class="codeline" id="line-53"><code>	}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>	// Consistency check on the presence of a keyShare and its parameters.</code></span>
+<span class="codeline" id="line-56"><code>	if hs.ecdheKey == nil || len(hs.hello.keyShares) != 1 {</code></span>
+<span class="codeline" id="line-57"><code>		return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	if err := hs.checkServerHelloOrHRR(); err != nil {</code></span>
+<span class="codeline" id="line-61"><code>		return err</code></span>
+<span class="codeline" id="line-62"><code>	}</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>	hs.transcript = hs.suite.hash.New()</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>	if err := transcriptMsg(hs.hello, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-67"><code>		return err</code></span>
+<span class="codeline" id="line-68"><code>	}</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>	if bytes.Equal(hs.serverHello.random, helloRetryRequestRandom) {</code></span>
+<span class="codeline" id="line-71"><code>		if err := hs.sendDummyChangeCipherSpec(); err != nil {</code></span>
+<span class="codeline" id="line-72"><code>			return err</code></span>
+<span class="codeline" id="line-73"><code>		}</code></span>
+<span class="codeline" id="line-74"><code>		if err := hs.processHelloRetryRequest(); err != nil {</code></span>
+<span class="codeline" id="line-75"><code>			return err</code></span>
+<span class="codeline" id="line-76"><code>		}</code></span>
+<span class="codeline" id="line-77"><code>	}</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>	if err := transcriptMsg(hs.serverHello, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-80"><code>		return err</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	c.buffering = true</code></span>
+<span class="codeline" id="line-84"><code>	if err := hs.processServerHello(); err != nil {</code></span>
+<span class="codeline" id="line-85"><code>		return err</code></span>
+<span class="codeline" id="line-86"><code>	}</code></span>
+<span class="codeline" id="line-87"><code>	if err := hs.sendDummyChangeCipherSpec(); err != nil {</code></span>
+<span class="codeline" id="line-88"><code>		return err</code></span>
+<span class="codeline" id="line-89"><code>	}</code></span>
+<span class="codeline" id="line-90"><code>	if err := hs.establishHandshakeKeys(); err != nil {</code></span>
+<span class="codeline" id="line-91"><code>		return err</code></span>
+<span class="codeline" id="line-92"><code>	}</code></span>
+<span class="codeline" id="line-93"><code>	if err := hs.readServerParameters(); err != nil {</code></span>
+<span class="codeline" id="line-94"><code>		return err</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>	if err := hs.readServerCertificate(); err != nil {</code></span>
+<span class="codeline" id="line-97"><code>		return err</code></span>
+<span class="codeline" id="line-98"><code>	}</code></span>
+<span class="codeline" id="line-99"><code>	if err := hs.readServerFinished(); err != nil {</code></span>
+<span class="codeline" id="line-100"><code>		return err</code></span>
+<span class="codeline" id="line-101"><code>	}</code></span>
+<span class="codeline" id="line-102"><code>	if err := hs.sendClientCertificate(); err != nil {</code></span>
+<span class="codeline" id="line-103"><code>		return err</code></span>
+<span class="codeline" id="line-104"><code>	}</code></span>
+<span class="codeline" id="line-105"><code>	if err := hs.sendClientFinished(); err != nil {</code></span>
+<span class="codeline" id="line-106"><code>		return err</code></span>
+<span class="codeline" id="line-107"><code>	}</code></span>
+<span class="codeline" id="line-108"><code>	if _, err := c.flush(); err != nil {</code></span>
+<span class="codeline" id="line-109"><code>		return err</code></span>
+<span class="codeline" id="line-110"><code>	}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	c.isHandshakeComplete.Store(true)</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>	return nil</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>// checkServerHelloOrHRR does validity checks that apply to both ServerHello and</code></span>
+<span class="codeline" id="line-118"><code>// HelloRetryRequest messages. It sets hs.suite.</code></span>
+<span class="codeline" id="line-119"><code>func (hs *clientHandshakeStateTLS13) checkServerHelloOrHRR() error {</code></span>
+<span class="codeline" id="line-120"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	if hs.serverHello.supportedVersion == 0 {</code></span>
+<span class="codeline" id="line-123"><code>		c.sendAlert(alertMissingExtension)</code></span>
+<span class="codeline" id="line-124"><code>		return errors.New("tls: server selected TLS 1.3 using the legacy version field")</code></span>
+<span class="codeline" id="line-125"><code>	}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>	if hs.serverHello.supportedVersion != VersionTLS13 {</code></span>
+<span class="codeline" id="line-128"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-129"><code>		return errors.New("tls: server selected an invalid version after a HelloRetryRequest")</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	if hs.serverHello.vers != VersionTLS12 {</code></span>
+<span class="codeline" id="line-133"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-134"><code>		return errors.New("tls: server sent an incorrect legacy version")</code></span>
+<span class="codeline" id="line-135"><code>	}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>	if hs.serverHello.ocspStapling ||</code></span>
+<span class="codeline" id="line-138"><code>		hs.serverHello.ticketSupported ||</code></span>
+<span class="codeline" id="line-139"><code>		hs.serverHello.extendedMasterSecret ||</code></span>
+<span class="codeline" id="line-140"><code>		hs.serverHello.secureRenegotiationSupported ||</code></span>
+<span class="codeline" id="line-141"><code>		len(hs.serverHello.secureRenegotiation) != 0 ||</code></span>
+<span class="codeline" id="line-142"><code>		len(hs.serverHello.alpnProtocol) != 0 ||</code></span>
+<span class="codeline" id="line-143"><code>		len(hs.serverHello.scts) != 0 {</code></span>
+<span class="codeline" id="line-144"><code>		c.sendAlert(alertUnsupportedExtension)</code></span>
+<span class="codeline" id="line-145"><code>		return errors.New("tls: server sent a ServerHello extension forbidden in TLS 1.3")</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>	if !bytes.Equal(hs.hello.sessionId, hs.serverHello.sessionId) {</code></span>
+<span class="codeline" id="line-149"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-150"><code>		return errors.New("tls: server did not echo the legacy session ID")</code></span>
+<span class="codeline" id="line-151"><code>	}</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>	if hs.serverHello.compressionMethod != compressionNone {</code></span>
+<span class="codeline" id="line-154"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-155"><code>		return errors.New("tls: server selected unsupported compression format")</code></span>
+<span class="codeline" id="line-156"><code>	}</code></span>
+<span class="codeline" id="line-157"><code></code></span>
+<span class="codeline" id="line-158"><code>	selectedSuite := mutualCipherSuiteTLS13(hs.hello.cipherSuites, hs.serverHello.cipherSuite)</code></span>
+<span class="codeline" id="line-159"><code>	if hs.suite != nil &amp;&amp; selectedSuite != hs.suite {</code></span>
+<span class="codeline" id="line-160"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-161"><code>		return errors.New("tls: server changed cipher suite after a HelloRetryRequest")</code></span>
+<span class="codeline" id="line-162"><code>	}</code></span>
+<span class="codeline" id="line-163"><code>	if selectedSuite == nil {</code></span>
+<span class="codeline" id="line-164"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-165"><code>		return errors.New("tls: server chose an unconfigured cipher suite")</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>	hs.suite = selectedSuite</code></span>
+<span class="codeline" id="line-168"><code>	c.cipherSuite = hs.suite.id</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>	return nil</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>// sendDummyChangeCipherSpec sends a ChangeCipherSpec record for compatibility</code></span>
+<span class="codeline" id="line-174"><code>// with middleboxes that didn't implement TLS correctly. See RFC 8446, Appendix D.4.</code></span>
+<span class="codeline" id="line-175"><code>func (hs *clientHandshakeStateTLS13) sendDummyChangeCipherSpec() error {</code></span>
+<span class="codeline" id="line-176"><code>	if hs.c.quic != nil {</code></span>
+<span class="codeline" id="line-177"><code>		return nil</code></span>
+<span class="codeline" id="line-178"><code>	}</code></span>
+<span class="codeline" id="line-179"><code>	if hs.sentDummyCCS {</code></span>
+<span class="codeline" id="line-180"><code>		return nil</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code>	hs.sentDummyCCS = true</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>	return hs.c.writeChangeCipherRecord()</code></span>
+<span class="codeline" id="line-185"><code>}</code></span>
+<span class="codeline" id="line-186"><code></code></span>
+<span class="codeline" id="line-187"><code>// processHelloRetryRequest handles the HRR in hs.serverHello, modifies and</code></span>
+<span class="codeline" id="line-188"><code>// resends hs.hello, and reads the new ServerHello into hs.serverHello.</code></span>
+<span class="codeline" id="line-189"><code>func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {</code></span>
+<span class="codeline" id="line-190"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-191"><code></code></span>
+<span class="codeline" id="line-192"><code>	// The first ClientHello gets double-hashed into the transcript upon a</code></span>
+<span class="codeline" id="line-193"><code>	// HelloRetryRequest. (The idea is that the server might offload transcript</code></span>
+<span class="codeline" id="line-194"><code>	// storage to the client in the cookie.) See RFC 8446, Section 4.4.1.</code></span>
+<span class="codeline" id="line-195"><code>	chHash := hs.transcript.Sum(nil)</code></span>
+<span class="codeline" id="line-196"><code>	hs.transcript.Reset()</code></span>
+<span class="codeline" id="line-197"><code>	hs.transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})</code></span>
+<span class="codeline" id="line-198"><code>	hs.transcript.Write(chHash)</code></span>
+<span class="codeline" id="line-199"><code>	if err := transcriptMsg(hs.serverHello, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-200"><code>		return err</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>	// The only HelloRetryRequest extensions we support are key_share and</code></span>
+<span class="codeline" id="line-204"><code>	// cookie, and clients must abort the handshake if the HRR would not result</code></span>
+<span class="codeline" id="line-205"><code>	// in any change in the ClientHello.</code></span>
+<span class="codeline" id="line-206"><code>	if hs.serverHello.selectedGroup == 0 &amp;&amp; hs.serverHello.cookie == nil {</code></span>
+<span class="codeline" id="line-207"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-208"><code>		return errors.New("tls: server sent an unnecessary HelloRetryRequest message")</code></span>
+<span class="codeline" id="line-209"><code>	}</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>	if hs.serverHello.cookie != nil {</code></span>
+<span class="codeline" id="line-212"><code>		hs.hello.cookie = hs.serverHello.cookie</code></span>
+<span class="codeline" id="line-213"><code>	}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>	if hs.serverHello.serverShare.group != 0 {</code></span>
+<span class="codeline" id="line-216"><code>		c.sendAlert(alertDecodeError)</code></span>
+<span class="codeline" id="line-217"><code>		return errors.New("tls: received malformed key_share extension")</code></span>
+<span class="codeline" id="line-218"><code>	}</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>	// If the server sent a key_share extension selecting a group, ensure it's</code></span>
+<span class="codeline" id="line-221"><code>	// a group we advertised but did not send a key share for, and send a key</code></span>
+<span class="codeline" id="line-222"><code>	// share for it this time.</code></span>
+<span class="codeline" id="line-223"><code>	if curveID := hs.serverHello.selectedGroup; curveID != 0 {</code></span>
+<span class="codeline" id="line-224"><code>		curveOK := false</code></span>
+<span class="codeline" id="line-225"><code>		for _, id := range hs.hello.supportedCurves {</code></span>
+<span class="codeline" id="line-226"><code>			if id == curveID {</code></span>
+<span class="codeline" id="line-227"><code>				curveOK = true</code></span>
+<span class="codeline" id="line-228"><code>				break</code></span>
+<span class="codeline" id="line-229"><code>			}</code></span>
+<span class="codeline" id="line-230"><code>		}</code></span>
+<span class="codeline" id="line-231"><code>		if !curveOK {</code></span>
+<span class="codeline" id="line-232"><code>			c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-233"><code>			return errors.New("tls: server selected unsupported group")</code></span>
+<span class="codeline" id="line-234"><code>		}</code></span>
+<span class="codeline" id="line-235"><code>		if sentID, _ := curveIDForCurve(hs.ecdheKey.Curve()); sentID == curveID {</code></span>
+<span class="codeline" id="line-236"><code>			c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-237"><code>			return errors.New("tls: server sent an unnecessary HelloRetryRequest key_share")</code></span>
+<span class="codeline" id="line-238"><code>		}</code></span>
+<span class="codeline" id="line-239"><code>		if _, ok := curveForCurveID(curveID); !ok {</code></span>
+<span class="codeline" id="line-240"><code>			c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-241"><code>			return errors.New("tls: CurvePreferences includes unsupported curve")</code></span>
+<span class="codeline" id="line-242"><code>		}</code></span>
+<span class="codeline" id="line-243"><code>		key, err := generateECDHEKey(c.config.rand(), curveID)</code></span>
+<span class="codeline" id="line-244"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-245"><code>			c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-246"><code>			return err</code></span>
+<span class="codeline" id="line-247"><code>		}</code></span>
+<span class="codeline" id="line-248"><code>		hs.ecdheKey = key</code></span>
+<span class="codeline" id="line-249"><code>		hs.hello.keyShares = []keyShare{{group: curveID, data: key.PublicKey().Bytes()}}</code></span>
+<span class="codeline" id="line-250"><code>	}</code></span>
+<span class="codeline" id="line-251"><code></code></span>
+<span class="codeline" id="line-252"><code>	hs.hello.raw = nil</code></span>
+<span class="codeline" id="line-253"><code>	if len(hs.hello.pskIdentities) &gt; 0 {</code></span>
+<span class="codeline" id="line-254"><code>		pskSuite := cipherSuiteTLS13ByID(hs.session.cipherSuite)</code></span>
+<span class="codeline" id="line-255"><code>		if pskSuite == nil {</code></span>
+<span class="codeline" id="line-256"><code>			return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-257"><code>		}</code></span>
+<span class="codeline" id="line-258"><code>		if pskSuite.hash == hs.suite.hash {</code></span>
+<span class="codeline" id="line-259"><code>			// Update binders and obfuscated_ticket_age.</code></span>
+<span class="codeline" id="line-260"><code>			ticketAge := c.config.time().Sub(time.Unix(int64(hs.session.createdAt), 0))</code></span>
+<span class="codeline" id="line-261"><code>			hs.hello.pskIdentities[0].obfuscatedTicketAge = uint32(ticketAge/time.Millisecond) + hs.session.ageAdd</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>			transcript := hs.suite.hash.New()</code></span>
+<span class="codeline" id="line-264"><code>			transcript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})</code></span>
+<span class="codeline" id="line-265"><code>			transcript.Write(chHash)</code></span>
+<span class="codeline" id="line-266"><code>			if err := transcriptMsg(hs.serverHello, transcript); err != nil {</code></span>
+<span class="codeline" id="line-267"><code>				return err</code></span>
+<span class="codeline" id="line-268"><code>			}</code></span>
+<span class="codeline" id="line-269"><code>			helloBytes, err := hs.hello.marshalWithoutBinders()</code></span>
+<span class="codeline" id="line-270"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-271"><code>				return err</code></span>
+<span class="codeline" id="line-272"><code>			}</code></span>
+<span class="codeline" id="line-273"><code>			transcript.Write(helloBytes)</code></span>
+<span class="codeline" id="line-274"><code>			pskBinders := [][]byte{hs.suite.finishedHash(hs.binderKey, transcript)}</code></span>
+<span class="codeline" id="line-275"><code>			if err := hs.hello.updateBinders(pskBinders); err != nil {</code></span>
+<span class="codeline" id="line-276"><code>				return err</code></span>
+<span class="codeline" id="line-277"><code>			}</code></span>
+<span class="codeline" id="line-278"><code>		} else {</code></span>
+<span class="codeline" id="line-279"><code>			// Server selected a cipher suite incompatible with the PSK.</code></span>
+<span class="codeline" id="line-280"><code>			hs.hello.pskIdentities = nil</code></span>
+<span class="codeline" id="line-281"><code>			hs.hello.pskBinders = nil</code></span>
+<span class="codeline" id="line-282"><code>		}</code></span>
+<span class="codeline" id="line-283"><code>	}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	if hs.hello.earlyData {</code></span>
+<span class="codeline" id="line-286"><code>		hs.hello.earlyData = false</code></span>
+<span class="codeline" id="line-287"><code>		c.quicRejectedEarlyData()</code></span>
+<span class="codeline" id="line-288"><code>	}</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	if _, err := hs.c.writeHandshakeRecord(hs.hello, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-291"><code>		return err</code></span>
+<span class="codeline" id="line-292"><code>	}</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>	// serverHelloMsg is not included in the transcript</code></span>
+<span class="codeline" id="line-295"><code>	msg, err := c.readHandshake(nil)</code></span>
+<span class="codeline" id="line-296"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-297"><code>		return err</code></span>
+<span class="codeline" id="line-298"><code>	}</code></span>
+<span class="codeline" id="line-299"><code></code></span>
+<span class="codeline" id="line-300"><code>	serverHello, ok := msg.(*serverHelloMsg)</code></span>
+<span class="codeline" id="line-301"><code>	if !ok {</code></span>
+<span class="codeline" id="line-302"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-303"><code>		return unexpectedMessageError(serverHello, msg)</code></span>
+<span class="codeline" id="line-304"><code>	}</code></span>
+<span class="codeline" id="line-305"><code>	hs.serverHello = serverHello</code></span>
+<span class="codeline" id="line-306"><code></code></span>
+<span class="codeline" id="line-307"><code>	if err := hs.checkServerHelloOrHRR(); err != nil {</code></span>
+<span class="codeline" id="line-308"><code>		return err</code></span>
+<span class="codeline" id="line-309"><code>	}</code></span>
+<span class="codeline" id="line-310"><code></code></span>
+<span class="codeline" id="line-311"><code>	return nil</code></span>
+<span class="codeline" id="line-312"><code>}</code></span>
+<span class="codeline" id="line-313"><code></code></span>
+<span class="codeline" id="line-314"><code>func (hs *clientHandshakeStateTLS13) processServerHello() error {</code></span>
+<span class="codeline" id="line-315"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>	if bytes.Equal(hs.serverHello.random, helloRetryRequestRandom) {</code></span>
+<span class="codeline" id="line-318"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-319"><code>		return errors.New("tls: server sent two HelloRetryRequest messages")</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>	if len(hs.serverHello.cookie) != 0 {</code></span>
+<span class="codeline" id="line-323"><code>		c.sendAlert(alertUnsupportedExtension)</code></span>
+<span class="codeline" id="line-324"><code>		return errors.New("tls: server sent a cookie in a normal ServerHello")</code></span>
+<span class="codeline" id="line-325"><code>	}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>	if hs.serverHello.selectedGroup != 0 {</code></span>
+<span class="codeline" id="line-328"><code>		c.sendAlert(alertDecodeError)</code></span>
+<span class="codeline" id="line-329"><code>		return errors.New("tls: malformed key_share extension")</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>	if hs.serverHello.serverShare.group == 0 {</code></span>
+<span class="codeline" id="line-333"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-334"><code>		return errors.New("tls: server did not send a key share")</code></span>
+<span class="codeline" id="line-335"><code>	}</code></span>
+<span class="codeline" id="line-336"><code>	if sentID, _ := curveIDForCurve(hs.ecdheKey.Curve()); hs.serverHello.serverShare.group != sentID {</code></span>
+<span class="codeline" id="line-337"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-338"><code>		return errors.New("tls: server selected unsupported group")</code></span>
+<span class="codeline" id="line-339"><code>	}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>	if !hs.serverHello.selectedIdentityPresent {</code></span>
+<span class="codeline" id="line-342"><code>		return nil</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code></code></span>
+<span class="codeline" id="line-345"><code>	if int(hs.serverHello.selectedIdentity) &gt;= len(hs.hello.pskIdentities) {</code></span>
+<span class="codeline" id="line-346"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-347"><code>		return errors.New("tls: server selected an invalid PSK")</code></span>
+<span class="codeline" id="line-348"><code>	}</code></span>
+<span class="codeline" id="line-349"><code></code></span>
+<span class="codeline" id="line-350"><code>	if len(hs.hello.pskIdentities) != 1 || hs.session == nil {</code></span>
+<span class="codeline" id="line-351"><code>		return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-352"><code>	}</code></span>
+<span class="codeline" id="line-353"><code>	pskSuite := cipherSuiteTLS13ByID(hs.session.cipherSuite)</code></span>
+<span class="codeline" id="line-354"><code>	if pskSuite == nil {</code></span>
+<span class="codeline" id="line-355"><code>		return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-356"><code>	}</code></span>
+<span class="codeline" id="line-357"><code>	if pskSuite.hash != hs.suite.hash {</code></span>
+<span class="codeline" id="line-358"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-359"><code>		return errors.New("tls: server selected an invalid PSK and cipher suite pair")</code></span>
+<span class="codeline" id="line-360"><code>	}</code></span>
+<span class="codeline" id="line-361"><code></code></span>
+<span class="codeline" id="line-362"><code>	hs.usingPSK = true</code></span>
+<span class="codeline" id="line-363"><code>	c.didResume = true</code></span>
+<span class="codeline" id="line-364"><code>	c.peerCertificates = hs.session.peerCertificates</code></span>
+<span class="codeline" id="line-365"><code>	c.activeCertHandles = hs.session.activeCertHandles</code></span>
+<span class="codeline" id="line-366"><code>	c.verifiedChains = hs.session.verifiedChains</code></span>
+<span class="codeline" id="line-367"><code>	c.ocspResponse = hs.session.ocspResponse</code></span>
+<span class="codeline" id="line-368"><code>	c.scts = hs.session.scts</code></span>
+<span class="codeline" id="line-369"><code>	return nil</code></span>
+<span class="codeline" id="line-370"><code>}</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {</code></span>
+<span class="codeline" id="line-373"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-374"><code></code></span>
+<span class="codeline" id="line-375"><code>	peerKey, err := hs.ecdheKey.Curve().NewPublicKey(hs.serverHello.serverShare.data)</code></span>
+<span class="codeline" id="line-376"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-377"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-378"><code>		return errors.New("tls: invalid server key share")</code></span>
+<span class="codeline" id="line-379"><code>	}</code></span>
+<span class="codeline" id="line-380"><code>	sharedKey, err := hs.ecdheKey.ECDH(peerKey)</code></span>
+<span class="codeline" id="line-381"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-382"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-383"><code>		return errors.New("tls: invalid server key share")</code></span>
+<span class="codeline" id="line-384"><code>	}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>	earlySecret := hs.earlySecret</code></span>
+<span class="codeline" id="line-387"><code>	if !hs.usingPSK {</code></span>
+<span class="codeline" id="line-388"><code>		earlySecret = hs.suite.extract(nil, nil)</code></span>
+<span class="codeline" id="line-389"><code>	}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>	handshakeSecret := hs.suite.extract(sharedKey,</code></span>
+<span class="codeline" id="line-392"><code>		hs.suite.deriveSecret(earlySecret, "derived", nil))</code></span>
+<span class="codeline" id="line-393"><code></code></span>
+<span class="codeline" id="line-394"><code>	clientSecret := hs.suite.deriveSecret(handshakeSecret,</code></span>
+<span class="codeline" id="line-395"><code>		clientHandshakeTrafficLabel, hs.transcript)</code></span>
+<span class="codeline" id="line-396"><code>	c.out.setTrafficSecret(hs.suite, QUICEncryptionLevelHandshake, clientSecret)</code></span>
+<span class="codeline" id="line-397"><code>	serverSecret := hs.suite.deriveSecret(handshakeSecret,</code></span>
+<span class="codeline" id="line-398"><code>		serverHandshakeTrafficLabel, hs.transcript)</code></span>
+<span class="codeline" id="line-399"><code>	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelHandshake, serverSecret)</code></span>
+<span class="codeline" id="line-400"><code></code></span>
+<span class="codeline" id="line-401"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-402"><code>		if c.hand.Len() != 0 {</code></span>
+<span class="codeline" id="line-403"><code>			c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-404"><code>		}</code></span>
+<span class="codeline" id="line-405"><code>		c.quicSetWriteSecret(QUICEncryptionLevelHandshake, hs.suite.id, clientSecret)</code></span>
+<span class="codeline" id="line-406"><code>		c.quicSetReadSecret(QUICEncryptionLevelHandshake, hs.suite.id, serverSecret)</code></span>
+<span class="codeline" id="line-407"><code>	}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>	err = c.config.writeKeyLog(keyLogLabelClientHandshake, hs.hello.random, clientSecret)</code></span>
+<span class="codeline" id="line-410"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-411"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-412"><code>		return err</code></span>
+<span class="codeline" id="line-413"><code>	}</code></span>
+<span class="codeline" id="line-414"><code>	err = c.config.writeKeyLog(keyLogLabelServerHandshake, hs.hello.random, serverSecret)</code></span>
+<span class="codeline" id="line-415"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-416"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-417"><code>		return err</code></span>
+<span class="codeline" id="line-418"><code>	}</code></span>
+<span class="codeline" id="line-419"><code></code></span>
+<span class="codeline" id="line-420"><code>	hs.masterSecret = hs.suite.extract(nil,</code></span>
+<span class="codeline" id="line-421"><code>		hs.suite.deriveSecret(handshakeSecret, "derived", nil))</code></span>
+<span class="codeline" id="line-422"><code></code></span>
+<span class="codeline" id="line-423"><code>	return nil</code></span>
+<span class="codeline" id="line-424"><code>}</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>func (hs *clientHandshakeStateTLS13) readServerParameters() error {</code></span>
+<span class="codeline" id="line-427"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-428"><code></code></span>
+<span class="codeline" id="line-429"><code>	msg, err := c.readHandshake(hs.transcript)</code></span>
+<span class="codeline" id="line-430"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-431"><code>		return err</code></span>
+<span class="codeline" id="line-432"><code>	}</code></span>
+<span class="codeline" id="line-433"><code></code></span>
+<span class="codeline" id="line-434"><code>	encryptedExtensions, ok := msg.(*encryptedExtensionsMsg)</code></span>
+<span class="codeline" id="line-435"><code>	if !ok {</code></span>
+<span class="codeline" id="line-436"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-437"><code>		return unexpectedMessageError(encryptedExtensions, msg)</code></span>
+<span class="codeline" id="line-438"><code>	}</code></span>
+<span class="codeline" id="line-439"><code></code></span>
+<span class="codeline" id="line-440"><code>	if err := checkALPN(hs.hello.alpnProtocols, encryptedExtensions.alpnProtocol, c.quic != nil); err != nil {</code></span>
+<span class="codeline" id="line-441"><code>		// RFC 8446 specifies that no_application_protocol is sent by servers, but</code></span>
+<span class="codeline" id="line-442"><code>		// does not specify how clients handle the selection of an incompatible protocol.</code></span>
+<span class="codeline" id="line-443"><code>		// RFC 9001 Section 8.1 specifies that QUIC clients send no_application_protocol</code></span>
+<span class="codeline" id="line-444"><code>		// in this case. Always sending no_application_protocol seems reasonable.</code></span>
+<span class="codeline" id="line-445"><code>		c.sendAlert(alertNoApplicationProtocol)</code></span>
+<span class="codeline" id="line-446"><code>		return err</code></span>
+<span class="codeline" id="line-447"><code>	}</code></span>
+<span class="codeline" id="line-448"><code>	c.clientProtocol = encryptedExtensions.alpnProtocol</code></span>
+<span class="codeline" id="line-449"><code></code></span>
+<span class="codeline" id="line-450"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-451"><code>		if encryptedExtensions.quicTransportParameters == nil {</code></span>
+<span class="codeline" id="line-452"><code>			// RFC 9001 Section 8.2.</code></span>
+<span class="codeline" id="line-453"><code>			c.sendAlert(alertMissingExtension)</code></span>
+<span class="codeline" id="line-454"><code>			return errors.New("tls: server did not send a quic_transport_parameters extension")</code></span>
+<span class="codeline" id="line-455"><code>		}</code></span>
+<span class="codeline" id="line-456"><code>		c.quicSetTransportParameters(encryptedExtensions.quicTransportParameters)</code></span>
+<span class="codeline" id="line-457"><code>	} else {</code></span>
+<span class="codeline" id="line-458"><code>		if encryptedExtensions.quicTransportParameters != nil {</code></span>
+<span class="codeline" id="line-459"><code>			c.sendAlert(alertUnsupportedExtension)</code></span>
+<span class="codeline" id="line-460"><code>			return errors.New("tls: server sent an unexpected quic_transport_parameters extension")</code></span>
+<span class="codeline" id="line-461"><code>		}</code></span>
+<span class="codeline" id="line-462"><code>	}</code></span>
+<span class="codeline" id="line-463"><code></code></span>
+<span class="codeline" id="line-464"><code>	if !hs.hello.earlyData &amp;&amp; encryptedExtensions.earlyData {</code></span>
+<span class="codeline" id="line-465"><code>		c.sendAlert(alertUnsupportedExtension)</code></span>
+<span class="codeline" id="line-466"><code>		return errors.New("tls: server sent an unexpected early_data extension")</code></span>
+<span class="codeline" id="line-467"><code>	}</code></span>
+<span class="codeline" id="line-468"><code>	if hs.hello.earlyData &amp;&amp; !encryptedExtensions.earlyData {</code></span>
+<span class="codeline" id="line-469"><code>		c.quicRejectedEarlyData()</code></span>
+<span class="codeline" id="line-470"><code>	}</code></span>
+<span class="codeline" id="line-471"><code>	if encryptedExtensions.earlyData {</code></span>
+<span class="codeline" id="line-472"><code>		if hs.session.cipherSuite != c.cipherSuite {</code></span>
+<span class="codeline" id="line-473"><code>			c.sendAlert(alertHandshakeFailure)</code></span>
+<span class="codeline" id="line-474"><code>			return errors.New("tls: server accepted 0-RTT with the wrong cipher suite")</code></span>
+<span class="codeline" id="line-475"><code>		}</code></span>
+<span class="codeline" id="line-476"><code>		if hs.session.alpnProtocol != c.clientProtocol {</code></span>
+<span class="codeline" id="line-477"><code>			c.sendAlert(alertHandshakeFailure)</code></span>
+<span class="codeline" id="line-478"><code>			return errors.New("tls: server accepted 0-RTT with the wrong ALPN")</code></span>
+<span class="codeline" id="line-479"><code>		}</code></span>
+<span class="codeline" id="line-480"><code>	}</code></span>
+<span class="codeline" id="line-481"><code></code></span>
+<span class="codeline" id="line-482"><code>	return nil</code></span>
+<span class="codeline" id="line-483"><code>}</code></span>
+<span class="codeline" id="line-484"><code></code></span>
+<span class="codeline" id="line-485"><code>func (hs *clientHandshakeStateTLS13) readServerCertificate() error {</code></span>
+<span class="codeline" id="line-486"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>	// Either a PSK or a certificate is always used, but not both.</code></span>
+<span class="codeline" id="line-489"><code>	// See RFC 8446, Section 4.1.1.</code></span>
+<span class="codeline" id="line-490"><code>	if hs.usingPSK {</code></span>
+<span class="codeline" id="line-491"><code>		// Make sure the connection is still being verified whether or not this</code></span>
+<span class="codeline" id="line-492"><code>		// is a resumption. Resumptions currently don't reverify certificates so</code></span>
+<span class="codeline" id="line-493"><code>		// they don't call verifyServerCertificate. See Issue 31641.</code></span>
+<span class="codeline" id="line-494"><code>		if c.config.VerifyConnection != nil {</code></span>
+<span class="codeline" id="line-495"><code>			if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {</code></span>
+<span class="codeline" id="line-496"><code>				c.sendAlert(alertBadCertificate)</code></span>
+<span class="codeline" id="line-497"><code>				return err</code></span>
+<span class="codeline" id="line-498"><code>			}</code></span>
+<span class="codeline" id="line-499"><code>		}</code></span>
+<span class="codeline" id="line-500"><code>		return nil</code></span>
+<span class="codeline" id="line-501"><code>	}</code></span>
+<span class="codeline" id="line-502"><code></code></span>
+<span class="codeline" id="line-503"><code>	msg, err := c.readHandshake(hs.transcript)</code></span>
+<span class="codeline" id="line-504"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-505"><code>		return err</code></span>
+<span class="codeline" id="line-506"><code>	}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>	certReq, ok := msg.(*certificateRequestMsgTLS13)</code></span>
+<span class="codeline" id="line-509"><code>	if ok {</code></span>
+<span class="codeline" id="line-510"><code>		hs.certReq = certReq</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>		msg, err = c.readHandshake(hs.transcript)</code></span>
+<span class="codeline" id="line-513"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-514"><code>			return err</code></span>
+<span class="codeline" id="line-515"><code>		}</code></span>
+<span class="codeline" id="line-516"><code>	}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>	certMsg, ok := msg.(*certificateMsgTLS13)</code></span>
+<span class="codeline" id="line-519"><code>	if !ok {</code></span>
+<span class="codeline" id="line-520"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-521"><code>		return unexpectedMessageError(certMsg, msg)</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code>	if len(certMsg.certificate.Certificate) == 0 {</code></span>
+<span class="codeline" id="line-524"><code>		c.sendAlert(alertDecodeError)</code></span>
+<span class="codeline" id="line-525"><code>		return errors.New("tls: received empty certificates message")</code></span>
+<span class="codeline" id="line-526"><code>	}</code></span>
+<span class="codeline" id="line-527"><code></code></span>
+<span class="codeline" id="line-528"><code>	c.scts = certMsg.certificate.SignedCertificateTimestamps</code></span>
+<span class="codeline" id="line-529"><code>	c.ocspResponse = certMsg.certificate.OCSPStaple</code></span>
+<span class="codeline" id="line-530"><code></code></span>
+<span class="codeline" id="line-531"><code>	if err := c.verifyServerCertificate(certMsg.certificate.Certificate); err != nil {</code></span>
+<span class="codeline" id="line-532"><code>		return err</code></span>
+<span class="codeline" id="line-533"><code>	}</code></span>
+<span class="codeline" id="line-534"><code></code></span>
+<span class="codeline" id="line-535"><code>	// certificateVerifyMsg is included in the transcript, but not until</code></span>
+<span class="codeline" id="line-536"><code>	// after we verify the handshake signature, since the state before</code></span>
+<span class="codeline" id="line-537"><code>	// this message was sent is used.</code></span>
+<span class="codeline" id="line-538"><code>	msg, err = c.readHandshake(nil)</code></span>
+<span class="codeline" id="line-539"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-540"><code>		return err</code></span>
+<span class="codeline" id="line-541"><code>	}</code></span>
+<span class="codeline" id="line-542"><code></code></span>
+<span class="codeline" id="line-543"><code>	certVerify, ok := msg.(*certificateVerifyMsg)</code></span>
+<span class="codeline" id="line-544"><code>	if !ok {</code></span>
+<span class="codeline" id="line-545"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-546"><code>		return unexpectedMessageError(certVerify, msg)</code></span>
+<span class="codeline" id="line-547"><code>	}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>	// See RFC 8446, Section 4.4.3.</code></span>
+<span class="codeline" id="line-550"><code>	if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms()) {</code></span>
+<span class="codeline" id="line-551"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-552"><code>		return errors.New("tls: certificate used with invalid signature algorithm")</code></span>
+<span class="codeline" id="line-553"><code>	}</code></span>
+<span class="codeline" id="line-554"><code>	sigType, sigHash, err := typeAndHashFromSignatureScheme(certVerify.signatureAlgorithm)</code></span>
+<span class="codeline" id="line-555"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-556"><code>		return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-557"><code>	}</code></span>
+<span class="codeline" id="line-558"><code>	if sigType == signaturePKCS1v15 || sigHash == crypto.SHA1 {</code></span>
+<span class="codeline" id="line-559"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-560"><code>		return errors.New("tls: certificate used with invalid signature algorithm")</code></span>
+<span class="codeline" id="line-561"><code>	}</code></span>
+<span class="codeline" id="line-562"><code>	signed := signedMessage(sigHash, serverSignatureContext, hs.transcript)</code></span>
+<span class="codeline" id="line-563"><code>	if err := verifyHandshakeSignature(sigType, c.peerCertificates[0].PublicKey,</code></span>
+<span class="codeline" id="line-564"><code>		sigHash, signed, certVerify.signature); err != nil {</code></span>
+<span class="codeline" id="line-565"><code>		c.sendAlert(alertDecryptError)</code></span>
+<span class="codeline" id="line-566"><code>		return errors.New("tls: invalid signature by the server certificate: " + err.Error())</code></span>
+<span class="codeline" id="line-567"><code>	}</code></span>
+<span class="codeline" id="line-568"><code></code></span>
+<span class="codeline" id="line-569"><code>	if err := transcriptMsg(certVerify, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-570"><code>		return err</code></span>
+<span class="codeline" id="line-571"><code>	}</code></span>
+<span class="codeline" id="line-572"><code></code></span>
+<span class="codeline" id="line-573"><code>	return nil</code></span>
+<span class="codeline" id="line-574"><code>}</code></span>
+<span class="codeline" id="line-575"><code></code></span>
+<span class="codeline" id="line-576"><code>func (hs *clientHandshakeStateTLS13) readServerFinished() error {</code></span>
+<span class="codeline" id="line-577"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-578"><code></code></span>
+<span class="codeline" id="line-579"><code>	// finishedMsg is included in the transcript, but not until after we</code></span>
+<span class="codeline" id="line-580"><code>	// check the client version, since the state before this message was</code></span>
+<span class="codeline" id="line-581"><code>	// sent is used during verification.</code></span>
+<span class="codeline" id="line-582"><code>	msg, err := c.readHandshake(nil)</code></span>
+<span class="codeline" id="line-583"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-584"><code>		return err</code></span>
+<span class="codeline" id="line-585"><code>	}</code></span>
+<span class="codeline" id="line-586"><code></code></span>
+<span class="codeline" id="line-587"><code>	finished, ok := msg.(*finishedMsg)</code></span>
+<span class="codeline" id="line-588"><code>	if !ok {</code></span>
+<span class="codeline" id="line-589"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-590"><code>		return unexpectedMessageError(finished, msg)</code></span>
+<span class="codeline" id="line-591"><code>	}</code></span>
+<span class="codeline" id="line-592"><code></code></span>
+<span class="codeline" id="line-593"><code>	expectedMAC := hs.suite.finishedHash(c.in.trafficSecret, hs.transcript)</code></span>
+<span class="codeline" id="line-594"><code>	if !hmac.Equal(expectedMAC, finished.verifyData) {</code></span>
+<span class="codeline" id="line-595"><code>		c.sendAlert(alertDecryptError)</code></span>
+<span class="codeline" id="line-596"><code>		return errors.New("tls: invalid server finished hash")</code></span>
+<span class="codeline" id="line-597"><code>	}</code></span>
+<span class="codeline" id="line-598"><code></code></span>
+<span class="codeline" id="line-599"><code>	if err := transcriptMsg(finished, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-600"><code>		return err</code></span>
+<span class="codeline" id="line-601"><code>	}</code></span>
+<span class="codeline" id="line-602"><code></code></span>
+<span class="codeline" id="line-603"><code>	// Derive secrets that take context through the server Finished.</code></span>
+<span class="codeline" id="line-604"><code></code></span>
+<span class="codeline" id="line-605"><code>	hs.trafficSecret = hs.suite.deriveSecret(hs.masterSecret,</code></span>
+<span class="codeline" id="line-606"><code>		clientApplicationTrafficLabel, hs.transcript)</code></span>
+<span class="codeline" id="line-607"><code>	serverSecret := hs.suite.deriveSecret(hs.masterSecret,</code></span>
+<span class="codeline" id="line-608"><code>		serverApplicationTrafficLabel, hs.transcript)</code></span>
+<span class="codeline" id="line-609"><code>	c.in.setTrafficSecret(hs.suite, QUICEncryptionLevelApplication, serverSecret)</code></span>
+<span class="codeline" id="line-610"><code></code></span>
+<span class="codeline" id="line-611"><code>	err = c.config.writeKeyLog(keyLogLabelClientTraffic, hs.hello.random, hs.trafficSecret)</code></span>
+<span class="codeline" id="line-612"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-613"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-614"><code>		return err</code></span>
+<span class="codeline" id="line-615"><code>	}</code></span>
+<span class="codeline" id="line-616"><code>	err = c.config.writeKeyLog(keyLogLabelServerTraffic, hs.hello.random, serverSecret)</code></span>
+<span class="codeline" id="line-617"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-618"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-619"><code>		return err</code></span>
+<span class="codeline" id="line-620"><code>	}</code></span>
+<span class="codeline" id="line-621"><code></code></span>
+<span class="codeline" id="line-622"><code>	c.ekm = hs.suite.exportKeyingMaterial(hs.masterSecret, hs.transcript)</code></span>
+<span class="codeline" id="line-623"><code></code></span>
+<span class="codeline" id="line-624"><code>	return nil</code></span>
+<span class="codeline" id="line-625"><code>}</code></span>
+<span class="codeline" id="line-626"><code></code></span>
+<span class="codeline" id="line-627"><code>func (hs *clientHandshakeStateTLS13) sendClientCertificate() error {</code></span>
+<span class="codeline" id="line-628"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-629"><code></code></span>
+<span class="codeline" id="line-630"><code>	if hs.certReq == nil {</code></span>
+<span class="codeline" id="line-631"><code>		return nil</code></span>
+<span class="codeline" id="line-632"><code>	}</code></span>
+<span class="codeline" id="line-633"><code></code></span>
+<span class="codeline" id="line-634"><code>	cert, err := c.getClientCertificate(&amp;CertificateRequestInfo{</code></span>
+<span class="codeline" id="line-635"><code>		AcceptableCAs:    hs.certReq.certificateAuthorities,</code></span>
+<span class="codeline" id="line-636"><code>		SignatureSchemes: hs.certReq.supportedSignatureAlgorithms,</code></span>
+<span class="codeline" id="line-637"><code>		Version:          c.vers,</code></span>
+<span class="codeline" id="line-638"><code>		ctx:              hs.ctx,</code></span>
+<span class="codeline" id="line-639"><code>	})</code></span>
+<span class="codeline" id="line-640"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-641"><code>		return err</code></span>
+<span class="codeline" id="line-642"><code>	}</code></span>
+<span class="codeline" id="line-643"><code></code></span>
+<span class="codeline" id="line-644"><code>	certMsg := new(certificateMsgTLS13)</code></span>
+<span class="codeline" id="line-645"><code></code></span>
+<span class="codeline" id="line-646"><code>	certMsg.certificate = *cert</code></span>
+<span class="codeline" id="line-647"><code>	certMsg.scts = hs.certReq.scts &amp;&amp; len(cert.SignedCertificateTimestamps) &gt; 0</code></span>
+<span class="codeline" id="line-648"><code>	certMsg.ocspStapling = hs.certReq.ocspStapling &amp;&amp; len(cert.OCSPStaple) &gt; 0</code></span>
+<span class="codeline" id="line-649"><code></code></span>
+<span class="codeline" id="line-650"><code>	if _, err := hs.c.writeHandshakeRecord(certMsg, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-651"><code>		return err</code></span>
+<span class="codeline" id="line-652"><code>	}</code></span>
+<span class="codeline" id="line-653"><code></code></span>
+<span class="codeline" id="line-654"><code>	// If we sent an empty certificate message, skip the CertificateVerify.</code></span>
+<span class="codeline" id="line-655"><code>	if len(cert.Certificate) == 0 {</code></span>
+<span class="codeline" id="line-656"><code>		return nil</code></span>
+<span class="codeline" id="line-657"><code>	}</code></span>
+<span class="codeline" id="line-658"><code></code></span>
+<span class="codeline" id="line-659"><code>	certVerifyMsg := new(certificateVerifyMsg)</code></span>
+<span class="codeline" id="line-660"><code>	certVerifyMsg.hasSignatureAlgorithm = true</code></span>
+<span class="codeline" id="line-661"><code></code></span>
+<span class="codeline" id="line-662"><code>	certVerifyMsg.signatureAlgorithm, err = selectSignatureScheme(c.vers, cert, hs.certReq.supportedSignatureAlgorithms)</code></span>
+<span class="codeline" id="line-663"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-664"><code>		// getClientCertificate returned a certificate incompatible with the</code></span>
+<span class="codeline" id="line-665"><code>		// CertificateRequestInfo supported signature algorithms.</code></span>
+<span class="codeline" id="line-666"><code>		c.sendAlert(alertHandshakeFailure)</code></span>
+<span class="codeline" id="line-667"><code>		return err</code></span>
+<span class="codeline" id="line-668"><code>	}</code></span>
+<span class="codeline" id="line-669"><code></code></span>
+<span class="codeline" id="line-670"><code>	sigType, sigHash, err := typeAndHashFromSignatureScheme(certVerifyMsg.signatureAlgorithm)</code></span>
+<span class="codeline" id="line-671"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-672"><code>		return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-673"><code>	}</code></span>
+<span class="codeline" id="line-674"><code></code></span>
+<span class="codeline" id="line-675"><code>	signed := signedMessage(sigHash, clientSignatureContext, hs.transcript)</code></span>
+<span class="codeline" id="line-676"><code>	signOpts := crypto.SignerOpts(sigHash)</code></span>
+<span class="codeline" id="line-677"><code>	if sigType == signatureRSAPSS {</code></span>
+<span class="codeline" id="line-678"><code>		signOpts = &amp;rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: sigHash}</code></span>
+<span class="codeline" id="line-679"><code>	}</code></span>
+<span class="codeline" id="line-680"><code>	sig, err := cert.PrivateKey.(crypto.Signer).Sign(c.config.rand(), signed, signOpts)</code></span>
+<span class="codeline" id="line-681"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-682"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-683"><code>		return errors.New("tls: failed to sign handshake: " + err.Error())</code></span>
+<span class="codeline" id="line-684"><code>	}</code></span>
+<span class="codeline" id="line-685"><code>	certVerifyMsg.signature = sig</code></span>
+<span class="codeline" id="line-686"><code></code></span>
+<span class="codeline" id="line-687"><code>	if _, err := hs.c.writeHandshakeRecord(certVerifyMsg, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-688"><code>		return err</code></span>
+<span class="codeline" id="line-689"><code>	}</code></span>
+<span class="codeline" id="line-690"><code></code></span>
+<span class="codeline" id="line-691"><code>	return nil</code></span>
+<span class="codeline" id="line-692"><code>}</code></span>
+<span class="codeline" id="line-693"><code></code></span>
+<span class="codeline" id="line-694"><code>func (hs *clientHandshakeStateTLS13) sendClientFinished() error {</code></span>
+<span class="codeline" id="line-695"><code>	c := hs.c</code></span>
+<span class="codeline" id="line-696"><code></code></span>
+<span class="codeline" id="line-697"><code>	finished := &amp;finishedMsg{</code></span>
+<span class="codeline" id="line-698"><code>		verifyData: hs.suite.finishedHash(c.out.trafficSecret, hs.transcript),</code></span>
+<span class="codeline" id="line-699"><code>	}</code></span>
+<span class="codeline" id="line-700"><code></code></span>
+<span class="codeline" id="line-701"><code>	if _, err := hs.c.writeHandshakeRecord(finished, hs.transcript); err != nil {</code></span>
+<span class="codeline" id="line-702"><code>		return err</code></span>
+<span class="codeline" id="line-703"><code>	}</code></span>
+<span class="codeline" id="line-704"><code></code></span>
+<span class="codeline" id="line-705"><code>	c.out.setTrafficSecret(hs.suite, QUICEncryptionLevelApplication, hs.trafficSecret)</code></span>
+<span class="codeline" id="line-706"><code></code></span>
+<span class="codeline" id="line-707"><code>	if !c.config.SessionTicketsDisabled &amp;&amp; c.config.ClientSessionCache != nil {</code></span>
+<span class="codeline" id="line-708"><code>		c.resumptionSecret = hs.suite.deriveSecret(hs.masterSecret,</code></span>
+<span class="codeline" id="line-709"><code>			resumptionLabel, hs.transcript)</code></span>
+<span class="codeline" id="line-710"><code>	}</code></span>
+<span class="codeline" id="line-711"><code></code></span>
+<span class="codeline" id="line-712"><code>	if c.quic != nil {</code></span>
+<span class="codeline" id="line-713"><code>		if c.hand.Len() != 0 {</code></span>
+<span class="codeline" id="line-714"><code>			c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-715"><code>		}</code></span>
+<span class="codeline" id="line-716"><code>		c.quicSetWriteSecret(QUICEncryptionLevelApplication, hs.suite.id, hs.trafficSecret)</code></span>
+<span class="codeline" id="line-717"><code>	}</code></span>
+<span class="codeline" id="line-718"><code></code></span>
+<span class="codeline" id="line-719"><code>	return nil</code></span>
+<span class="codeline" id="line-720"><code>}</code></span>
+<span class="codeline" id="line-721"><code></code></span>
+<span class="codeline" id="line-722"><code>func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {</code></span>
+<span class="codeline" id="line-723"><code>	if !c.isClient {</code></span>
+<span class="codeline" id="line-724"><code>		c.sendAlert(alertUnexpectedMessage)</code></span>
+<span class="codeline" id="line-725"><code>		return errors.New("tls: received new session ticket from a client")</code></span>
+<span class="codeline" id="line-726"><code>	}</code></span>
+<span class="codeline" id="line-727"><code></code></span>
+<span class="codeline" id="line-728"><code>	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {</code></span>
+<span class="codeline" id="line-729"><code>		return nil</code></span>
+<span class="codeline" id="line-730"><code>	}</code></span>
+<span class="codeline" id="line-731"><code></code></span>
+<span class="codeline" id="line-732"><code>	// See RFC 8446, Section 4.6.1.</code></span>
+<span class="codeline" id="line-733"><code>	if msg.lifetime == 0 {</code></span>
+<span class="codeline" id="line-734"><code>		return nil</code></span>
+<span class="codeline" id="line-735"><code>	}</code></span>
+<span class="codeline" id="line-736"><code>	lifetime := time.Duration(msg.lifetime) * time.Second</code></span>
+<span class="codeline" id="line-737"><code>	if lifetime &gt; maxSessionTicketLifetime {</code></span>
+<span class="codeline" id="line-738"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-739"><code>		return errors.New("tls: received a session ticket with invalid lifetime")</code></span>
+<span class="codeline" id="line-740"><code>	}</code></span>
+<span class="codeline" id="line-741"><code></code></span>
+<span class="codeline" id="line-742"><code>	// RFC 9001, Section 4.6.1</code></span>
+<span class="codeline" id="line-743"><code>	if c.quic != nil &amp;&amp; msg.maxEarlyData != 0 &amp;&amp; msg.maxEarlyData != 0xffffffff {</code></span>
+<span class="codeline" id="line-744"><code>		c.sendAlert(alertIllegalParameter)</code></span>
+<span class="codeline" id="line-745"><code>		return errors.New("tls: invalid early data for QUIC connection")</code></span>
+<span class="codeline" id="line-746"><code>	}</code></span>
+<span class="codeline" id="line-747"><code></code></span>
+<span class="codeline" id="line-748"><code>	cipherSuite := cipherSuiteTLS13ByID(c.cipherSuite)</code></span>
+<span class="codeline" id="line-749"><code>	if cipherSuite == nil || c.resumptionSecret == nil {</code></span>
+<span class="codeline" id="line-750"><code>		return c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-751"><code>	}</code></span>
+<span class="codeline" id="line-752"><code></code></span>
+<span class="codeline" id="line-753"><code>	psk := cipherSuite.expandLabel(c.resumptionSecret, "resumption",</code></span>
+<span class="codeline" id="line-754"><code>		msg.nonce, cipherSuite.hash.Size())</code></span>
+<span class="codeline" id="line-755"><code></code></span>
+<span class="codeline" id="line-756"><code>	session, err := c.sessionState()</code></span>
+<span class="codeline" id="line-757"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-758"><code>		c.sendAlert(alertInternalError)</code></span>
+<span class="codeline" id="line-759"><code>		return err</code></span>
+<span class="codeline" id="line-760"><code>	}</code></span>
+<span class="codeline" id="line-761"><code>	session.secret = psk</code></span>
+<span class="codeline" id="line-762"><code>	session.useBy = uint64(c.config.time().Add(lifetime).Unix())</code></span>
+<span class="codeline" id="line-763"><code>	session.ageAdd = msg.ageAdd</code></span>
+<span class="codeline" id="line-764"><code>	session.EarlyData = c.quic != nil &amp;&amp; msg.maxEarlyData == 0xffffffff // RFC 9001, Section 4.6.1</code></span>
+<span class="codeline" id="line-765"><code>	cs := &amp;ClientSessionState{ticket: msg.label, session: session}</code></span>
+<span class="codeline" id="line-766"><code></code></span>
+<span class="codeline" id="line-767"><code>	if cacheKey := c.clientSessionCacheKey(); cacheKey != "" {</code></span>
+<span class="codeline" id="line-768"><code>		c.config.ClientSessionCache.Put(cacheKey, cs)</code></span>
+<span class="codeline" id="line-769"><code>	}</code></span>
+<span class="codeline" id="line-770"><code></code></span>
+<span class="codeline" id="line-771"><code>	return nil</code></span>
+<span class="codeline" id="line-772"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

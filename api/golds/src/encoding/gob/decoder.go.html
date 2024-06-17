@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: decoder.go in package encoding/gob</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	decoder.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/encoding/gob.html">encoding/gob</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package gob</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bufio"</code></span>
+<span class="codeline" id="line-9"><code>	"errors"</code></span>
+<span class="codeline" id="line-10"><code>	"internal/saferio"</code></span>
+<span class="codeline" id="line-11"><code>	"io"</code></span>
+<span class="codeline" id="line-12"><code>	"reflect"</code></span>
+<span class="codeline" id="line-13"><code>	"sync"</code></span>
+<span class="codeline" id="line-14"><code>)</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// tooBig provides a sanity check for sizes; used in several places. Upper limit</code></span>
+<span class="codeline" id="line-17"><code>// of is 1GB on 32-bit systems, 8GB on 64-bit, allowing room to grow a little</code></span>
+<span class="codeline" id="line-18"><code>// without overflow.</code></span>
+<span class="codeline" id="line-19"><code>const tooBig = (1 &lt;&lt; 30) &lt;&lt; (^uint(0) &gt;&gt; 62)</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>// A Decoder manages the receipt of type and data information read from the</code></span>
+<span class="codeline" id="line-22"><code>// remote side of a connection.  It is safe for concurrent use by multiple</code></span>
+<span class="codeline" id="line-23"><code>// goroutines.</code></span>
+<span class="codeline" id="line-24"><code>//</code></span>
+<span class="codeline" id="line-25"><code>// The Decoder does only basic sanity checking on decoded input sizes,</code></span>
+<span class="codeline" id="line-26"><code>// and its limits are not configurable. Take caution when decoding gob data</code></span>
+<span class="codeline" id="line-27"><code>// from untrusted sources.</code></span>
+<span class="codeline" id="line-28"><code>type Decoder struct {</code></span>
+<span class="codeline" id="line-29"><code>	mutex        sync.Mutex                              // each item must be received atomically</code></span>
+<span class="codeline" id="line-30"><code>	r            io.Reader                               // source of the data</code></span>
+<span class="codeline" id="line-31"><code>	buf          decBuffer                               // buffer for more efficient i/o from r</code></span>
+<span class="codeline" id="line-32"><code>	wireType     map[typeId]*wireType                    // map from remote ID to local description</code></span>
+<span class="codeline" id="line-33"><code>	decoderCache map[reflect.Type]map[typeId]**decEngine // cache of compiled engines</code></span>
+<span class="codeline" id="line-34"><code>	ignorerCache map[typeId]**decEngine                  // ditto for ignored objects</code></span>
+<span class="codeline" id="line-35"><code>	freeList     *decoderState                           // list of free decoderStates; avoids reallocation</code></span>
+<span class="codeline" id="line-36"><code>	countBuf     []byte                                  // used for decoding integers while parsing messages</code></span>
+<span class="codeline" id="line-37"><code>	err          error</code></span>
+<span class="codeline" id="line-38"><code>}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>// NewDecoder returns a new decoder that reads from the [io.Reader].</code></span>
+<span class="codeline" id="line-41"><code>// If r does not also implement [io.ByteReader], it will be wrapped in a</code></span>
+<span class="codeline" id="line-42"><code>// [bufio.Reader].</code></span>
+<span class="codeline" id="line-43"><code>func NewDecoder(r io.Reader) *Decoder {</code></span>
+<span class="codeline" id="line-44"><code>	dec := new(Decoder)</code></span>
+<span class="codeline" id="line-45"><code>	// We use the ability to read bytes as a plausible surrogate for buffering.</code></span>
+<span class="codeline" id="line-46"><code>	if _, ok := r.(io.ByteReader); !ok {</code></span>
+<span class="codeline" id="line-47"><code>		r = bufio.NewReader(r)</code></span>
+<span class="codeline" id="line-48"><code>	}</code></span>
+<span class="codeline" id="line-49"><code>	dec.r = r</code></span>
+<span class="codeline" id="line-50"><code>	dec.wireType = make(map[typeId]*wireType)</code></span>
+<span class="codeline" id="line-51"><code>	dec.decoderCache = make(map[reflect.Type]map[typeId]**decEngine)</code></span>
+<span class="codeline" id="line-52"><code>	dec.ignorerCache = make(map[typeId]**decEngine)</code></span>
+<span class="codeline" id="line-53"><code>	dec.countBuf = make([]byte, 9) // counts may be uint64s (unlikely!), require 9 bytes</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>	return dec</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// recvType loads the definition of a type.</code></span>
+<span class="codeline" id="line-59"><code>func (dec *Decoder) recvType(id typeId) {</code></span>
+<span class="codeline" id="line-60"><code>	// Have we already seen this type? That's an error</code></span>
+<span class="codeline" id="line-61"><code>	if id &lt; firstUserId || dec.wireType[id] != nil {</code></span>
+<span class="codeline" id="line-62"><code>		dec.err = errors.New("gob: duplicate type received")</code></span>
+<span class="codeline" id="line-63"><code>		return</code></span>
+<span class="codeline" id="line-64"><code>	}</code></span>
+<span class="codeline" id="line-65"><code></code></span>
+<span class="codeline" id="line-66"><code>	// Type:</code></span>
+<span class="codeline" id="line-67"><code>	wire := new(wireType)</code></span>
+<span class="codeline" id="line-68"><code>	dec.decodeValue(tWireType, reflect.ValueOf(wire))</code></span>
+<span class="codeline" id="line-69"><code>	if dec.err != nil {</code></span>
+<span class="codeline" id="line-70"><code>		return</code></span>
+<span class="codeline" id="line-71"><code>	}</code></span>
+<span class="codeline" id="line-72"><code>	// Remember we've seen this type.</code></span>
+<span class="codeline" id="line-73"><code>	dec.wireType[id] = wire</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>var errBadCount = errors.New("invalid message length")</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>// recvMessage reads the next count-delimited item from the input. It is the converse</code></span>
+<span class="codeline" id="line-79"><code>// of Encoder.writeMessage. It returns false on EOF or other error reading the message.</code></span>
+<span class="codeline" id="line-80"><code>func (dec *Decoder) recvMessage() bool {</code></span>
+<span class="codeline" id="line-81"><code>	// Read a count.</code></span>
+<span class="codeline" id="line-82"><code>	nbytes, _, err := decodeUintReader(dec.r, dec.countBuf)</code></span>
+<span class="codeline" id="line-83"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-84"><code>		dec.err = err</code></span>
+<span class="codeline" id="line-85"><code>		return false</code></span>
+<span class="codeline" id="line-86"><code>	}</code></span>
+<span class="codeline" id="line-87"><code>	if nbytes &gt;= tooBig {</code></span>
+<span class="codeline" id="line-88"><code>		dec.err = errBadCount</code></span>
+<span class="codeline" id="line-89"><code>		return false</code></span>
+<span class="codeline" id="line-90"><code>	}</code></span>
+<span class="codeline" id="line-91"><code>	dec.readMessage(int(nbytes))</code></span>
+<span class="codeline" id="line-92"><code>	return dec.err == nil</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>// readMessage reads the next nbytes bytes from the input.</code></span>
+<span class="codeline" id="line-96"><code>func (dec *Decoder) readMessage(nbytes int) {</code></span>
+<span class="codeline" id="line-97"><code>	if dec.buf.Len() != 0 {</code></span>
+<span class="codeline" id="line-98"><code>		// The buffer should always be empty now.</code></span>
+<span class="codeline" id="line-99"><code>		panic("non-empty decoder buffer")</code></span>
+<span class="codeline" id="line-100"><code>	}</code></span>
+<span class="codeline" id="line-101"><code>	// Read the data</code></span>
+<span class="codeline" id="line-102"><code>	var buf []byte</code></span>
+<span class="codeline" id="line-103"><code>	buf, dec.err = saferio.ReadData(dec.r, uint64(nbytes))</code></span>
+<span class="codeline" id="line-104"><code>	dec.buf.SetBytes(buf)</code></span>
+<span class="codeline" id="line-105"><code>	if dec.err == io.EOF {</code></span>
+<span class="codeline" id="line-106"><code>		dec.err = io.ErrUnexpectedEOF</code></span>
+<span class="codeline" id="line-107"><code>	}</code></span>
+<span class="codeline" id="line-108"><code>}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>// toInt turns an encoded uint64 into an int, according to the marshaling rules.</code></span>
+<span class="codeline" id="line-111"><code>func toInt(x uint64) int64 {</code></span>
+<span class="codeline" id="line-112"><code>	i := int64(x &gt;&gt; 1)</code></span>
+<span class="codeline" id="line-113"><code>	if x&amp;1 != 0 {</code></span>
+<span class="codeline" id="line-114"><code>		i = ^i</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	return i</code></span>
+<span class="codeline" id="line-117"><code>}</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>func (dec *Decoder) nextInt() int64 {</code></span>
+<span class="codeline" id="line-120"><code>	n, _, err := decodeUintReader(&amp;dec.buf, dec.countBuf)</code></span>
+<span class="codeline" id="line-121"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-122"><code>		dec.err = err</code></span>
+<span class="codeline" id="line-123"><code>	}</code></span>
+<span class="codeline" id="line-124"><code>	return toInt(n)</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>func (dec *Decoder) nextUint() uint64 {</code></span>
+<span class="codeline" id="line-128"><code>	n, _, err := decodeUintReader(&amp;dec.buf, dec.countBuf)</code></span>
+<span class="codeline" id="line-129"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-130"><code>		dec.err = err</code></span>
+<span class="codeline" id="line-131"><code>	}</code></span>
+<span class="codeline" id="line-132"><code>	return n</code></span>
+<span class="codeline" id="line-133"><code>}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>// decodeTypeSequence parses:</code></span>
+<span class="codeline" id="line-136"><code>// TypeSequence</code></span>
+<span class="codeline" id="line-137"><code>//</code></span>
+<span class="codeline" id="line-138"><code>//	(TypeDefinition DelimitedTypeDefinition*)?</code></span>
+<span class="codeline" id="line-139"><code>//</code></span>
+<span class="codeline" id="line-140"><code>// and returns the type id of the next value. It returns -1 at</code></span>
+<span class="codeline" id="line-141"><code>// EOF.  Upon return, the remainder of dec.buf is the value to be</code></span>
+<span class="codeline" id="line-142"><code>// decoded. If this is an interface value, it can be ignored by</code></span>
+<span class="codeline" id="line-143"><code>// resetting that buffer.</code></span>
+<span class="codeline" id="line-144"><code>func (dec *Decoder) decodeTypeSequence(isInterface bool) typeId {</code></span>
+<span class="codeline" id="line-145"><code>	firstMessage := true</code></span>
+<span class="codeline" id="line-146"><code>	for dec.err == nil {</code></span>
+<span class="codeline" id="line-147"><code>		if dec.buf.Len() == 0 {</code></span>
+<span class="codeline" id="line-148"><code>			if !dec.recvMessage() {</code></span>
+<span class="codeline" id="line-149"><code>				// We can only return io.EOF if the input was empty.</code></span>
+<span class="codeline" id="line-150"><code>				// If we read one or more type spec messages,</code></span>
+<span class="codeline" id="line-151"><code>				// require a data item message to follow.</code></span>
+<span class="codeline" id="line-152"><code>				// If we hit an EOF before that, then give ErrUnexpectedEOF.</code></span>
+<span class="codeline" id="line-153"><code>				if !firstMessage &amp;&amp; dec.err == io.EOF {</code></span>
+<span class="codeline" id="line-154"><code>					dec.err = io.ErrUnexpectedEOF</code></span>
+<span class="codeline" id="line-155"><code>				}</code></span>
+<span class="codeline" id="line-156"><code>				break</code></span>
+<span class="codeline" id="line-157"><code>			}</code></span>
+<span class="codeline" id="line-158"><code>		}</code></span>
+<span class="codeline" id="line-159"><code>		// Receive a type id.</code></span>
+<span class="codeline" id="line-160"><code>		id := typeId(dec.nextInt())</code></span>
+<span class="codeline" id="line-161"><code>		if id &gt;= 0 {</code></span>
+<span class="codeline" id="line-162"><code>			// Value follows.</code></span>
+<span class="codeline" id="line-163"><code>			return id</code></span>
+<span class="codeline" id="line-164"><code>		}</code></span>
+<span class="codeline" id="line-165"><code>		// Type definition for (-id) follows.</code></span>
+<span class="codeline" id="line-166"><code>		dec.recvType(-id)</code></span>
+<span class="codeline" id="line-167"><code>		if dec.err != nil {</code></span>
+<span class="codeline" id="line-168"><code>			break</code></span>
+<span class="codeline" id="line-169"><code>		}</code></span>
+<span class="codeline" id="line-170"><code>		// When decoding an interface, after a type there may be a</code></span>
+<span class="codeline" id="line-171"><code>		// DelimitedValue still in the buffer. Skip its count.</code></span>
+<span class="codeline" id="line-172"><code>		// (Alternatively, the buffer is empty and the byte count</code></span>
+<span class="codeline" id="line-173"><code>		// will be absorbed by recvMessage.)</code></span>
+<span class="codeline" id="line-174"><code>		if dec.buf.Len() &gt; 0 {</code></span>
+<span class="codeline" id="line-175"><code>			if !isInterface {</code></span>
+<span class="codeline" id="line-176"><code>				dec.err = errors.New("extra data in buffer")</code></span>
+<span class="codeline" id="line-177"><code>				break</code></span>
+<span class="codeline" id="line-178"><code>			}</code></span>
+<span class="codeline" id="line-179"><code>			dec.nextUint()</code></span>
+<span class="codeline" id="line-180"><code>		}</code></span>
+<span class="codeline" id="line-181"><code>		firstMessage = false</code></span>
+<span class="codeline" id="line-182"><code>	}</code></span>
+<span class="codeline" id="line-183"><code>	return -1</code></span>
+<span class="codeline" id="line-184"><code>}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>// Decode reads the next value from the input stream and stores</code></span>
+<span class="codeline" id="line-187"><code>// it in the data represented by the empty interface value.</code></span>
+<span class="codeline" id="line-188"><code>// If e is nil, the value will be discarded. Otherwise,</code></span>
+<span class="codeline" id="line-189"><code>// the value underlying e must be a pointer to the</code></span>
+<span class="codeline" id="line-190"><code>// correct type for the next data item received.</code></span>
+<span class="codeline" id="line-191"><code>// If the input is at EOF, Decode returns [io.EOF] and</code></span>
+<span class="codeline" id="line-192"><code>// does not modify e.</code></span>
+<span class="codeline" id="line-193"><code>func (dec *Decoder) Decode(e any) error {</code></span>
+<span class="codeline" id="line-194"><code>	if e == nil {</code></span>
+<span class="codeline" id="line-195"><code>		return dec.DecodeValue(reflect.Value{})</code></span>
+<span class="codeline" id="line-196"><code>	}</code></span>
+<span class="codeline" id="line-197"><code>	value := reflect.ValueOf(e)</code></span>
+<span class="codeline" id="line-198"><code>	// If e represents a value as opposed to a pointer, the answer won't</code></span>
+<span class="codeline" id="line-199"><code>	// get back to the caller. Make sure it's a pointer.</code></span>
+<span class="codeline" id="line-200"><code>	if value.Type().Kind() != reflect.Pointer {</code></span>
+<span class="codeline" id="line-201"><code>		dec.err = errors.New("gob: attempt to decode into a non-pointer")</code></span>
+<span class="codeline" id="line-202"><code>		return dec.err</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code>	return dec.DecodeValue(value)</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>// DecodeValue reads the next value from the input stream.</code></span>
+<span class="codeline" id="line-208"><code>// If v is the zero reflect.Value (v.Kind() == Invalid), DecodeValue discards the value.</code></span>
+<span class="codeline" id="line-209"><code>// Otherwise, it stores the value into v. In that case, v must represent</code></span>
+<span class="codeline" id="line-210"><code>// a non-nil pointer to data or be an assignable reflect.Value (v.CanSet())</code></span>
+<span class="codeline" id="line-211"><code>// If the input is at EOF, DecodeValue returns [io.EOF] and</code></span>
+<span class="codeline" id="line-212"><code>// does not modify v.</code></span>
+<span class="codeline" id="line-213"><code>func (dec *Decoder) DecodeValue(v reflect.Value) error {</code></span>
+<span class="codeline" id="line-214"><code>	if v.IsValid() {</code></span>
+<span class="codeline" id="line-215"><code>		if v.Kind() == reflect.Pointer &amp;&amp; !v.IsNil() {</code></span>
+<span class="codeline" id="line-216"><code>			// That's okay, we'll store through the pointer.</code></span>
+<span class="codeline" id="line-217"><code>		} else if !v.CanSet() {</code></span>
+<span class="codeline" id="line-218"><code>			return errors.New("gob: DecodeValue of unassignable value")</code></span>
+<span class="codeline" id="line-219"><code>		}</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code>	// Make sure we're single-threaded through here.</code></span>
+<span class="codeline" id="line-222"><code>	dec.mutex.Lock()</code></span>
+<span class="codeline" id="line-223"><code>	defer dec.mutex.Unlock()</code></span>
+<span class="codeline" id="line-224"><code></code></span>
+<span class="codeline" id="line-225"><code>	dec.buf.Reset() // In case data lingers from previous invocation.</code></span>
+<span class="codeline" id="line-226"><code>	dec.err = nil</code></span>
+<span class="codeline" id="line-227"><code>	id := dec.decodeTypeSequence(false)</code></span>
+<span class="codeline" id="line-228"><code>	if dec.err == nil {</code></span>
+<span class="codeline" id="line-229"><code>		dec.decodeValue(id, v)</code></span>
+<span class="codeline" id="line-230"><code>	}</code></span>
+<span class="codeline" id="line-231"><code>	return dec.err</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>// If debug.go is compiled into the program, debugFunc prints a human-readable</code></span>
+<span class="codeline" id="line-235"><code>// representation of the gob data read from r by calling that file's Debug function.</code></span>
+<span class="codeline" id="line-236"><code>// Otherwise it is nil.</code></span>
+<span class="codeline" id="line-237"><code>var debugFunc func(io.Reader)</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

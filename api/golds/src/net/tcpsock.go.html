@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: tcpsock.go in package net</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	tcpsock.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/net.html">net</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package net</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"context"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/itoa"</code></span>
+<span class="codeline" id="line-10"><code>	"io"</code></span>
+<span class="codeline" id="line-11"><code>	"net/netip"</code></span>
+<span class="codeline" id="line-12"><code>	"os"</code></span>
+<span class="codeline" id="line-13"><code>	"syscall"</code></span>
+<span class="codeline" id="line-14"><code>	"time"</code></span>
+<span class="codeline" id="line-15"><code>)</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>// BUG(mikio): On JS and Windows, the File method of TCPConn and</code></span>
+<span class="codeline" id="line-18"><code>// TCPListener is not implemented.</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>// TCPAddr represents the address of a TCP end point.</code></span>
+<span class="codeline" id="line-21"><code>type TCPAddr struct {</code></span>
+<span class="codeline" id="line-22"><code>	IP   IP</code></span>
+<span class="codeline" id="line-23"><code>	Port int</code></span>
+<span class="codeline" id="line-24"><code>	Zone string // IPv6 scoped addressing zone</code></span>
+<span class="codeline" id="line-25"><code>}</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>// AddrPort returns the [TCPAddr] a as a [netip.AddrPort].</code></span>
+<span class="codeline" id="line-28"><code>//</code></span>
+<span class="codeline" id="line-29"><code>// If a.Port does not fit in a uint16, it's silently truncated.</code></span>
+<span class="codeline" id="line-30"><code>//</code></span>
+<span class="codeline" id="line-31"><code>// If a is nil, a zero value is returned.</code></span>
+<span class="codeline" id="line-32"><code>func (a *TCPAddr) AddrPort() netip.AddrPort {</code></span>
+<span class="codeline" id="line-33"><code>	if a == nil {</code></span>
+<span class="codeline" id="line-34"><code>		return netip.AddrPort{}</code></span>
+<span class="codeline" id="line-35"><code>	}</code></span>
+<span class="codeline" id="line-36"><code>	na, _ := netip.AddrFromSlice(a.IP)</code></span>
+<span class="codeline" id="line-37"><code>	na = na.WithZone(a.Zone)</code></span>
+<span class="codeline" id="line-38"><code>	return netip.AddrPortFrom(na, uint16(a.Port))</code></span>
+<span class="codeline" id="line-39"><code>}</code></span>
+<span class="codeline" id="line-40"><code></code></span>
+<span class="codeline" id="line-41"><code>// Network returns the address's network name, "tcp".</code></span>
+<span class="codeline" id="line-42"><code>func (a *TCPAddr) Network() string { return "tcp" }</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>func (a *TCPAddr) String() string {</code></span>
+<span class="codeline" id="line-45"><code>	if a == nil {</code></span>
+<span class="codeline" id="line-46"><code>		return "&lt;nil&gt;"</code></span>
+<span class="codeline" id="line-47"><code>	}</code></span>
+<span class="codeline" id="line-48"><code>	ip := ipEmptyString(a.IP)</code></span>
+<span class="codeline" id="line-49"><code>	if a.Zone != "" {</code></span>
+<span class="codeline" id="line-50"><code>		return JoinHostPort(ip+"%"+a.Zone, itoa.Itoa(a.Port))</code></span>
+<span class="codeline" id="line-51"><code>	}</code></span>
+<span class="codeline" id="line-52"><code>	return JoinHostPort(ip, itoa.Itoa(a.Port))</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>func (a *TCPAddr) isWildcard() bool {</code></span>
+<span class="codeline" id="line-56"><code>	if a == nil || a.IP == nil {</code></span>
+<span class="codeline" id="line-57"><code>		return true</code></span>
+<span class="codeline" id="line-58"><code>	}</code></span>
+<span class="codeline" id="line-59"><code>	return a.IP.IsUnspecified()</code></span>
+<span class="codeline" id="line-60"><code>}</code></span>
+<span class="codeline" id="line-61"><code></code></span>
+<span class="codeline" id="line-62"><code>func (a *TCPAddr) opAddr() Addr {</code></span>
+<span class="codeline" id="line-63"><code>	if a == nil {</code></span>
+<span class="codeline" id="line-64"><code>		return nil</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code>	return a</code></span>
+<span class="codeline" id="line-67"><code>}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>// ResolveTCPAddr returns an address of TCP end point.</code></span>
+<span class="codeline" id="line-70"><code>//</code></span>
+<span class="codeline" id="line-71"><code>// The network must be a TCP network name.</code></span>
+<span class="codeline" id="line-72"><code>//</code></span>
+<span class="codeline" id="line-73"><code>// If the host in the address parameter is not a literal IP address or</code></span>
+<span class="codeline" id="line-74"><code>// the port is not a literal port number, ResolveTCPAddr resolves the</code></span>
+<span class="codeline" id="line-75"><code>// address to an address of TCP end point.</code></span>
+<span class="codeline" id="line-76"><code>// Otherwise, it parses the address as a pair of literal IP address</code></span>
+<span class="codeline" id="line-77"><code>// and port number.</code></span>
+<span class="codeline" id="line-78"><code>// The address parameter can use a host name, but this is not</code></span>
+<span class="codeline" id="line-79"><code>// recommended, because it will return at most one of the host name's</code></span>
+<span class="codeline" id="line-80"><code>// IP addresses.</code></span>
+<span class="codeline" id="line-81"><code>//</code></span>
+<span class="codeline" id="line-82"><code>// See func [Dial] for a description of the network and address</code></span>
+<span class="codeline" id="line-83"><code>// parameters.</code></span>
+<span class="codeline" id="line-84"><code>func ResolveTCPAddr(network, address string) (*TCPAddr, error) {</code></span>
+<span class="codeline" id="line-85"><code>	switch network {</code></span>
+<span class="codeline" id="line-86"><code>	case "tcp", "tcp4", "tcp6":</code></span>
+<span class="codeline" id="line-87"><code>	case "": // a hint wildcard for Go 1.0 undocumented behavior</code></span>
+<span class="codeline" id="line-88"><code>		network = "tcp"</code></span>
+<span class="codeline" id="line-89"><code>	default:</code></span>
+<span class="codeline" id="line-90"><code>		return nil, UnknownNetworkError(network)</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code>	addrs, err := DefaultResolver.internetAddrList(context.Background(), network, address)</code></span>
+<span class="codeline" id="line-93"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-94"><code>		return nil, err</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code>	return addrs.forResolve(network, address).(*TCPAddr), nil</code></span>
+<span class="codeline" id="line-97"><code>}</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>// TCPAddrFromAddrPort returns addr as a [TCPAddr]. If addr.IsValid() is false,</code></span>
+<span class="codeline" id="line-100"><code>// then the returned TCPAddr will contain a nil IP field, indicating an</code></span>
+<span class="codeline" id="line-101"><code>// address family-agnostic unspecified address.</code></span>
+<span class="codeline" id="line-102"><code>func TCPAddrFromAddrPort(addr netip.AddrPort) *TCPAddr {</code></span>
+<span class="codeline" id="line-103"><code>	return &amp;TCPAddr{</code></span>
+<span class="codeline" id="line-104"><code>		IP:   addr.Addr().AsSlice(),</code></span>
+<span class="codeline" id="line-105"><code>		Zone: addr.Addr().Zone(),</code></span>
+<span class="codeline" id="line-106"><code>		Port: int(addr.Port()),</code></span>
+<span class="codeline" id="line-107"><code>	}</code></span>
+<span class="codeline" id="line-108"><code>}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>// TCPConn is an implementation of the [Conn] interface for TCP network</code></span>
+<span class="codeline" id="line-111"><code>// connections.</code></span>
+<span class="codeline" id="line-112"><code>type TCPConn struct {</code></span>
+<span class="codeline" id="line-113"><code>	conn</code></span>
+<span class="codeline" id="line-114"><code>}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>// SyscallConn returns a raw network connection.</code></span>
+<span class="codeline" id="line-117"><code>// This implements the [syscall.Conn] interface.</code></span>
+<span class="codeline" id="line-118"><code>func (c *TCPConn) SyscallConn() (syscall.RawConn, error) {</code></span>
+<span class="codeline" id="line-119"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-120"><code>		return nil, syscall.EINVAL</code></span>
+<span class="codeline" id="line-121"><code>	}</code></span>
+<span class="codeline" id="line-122"><code>	return newRawConn(c.fd), nil</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// ReadFrom implements the [io.ReaderFrom] ReadFrom method.</code></span>
+<span class="codeline" id="line-126"><code>func (c *TCPConn) ReadFrom(r io.Reader) (int64, error) {</code></span>
+<span class="codeline" id="line-127"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-128"><code>		return 0, syscall.EINVAL</code></span>
+<span class="codeline" id="line-129"><code>	}</code></span>
+<span class="codeline" id="line-130"><code>	n, err := c.readFrom(r)</code></span>
+<span class="codeline" id="line-131"><code>	if err != nil &amp;&amp; err != io.EOF {</code></span>
+<span class="codeline" id="line-132"><code>		err = &amp;OpError{Op: "readfrom", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-133"><code>	}</code></span>
+<span class="codeline" id="line-134"><code>	return n, err</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>// WriteTo implements the io.WriterTo WriteTo method.</code></span>
+<span class="codeline" id="line-138"><code>func (c *TCPConn) WriteTo(w io.Writer) (int64, error) {</code></span>
+<span class="codeline" id="line-139"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-140"><code>		return 0, syscall.EINVAL</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code>	n, err := c.writeTo(w)</code></span>
+<span class="codeline" id="line-143"><code>	if err != nil &amp;&amp; err != io.EOF {</code></span>
+<span class="codeline" id="line-144"><code>		err = &amp;OpError{Op: "writeto", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-145"><code>	}</code></span>
+<span class="codeline" id="line-146"><code>	return n, err</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>// CloseRead shuts down the reading side of the TCP connection.</code></span>
+<span class="codeline" id="line-150"><code>// Most callers should just use Close.</code></span>
+<span class="codeline" id="line-151"><code>func (c *TCPConn) CloseRead() error {</code></span>
+<span class="codeline" id="line-152"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-153"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-154"><code>	}</code></span>
+<span class="codeline" id="line-155"><code>	if err := c.fd.closeRead(); err != nil {</code></span>
+<span class="codeline" id="line-156"><code>		return &amp;OpError{Op: "close", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code>	return nil</code></span>
+<span class="codeline" id="line-159"><code>}</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>// CloseWrite shuts down the writing side of the TCP connection.</code></span>
+<span class="codeline" id="line-162"><code>// Most callers should just use Close.</code></span>
+<span class="codeline" id="line-163"><code>func (c *TCPConn) CloseWrite() error {</code></span>
+<span class="codeline" id="line-164"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-165"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>	if err := c.fd.closeWrite(); err != nil {</code></span>
+<span class="codeline" id="line-168"><code>		return &amp;OpError{Op: "close", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code>	return nil</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>// SetLinger sets the behavior of Close on a connection which still</code></span>
+<span class="codeline" id="line-174"><code>// has data waiting to be sent or to be acknowledged.</code></span>
+<span class="codeline" id="line-175"><code>//</code></span>
+<span class="codeline" id="line-176"><code>// If sec &lt; 0 (the default), the operating system finishes sending the</code></span>
+<span class="codeline" id="line-177"><code>// data in the background.</code></span>
+<span class="codeline" id="line-178"><code>//</code></span>
+<span class="codeline" id="line-179"><code>// If sec == 0, the operating system discards any unsent or</code></span>
+<span class="codeline" id="line-180"><code>// unacknowledged data.</code></span>
+<span class="codeline" id="line-181"><code>//</code></span>
+<span class="codeline" id="line-182"><code>// If sec &gt; 0, the data is sent in the background as with sec &lt; 0.</code></span>
+<span class="codeline" id="line-183"><code>// On some operating systems including Linux, this may cause Close to block</code></span>
+<span class="codeline" id="line-184"><code>// until all data has been sent or discarded.</code></span>
+<span class="codeline" id="line-185"><code>// On some operating systems after sec seconds have elapsed any remaining</code></span>
+<span class="codeline" id="line-186"><code>// unsent data may be discarded.</code></span>
+<span class="codeline" id="line-187"><code>func (c *TCPConn) SetLinger(sec int) error {</code></span>
+<span class="codeline" id="line-188"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-189"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-190"><code>	}</code></span>
+<span class="codeline" id="line-191"><code>	if err := setLinger(c.fd, sec); err != nil {</code></span>
+<span class="codeline" id="line-192"><code>		return &amp;OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-193"><code>	}</code></span>
+<span class="codeline" id="line-194"><code>	return nil</code></span>
+<span class="codeline" id="line-195"><code>}</code></span>
+<span class="codeline" id="line-196"><code></code></span>
+<span class="codeline" id="line-197"><code>// SetKeepAlive sets whether the operating system should send</code></span>
+<span class="codeline" id="line-198"><code>// keep-alive messages on the connection.</code></span>
+<span class="codeline" id="line-199"><code>func (c *TCPConn) SetKeepAlive(keepalive bool) error {</code></span>
+<span class="codeline" id="line-200"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-201"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-202"><code>	}</code></span>
+<span class="codeline" id="line-203"><code>	if err := setKeepAlive(c.fd, keepalive); err != nil {</code></span>
+<span class="codeline" id="line-204"><code>		return &amp;OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-205"><code>	}</code></span>
+<span class="codeline" id="line-206"><code>	return nil</code></span>
+<span class="codeline" id="line-207"><code>}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>// SetKeepAlivePeriod sets period between keep-alives.</code></span>
+<span class="codeline" id="line-210"><code>func (c *TCPConn) SetKeepAlivePeriod(d time.Duration) error {</code></span>
+<span class="codeline" id="line-211"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-212"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-213"><code>	}</code></span>
+<span class="codeline" id="line-214"><code>	if err := setKeepAlivePeriod(c.fd, d); err != nil {</code></span>
+<span class="codeline" id="line-215"><code>		return &amp;OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-216"><code>	}</code></span>
+<span class="codeline" id="line-217"><code>	return nil</code></span>
+<span class="codeline" id="line-218"><code>}</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>// SetNoDelay controls whether the operating system should delay</code></span>
+<span class="codeline" id="line-221"><code>// packet transmission in hopes of sending fewer packets (Nagle's</code></span>
+<span class="codeline" id="line-222"><code>// algorithm).  The default is true (no delay), meaning that data is</code></span>
+<span class="codeline" id="line-223"><code>// sent as soon as possible after a Write.</code></span>
+<span class="codeline" id="line-224"><code>func (c *TCPConn) SetNoDelay(noDelay bool) error {</code></span>
+<span class="codeline" id="line-225"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-226"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-227"><code>	}</code></span>
+<span class="codeline" id="line-228"><code>	if err := setNoDelay(c.fd, noDelay); err != nil {</code></span>
+<span class="codeline" id="line-229"><code>		return &amp;OpError{Op: "set", Net: c.fd.net, Source: c.fd.laddr, Addr: c.fd.raddr, Err: err}</code></span>
+<span class="codeline" id="line-230"><code>	}</code></span>
+<span class="codeline" id="line-231"><code>	return nil</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>// MultipathTCP reports whether the ongoing connection is using MPTCP.</code></span>
+<span class="codeline" id="line-235"><code>//</code></span>
+<span class="codeline" id="line-236"><code>// If Multipath TCP is not supported by the host, by the other peer or</code></span>
+<span class="codeline" id="line-237"><code>// intentionally / accidentally filtered out by a device in between, a</code></span>
+<span class="codeline" id="line-238"><code>// fallback to TCP will be done. This method does its best to check if</code></span>
+<span class="codeline" id="line-239"><code>// MPTCP is still being used or not.</code></span>
+<span class="codeline" id="line-240"><code>//</code></span>
+<span class="codeline" id="line-241"><code>// On Linux, more conditions are verified on kernels &gt;= v5.16, improving</code></span>
+<span class="codeline" id="line-242"><code>// the results.</code></span>
+<span class="codeline" id="line-243"><code>func (c *TCPConn) MultipathTCP() (bool, error) {</code></span>
+<span class="codeline" id="line-244"><code>	if !c.ok() {</code></span>
+<span class="codeline" id="line-245"><code>		return false, syscall.EINVAL</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code>	return isUsingMultipathTCP(c.fd), nil</code></span>
+<span class="codeline" id="line-248"><code>}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>func newTCPConn(fd *netFD, keepAlive time.Duration, keepAliveHook func(time.Duration)) *TCPConn {</code></span>
+<span class="codeline" id="line-251"><code>	setNoDelay(fd, true)</code></span>
+<span class="codeline" id="line-252"><code>	if keepAlive == 0 {</code></span>
+<span class="codeline" id="line-253"><code>		keepAlive = defaultTCPKeepAlive</code></span>
+<span class="codeline" id="line-254"><code>	}</code></span>
+<span class="codeline" id="line-255"><code>	if keepAlive &gt; 0 {</code></span>
+<span class="codeline" id="line-256"><code>		setKeepAlive(fd, true)</code></span>
+<span class="codeline" id="line-257"><code>		setKeepAlivePeriod(fd, keepAlive)</code></span>
+<span class="codeline" id="line-258"><code>		if keepAliveHook != nil {</code></span>
+<span class="codeline" id="line-259"><code>			keepAliveHook(keepAlive)</code></span>
+<span class="codeline" id="line-260"><code>		}</code></span>
+<span class="codeline" id="line-261"><code>	}</code></span>
+<span class="codeline" id="line-262"><code>	return &amp;TCPConn{conn{fd}}</code></span>
+<span class="codeline" id="line-263"><code>}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>// DialTCP acts like [Dial] for TCP networks.</code></span>
+<span class="codeline" id="line-266"><code>//</code></span>
+<span class="codeline" id="line-267"><code>// The network must be a TCP network name; see func Dial for details.</code></span>
+<span class="codeline" id="line-268"><code>//</code></span>
+<span class="codeline" id="line-269"><code>// If laddr is nil, a local address is automatically chosen.</code></span>
+<span class="codeline" id="line-270"><code>// If the IP field of raddr is nil or an unspecified IP address, the</code></span>
+<span class="codeline" id="line-271"><code>// local system is assumed.</code></span>
+<span class="codeline" id="line-272"><code>func DialTCP(network string, laddr, raddr *TCPAddr) (*TCPConn, error) {</code></span>
+<span class="codeline" id="line-273"><code>	switch network {</code></span>
+<span class="codeline" id="line-274"><code>	case "tcp", "tcp4", "tcp6":</code></span>
+<span class="codeline" id="line-275"><code>	default:</code></span>
+<span class="codeline" id="line-276"><code>		return nil, &amp;OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: UnknownNetworkError(network)}</code></span>
+<span class="codeline" id="line-277"><code>	}</code></span>
+<span class="codeline" id="line-278"><code>	if raddr == nil {</code></span>
+<span class="codeline" id="line-279"><code>		return nil, &amp;OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: nil, Err: errMissingAddress}</code></span>
+<span class="codeline" id="line-280"><code>	}</code></span>
+<span class="codeline" id="line-281"><code>	sd := &amp;sysDialer{network: network, address: raddr.String()}</code></span>
+<span class="codeline" id="line-282"><code>	c, err := sd.dialTCP(context.Background(), laddr, raddr)</code></span>
+<span class="codeline" id="line-283"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-284"><code>		return nil, &amp;OpError{Op: "dial", Net: network, Source: laddr.opAddr(), Addr: raddr.opAddr(), Err: err}</code></span>
+<span class="codeline" id="line-285"><code>	}</code></span>
+<span class="codeline" id="line-286"><code>	return c, nil</code></span>
+<span class="codeline" id="line-287"><code>}</code></span>
+<span class="codeline" id="line-288"><code></code></span>
+<span class="codeline" id="line-289"><code>// TCPListener is a TCP network listener. Clients should typically</code></span>
+<span class="codeline" id="line-290"><code>// use variables of type [Listener] instead of assuming TCP.</code></span>
+<span class="codeline" id="line-291"><code>type TCPListener struct {</code></span>
+<span class="codeline" id="line-292"><code>	fd *netFD</code></span>
+<span class="codeline" id="line-293"><code>	lc ListenConfig</code></span>
+<span class="codeline" id="line-294"><code>}</code></span>
+<span class="codeline" id="line-295"><code></code></span>
+<span class="codeline" id="line-296"><code>// SyscallConn returns a raw network connection.</code></span>
+<span class="codeline" id="line-297"><code>// This implements the [syscall.Conn] interface.</code></span>
+<span class="codeline" id="line-298"><code>//</code></span>
+<span class="codeline" id="line-299"><code>// The returned RawConn only supports calling Control. Read and</code></span>
+<span class="codeline" id="line-300"><code>// Write return an error.</code></span>
+<span class="codeline" id="line-301"><code>func (l *TCPListener) SyscallConn() (syscall.RawConn, error) {</code></span>
+<span class="codeline" id="line-302"><code>	if !l.ok() {</code></span>
+<span class="codeline" id="line-303"><code>		return nil, syscall.EINVAL</code></span>
+<span class="codeline" id="line-304"><code>	}</code></span>
+<span class="codeline" id="line-305"><code>	return newRawListener(l.fd), nil</code></span>
+<span class="codeline" id="line-306"><code>}</code></span>
+<span class="codeline" id="line-307"><code></code></span>
+<span class="codeline" id="line-308"><code>// AcceptTCP accepts the next incoming call and returns the new</code></span>
+<span class="codeline" id="line-309"><code>// connection.</code></span>
+<span class="codeline" id="line-310"><code>func (l *TCPListener) AcceptTCP() (*TCPConn, error) {</code></span>
+<span class="codeline" id="line-311"><code>	if !l.ok() {</code></span>
+<span class="codeline" id="line-312"><code>		return nil, syscall.EINVAL</code></span>
+<span class="codeline" id="line-313"><code>	}</code></span>
+<span class="codeline" id="line-314"><code>	c, err := l.accept()</code></span>
+<span class="codeline" id="line-315"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-316"><code>		return nil, &amp;OpError{Op: "accept", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}</code></span>
+<span class="codeline" id="line-317"><code>	}</code></span>
+<span class="codeline" id="line-318"><code>	return c, nil</code></span>
+<span class="codeline" id="line-319"><code>}</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>// Accept implements the Accept method in the [Listener] interface; it</code></span>
+<span class="codeline" id="line-322"><code>// waits for the next call and returns a generic [Conn].</code></span>
+<span class="codeline" id="line-323"><code>func (l *TCPListener) Accept() (Conn, error) {</code></span>
+<span class="codeline" id="line-324"><code>	if !l.ok() {</code></span>
+<span class="codeline" id="line-325"><code>		return nil, syscall.EINVAL</code></span>
+<span class="codeline" id="line-326"><code>	}</code></span>
+<span class="codeline" id="line-327"><code>	c, err := l.accept()</code></span>
+<span class="codeline" id="line-328"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-329"><code>		return nil, &amp;OpError{Op: "accept", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	return c, nil</code></span>
+<span class="codeline" id="line-332"><code>}</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>// Close stops listening on the TCP address.</code></span>
+<span class="codeline" id="line-335"><code>// Already Accepted connections are not closed.</code></span>
+<span class="codeline" id="line-336"><code>func (l *TCPListener) Close() error {</code></span>
+<span class="codeline" id="line-337"><code>	if !l.ok() {</code></span>
+<span class="codeline" id="line-338"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-339"><code>	}</code></span>
+<span class="codeline" id="line-340"><code>	if err := l.close(); err != nil {</code></span>
+<span class="codeline" id="line-341"><code>		return &amp;OpError{Op: "close", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}</code></span>
+<span class="codeline" id="line-342"><code>	}</code></span>
+<span class="codeline" id="line-343"><code>	return nil</code></span>
+<span class="codeline" id="line-344"><code>}</code></span>
+<span class="codeline" id="line-345"><code></code></span>
+<span class="codeline" id="line-346"><code>// Addr returns the listener's network address, a [*TCPAddr].</code></span>
+<span class="codeline" id="line-347"><code>// The Addr returned is shared by all invocations of Addr, so</code></span>
+<span class="codeline" id="line-348"><code>// do not modify it.</code></span>
+<span class="codeline" id="line-349"><code>func (l *TCPListener) Addr() Addr { return l.fd.laddr }</code></span>
+<span class="codeline" id="line-350"><code></code></span>
+<span class="codeline" id="line-351"><code>// SetDeadline sets the deadline associated with the listener.</code></span>
+<span class="codeline" id="line-352"><code>// A zero time value disables the deadline.</code></span>
+<span class="codeline" id="line-353"><code>func (l *TCPListener) SetDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-354"><code>	if !l.ok() {</code></span>
+<span class="codeline" id="line-355"><code>		return syscall.EINVAL</code></span>
+<span class="codeline" id="line-356"><code>	}</code></span>
+<span class="codeline" id="line-357"><code>	return l.fd.SetDeadline(t)</code></span>
+<span class="codeline" id="line-358"><code>}</code></span>
+<span class="codeline" id="line-359"><code></code></span>
+<span class="codeline" id="line-360"><code>// File returns a copy of the underlying [os.File].</code></span>
+<span class="codeline" id="line-361"><code>// It is the caller's responsibility to close f when finished.</code></span>
+<span class="codeline" id="line-362"><code>// Closing l does not affect f, and closing f does not affect l.</code></span>
+<span class="codeline" id="line-363"><code>//</code></span>
+<span class="codeline" id="line-364"><code>// The returned os.File's file descriptor is different from the</code></span>
+<span class="codeline" id="line-365"><code>// connection's. Attempting to change properties of the original</code></span>
+<span class="codeline" id="line-366"><code>// using this duplicate may or may not have the desired effect.</code></span>
+<span class="codeline" id="line-367"><code>func (l *TCPListener) File() (f *os.File, err error) {</code></span>
+<span class="codeline" id="line-368"><code>	if !l.ok() {</code></span>
+<span class="codeline" id="line-369"><code>		return nil, syscall.EINVAL</code></span>
+<span class="codeline" id="line-370"><code>	}</code></span>
+<span class="codeline" id="line-371"><code>	f, err = l.file()</code></span>
+<span class="codeline" id="line-372"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-373"><code>		return nil, &amp;OpError{Op: "file", Net: l.fd.net, Source: nil, Addr: l.fd.laddr, Err: err}</code></span>
+<span class="codeline" id="line-374"><code>	}</code></span>
+<span class="codeline" id="line-375"><code>	return</code></span>
+<span class="codeline" id="line-376"><code>}</code></span>
+<span class="codeline" id="line-377"><code></code></span>
+<span class="codeline" id="line-378"><code>// ListenTCP acts like [Listen] for TCP networks.</code></span>
+<span class="codeline" id="line-379"><code>//</code></span>
+<span class="codeline" id="line-380"><code>// The network must be a TCP network name; see func Dial for details.</code></span>
+<span class="codeline" id="line-381"><code>//</code></span>
+<span class="codeline" id="line-382"><code>// If the IP field of laddr is nil or an unspecified IP address,</code></span>
+<span class="codeline" id="line-383"><code>// ListenTCP listens on all available unicast and anycast IP addresses</code></span>
+<span class="codeline" id="line-384"><code>// of the local system.</code></span>
+<span class="codeline" id="line-385"><code>// If the Port field of laddr is 0, a port number is automatically</code></span>
+<span class="codeline" id="line-386"><code>// chosen.</code></span>
+<span class="codeline" id="line-387"><code>func ListenTCP(network string, laddr *TCPAddr) (*TCPListener, error) {</code></span>
+<span class="codeline" id="line-388"><code>	switch network {</code></span>
+<span class="codeline" id="line-389"><code>	case "tcp", "tcp4", "tcp6":</code></span>
+<span class="codeline" id="line-390"><code>	default:</code></span>
+<span class="codeline" id="line-391"><code>		return nil, &amp;OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: UnknownNetworkError(network)}</code></span>
+<span class="codeline" id="line-392"><code>	}</code></span>
+<span class="codeline" id="line-393"><code>	if laddr == nil {</code></span>
+<span class="codeline" id="line-394"><code>		laddr = &amp;TCPAddr{}</code></span>
+<span class="codeline" id="line-395"><code>	}</code></span>
+<span class="codeline" id="line-396"><code>	sl := &amp;sysListener{network: network, address: laddr.String()}</code></span>
+<span class="codeline" id="line-397"><code>	ln, err := sl.listenTCP(context.Background(), laddr)</code></span>
+<span class="codeline" id="line-398"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-399"><code>		return nil, &amp;OpError{Op: "listen", Net: network, Source: nil, Addr: laddr.opAddr(), Err: err}</code></span>
+<span class="codeline" id="line-400"><code>	}</code></span>
+<span class="codeline" id="line-401"><code>	return ln, nil</code></span>
+<span class="codeline" id="line-402"><code>}</code></span>
+<span class="codeline" id="line-403"><code></code></span>
+<span class="codeline" id="line-404"><code>// roundDurationUp rounds d to the next multiple of to.</code></span>
+<span class="codeline" id="line-405"><code>func roundDurationUp(d time.Duration, to time.Duration) time.Duration {</code></span>
+<span class="codeline" id="line-406"><code>	return (d + to - 1) / to</code></span>
+<span class="codeline" id="line-407"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

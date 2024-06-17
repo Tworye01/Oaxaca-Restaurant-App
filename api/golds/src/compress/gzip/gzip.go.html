@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: gzip.go in package compress/gzip</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	gzip.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/compress/gzip.html">compress/gzip</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2010 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package gzip</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"compress/flate"</code></span>
+<span class="codeline" id="line-9"><code>	"errors"</code></span>
+<span class="codeline" id="line-10"><code>	"fmt"</code></span>
+<span class="codeline" id="line-11"><code>	"hash/crc32"</code></span>
+<span class="codeline" id="line-12"><code>	"io"</code></span>
+<span class="codeline" id="line-13"><code>	"time"</code></span>
+<span class="codeline" id="line-14"><code>)</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// These constants are copied from the flate package, so that code that imports</code></span>
+<span class="codeline" id="line-17"><code>// "compress/gzip" does not also have to import "compress/flate".</code></span>
+<span class="codeline" id="line-18"><code>const (</code></span>
+<span class="codeline" id="line-19"><code>	NoCompression      = flate.NoCompression</code></span>
+<span class="codeline" id="line-20"><code>	BestSpeed          = flate.BestSpeed</code></span>
+<span class="codeline" id="line-21"><code>	BestCompression    = flate.BestCompression</code></span>
+<span class="codeline" id="line-22"><code>	DefaultCompression = flate.DefaultCompression</code></span>
+<span class="codeline" id="line-23"><code>	HuffmanOnly        = flate.HuffmanOnly</code></span>
+<span class="codeline" id="line-24"><code>)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>// A Writer is an io.WriteCloser.</code></span>
+<span class="codeline" id="line-27"><code>// Writes to a Writer are compressed and written to w.</code></span>
+<span class="codeline" id="line-28"><code>type Writer struct {</code></span>
+<span class="codeline" id="line-29"><code>	Header      // written at first call to Write, Flush, or Close</code></span>
+<span class="codeline" id="line-30"><code>	w           io.Writer</code></span>
+<span class="codeline" id="line-31"><code>	level       int</code></span>
+<span class="codeline" id="line-32"><code>	wroteHeader bool</code></span>
+<span class="codeline" id="line-33"><code>	compressor  *flate.Writer</code></span>
+<span class="codeline" id="line-34"><code>	digest      uint32 // CRC-32, IEEE polynomial (section 8)</code></span>
+<span class="codeline" id="line-35"><code>	size        uint32 // Uncompressed size (section 2.3.1)</code></span>
+<span class="codeline" id="line-36"><code>	closed      bool</code></span>
+<span class="codeline" id="line-37"><code>	buf         [10]byte</code></span>
+<span class="codeline" id="line-38"><code>	err         error</code></span>
+<span class="codeline" id="line-39"><code>}</code></span>
+<span class="codeline" id="line-40"><code></code></span>
+<span class="codeline" id="line-41"><code>// NewWriter returns a new [Writer].</code></span>
+<span class="codeline" id="line-42"><code>// Writes to the returned writer are compressed and written to w.</code></span>
+<span class="codeline" id="line-43"><code>//</code></span>
+<span class="codeline" id="line-44"><code>// It is the caller's responsibility to call Close on the [Writer] when done.</code></span>
+<span class="codeline" id="line-45"><code>// Writes may be buffered and not flushed until Close.</code></span>
+<span class="codeline" id="line-46"><code>//</code></span>
+<span class="codeline" id="line-47"><code>// Callers that wish to set the fields in Writer.Header must do so before</code></span>
+<span class="codeline" id="line-48"><code>// the first call to Write, Flush, or Close.</code></span>
+<span class="codeline" id="line-49"><code>func NewWriter(w io.Writer) *Writer {</code></span>
+<span class="codeline" id="line-50"><code>	z, _ := NewWriterLevel(w, DefaultCompression)</code></span>
+<span class="codeline" id="line-51"><code>	return z</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>// NewWriterLevel is like [NewWriter] but specifies the compression level instead</code></span>
+<span class="codeline" id="line-55"><code>// of assuming [DefaultCompression].</code></span>
+<span class="codeline" id="line-56"><code>//</code></span>
+<span class="codeline" id="line-57"><code>// The compression level can be [DefaultCompression], [NoCompression], [HuffmanOnly]</code></span>
+<span class="codeline" id="line-58"><code>// or any integer value between [BestSpeed] and [BestCompression] inclusive.</code></span>
+<span class="codeline" id="line-59"><code>// The error returned will be nil if the level is valid.</code></span>
+<span class="codeline" id="line-60"><code>func NewWriterLevel(w io.Writer, level int) (*Writer, error) {</code></span>
+<span class="codeline" id="line-61"><code>	if level &lt; HuffmanOnly || level &gt; BestCompression {</code></span>
+<span class="codeline" id="line-62"><code>		return nil, fmt.Errorf("gzip: invalid compression level: %d", level)</code></span>
+<span class="codeline" id="line-63"><code>	}</code></span>
+<span class="codeline" id="line-64"><code>	z := new(Writer)</code></span>
+<span class="codeline" id="line-65"><code>	z.init(w, level)</code></span>
+<span class="codeline" id="line-66"><code>	return z, nil</code></span>
+<span class="codeline" id="line-67"><code>}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>func (z *Writer) init(w io.Writer, level int) {</code></span>
+<span class="codeline" id="line-70"><code>	compressor := z.compressor</code></span>
+<span class="codeline" id="line-71"><code>	if compressor != nil {</code></span>
+<span class="codeline" id="line-72"><code>		compressor.Reset(w)</code></span>
+<span class="codeline" id="line-73"><code>	}</code></span>
+<span class="codeline" id="line-74"><code>	*z = Writer{</code></span>
+<span class="codeline" id="line-75"><code>		Header: Header{</code></span>
+<span class="codeline" id="line-76"><code>			OS: 255, // unknown</code></span>
+<span class="codeline" id="line-77"><code>		},</code></span>
+<span class="codeline" id="line-78"><code>		w:          w,</code></span>
+<span class="codeline" id="line-79"><code>		level:      level,</code></span>
+<span class="codeline" id="line-80"><code>		compressor: compressor,</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code>}</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// Reset discards the [Writer] z's state and makes it equivalent to the</code></span>
+<span class="codeline" id="line-85"><code>// result of its original state from [NewWriter] or [NewWriterLevel], but</code></span>
+<span class="codeline" id="line-86"><code>// writing to w instead. This permits reusing a [Writer] rather than</code></span>
+<span class="codeline" id="line-87"><code>// allocating a new one.</code></span>
+<span class="codeline" id="line-88"><code>func (z *Writer) Reset(w io.Writer) {</code></span>
+<span class="codeline" id="line-89"><code>	z.init(w, z.level)</code></span>
+<span class="codeline" id="line-90"><code>}</code></span>
+<span class="codeline" id="line-91"><code></code></span>
+<span class="codeline" id="line-92"><code>// writeBytes writes a length-prefixed byte slice to z.w.</code></span>
+<span class="codeline" id="line-93"><code>func (z *Writer) writeBytes(b []byte) error {</code></span>
+<span class="codeline" id="line-94"><code>	if len(b) &gt; 0xffff {</code></span>
+<span class="codeline" id="line-95"><code>		return errors.New("gzip.Write: Extra data is too large")</code></span>
+<span class="codeline" id="line-96"><code>	}</code></span>
+<span class="codeline" id="line-97"><code>	le.PutUint16(z.buf[:2], uint16(len(b)))</code></span>
+<span class="codeline" id="line-98"><code>	_, err := z.w.Write(z.buf[:2])</code></span>
+<span class="codeline" id="line-99"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-100"><code>		return err</code></span>
+<span class="codeline" id="line-101"><code>	}</code></span>
+<span class="codeline" id="line-102"><code>	_, err = z.w.Write(b)</code></span>
+<span class="codeline" id="line-103"><code>	return err</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>// writeString writes a UTF-8 string s in GZIP's format to z.w.</code></span>
+<span class="codeline" id="line-107"><code>// GZIP (RFC 1952) specifies that strings are NUL-terminated ISO 8859-1 (Latin-1).</code></span>
+<span class="codeline" id="line-108"><code>func (z *Writer) writeString(s string) (err error) {</code></span>
+<span class="codeline" id="line-109"><code>	// GZIP stores Latin-1 strings; error if non-Latin-1; convert if non-ASCII.</code></span>
+<span class="codeline" id="line-110"><code>	needconv := false</code></span>
+<span class="codeline" id="line-111"><code>	for _, v := range s {</code></span>
+<span class="codeline" id="line-112"><code>		if v == 0 || v &gt; 0xff {</code></span>
+<span class="codeline" id="line-113"><code>			return errors.New("gzip.Write: non-Latin-1 header string")</code></span>
+<span class="codeline" id="line-114"><code>		}</code></span>
+<span class="codeline" id="line-115"><code>		if v &gt; 0x7f {</code></span>
+<span class="codeline" id="line-116"><code>			needconv = true</code></span>
+<span class="codeline" id="line-117"><code>		}</code></span>
+<span class="codeline" id="line-118"><code>	}</code></span>
+<span class="codeline" id="line-119"><code>	if needconv {</code></span>
+<span class="codeline" id="line-120"><code>		b := make([]byte, 0, len(s))</code></span>
+<span class="codeline" id="line-121"><code>		for _, v := range s {</code></span>
+<span class="codeline" id="line-122"><code>			b = append(b, byte(v))</code></span>
+<span class="codeline" id="line-123"><code>		}</code></span>
+<span class="codeline" id="line-124"><code>		_, err = z.w.Write(b)</code></span>
+<span class="codeline" id="line-125"><code>	} else {</code></span>
+<span class="codeline" id="line-126"><code>		_, err = io.WriteString(z.w, s)</code></span>
+<span class="codeline" id="line-127"><code>	}</code></span>
+<span class="codeline" id="line-128"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-129"><code>		return err</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code>	// GZIP strings are NUL-terminated.</code></span>
+<span class="codeline" id="line-132"><code>	z.buf[0] = 0</code></span>
+<span class="codeline" id="line-133"><code>	_, err = z.w.Write(z.buf[:1])</code></span>
+<span class="codeline" id="line-134"><code>	return err</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>// Write writes a compressed form of p to the underlying [io.Writer]. The</code></span>
+<span class="codeline" id="line-138"><code>// compressed bytes are not necessarily flushed until the [Writer] is closed.</code></span>
+<span class="codeline" id="line-139"><code>func (z *Writer) Write(p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-140"><code>	if z.err != nil {</code></span>
+<span class="codeline" id="line-141"><code>		return 0, z.err</code></span>
+<span class="codeline" id="line-142"><code>	}</code></span>
+<span class="codeline" id="line-143"><code>	var n int</code></span>
+<span class="codeline" id="line-144"><code>	// Write the GZIP header lazily.</code></span>
+<span class="codeline" id="line-145"><code>	if !z.wroteHeader {</code></span>
+<span class="codeline" id="line-146"><code>		z.wroteHeader = true</code></span>
+<span class="codeline" id="line-147"><code>		z.buf = [10]byte{0: gzipID1, 1: gzipID2, 2: gzipDeflate}</code></span>
+<span class="codeline" id="line-148"><code>		if z.Extra != nil {</code></span>
+<span class="codeline" id="line-149"><code>			z.buf[3] |= 0x04</code></span>
+<span class="codeline" id="line-150"><code>		}</code></span>
+<span class="codeline" id="line-151"><code>		if z.Name != "" {</code></span>
+<span class="codeline" id="line-152"><code>			z.buf[3] |= 0x08</code></span>
+<span class="codeline" id="line-153"><code>		}</code></span>
+<span class="codeline" id="line-154"><code>		if z.Comment != "" {</code></span>
+<span class="codeline" id="line-155"><code>			z.buf[3] |= 0x10</code></span>
+<span class="codeline" id="line-156"><code>		}</code></span>
+<span class="codeline" id="line-157"><code>		if z.ModTime.After(time.Unix(0, 0)) {</code></span>
+<span class="codeline" id="line-158"><code>			// Section 2.3.1, the zero value for MTIME means that the</code></span>
+<span class="codeline" id="line-159"><code>			// modified time is not set.</code></span>
+<span class="codeline" id="line-160"><code>			le.PutUint32(z.buf[4:8], uint32(z.ModTime.Unix()))</code></span>
+<span class="codeline" id="line-161"><code>		}</code></span>
+<span class="codeline" id="line-162"><code>		if z.level == BestCompression {</code></span>
+<span class="codeline" id="line-163"><code>			z.buf[8] = 2</code></span>
+<span class="codeline" id="line-164"><code>		} else if z.level == BestSpeed {</code></span>
+<span class="codeline" id="line-165"><code>			z.buf[8] = 4</code></span>
+<span class="codeline" id="line-166"><code>		}</code></span>
+<span class="codeline" id="line-167"><code>		z.buf[9] = z.OS</code></span>
+<span class="codeline" id="line-168"><code>		_, z.err = z.w.Write(z.buf[:10])</code></span>
+<span class="codeline" id="line-169"><code>		if z.err != nil {</code></span>
+<span class="codeline" id="line-170"><code>			return 0, z.err</code></span>
+<span class="codeline" id="line-171"><code>		}</code></span>
+<span class="codeline" id="line-172"><code>		if z.Extra != nil {</code></span>
+<span class="codeline" id="line-173"><code>			z.err = z.writeBytes(z.Extra)</code></span>
+<span class="codeline" id="line-174"><code>			if z.err != nil {</code></span>
+<span class="codeline" id="line-175"><code>				return 0, z.err</code></span>
+<span class="codeline" id="line-176"><code>			}</code></span>
+<span class="codeline" id="line-177"><code>		}</code></span>
+<span class="codeline" id="line-178"><code>		if z.Name != "" {</code></span>
+<span class="codeline" id="line-179"><code>			z.err = z.writeString(z.Name)</code></span>
+<span class="codeline" id="line-180"><code>			if z.err != nil {</code></span>
+<span class="codeline" id="line-181"><code>				return 0, z.err</code></span>
+<span class="codeline" id="line-182"><code>			}</code></span>
+<span class="codeline" id="line-183"><code>		}</code></span>
+<span class="codeline" id="line-184"><code>		if z.Comment != "" {</code></span>
+<span class="codeline" id="line-185"><code>			z.err = z.writeString(z.Comment)</code></span>
+<span class="codeline" id="line-186"><code>			if z.err != nil {</code></span>
+<span class="codeline" id="line-187"><code>				return 0, z.err</code></span>
+<span class="codeline" id="line-188"><code>			}</code></span>
+<span class="codeline" id="line-189"><code>		}</code></span>
+<span class="codeline" id="line-190"><code>		if z.compressor == nil {</code></span>
+<span class="codeline" id="line-191"><code>			z.compressor, _ = flate.NewWriter(z.w, z.level)</code></span>
+<span class="codeline" id="line-192"><code>		}</code></span>
+<span class="codeline" id="line-193"><code>	}</code></span>
+<span class="codeline" id="line-194"><code>	z.size += uint32(len(p))</code></span>
+<span class="codeline" id="line-195"><code>	z.digest = crc32.Update(z.digest, crc32.IEEETable, p)</code></span>
+<span class="codeline" id="line-196"><code>	n, z.err = z.compressor.Write(p)</code></span>
+<span class="codeline" id="line-197"><code>	return n, z.err</code></span>
+<span class="codeline" id="line-198"><code>}</code></span>
+<span class="codeline" id="line-199"><code></code></span>
+<span class="codeline" id="line-200"><code>// Flush flushes any pending compressed data to the underlying writer.</code></span>
+<span class="codeline" id="line-201"><code>//</code></span>
+<span class="codeline" id="line-202"><code>// It is useful mainly in compressed network protocols, to ensure that</code></span>
+<span class="codeline" id="line-203"><code>// a remote reader has enough data to reconstruct a packet. Flush does</code></span>
+<span class="codeline" id="line-204"><code>// not return until the data has been written. If the underlying</code></span>
+<span class="codeline" id="line-205"><code>// writer returns an error, Flush returns that error.</code></span>
+<span class="codeline" id="line-206"><code>//</code></span>
+<span class="codeline" id="line-207"><code>// In the terminology of the zlib library, Flush is equivalent to Z_SYNC_FLUSH.</code></span>
+<span class="codeline" id="line-208"><code>func (z *Writer) Flush() error {</code></span>
+<span class="codeline" id="line-209"><code>	if z.err != nil {</code></span>
+<span class="codeline" id="line-210"><code>		return z.err</code></span>
+<span class="codeline" id="line-211"><code>	}</code></span>
+<span class="codeline" id="line-212"><code>	if z.closed {</code></span>
+<span class="codeline" id="line-213"><code>		return nil</code></span>
+<span class="codeline" id="line-214"><code>	}</code></span>
+<span class="codeline" id="line-215"><code>	if !z.wroteHeader {</code></span>
+<span class="codeline" id="line-216"><code>		z.Write(nil)</code></span>
+<span class="codeline" id="line-217"><code>		if z.err != nil {</code></span>
+<span class="codeline" id="line-218"><code>			return z.err</code></span>
+<span class="codeline" id="line-219"><code>		}</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code>	z.err = z.compressor.Flush()</code></span>
+<span class="codeline" id="line-222"><code>	return z.err</code></span>
+<span class="codeline" id="line-223"><code>}</code></span>
+<span class="codeline" id="line-224"><code></code></span>
+<span class="codeline" id="line-225"><code>// Close closes the [Writer] by flushing any unwritten data to the underlying</code></span>
+<span class="codeline" id="line-226"><code>// [io.Writer] and writing the GZIP footer.</code></span>
+<span class="codeline" id="line-227"><code>// It does not close the underlying [io.Writer].</code></span>
+<span class="codeline" id="line-228"><code>func (z *Writer) Close() error {</code></span>
+<span class="codeline" id="line-229"><code>	if z.err != nil {</code></span>
+<span class="codeline" id="line-230"><code>		return z.err</code></span>
+<span class="codeline" id="line-231"><code>	}</code></span>
+<span class="codeline" id="line-232"><code>	if z.closed {</code></span>
+<span class="codeline" id="line-233"><code>		return nil</code></span>
+<span class="codeline" id="line-234"><code>	}</code></span>
+<span class="codeline" id="line-235"><code>	z.closed = true</code></span>
+<span class="codeline" id="line-236"><code>	if !z.wroteHeader {</code></span>
+<span class="codeline" id="line-237"><code>		z.Write(nil)</code></span>
+<span class="codeline" id="line-238"><code>		if z.err != nil {</code></span>
+<span class="codeline" id="line-239"><code>			return z.err</code></span>
+<span class="codeline" id="line-240"><code>		}</code></span>
+<span class="codeline" id="line-241"><code>	}</code></span>
+<span class="codeline" id="line-242"><code>	z.err = z.compressor.Close()</code></span>
+<span class="codeline" id="line-243"><code>	if z.err != nil {</code></span>
+<span class="codeline" id="line-244"><code>		return z.err</code></span>
+<span class="codeline" id="line-245"><code>	}</code></span>
+<span class="codeline" id="line-246"><code>	le.PutUint32(z.buf[:4], z.digest)</code></span>
+<span class="codeline" id="line-247"><code>	le.PutUint32(z.buf[4:8], z.size)</code></span>
+<span class="codeline" id="line-248"><code>	_, z.err = z.w.Write(z.buf[:8])</code></span>
+<span class="codeline" id="line-249"><code>	return z.err</code></span>
+<span class="codeline" id="line-250"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

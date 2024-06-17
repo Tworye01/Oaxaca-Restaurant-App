@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: crc32.go in package hash/crc32</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	crc32.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/hash/crc32.html">hash/crc32</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package crc32 implements the 32-bit cyclic redundancy check, or CRC-32,</code></span>
+<span class="codeline" id="line-6"><code>// checksum. See https://en.wikipedia.org/wiki/Cyclic_redundancy_check for</code></span>
+<span class="codeline" id="line-7"><code>// information.</code></span>
+<span class="codeline" id="line-8"><code>//</code></span>
+<span class="codeline" id="line-9"><code>// Polynomials are represented in LSB-first form also known as reversed representation.</code></span>
+<span class="codeline" id="line-10"><code>//</code></span>
+<span class="codeline" id="line-11"><code>// See https://en.wikipedia.org/wiki/Mathematics_of_cyclic_redundancy_checks#Reversed_representations_and_reciprocal_polynomials</code></span>
+<span class="codeline" id="line-12"><code>// for information.</code></span></div><span class="codeline" id="line-13"><code>package crc32</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>import (</code></span>
+<span class="codeline" id="line-16"><code>	"errors"</code></span>
+<span class="codeline" id="line-17"><code>	"hash"</code></span>
+<span class="codeline" id="line-18"><code>	"sync"</code></span>
+<span class="codeline" id="line-19"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-20"><code>)</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>// The size of a CRC-32 checksum in bytes.</code></span>
+<span class="codeline" id="line-23"><code>const Size = 4</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>// Predefined polynomials.</code></span>
+<span class="codeline" id="line-26"><code>const (</code></span>
+<span class="codeline" id="line-27"><code>	// IEEE is by far and away the most common CRC-32 polynomial.</code></span>
+<span class="codeline" id="line-28"><code>	// Used by ethernet (IEEE 802.3), v.42, fddi, gzip, zip, png, ...</code></span>
+<span class="codeline" id="line-29"><code>	IEEE = 0xedb88320</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>	// Castagnoli's polynomial, used in iSCSI.</code></span>
+<span class="codeline" id="line-32"><code>	// Has better error detection characteristics than IEEE.</code></span>
+<span class="codeline" id="line-33"><code>	// https://dx.doi.org/10.1109/26.231911</code></span>
+<span class="codeline" id="line-34"><code>	Castagnoli = 0x82f63b78</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>	// Koopman's polynomial.</code></span>
+<span class="codeline" id="line-37"><code>	// Also has better error detection characteristics than IEEE.</code></span>
+<span class="codeline" id="line-38"><code>	// https://dx.doi.org/10.1109/DSN.2002.1028931</code></span>
+<span class="codeline" id="line-39"><code>	Koopman = 0xeb31d82e</code></span>
+<span class="codeline" id="line-40"><code>)</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>// Table is a 256-word table representing the polynomial for efficient processing.</code></span>
+<span class="codeline" id="line-43"><code>type Table [256]uint32</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>// This file makes use of functions implemented in architecture-specific files.</code></span>
+<span class="codeline" id="line-46"><code>// The interface that they implement is as follows:</code></span>
+<span class="codeline" id="line-47"><code>//</code></span>
+<span class="codeline" id="line-48"><code>//    // archAvailableIEEE reports whether an architecture-specific CRC32-IEEE</code></span>
+<span class="codeline" id="line-49"><code>//    // algorithm is available.</code></span>
+<span class="codeline" id="line-50"><code>//    archAvailableIEEE() bool</code></span>
+<span class="codeline" id="line-51"><code>//</code></span>
+<span class="codeline" id="line-52"><code>//    // archInitIEEE initializes the architecture-specific CRC3-IEEE algorithm.</code></span>
+<span class="codeline" id="line-53"><code>//    // It can only be called if archAvailableIEEE() returns true.</code></span>
+<span class="codeline" id="line-54"><code>//    archInitIEEE()</code></span>
+<span class="codeline" id="line-55"><code>//</code></span>
+<span class="codeline" id="line-56"><code>//    // archUpdateIEEE updates the given CRC32-IEEE. It can only be called if</code></span>
+<span class="codeline" id="line-57"><code>//    // archInitIEEE() was previously called.</code></span>
+<span class="codeline" id="line-58"><code>//    archUpdateIEEE(crc uint32, p []byte) uint32</code></span>
+<span class="codeline" id="line-59"><code>//</code></span>
+<span class="codeline" id="line-60"><code>//    // archAvailableCastagnoli reports whether an architecture-specific</code></span>
+<span class="codeline" id="line-61"><code>//    // CRC32-C algorithm is available.</code></span>
+<span class="codeline" id="line-62"><code>//    archAvailableCastagnoli() bool</code></span>
+<span class="codeline" id="line-63"><code>//</code></span>
+<span class="codeline" id="line-64"><code>//    // archInitCastagnoli initializes the architecture-specific CRC32-C</code></span>
+<span class="codeline" id="line-65"><code>//    // algorithm. It can only be called if archAvailableCastagnoli() returns</code></span>
+<span class="codeline" id="line-66"><code>//    // true.</code></span>
+<span class="codeline" id="line-67"><code>//    archInitCastagnoli()</code></span>
+<span class="codeline" id="line-68"><code>//</code></span>
+<span class="codeline" id="line-69"><code>//    // archUpdateCastagnoli updates the given CRC32-C. It can only be called</code></span>
+<span class="codeline" id="line-70"><code>//    // if archInitCastagnoli() was previously called.</code></span>
+<span class="codeline" id="line-71"><code>//    archUpdateCastagnoli(crc uint32, p []byte) uint32</code></span>
+<span class="codeline" id="line-72"><code></code></span>
+<span class="codeline" id="line-73"><code>// castagnoliTable points to a lazily initialized Table for the Castagnoli</code></span>
+<span class="codeline" id="line-74"><code>// polynomial. MakeTable will always return this value when asked to make a</code></span>
+<span class="codeline" id="line-75"><code>// Castagnoli table so we can compare against it to find when the caller is</code></span>
+<span class="codeline" id="line-76"><code>// using this polynomial.</code></span>
+<span class="codeline" id="line-77"><code>var castagnoliTable *Table</code></span>
+<span class="codeline" id="line-78"><code>var castagnoliTable8 *slicing8Table</code></span>
+<span class="codeline" id="line-79"><code>var updateCastagnoli func(crc uint32, p []byte) uint32</code></span>
+<span class="codeline" id="line-80"><code>var castagnoliOnce sync.Once</code></span>
+<span class="codeline" id="line-81"><code>var haveCastagnoli atomic.Bool</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>func castagnoliInit() {</code></span>
+<span class="codeline" id="line-84"><code>	castagnoliTable = simpleMakeTable(Castagnoli)</code></span>
+<span class="codeline" id="line-85"><code></code></span>
+<span class="codeline" id="line-86"><code>	if archAvailableCastagnoli() {</code></span>
+<span class="codeline" id="line-87"><code>		archInitCastagnoli()</code></span>
+<span class="codeline" id="line-88"><code>		updateCastagnoli = archUpdateCastagnoli</code></span>
+<span class="codeline" id="line-89"><code>	} else {</code></span>
+<span class="codeline" id="line-90"><code>		// Initialize the slicing-by-8 table.</code></span>
+<span class="codeline" id="line-91"><code>		castagnoliTable8 = slicingMakeTable(Castagnoli)</code></span>
+<span class="codeline" id="line-92"><code>		updateCastagnoli = func(crc uint32, p []byte) uint32 {</code></span>
+<span class="codeline" id="line-93"><code>			return slicingUpdate(crc, castagnoliTable8, p)</code></span>
+<span class="codeline" id="line-94"><code>		}</code></span>
+<span class="codeline" id="line-95"><code>	}</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>	haveCastagnoli.Store(true)</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>// IEEETable is the table for the [IEEE] polynomial.</code></span>
+<span class="codeline" id="line-101"><code>var IEEETable = simpleMakeTable(IEEE)</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>// ieeeTable8 is the slicing8Table for IEEE</code></span>
+<span class="codeline" id="line-104"><code>var ieeeTable8 *slicing8Table</code></span>
+<span class="codeline" id="line-105"><code>var updateIEEE func(crc uint32, p []byte) uint32</code></span>
+<span class="codeline" id="line-106"><code>var ieeeOnce sync.Once</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>func ieeeInit() {</code></span>
+<span class="codeline" id="line-109"><code>	if archAvailableIEEE() {</code></span>
+<span class="codeline" id="line-110"><code>		archInitIEEE()</code></span>
+<span class="codeline" id="line-111"><code>		updateIEEE = archUpdateIEEE</code></span>
+<span class="codeline" id="line-112"><code>	} else {</code></span>
+<span class="codeline" id="line-113"><code>		// Initialize the slicing-by-8 table.</code></span>
+<span class="codeline" id="line-114"><code>		ieeeTable8 = slicingMakeTable(IEEE)</code></span>
+<span class="codeline" id="line-115"><code>		updateIEEE = func(crc uint32, p []byte) uint32 {</code></span>
+<span class="codeline" id="line-116"><code>			return slicingUpdate(crc, ieeeTable8, p)</code></span>
+<span class="codeline" id="line-117"><code>		}</code></span>
+<span class="codeline" id="line-118"><code>	}</code></span>
+<span class="codeline" id="line-119"><code>}</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>// MakeTable returns a [Table] constructed from the specified polynomial.</code></span>
+<span class="codeline" id="line-122"><code>// The contents of this [Table] must not be modified.</code></span>
+<span class="codeline" id="line-123"><code>func MakeTable(poly uint32) *Table {</code></span>
+<span class="codeline" id="line-124"><code>	switch poly {</code></span>
+<span class="codeline" id="line-125"><code>	case IEEE:</code></span>
+<span class="codeline" id="line-126"><code>		ieeeOnce.Do(ieeeInit)</code></span>
+<span class="codeline" id="line-127"><code>		return IEEETable</code></span>
+<span class="codeline" id="line-128"><code>	case Castagnoli:</code></span>
+<span class="codeline" id="line-129"><code>		castagnoliOnce.Do(castagnoliInit)</code></span>
+<span class="codeline" id="line-130"><code>		return castagnoliTable</code></span>
+<span class="codeline" id="line-131"><code>	default:</code></span>
+<span class="codeline" id="line-132"><code>		return simpleMakeTable(poly)</code></span>
+<span class="codeline" id="line-133"><code>	}</code></span>
+<span class="codeline" id="line-134"><code>}</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>// digest represents the partial evaluation of a checksum.</code></span>
+<span class="codeline" id="line-137"><code>type digest struct {</code></span>
+<span class="codeline" id="line-138"><code>	crc uint32</code></span>
+<span class="codeline" id="line-139"><code>	tab *Table</code></span>
+<span class="codeline" id="line-140"><code>}</code></span>
+<span class="codeline" id="line-141"><code></code></span>
+<span class="codeline" id="line-142"><code>// New creates a new [hash.Hash32] computing the CRC-32 checksum using the</code></span>
+<span class="codeline" id="line-143"><code>// polynomial represented by the [Table]. Its Sum method will lay the</code></span>
+<span class="codeline" id="line-144"><code>// value out in big-endian byte order. The returned Hash32 also</code></span>
+<span class="codeline" id="line-145"><code>// implements [encoding.BinaryMarshaler] and [encoding.BinaryUnmarshaler] to</code></span>
+<span class="codeline" id="line-146"><code>// marshal and unmarshal the internal state of the hash.</code></span>
+<span class="codeline" id="line-147"><code>func New(tab *Table) hash.Hash32 {</code></span>
+<span class="codeline" id="line-148"><code>	if tab == IEEETable {</code></span>
+<span class="codeline" id="line-149"><code>		ieeeOnce.Do(ieeeInit)</code></span>
+<span class="codeline" id="line-150"><code>	}</code></span>
+<span class="codeline" id="line-151"><code>	return &amp;digest{0, tab}</code></span>
+<span class="codeline" id="line-152"><code>}</code></span>
+<span class="codeline" id="line-153"><code></code></span>
+<span class="codeline" id="line-154"><code>// NewIEEE creates a new [hash.Hash32] computing the CRC-32 checksum using</code></span>
+<span class="codeline" id="line-155"><code>// the [IEEE] polynomial. Its Sum method will lay the value out in</code></span>
+<span class="codeline" id="line-156"><code>// big-endian byte order. The returned Hash32 also implements</code></span>
+<span class="codeline" id="line-157"><code>// [encoding.BinaryMarshaler] and [encoding.BinaryUnmarshaler] to marshal</code></span>
+<span class="codeline" id="line-158"><code>// and unmarshal the internal state of the hash.</code></span>
+<span class="codeline" id="line-159"><code>func NewIEEE() hash.Hash32 { return New(IEEETable) }</code></span>
+<span class="codeline" id="line-160"><code></code></span>
+<span class="codeline" id="line-161"><code>func (d *digest) Size() int { return Size }</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>func (d *digest) BlockSize() int { return 1 }</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>func (d *digest) Reset() { d.crc = 0 }</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>const (</code></span>
+<span class="codeline" id="line-168"><code>	magic         = "crc\x01"</code></span>
+<span class="codeline" id="line-169"><code>	marshaledSize = len(magic) + 4 + 4</code></span>
+<span class="codeline" id="line-170"><code>)</code></span>
+<span class="codeline" id="line-171"><code></code></span>
+<span class="codeline" id="line-172"><code>func (d *digest) MarshalBinary() ([]byte, error) {</code></span>
+<span class="codeline" id="line-173"><code>	b := make([]byte, 0, marshaledSize)</code></span>
+<span class="codeline" id="line-174"><code>	b = append(b, magic...)</code></span>
+<span class="codeline" id="line-175"><code>	b = appendUint32(b, tableSum(d.tab))</code></span>
+<span class="codeline" id="line-176"><code>	b = appendUint32(b, d.crc)</code></span>
+<span class="codeline" id="line-177"><code>	return b, nil</code></span>
+<span class="codeline" id="line-178"><code>}</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>func (d *digest) UnmarshalBinary(b []byte) error {</code></span>
+<span class="codeline" id="line-181"><code>	if len(b) &lt; len(magic) || string(b[:len(magic)]) != magic {</code></span>
+<span class="codeline" id="line-182"><code>		return errors.New("hash/crc32: invalid hash state identifier")</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code>	if len(b) != marshaledSize {</code></span>
+<span class="codeline" id="line-185"><code>		return errors.New("hash/crc32: invalid hash state size")</code></span>
+<span class="codeline" id="line-186"><code>	}</code></span>
+<span class="codeline" id="line-187"><code>	if tableSum(d.tab) != readUint32(b[4:]) {</code></span>
+<span class="codeline" id="line-188"><code>		return errors.New("hash/crc32: tables do not match")</code></span>
+<span class="codeline" id="line-189"><code>	}</code></span>
+<span class="codeline" id="line-190"><code>	d.crc = readUint32(b[8:])</code></span>
+<span class="codeline" id="line-191"><code>	return nil</code></span>
+<span class="codeline" id="line-192"><code>}</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>// appendUint32 is semantically the same as [binary.BigEndian.AppendUint32]</code></span>
+<span class="codeline" id="line-195"><code>// We copied this function because we can not import "encoding/binary" here.</code></span>
+<span class="codeline" id="line-196"><code>func appendUint32(b []byte, x uint32) []byte {</code></span>
+<span class="codeline" id="line-197"><code>	return append(b,</code></span>
+<span class="codeline" id="line-198"><code>		byte(x&gt;&gt;24),</code></span>
+<span class="codeline" id="line-199"><code>		byte(x&gt;&gt;16),</code></span>
+<span class="codeline" id="line-200"><code>		byte(x&gt;&gt;8),</code></span>
+<span class="codeline" id="line-201"><code>		byte(x),</code></span>
+<span class="codeline" id="line-202"><code>	)</code></span>
+<span class="codeline" id="line-203"><code>}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>// readUint32 is semantically the same as [binary.BigEndian.Uint32]</code></span>
+<span class="codeline" id="line-206"><code>// We copied this function because we can not import "encoding/binary" here.</code></span>
+<span class="codeline" id="line-207"><code>func readUint32(b []byte) uint32 {</code></span>
+<span class="codeline" id="line-208"><code>	_ = b[3]</code></span>
+<span class="codeline" id="line-209"><code>	return uint32(b[3]) | uint32(b[2])&lt;&lt;8 | uint32(b[1])&lt;&lt;16 | uint32(b[0])&lt;&lt;24</code></span>
+<span class="codeline" id="line-210"><code>}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>func update(crc uint32, tab *Table, p []byte, checkInitIEEE bool) uint32 {</code></span>
+<span class="codeline" id="line-213"><code>	switch {</code></span>
+<span class="codeline" id="line-214"><code>	case haveCastagnoli.Load() &amp;&amp; tab == castagnoliTable:</code></span>
+<span class="codeline" id="line-215"><code>		return updateCastagnoli(crc, p)</code></span>
+<span class="codeline" id="line-216"><code>	case tab == IEEETable:</code></span>
+<span class="codeline" id="line-217"><code>		if checkInitIEEE {</code></span>
+<span class="codeline" id="line-218"><code>			ieeeOnce.Do(ieeeInit)</code></span>
+<span class="codeline" id="line-219"><code>		}</code></span>
+<span class="codeline" id="line-220"><code>		return updateIEEE(crc, p)</code></span>
+<span class="codeline" id="line-221"><code>	default:</code></span>
+<span class="codeline" id="line-222"><code>		return simpleUpdate(crc, tab, p)</code></span>
+<span class="codeline" id="line-223"><code>	}</code></span>
+<span class="codeline" id="line-224"><code>}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>// Update returns the result of adding the bytes in p to the crc.</code></span>
+<span class="codeline" id="line-227"><code>func Update(crc uint32, tab *Table, p []byte) uint32 {</code></span>
+<span class="codeline" id="line-228"><code>	// Unfortunately, because IEEETable is exported, IEEE may be used without a</code></span>
+<span class="codeline" id="line-229"><code>	// call to MakeTable. We have to make sure it gets initialized in that case.</code></span>
+<span class="codeline" id="line-230"><code>	return update(crc, tab, p, true)</code></span>
+<span class="codeline" id="line-231"><code>}</code></span>
+<span class="codeline" id="line-232"><code></code></span>
+<span class="codeline" id="line-233"><code>func (d *digest) Write(p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-234"><code>	// We only create digest objects through New() which takes care of</code></span>
+<span class="codeline" id="line-235"><code>	// initialization in this case.</code></span>
+<span class="codeline" id="line-236"><code>	d.crc = update(d.crc, d.tab, p, false)</code></span>
+<span class="codeline" id="line-237"><code>	return len(p), nil</code></span>
+<span class="codeline" id="line-238"><code>}</code></span>
+<span class="codeline" id="line-239"><code></code></span>
+<span class="codeline" id="line-240"><code>func (d *digest) Sum32() uint32 { return d.crc }</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>func (d *digest) Sum(in []byte) []byte {</code></span>
+<span class="codeline" id="line-243"><code>	s := d.Sum32()</code></span>
+<span class="codeline" id="line-244"><code>	return append(in, byte(s&gt;&gt;24), byte(s&gt;&gt;16), byte(s&gt;&gt;8), byte(s))</code></span>
+<span class="codeline" id="line-245"><code>}</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>// Checksum returns the CRC-32 checksum of data</code></span>
+<span class="codeline" id="line-248"><code>// using the polynomial represented by the [Table].</code></span>
+<span class="codeline" id="line-249"><code>func Checksum(data []byte, tab *Table) uint32 { return Update(0, tab, data) }</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>// ChecksumIEEE returns the CRC-32 checksum of data</code></span>
+<span class="codeline" id="line-252"><code>// using the [IEEE] polynomial.</code></span>
+<span class="codeline" id="line-253"><code>func ChecksumIEEE(data []byte) uint32 {</code></span>
+<span class="codeline" id="line-254"><code>	ieeeOnce.Do(ieeeInit)</code></span>
+<span class="codeline" id="line-255"><code>	return updateIEEE(0, data)</code></span>
+<span class="codeline" id="line-256"><code>}</code></span>
+<span class="codeline" id="line-257"><code></code></span>
+<span class="codeline" id="line-258"><code>// tableSum returns the IEEE checksum of table t.</code></span>
+<span class="codeline" id="line-259"><code>func tableSum(t *Table) uint32 {</code></span>
+<span class="codeline" id="line-260"><code>	var a [1024]byte</code></span>
+<span class="codeline" id="line-261"><code>	b := a[:0]</code></span>
+<span class="codeline" id="line-262"><code>	if t != nil {</code></span>
+<span class="codeline" id="line-263"><code>		for _, x := range t {</code></span>
+<span class="codeline" id="line-264"><code>			b = appendUint32(b, x)</code></span>
+<span class="codeline" id="line-265"><code>		}</code></span>
+<span class="codeline" id="line-266"><code>	}</code></span>
+<span class="codeline" id="line-267"><code>	return ChecksumIEEE(b)</code></span>
+<span class="codeline" id="line-268"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: trace2map.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	trace2map.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build goexperiment.exectracer2</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// Simple hash table for tracing. Provides a mapping</code></span>
+<span class="codeline" id="line-8"><code>// between variable-length data and a unique ID. Subsequent</code></span>
+<span class="codeline" id="line-9"><code>// puts of the same data will return the same ID.</code></span>
+<span class="codeline" id="line-10"><code>//</code></span>
+<span class="codeline" id="line-11"><code>// Uses a region-based allocation scheme and assumes that the</code></span>
+<span class="codeline" id="line-12"><code>// table doesn't ever grow very big.</code></span>
+<span class="codeline" id="line-13"><code>//</code></span>
+<span class="codeline" id="line-14"><code>// This is definitely not a general-purpose hash table! It avoids</code></span>
+<span class="codeline" id="line-15"><code>// doing any high-level Go operations so it's safe to use even in</code></span>
+<span class="codeline" id="line-16"><code>// sensitive contexts.</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>package runtime</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>import (</code></span>
+<span class="codeline" id="line-21"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-22"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-23"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-24"><code>)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>type traceMap struct {</code></span>
+<span class="codeline" id="line-27"><code>	lock mutex // Must be acquired on the system stack</code></span>
+<span class="codeline" id="line-28"><code>	seq  atomic.Uint64</code></span>
+<span class="codeline" id="line-29"><code>	mem  traceRegionAlloc</code></span>
+<span class="codeline" id="line-30"><code>	tab  [1 &lt;&lt; 13]atomic.UnsafePointer // *traceMapNode (can't use generics because it's notinheap)</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>type traceMapNode struct {</code></span>
+<span class="codeline" id="line-34"><code>	_    sys.NotInHeap</code></span>
+<span class="codeline" id="line-35"><code>	link atomic.UnsafePointer // *traceMapNode (can't use generics because it's notinheap)</code></span>
+<span class="codeline" id="line-36"><code>	hash uintptr</code></span>
+<span class="codeline" id="line-37"><code>	id   uint64</code></span>
+<span class="codeline" id="line-38"><code>	data []byte</code></span>
+<span class="codeline" id="line-39"><code>}</code></span>
+<span class="codeline" id="line-40"><code></code></span>
+<span class="codeline" id="line-41"><code>// next is a type-safe wrapper around link.</code></span>
+<span class="codeline" id="line-42"><code>func (n *traceMapNode) next() *traceMapNode {</code></span>
+<span class="codeline" id="line-43"><code>	return (*traceMapNode)(n.link.Load())</code></span>
+<span class="codeline" id="line-44"><code>}</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>// stealID steals an ID from the table, ensuring that it will not</code></span>
+<span class="codeline" id="line-47"><code>// appear in the table anymore.</code></span>
+<span class="codeline" id="line-48"><code>func (tab *traceMap) stealID() uint64 {</code></span>
+<span class="codeline" id="line-49"><code>	return tab.seq.Add(1)</code></span>
+<span class="codeline" id="line-50"><code>}</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>// put inserts the data into the table.</code></span>
+<span class="codeline" id="line-53"><code>//</code></span>
+<span class="codeline" id="line-54"><code>// It's always safe to noescape data because its bytes are always copied.</code></span>
+<span class="codeline" id="line-55"><code>//</code></span>
+<span class="codeline" id="line-56"><code>// Returns a unique ID for the data and whether this is the first time</code></span>
+<span class="codeline" id="line-57"><code>// the data has been added to the map.</code></span>
+<span class="codeline" id="line-58"><code>func (tab *traceMap) put(data unsafe.Pointer, size uintptr) (uint64, bool) {</code></span>
+<span class="codeline" id="line-59"><code>	if size == 0 {</code></span>
+<span class="codeline" id="line-60"><code>		return 0, false</code></span>
+<span class="codeline" id="line-61"><code>	}</code></span>
+<span class="codeline" id="line-62"><code>	hash := memhash(data, 0, size)</code></span>
+<span class="codeline" id="line-63"><code>	// First, search the hashtable w/o the mutex.</code></span>
+<span class="codeline" id="line-64"><code>	if id := tab.find(data, size, hash); id != 0 {</code></span>
+<span class="codeline" id="line-65"><code>		return id, false</code></span>
+<span class="codeline" id="line-66"><code>	}</code></span>
+<span class="codeline" id="line-67"><code>	// Now, double check under the mutex.</code></span>
+<span class="codeline" id="line-68"><code>	// Switch to the system stack so we can acquire tab.lock</code></span>
+<span class="codeline" id="line-69"><code>	var id uint64</code></span>
+<span class="codeline" id="line-70"><code>	var added bool</code></span>
+<span class="codeline" id="line-71"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-72"><code>		lock(&amp;tab.lock)</code></span>
+<span class="codeline" id="line-73"><code>		if id = tab.find(data, size, hash); id != 0 {</code></span>
+<span class="codeline" id="line-74"><code>			unlock(&amp;tab.lock)</code></span>
+<span class="codeline" id="line-75"><code>			return</code></span>
+<span class="codeline" id="line-76"><code>		}</code></span>
+<span class="codeline" id="line-77"><code>		// Create new record.</code></span>
+<span class="codeline" id="line-78"><code>		id = tab.seq.Add(1)</code></span>
+<span class="codeline" id="line-79"><code>		vd := tab.newTraceMapNode(data, size, hash, id)</code></span>
+<span class="codeline" id="line-80"><code></code></span>
+<span class="codeline" id="line-81"><code>		// Insert it into the table.</code></span>
+<span class="codeline" id="line-82"><code>		//</code></span>
+<span class="codeline" id="line-83"><code>		// Update the link first, since the node isn't published yet.</code></span>
+<span class="codeline" id="line-84"><code>		// Then, store the node in the table as the new first node</code></span>
+<span class="codeline" id="line-85"><code>		// for the bucket.</code></span>
+<span class="codeline" id="line-86"><code>		part := int(hash % uintptr(len(tab.tab)))</code></span>
+<span class="codeline" id="line-87"><code>		vd.link.StoreNoWB(tab.tab[part].Load())</code></span>
+<span class="codeline" id="line-88"><code>		tab.tab[part].StoreNoWB(unsafe.Pointer(vd))</code></span>
+<span class="codeline" id="line-89"><code>		unlock(&amp;tab.lock)</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>		added = true</code></span>
+<span class="codeline" id="line-92"><code>	})</code></span>
+<span class="codeline" id="line-93"><code>	return id, added</code></span>
+<span class="codeline" id="line-94"><code>}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// find looks up data in the table, assuming hash is a hash of data.</code></span>
+<span class="codeline" id="line-97"><code>//</code></span>
+<span class="codeline" id="line-98"><code>// Returns 0 if the data is not found, and the unique ID for it if it is.</code></span>
+<span class="codeline" id="line-99"><code>func (tab *traceMap) find(data unsafe.Pointer, size, hash uintptr) uint64 {</code></span>
+<span class="codeline" id="line-100"><code>	part := int(hash % uintptr(len(tab.tab)))</code></span>
+<span class="codeline" id="line-101"><code>	for vd := tab.bucket(part); vd != nil; vd = vd.next() {</code></span>
+<span class="codeline" id="line-102"><code>		// Synchronization not necessary. Once published to the table, these</code></span>
+<span class="codeline" id="line-103"><code>		// values are immutable.</code></span>
+<span class="codeline" id="line-104"><code>		if vd.hash == hash &amp;&amp; uintptr(len(vd.data)) == size {</code></span>
+<span class="codeline" id="line-105"><code>			if memequal(unsafe.Pointer(&amp;vd.data[0]), data, size) {</code></span>
+<span class="codeline" id="line-106"><code>				return vd.id</code></span>
+<span class="codeline" id="line-107"><code>			}</code></span>
+<span class="codeline" id="line-108"><code>		}</code></span>
+<span class="codeline" id="line-109"><code>	}</code></span>
+<span class="codeline" id="line-110"><code>	return 0</code></span>
+<span class="codeline" id="line-111"><code>}</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>// bucket is a type-safe wrapper for looking up a value in tab.tab.</code></span>
+<span class="codeline" id="line-114"><code>func (tab *traceMap) bucket(part int) *traceMapNode {</code></span>
+<span class="codeline" id="line-115"><code>	return (*traceMapNode)(tab.tab[part].Load())</code></span>
+<span class="codeline" id="line-116"><code>}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>func (tab *traceMap) newTraceMapNode(data unsafe.Pointer, size, hash uintptr, id uint64) *traceMapNode {</code></span>
+<span class="codeline" id="line-119"><code>	// Create data array.</code></span>
+<span class="codeline" id="line-120"><code>	sl := notInHeapSlice{</code></span>
+<span class="codeline" id="line-121"><code>		array: tab.mem.alloc(size),</code></span>
+<span class="codeline" id="line-122"><code>		len:   int(size),</code></span>
+<span class="codeline" id="line-123"><code>		cap:   int(size),</code></span>
+<span class="codeline" id="line-124"><code>	}</code></span>
+<span class="codeline" id="line-125"><code>	memmove(unsafe.Pointer(sl.array), data, size)</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>	// Create metadata structure.</code></span>
+<span class="codeline" id="line-128"><code>	meta := (*traceMapNode)(unsafe.Pointer(tab.mem.alloc(unsafe.Sizeof(traceMapNode{}))))</code></span>
+<span class="codeline" id="line-129"><code>	*(*notInHeapSlice)(unsafe.Pointer(&amp;meta.data)) = sl</code></span>
+<span class="codeline" id="line-130"><code>	meta.id = id</code></span>
+<span class="codeline" id="line-131"><code>	meta.hash = hash</code></span>
+<span class="codeline" id="line-132"><code>	return meta</code></span>
+<span class="codeline" id="line-133"><code>}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>// reset drops all allocated memory from the table and resets it.</code></span>
+<span class="codeline" id="line-136"><code>//</code></span>
+<span class="codeline" id="line-137"><code>// tab.lock must be held. Must run on the system stack because of this.</code></span>
+<span class="codeline" id="line-138"><code>//</code></span>
+<span class="codeline" id="line-139"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-140"><code>func (tab *traceMap) reset() {</code></span>
+<span class="codeline" id="line-141"><code>	assertLockHeld(&amp;tab.lock)</code></span>
+<span class="codeline" id="line-142"><code>	tab.mem.drop()</code></span>
+<span class="codeline" id="line-143"><code>	tab.seq.Store(0)</code></span>
+<span class="codeline" id="line-144"><code>	// Clear table without write barriers. The table consists entirely</code></span>
+<span class="codeline" id="line-145"><code>	// of notinheap pointers, so this is fine.</code></span>
+<span class="codeline" id="line-146"><code>	//</code></span>
+<span class="codeline" id="line-147"><code>	// Write barriers may theoretically call into the tracer and acquire</code></span>
+<span class="codeline" id="line-148"><code>	// the lock again, and this lock ordering is expressed in the static</code></span>
+<span class="codeline" id="line-149"><code>	// lock ranking checker.</code></span>
+<span class="codeline" id="line-150"><code>	memclrNoHeapPointers(unsafe.Pointer(&amp;tab.tab), unsafe.Sizeof(tab.tab))</code></span>
+<span class="codeline" id="line-151"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

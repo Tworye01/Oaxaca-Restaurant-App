@@ -1,0 +1,1723 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: malloc.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	malloc.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2014 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// Memory allocator.</code></span>
+<span class="codeline" id="line-6"><code>//</code></span>
+<span class="codeline" id="line-7"><code>// This was originally based on tcmalloc, but has diverged quite a bit.</code></span>
+<span class="codeline" id="line-8"><code>// http://goog-perftools.sourceforge.net/doc/tcmalloc.html</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>// The main allocator works in runs of pages.</code></span>
+<span class="codeline" id="line-11"><code>// Small allocation sizes (up to and including 32 kB) are</code></span>
+<span class="codeline" id="line-12"><code>// rounded to one of about 70 size classes, each of which</code></span>
+<span class="codeline" id="line-13"><code>// has its own free set of objects of exactly that size.</code></span>
+<span class="codeline" id="line-14"><code>// Any free page of memory can be split into a set of objects</code></span>
+<span class="codeline" id="line-15"><code>// of one size class, which are then managed using a free bitmap.</code></span>
+<span class="codeline" id="line-16"><code>//</code></span>
+<span class="codeline" id="line-17"><code>// The allocator's data structures are:</code></span>
+<span class="codeline" id="line-18"><code>//</code></span>
+<span class="codeline" id="line-19"><code>//	fixalloc: a free-list allocator for fixed-size off-heap objects,</code></span>
+<span class="codeline" id="line-20"><code>//		used to manage storage used by the allocator.</code></span>
+<span class="codeline" id="line-21"><code>//	mheap: the malloc heap, managed at page (8192-byte) granularity.</code></span>
+<span class="codeline" id="line-22"><code>//	mspan: a run of in-use pages managed by the mheap.</code></span>
+<span class="codeline" id="line-23"><code>//	mcentral: collects all spans of a given size class.</code></span>
+<span class="codeline" id="line-24"><code>//	mcache: a per-P cache of mspans with free space.</code></span>
+<span class="codeline" id="line-25"><code>//	mstats: allocation statistics.</code></span>
+<span class="codeline" id="line-26"><code>//</code></span>
+<span class="codeline" id="line-27"><code>// Allocating a small object proceeds up a hierarchy of caches:</code></span>
+<span class="codeline" id="line-28"><code>//</code></span>
+<span class="codeline" id="line-29"><code>//	1. Round the size up to one of the small size classes</code></span>
+<span class="codeline" id="line-30"><code>//	   and look in the corresponding mspan in this P's mcache.</code></span>
+<span class="codeline" id="line-31"><code>//	   Scan the mspan's free bitmap to find a free slot.</code></span>
+<span class="codeline" id="line-32"><code>//	   If there is a free slot, allocate it.</code></span>
+<span class="codeline" id="line-33"><code>//	   This can all be done without acquiring a lock.</code></span>
+<span class="codeline" id="line-34"><code>//</code></span>
+<span class="codeline" id="line-35"><code>//	2. If the mspan has no free slots, obtain a new mspan</code></span>
+<span class="codeline" id="line-36"><code>//	   from the mcentral's list of mspans of the required size</code></span>
+<span class="codeline" id="line-37"><code>//	   class that have free space.</code></span>
+<span class="codeline" id="line-38"><code>//	   Obtaining a whole span amortizes the cost of locking</code></span>
+<span class="codeline" id="line-39"><code>//	   the mcentral.</code></span>
+<span class="codeline" id="line-40"><code>//</code></span>
+<span class="codeline" id="line-41"><code>//	3. If the mcentral's mspan list is empty, obtain a run</code></span>
+<span class="codeline" id="line-42"><code>//	   of pages from the mheap to use for the mspan.</code></span>
+<span class="codeline" id="line-43"><code>//</code></span>
+<span class="codeline" id="line-44"><code>//	4. If the mheap is empty or has no page runs large enough,</code></span>
+<span class="codeline" id="line-45"><code>//	   allocate a new group of pages (at least 1MB) from the</code></span>
+<span class="codeline" id="line-46"><code>//	   operating system. Allocating a large run of pages</code></span>
+<span class="codeline" id="line-47"><code>//	   amortizes the cost of talking to the operating system.</code></span>
+<span class="codeline" id="line-48"><code>//</code></span>
+<span class="codeline" id="line-49"><code>// Sweeping an mspan and freeing objects on it proceeds up a similar</code></span>
+<span class="codeline" id="line-50"><code>// hierarchy:</code></span>
+<span class="codeline" id="line-51"><code>//</code></span>
+<span class="codeline" id="line-52"><code>//	1. If the mspan is being swept in response to allocation, it</code></span>
+<span class="codeline" id="line-53"><code>//	   is returned to the mcache to satisfy the allocation.</code></span>
+<span class="codeline" id="line-54"><code>//</code></span>
+<span class="codeline" id="line-55"><code>//	2. Otherwise, if the mspan still has allocated objects in it,</code></span>
+<span class="codeline" id="line-56"><code>//	   it is placed on the mcentral free list for the mspan's size</code></span>
+<span class="codeline" id="line-57"><code>//	   class.</code></span>
+<span class="codeline" id="line-58"><code>//</code></span>
+<span class="codeline" id="line-59"><code>//	3. Otherwise, if all objects in the mspan are free, the mspan's</code></span>
+<span class="codeline" id="line-60"><code>//	   pages are returned to the mheap and the mspan is now dead.</code></span>
+<span class="codeline" id="line-61"><code>//</code></span>
+<span class="codeline" id="line-62"><code>// Allocating and freeing a large object uses the mheap</code></span>
+<span class="codeline" id="line-63"><code>// directly, bypassing the mcache and mcentral.</code></span>
+<span class="codeline" id="line-64"><code>//</code></span>
+<span class="codeline" id="line-65"><code>// If mspan.needzero is false, then free object slots in the mspan are</code></span>
+<span class="codeline" id="line-66"><code>// already zeroed. Otherwise if needzero is true, objects are zeroed as</code></span>
+<span class="codeline" id="line-67"><code>// they are allocated. There are various benefits to delaying zeroing</code></span>
+<span class="codeline" id="line-68"><code>// this way:</code></span>
+<span class="codeline" id="line-69"><code>//</code></span>
+<span class="codeline" id="line-70"><code>//	1. Stack frame allocation can avoid zeroing altogether.</code></span>
+<span class="codeline" id="line-71"><code>//</code></span>
+<span class="codeline" id="line-72"><code>//	2. It exhibits better temporal locality, since the program is</code></span>
+<span class="codeline" id="line-73"><code>//	   probably about to write to the memory.</code></span>
+<span class="codeline" id="line-74"><code>//</code></span>
+<span class="codeline" id="line-75"><code>//	3. We don't zero pages that never get reused.</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>// Virtual memory layout</code></span>
+<span class="codeline" id="line-78"><code>//</code></span>
+<span class="codeline" id="line-79"><code>// The heap consists of a set of arenas, which are 64MB on 64-bit and</code></span>
+<span class="codeline" id="line-80"><code>// 4MB on 32-bit (heapArenaBytes). Each arena's start address is also</code></span>
+<span class="codeline" id="line-81"><code>// aligned to the arena size.</code></span>
+<span class="codeline" id="line-82"><code>//</code></span>
+<span class="codeline" id="line-83"><code>// Each arena has an associated heapArena object that stores the</code></span>
+<span class="codeline" id="line-84"><code>// metadata for that arena: the heap bitmap for all words in the arena</code></span>
+<span class="codeline" id="line-85"><code>// and the span map for all pages in the arena. heapArena objects are</code></span>
+<span class="codeline" id="line-86"><code>// themselves allocated off-heap.</code></span>
+<span class="codeline" id="line-87"><code>//</code></span>
+<span class="codeline" id="line-88"><code>// Since arenas are aligned, the address space can be viewed as a</code></span>
+<span class="codeline" id="line-89"><code>// series of arena frames. The arena map (mheap_.arenas) maps from</code></span>
+<span class="codeline" id="line-90"><code>// arena frame number to *heapArena, or nil for parts of the address</code></span>
+<span class="codeline" id="line-91"><code>// space not backed by the Go heap. The arena map is structured as a</code></span>
+<span class="codeline" id="line-92"><code>// two-level array consisting of a "L1" arena map and many "L2" arena</code></span>
+<span class="codeline" id="line-93"><code>// maps; however, since arenas are large, on many architectures, the</code></span>
+<span class="codeline" id="line-94"><code>// arena map consists of a single, large L2 map.</code></span>
+<span class="codeline" id="line-95"><code>//</code></span>
+<span class="codeline" id="line-96"><code>// The arena map covers the entire possible address space, allowing</code></span>
+<span class="codeline" id="line-97"><code>// the Go heap to use any part of the address space. The allocator</code></span>
+<span class="codeline" id="line-98"><code>// attempts to keep arenas contiguous so that large spans (and hence</code></span>
+<span class="codeline" id="line-99"><code>// large objects) can cross arenas.</code></span>
+<span class="codeline" id="line-100"><code></code></span>
+<span class="codeline" id="line-101"><code>package runtime</code></span>
+<span class="codeline" id="line-102"><code></code></span>
+<span class="codeline" id="line-103"><code>import (</code></span>
+<span class="codeline" id="line-104"><code>	"internal/goarch"</code></span>
+<span class="codeline" id="line-105"><code>	"internal/goexperiment"</code></span>
+<span class="codeline" id="line-106"><code>	"internal/goos"</code></span>
+<span class="codeline" id="line-107"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-108"><code>	"runtime/internal/math"</code></span>
+<span class="codeline" id="line-109"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-110"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-111"><code>)</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>const (</code></span>
+<span class="codeline" id="line-114"><code>	maxTinySize   = _TinySize</code></span>
+<span class="codeline" id="line-115"><code>	tinySizeClass = _TinySizeClass</code></span>
+<span class="codeline" id="line-116"><code>	maxSmallSize  = _MaxSmallSize</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	pageShift = _PageShift</code></span>
+<span class="codeline" id="line-119"><code>	pageSize  = _PageSize</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>	_PageSize = 1 &lt;&lt; _PageShift</code></span>
+<span class="codeline" id="line-122"><code>	_PageMask = _PageSize - 1</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>	// _64bit = 1 on 64-bit systems, 0 on 32-bit systems</code></span>
+<span class="codeline" id="line-125"><code>	_64bit = 1 &lt;&lt; (^uintptr(0) &gt;&gt; 63) / 2</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>	// Tiny allocator parameters, see "Tiny allocator" comment in malloc.go.</code></span>
+<span class="codeline" id="line-128"><code>	_TinySize      = 16</code></span>
+<span class="codeline" id="line-129"><code>	_TinySizeClass = int8(2)</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>	_FixAllocChunk = 16 &lt;&lt; 10 // Chunk size for FixAlloc</code></span>
+<span class="codeline" id="line-132"><code></code></span>
+<span class="codeline" id="line-133"><code>	// Per-P, per order stack segment cache size.</code></span>
+<span class="codeline" id="line-134"><code>	_StackCacheSize = 32 * 1024</code></span>
+<span class="codeline" id="line-135"><code></code></span>
+<span class="codeline" id="line-136"><code>	// Number of orders that get caching. Order 0 is FixedStack</code></span>
+<span class="codeline" id="line-137"><code>	// and each successive order is twice as large.</code></span>
+<span class="codeline" id="line-138"><code>	// We want to cache 2KB, 4KB, 8KB, and 16KB stacks. Larger stacks</code></span>
+<span class="codeline" id="line-139"><code>	// will be allocated directly.</code></span>
+<span class="codeline" id="line-140"><code>	// Since FixedStack is different on different systems, we</code></span>
+<span class="codeline" id="line-141"><code>	// must vary NumStackOrders to keep the same maximum cached size.</code></span>
+<span class="codeline" id="line-142"><code>	//   OS               | FixedStack | NumStackOrders</code></span>
+<span class="codeline" id="line-143"><code>	//   -----------------+------------+---------------</code></span>
+<span class="codeline" id="line-144"><code>	//   linux/darwin/bsd | 2KB        | 4</code></span>
+<span class="codeline" id="line-145"><code>	//   windows/32       | 4KB        | 3</code></span>
+<span class="codeline" id="line-146"><code>	//   windows/64       | 8KB        | 2</code></span>
+<span class="codeline" id="line-147"><code>	//   plan9            | 4KB        | 3</code></span>
+<span class="codeline" id="line-148"><code>	_NumStackOrders = 4 - goarch.PtrSize/4*goos.IsWindows - 1*goos.IsPlan9</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>	// heapAddrBits is the number of bits in a heap address. On</code></span>
+<span class="codeline" id="line-151"><code>	// amd64, addresses are sign-extended beyond heapAddrBits. On</code></span>
+<span class="codeline" id="line-152"><code>	// other arches, they are zero-extended.</code></span>
+<span class="codeline" id="line-153"><code>	//</code></span>
+<span class="codeline" id="line-154"><code>	// On most 64-bit platforms, we limit this to 48 bits based on a</code></span>
+<span class="codeline" id="line-155"><code>	// combination of hardware and OS limitations.</code></span>
+<span class="codeline" id="line-156"><code>	//</code></span>
+<span class="codeline" id="line-157"><code>	// amd64 hardware limits addresses to 48 bits, sign-extended</code></span>
+<span class="codeline" id="line-158"><code>	// to 64 bits. Addresses where the top 16 bits are not either</code></span>
+<span class="codeline" id="line-159"><code>	// all 0 or all 1 are "non-canonical" and invalid. Because of</code></span>
+<span class="codeline" id="line-160"><code>	// these "negative" addresses, we offset addresses by 1&lt;&lt;47</code></span>
+<span class="codeline" id="line-161"><code>	// (arenaBaseOffset) on amd64 before computing indexes into</code></span>
+<span class="codeline" id="line-162"><code>	// the heap arenas index. In 2017, amd64 hardware added</code></span>
+<span class="codeline" id="line-163"><code>	// support for 57 bit addresses; however, currently only Linux</code></span>
+<span class="codeline" id="line-164"><code>	// supports this extension and the kernel will never choose an</code></span>
+<span class="codeline" id="line-165"><code>	// address above 1&lt;&lt;47 unless mmap is called with a hint</code></span>
+<span class="codeline" id="line-166"><code>	// address above 1&lt;&lt;47 (which we never do).</code></span>
+<span class="codeline" id="line-167"><code>	//</code></span>
+<span class="codeline" id="line-168"><code>	// arm64 hardware (as of ARMv8) limits user addresses to 48</code></span>
+<span class="codeline" id="line-169"><code>	// bits, in the range [0, 1&lt;&lt;48).</code></span>
+<span class="codeline" id="line-170"><code>	//</code></span>
+<span class="codeline" id="line-171"><code>	// ppc64, mips64, and s390x support arbitrary 64 bit addresses</code></span>
+<span class="codeline" id="line-172"><code>	// in hardware. On Linux, Go leans on stricter OS limits. Based</code></span>
+<span class="codeline" id="line-173"><code>	// on Linux's processor.h, the user address space is limited as</code></span>
+<span class="codeline" id="line-174"><code>	// follows on 64-bit architectures:</code></span>
+<span class="codeline" id="line-175"><code>	//</code></span>
+<span class="codeline" id="line-176"><code>	// Architecture  Name              Maximum Value (exclusive)</code></span>
+<span class="codeline" id="line-177"><code>	// ---------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-178"><code>	// amd64         TASK_SIZE_MAX     0x007ffffffff000 (47 bit addresses)</code></span>
+<span class="codeline" id="line-179"><code>	// arm64         TASK_SIZE_64      0x01000000000000 (48 bit addresses)</code></span>
+<span class="codeline" id="line-180"><code>	// ppc64{,le}    TASK_SIZE_USER64  0x00400000000000 (46 bit addresses)</code></span>
+<span class="codeline" id="line-181"><code>	// mips64{,le}   TASK_SIZE64       0x00010000000000 (40 bit addresses)</code></span>
+<span class="codeline" id="line-182"><code>	// s390x         TASK_SIZE         1&lt;&lt;64 (64 bit addresses)</code></span>
+<span class="codeline" id="line-183"><code>	//</code></span>
+<span class="codeline" id="line-184"><code>	// These limits may increase over time, but are currently at</code></span>
+<span class="codeline" id="line-185"><code>	// most 48 bits except on s390x. On all architectures, Linux</code></span>
+<span class="codeline" id="line-186"><code>	// starts placing mmap'd regions at addresses that are</code></span>
+<span class="codeline" id="line-187"><code>	// significantly below 48 bits, so even if it's possible to</code></span>
+<span class="codeline" id="line-188"><code>	// exceed Go's 48 bit limit, it's extremely unlikely in</code></span>
+<span class="codeline" id="line-189"><code>	// practice.</code></span>
+<span class="codeline" id="line-190"><code>	//</code></span>
+<span class="codeline" id="line-191"><code>	// On 32-bit platforms, we accept the full 32-bit address</code></span>
+<span class="codeline" id="line-192"><code>	// space because doing so is cheap.</code></span>
+<span class="codeline" id="line-193"><code>	// mips32 only has access to the low 2GB of virtual memory, so</code></span>
+<span class="codeline" id="line-194"><code>	// we further limit it to 31 bits.</code></span>
+<span class="codeline" id="line-195"><code>	//</code></span>
+<span class="codeline" id="line-196"><code>	// On ios/arm64, although 64-bit pointers are presumably</code></span>
+<span class="codeline" id="line-197"><code>	// available, pointers are truncated to 33 bits in iOS &lt;14.</code></span>
+<span class="codeline" id="line-198"><code>	// Furthermore, only the top 4 GiB of the address space are</code></span>
+<span class="codeline" id="line-199"><code>	// actually available to the application. In iOS &gt;=14, more</code></span>
+<span class="codeline" id="line-200"><code>	// of the address space is available, and the OS can now</code></span>
+<span class="codeline" id="line-201"><code>	// provide addresses outside of those 33 bits. Pick 40 bits</code></span>
+<span class="codeline" id="line-202"><code>	// as a reasonable balance between address space usage by the</code></span>
+<span class="codeline" id="line-203"><code>	// page allocator, and flexibility for what mmap'd regions</code></span>
+<span class="codeline" id="line-204"><code>	// we'll accept for the heap. We can't just move to the full</code></span>
+<span class="codeline" id="line-205"><code>	// 48 bits because this uses too much address space for older</code></span>
+<span class="codeline" id="line-206"><code>	// iOS versions.</code></span>
+<span class="codeline" id="line-207"><code>	// TODO(mknyszek): Once iOS &lt;14 is deprecated, promote ios/arm64</code></span>
+<span class="codeline" id="line-208"><code>	// to a 48-bit address space like every other arm64 platform.</code></span>
+<span class="codeline" id="line-209"><code>	//</code></span>
+<span class="codeline" id="line-210"><code>	// WebAssembly currently has a limit of 4GB linear memory.</code></span>
+<span class="codeline" id="line-211"><code>	heapAddrBits = (_64bit*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64))*48 + (1-_64bit+goarch.IsWasm)*(32-(goarch.IsMips+goarch.IsMipsle)) + 40*goos.IsIos*goarch.IsArm64</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>	// maxAlloc is the maximum size of an allocation. On 64-bit,</code></span>
+<span class="codeline" id="line-214"><code>	// it's theoretically possible to allocate 1&lt;&lt;heapAddrBits bytes. On</code></span>
+<span class="codeline" id="line-215"><code>	// 32-bit, however, this is one less than 1&lt;&lt;32 because the</code></span>
+<span class="codeline" id="line-216"><code>	// number of bytes in the address space doesn't actually fit</code></span>
+<span class="codeline" id="line-217"><code>	// in a uintptr.</code></span>
+<span class="codeline" id="line-218"><code>	maxAlloc = (1 &lt;&lt; heapAddrBits) - (1-_64bit)*1</code></span>
+<span class="codeline" id="line-219"><code></code></span>
+<span class="codeline" id="line-220"><code>	// The number of bits in a heap address, the size of heap</code></span>
+<span class="codeline" id="line-221"><code>	// arenas, and the L1 and L2 arena map sizes are related by</code></span>
+<span class="codeline" id="line-222"><code>	//</code></span>
+<span class="codeline" id="line-223"><code>	//   (1 &lt;&lt; addr bits) = arena size * L1 entries * L2 entries</code></span>
+<span class="codeline" id="line-224"><code>	//</code></span>
+<span class="codeline" id="line-225"><code>	// Currently, we balance these as follows:</code></span>
+<span class="codeline" id="line-226"><code>	//</code></span>
+<span class="codeline" id="line-227"><code>	//       Platform  Addr bits  Arena size  L1 entries   L2 entries</code></span>
+<span class="codeline" id="line-228"><code>	// --------------  ---------  ----------  ----------  -----------</code></span>
+<span class="codeline" id="line-229"><code>	//       */64-bit         48        64MB           1    4M (32MB)</code></span>
+<span class="codeline" id="line-230"><code>	// windows/64-bit         48         4MB          64    1M  (8MB)</code></span>
+<span class="codeline" id="line-231"><code>	//      ios/arm64         33         4MB           1  2048  (8KB)</code></span>
+<span class="codeline" id="line-232"><code>	//       */32-bit         32         4MB           1  1024  (4KB)</code></span>
+<span class="codeline" id="line-233"><code>	//     */mips(le)         31         4MB           1   512  (2KB)</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>	// heapArenaBytes is the size of a heap arena. The heap</code></span>
+<span class="codeline" id="line-236"><code>	// consists of mappings of size heapArenaBytes, aligned to</code></span>
+<span class="codeline" id="line-237"><code>	// heapArenaBytes. The initial heap mapping is one arena.</code></span>
+<span class="codeline" id="line-238"><code>	//</code></span>
+<span class="codeline" id="line-239"><code>	// This is currently 64MB on 64-bit non-Windows and 4MB on</code></span>
+<span class="codeline" id="line-240"><code>	// 32-bit and on Windows. We use smaller arenas on Windows</code></span>
+<span class="codeline" id="line-241"><code>	// because all committed memory is charged to the process,</code></span>
+<span class="codeline" id="line-242"><code>	// even if it's not touched. Hence, for processes with small</code></span>
+<span class="codeline" id="line-243"><code>	// heaps, the mapped arena space needs to be commensurate.</code></span>
+<span class="codeline" id="line-244"><code>	// This is particularly important with the race detector,</code></span>
+<span class="codeline" id="line-245"><code>	// since it significantly amplifies the cost of committed</code></span>
+<span class="codeline" id="line-246"><code>	// memory.</code></span>
+<span class="codeline" id="line-247"><code>	heapArenaBytes = 1 &lt;&lt; logHeapArenaBytes</code></span>
+<span class="codeline" id="line-248"><code></code></span>
+<span class="codeline" id="line-249"><code>	heapArenaWords = heapArenaBytes / goarch.PtrSize</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>	// logHeapArenaBytes is log_2 of heapArenaBytes. For clarity,</code></span>
+<span class="codeline" id="line-252"><code>	// prefer using heapArenaBytes where possible (we need the</code></span>
+<span class="codeline" id="line-253"><code>	// constant to compute some other constants).</code></span>
+<span class="codeline" id="line-254"><code>	logHeapArenaBytes = (6+20)*(_64bit*(1-goos.IsWindows)*(1-goarch.IsWasm)*(1-goos.IsIos*goarch.IsArm64)) + (2+20)*(_64bit*goos.IsWindows) + (2+20)*(1-_64bit) + (2+20)*goarch.IsWasm + (2+20)*goos.IsIos*goarch.IsArm64</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>	// heapArenaBitmapWords is the size of each heap arena's bitmap in uintptrs.</code></span>
+<span class="codeline" id="line-257"><code>	heapArenaBitmapWords = heapArenaWords / (8 * goarch.PtrSize)</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>	pagesPerArena = heapArenaBytes / pageSize</code></span>
+<span class="codeline" id="line-260"><code></code></span>
+<span class="codeline" id="line-261"><code>	// arenaL1Bits is the number of bits of the arena number</code></span>
+<span class="codeline" id="line-262"><code>	// covered by the first level arena map.</code></span>
+<span class="codeline" id="line-263"><code>	//</code></span>
+<span class="codeline" id="line-264"><code>	// This number should be small, since the first level arena</code></span>
+<span class="codeline" id="line-265"><code>	// map requires PtrSize*(1&lt;&lt;arenaL1Bits) of space in the</code></span>
+<span class="codeline" id="line-266"><code>	// binary's BSS. It can be zero, in which case the first level</code></span>
+<span class="codeline" id="line-267"><code>	// index is effectively unused. There is a performance benefit</code></span>
+<span class="codeline" id="line-268"><code>	// to this, since the generated code can be more efficient,</code></span>
+<span class="codeline" id="line-269"><code>	// but comes at the cost of having a large L2 mapping.</code></span>
+<span class="codeline" id="line-270"><code>	//</code></span>
+<span class="codeline" id="line-271"><code>	// We use the L1 map on 64-bit Windows because the arena size</code></span>
+<span class="codeline" id="line-272"><code>	// is small, but the address space is still 48 bits, and</code></span>
+<span class="codeline" id="line-273"><code>	// there's a high cost to having a large L2.</code></span>
+<span class="codeline" id="line-274"><code>	arenaL1Bits = 6 * (_64bit * goos.IsWindows)</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>	// arenaL2Bits is the number of bits of the arena number</code></span>
+<span class="codeline" id="line-277"><code>	// covered by the second level arena index.</code></span>
+<span class="codeline" id="line-278"><code>	//</code></span>
+<span class="codeline" id="line-279"><code>	// The size of each arena map allocation is proportional to</code></span>
+<span class="codeline" id="line-280"><code>	// 1&lt;&lt;arenaL2Bits, so it's important that this not be too</code></span>
+<span class="codeline" id="line-281"><code>	// large. 48 bits leads to 32MB arena index allocations, which</code></span>
+<span class="codeline" id="line-282"><code>	// is about the practical threshold.</code></span>
+<span class="codeline" id="line-283"><code>	arenaL2Bits = heapAddrBits - logHeapArenaBytes - arenaL1Bits</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	// arenaL1Shift is the number of bits to shift an arena frame</code></span>
+<span class="codeline" id="line-286"><code>	// number by to compute an index into the first level arena map.</code></span>
+<span class="codeline" id="line-287"><code>	arenaL1Shift = arenaL2Bits</code></span>
+<span class="codeline" id="line-288"><code></code></span>
+<span class="codeline" id="line-289"><code>	// arenaBits is the total bits in a combined arena map index.</code></span>
+<span class="codeline" id="line-290"><code>	// This is split between the index into the L1 arena map and</code></span>
+<span class="codeline" id="line-291"><code>	// the L2 arena map.</code></span>
+<span class="codeline" id="line-292"><code>	arenaBits = arenaL1Bits + arenaL2Bits</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>	// arenaBaseOffset is the pointer value that corresponds to</code></span>
+<span class="codeline" id="line-295"><code>	// index 0 in the heap arena map.</code></span>
+<span class="codeline" id="line-296"><code>	//</code></span>
+<span class="codeline" id="line-297"><code>	// On amd64, the address space is 48 bits, sign extended to 64</code></span>
+<span class="codeline" id="line-298"><code>	// bits. This offset lets us handle "negative" addresses (or</code></span>
+<span class="codeline" id="line-299"><code>	// high addresses if viewed as unsigned).</code></span>
+<span class="codeline" id="line-300"><code>	//</code></span>
+<span class="codeline" id="line-301"><code>	// On aix/ppc64, this offset allows to keep the heapAddrBits to</code></span>
+<span class="codeline" id="line-302"><code>	// 48. Otherwise, it would be 60 in order to handle mmap addresses</code></span>
+<span class="codeline" id="line-303"><code>	// (in range 0x0a00000000000000 - 0x0afffffffffffff). But in this</code></span>
+<span class="codeline" id="line-304"><code>	// case, the memory reserved in (s *pageAlloc).init for chunks</code></span>
+<span class="codeline" id="line-305"><code>	// is causing important slowdowns.</code></span>
+<span class="codeline" id="line-306"><code>	//</code></span>
+<span class="codeline" id="line-307"><code>	// On other platforms, the user address space is contiguous</code></span>
+<span class="codeline" id="line-308"><code>	// and starts at 0, so no offset is necessary.</code></span>
+<span class="codeline" id="line-309"><code>	arenaBaseOffset = 0xffff800000000000*goarch.IsAmd64 + 0x0a00000000000000*goos.IsAix</code></span>
+<span class="codeline" id="line-310"><code>	// A typed version of this constant that will make it into DWARF (for viewcore).</code></span>
+<span class="codeline" id="line-311"><code>	arenaBaseOffsetUintptr = uintptr(arenaBaseOffset)</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>	// Max number of threads to run garbage collection.</code></span>
+<span class="codeline" id="line-314"><code>	// 2, 3, and 4 are all plausible maximums depending</code></span>
+<span class="codeline" id="line-315"><code>	// on the hardware details of the machine. The garbage</code></span>
+<span class="codeline" id="line-316"><code>	// collector scales well to 32 cpus.</code></span>
+<span class="codeline" id="line-317"><code>	_MaxGcproc = 32</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>	// minLegalPointer is the smallest possible legal pointer.</code></span>
+<span class="codeline" id="line-320"><code>	// This is the smallest possible architectural page size,</code></span>
+<span class="codeline" id="line-321"><code>	// since we assume that the first page is never mapped.</code></span>
+<span class="codeline" id="line-322"><code>	//</code></span>
+<span class="codeline" id="line-323"><code>	// This should agree with minZeroPage in the compiler.</code></span>
+<span class="codeline" id="line-324"><code>	minLegalPointer uintptr = 4096</code></span>
+<span class="codeline" id="line-325"><code></code></span>
+<span class="codeline" id="line-326"><code>	// minHeapForMetadataHugePages sets a threshold on when certain kinds of</code></span>
+<span class="codeline" id="line-327"><code>	// heap metadata, currently the arenas map L2 entries and page alloc bitmap</code></span>
+<span class="codeline" id="line-328"><code>	// mappings, are allowed to be backed by huge pages. If the heap goal ever</code></span>
+<span class="codeline" id="line-329"><code>	// exceeds this threshold, then huge pages are enabled.</code></span>
+<span class="codeline" id="line-330"><code>	//</code></span>
+<span class="codeline" id="line-331"><code>	// These numbers are chosen with the assumption that huge pages are on the</code></span>
+<span class="codeline" id="line-332"><code>	// order of a few MiB in size.</code></span>
+<span class="codeline" id="line-333"><code>	//</code></span>
+<span class="codeline" id="line-334"><code>	// The kind of metadata this applies to has a very low overhead when compared</code></span>
+<span class="codeline" id="line-335"><code>	// to address space used, but their constant overheads for small heaps would</code></span>
+<span class="codeline" id="line-336"><code>	// be very high if they were to be backed by huge pages (e.g. a few MiB makes</code></span>
+<span class="codeline" id="line-337"><code>	// a huge difference for an 8 MiB heap, but barely any difference for a 1 GiB</code></span>
+<span class="codeline" id="line-338"><code>	// heap). The benefit of huge pages is also not worth it for small heaps,</code></span>
+<span class="codeline" id="line-339"><code>	// because only a very, very small part of the metadata is used for small heaps.</code></span>
+<span class="codeline" id="line-340"><code>	//</code></span>
+<span class="codeline" id="line-341"><code>	// N.B. If the heap goal exceeds the threshold then shrinks to a very small size</code></span>
+<span class="codeline" id="line-342"><code>	// again, then huge pages will still be enabled for this mapping. The reason is that</code></span>
+<span class="codeline" id="line-343"><code>	// there's no point unless we're also returning the physical memory for these</code></span>
+<span class="codeline" id="line-344"><code>	// metadata mappings back to the OS. That would be quite complex to do in general</code></span>
+<span class="codeline" id="line-345"><code>	// as the heap is likely fragmented after a reduction in heap size.</code></span>
+<span class="codeline" id="line-346"><code>	minHeapForMetadataHugePages = 1 &lt;&lt; 30</code></span>
+<span class="codeline" id="line-347"><code>)</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>// physPageSize is the size in bytes of the OS's physical pages.</code></span>
+<span class="codeline" id="line-350"><code>// Mapping and unmapping operations must be done at multiples of</code></span>
+<span class="codeline" id="line-351"><code>// physPageSize.</code></span>
+<span class="codeline" id="line-352"><code>//</code></span>
+<span class="codeline" id="line-353"><code>// This must be set by the OS init code (typically in osinit) before</code></span>
+<span class="codeline" id="line-354"><code>// mallocinit.</code></span>
+<span class="codeline" id="line-355"><code>var physPageSize uintptr</code></span>
+<span class="codeline" id="line-356"><code></code></span>
+<span class="codeline" id="line-357"><code>// physHugePageSize is the size in bytes of the OS's default physical huge</code></span>
+<span class="codeline" id="line-358"><code>// page size whose allocation is opaque to the application. It is assumed</code></span>
+<span class="codeline" id="line-359"><code>// and verified to be a power of two.</code></span>
+<span class="codeline" id="line-360"><code>//</code></span>
+<span class="codeline" id="line-361"><code>// If set, this must be set by the OS init code (typically in osinit) before</code></span>
+<span class="codeline" id="line-362"><code>// mallocinit. However, setting it at all is optional, and leaving the default</code></span>
+<span class="codeline" id="line-363"><code>// value is always safe (though potentially less efficient).</code></span>
+<span class="codeline" id="line-364"><code>//</code></span>
+<span class="codeline" id="line-365"><code>// Since physHugePageSize is always assumed to be a power of two,</code></span>
+<span class="codeline" id="line-366"><code>// physHugePageShift is defined as physHugePageSize == 1 &lt;&lt; physHugePageShift.</code></span>
+<span class="codeline" id="line-367"><code>// The purpose of physHugePageShift is to avoid doing divisions in</code></span>
+<span class="codeline" id="line-368"><code>// performance critical functions.</code></span>
+<span class="codeline" id="line-369"><code>var (</code></span>
+<span class="codeline" id="line-370"><code>	physHugePageSize  uintptr</code></span>
+<span class="codeline" id="line-371"><code>	physHugePageShift uint</code></span>
+<span class="codeline" id="line-372"><code>)</code></span>
+<span class="codeline" id="line-373"><code></code></span>
+<span class="codeline" id="line-374"><code>func mallocinit() {</code></span>
+<span class="codeline" id="line-375"><code>	if class_to_size[_TinySizeClass] != _TinySize {</code></span>
+<span class="codeline" id="line-376"><code>		throw("bad TinySizeClass")</code></span>
+<span class="codeline" id="line-377"><code>	}</code></span>
+<span class="codeline" id="line-378"><code></code></span>
+<span class="codeline" id="line-379"><code>	if heapArenaBitmapWords&amp;(heapArenaBitmapWords-1) != 0 {</code></span>
+<span class="codeline" id="line-380"><code>		// heapBits expects modular arithmetic on bitmap</code></span>
+<span class="codeline" id="line-381"><code>		// addresses to work.</code></span>
+<span class="codeline" id="line-382"><code>		throw("heapArenaBitmapWords not a power of 2")</code></span>
+<span class="codeline" id="line-383"><code>	}</code></span>
+<span class="codeline" id="line-384"><code></code></span>
+<span class="codeline" id="line-385"><code>	// Check physPageSize.</code></span>
+<span class="codeline" id="line-386"><code>	if physPageSize == 0 {</code></span>
+<span class="codeline" id="line-387"><code>		// The OS init code failed to fetch the physical page size.</code></span>
+<span class="codeline" id="line-388"><code>		throw("failed to get system page size")</code></span>
+<span class="codeline" id="line-389"><code>	}</code></span>
+<span class="codeline" id="line-390"><code>	if physPageSize &gt; maxPhysPageSize {</code></span>
+<span class="codeline" id="line-391"><code>		print("system page size (", physPageSize, ") is larger than maximum page size (", maxPhysPageSize, ")\n")</code></span>
+<span class="codeline" id="line-392"><code>		throw("bad system page size")</code></span>
+<span class="codeline" id="line-393"><code>	}</code></span>
+<span class="codeline" id="line-394"><code>	if physPageSize &lt; minPhysPageSize {</code></span>
+<span class="codeline" id="line-395"><code>		print("system page size (", physPageSize, ") is smaller than minimum page size (", minPhysPageSize, ")\n")</code></span>
+<span class="codeline" id="line-396"><code>		throw("bad system page size")</code></span>
+<span class="codeline" id="line-397"><code>	}</code></span>
+<span class="codeline" id="line-398"><code>	if physPageSize&amp;(physPageSize-1) != 0 {</code></span>
+<span class="codeline" id="line-399"><code>		print("system page size (", physPageSize, ") must be a power of 2\n")</code></span>
+<span class="codeline" id="line-400"><code>		throw("bad system page size")</code></span>
+<span class="codeline" id="line-401"><code>	}</code></span>
+<span class="codeline" id="line-402"><code>	if physHugePageSize&amp;(physHugePageSize-1) != 0 {</code></span>
+<span class="codeline" id="line-403"><code>		print("system huge page size (", physHugePageSize, ") must be a power of 2\n")</code></span>
+<span class="codeline" id="line-404"><code>		throw("bad system huge page size")</code></span>
+<span class="codeline" id="line-405"><code>	}</code></span>
+<span class="codeline" id="line-406"><code>	if physHugePageSize &gt; maxPhysHugePageSize {</code></span>
+<span class="codeline" id="line-407"><code>		// physHugePageSize is greater than the maximum supported huge page size.</code></span>
+<span class="codeline" id="line-408"><code>		// Don't throw here, like in the other cases, since a system configured</code></span>
+<span class="codeline" id="line-409"><code>		// in this way isn't wrong, we just don't have the code to support them.</code></span>
+<span class="codeline" id="line-410"><code>		// Instead, silently set the huge page size to zero.</code></span>
+<span class="codeline" id="line-411"><code>		physHugePageSize = 0</code></span>
+<span class="codeline" id="line-412"><code>	}</code></span>
+<span class="codeline" id="line-413"><code>	if physHugePageSize != 0 {</code></span>
+<span class="codeline" id="line-414"><code>		// Since physHugePageSize is a power of 2, it suffices to increase</code></span>
+<span class="codeline" id="line-415"><code>		// physHugePageShift until 1&lt;&lt;physHugePageShift == physHugePageSize.</code></span>
+<span class="codeline" id="line-416"><code>		for 1&lt;&lt;physHugePageShift != physHugePageSize {</code></span>
+<span class="codeline" id="line-417"><code>			physHugePageShift++</code></span>
+<span class="codeline" id="line-418"><code>		}</code></span>
+<span class="codeline" id="line-419"><code>	}</code></span>
+<span class="codeline" id="line-420"><code>	if pagesPerArena%pagesPerSpanRoot != 0 {</code></span>
+<span class="codeline" id="line-421"><code>		print("pagesPerArena (", pagesPerArena, ") is not divisible by pagesPerSpanRoot (", pagesPerSpanRoot, ")\n")</code></span>
+<span class="codeline" id="line-422"><code>		throw("bad pagesPerSpanRoot")</code></span>
+<span class="codeline" id="line-423"><code>	}</code></span>
+<span class="codeline" id="line-424"><code>	if pagesPerArena%pagesPerReclaimerChunk != 0 {</code></span>
+<span class="codeline" id="line-425"><code>		print("pagesPerArena (", pagesPerArena, ") is not divisible by pagesPerReclaimerChunk (", pagesPerReclaimerChunk, ")\n")</code></span>
+<span class="codeline" id="line-426"><code>		throw("bad pagesPerReclaimerChunk")</code></span>
+<span class="codeline" id="line-427"><code>	}</code></span>
+<span class="codeline" id="line-428"><code>	if goexperiment.AllocHeaders {</code></span>
+<span class="codeline" id="line-429"><code>		// Check that the minimum size (exclusive) for a malloc header is also</code></span>
+<span class="codeline" id="line-430"><code>		// a size class boundary. This is important to making sure checks align</code></span>
+<span class="codeline" id="line-431"><code>		// across different parts of the runtime.</code></span>
+<span class="codeline" id="line-432"><code>		minSizeForMallocHeaderIsSizeClass := false</code></span>
+<span class="codeline" id="line-433"><code>		for i := 0; i &lt; len(class_to_size); i++ {</code></span>
+<span class="codeline" id="line-434"><code>			if minSizeForMallocHeader == uintptr(class_to_size[i]) {</code></span>
+<span class="codeline" id="line-435"><code>				minSizeForMallocHeaderIsSizeClass = true</code></span>
+<span class="codeline" id="line-436"><code>				break</code></span>
+<span class="codeline" id="line-437"><code>			}</code></span>
+<span class="codeline" id="line-438"><code>		}</code></span>
+<span class="codeline" id="line-439"><code>		if !minSizeForMallocHeaderIsSizeClass {</code></span>
+<span class="codeline" id="line-440"><code>			throw("min size of malloc header is not a size class boundary")</code></span>
+<span class="codeline" id="line-441"><code>		}</code></span>
+<span class="codeline" id="line-442"><code>		// Check that the pointer bitmap for all small sizes without a malloc header</code></span>
+<span class="codeline" id="line-443"><code>		// fits in a word.</code></span>
+<span class="codeline" id="line-444"><code>		if minSizeForMallocHeader/goarch.PtrSize &gt; 8*goarch.PtrSize {</code></span>
+<span class="codeline" id="line-445"><code>			throw("max pointer/scan bitmap size for headerless objects is too large")</code></span>
+<span class="codeline" id="line-446"><code>		}</code></span>
+<span class="codeline" id="line-447"><code>	}</code></span>
+<span class="codeline" id="line-448"><code></code></span>
+<span class="codeline" id="line-449"><code>	if minTagBits &gt; taggedPointerBits {</code></span>
+<span class="codeline" id="line-450"><code>		throw("taggedPointerbits too small")</code></span>
+<span class="codeline" id="line-451"><code>	}</code></span>
+<span class="codeline" id="line-452"><code></code></span>
+<span class="codeline" id="line-453"><code>	// Initialize the heap.</code></span>
+<span class="codeline" id="line-454"><code>	mheap_.init()</code></span>
+<span class="codeline" id="line-455"><code>	mcache0 = allocmcache()</code></span>
+<span class="codeline" id="line-456"><code>	lockInit(&amp;gcBitsArenas.lock, lockRankGcBitsArenas)</code></span>
+<span class="codeline" id="line-457"><code>	lockInit(&amp;profInsertLock, lockRankProfInsert)</code></span>
+<span class="codeline" id="line-458"><code>	lockInit(&amp;profBlockLock, lockRankProfBlock)</code></span>
+<span class="codeline" id="line-459"><code>	lockInit(&amp;profMemActiveLock, lockRankProfMemActive)</code></span>
+<span class="codeline" id="line-460"><code>	for i := range profMemFutureLock {</code></span>
+<span class="codeline" id="line-461"><code>		lockInit(&amp;profMemFutureLock[i], lockRankProfMemFuture)</code></span>
+<span class="codeline" id="line-462"><code>	}</code></span>
+<span class="codeline" id="line-463"><code>	lockInit(&amp;globalAlloc.mutex, lockRankGlobalAlloc)</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>	// Create initial arena growth hints.</code></span>
+<span class="codeline" id="line-466"><code>	if goarch.PtrSize == 8 {</code></span>
+<span class="codeline" id="line-467"><code>		// On a 64-bit machine, we pick the following hints</code></span>
+<span class="codeline" id="line-468"><code>		// because:</code></span>
+<span class="codeline" id="line-469"><code>		//</code></span>
+<span class="codeline" id="line-470"><code>		// 1. Starting from the middle of the address space</code></span>
+<span class="codeline" id="line-471"><code>		// makes it easier to grow out a contiguous range</code></span>
+<span class="codeline" id="line-472"><code>		// without running in to some other mapping.</code></span>
+<span class="codeline" id="line-473"><code>		//</code></span>
+<span class="codeline" id="line-474"><code>		// 2. This makes Go heap addresses more easily</code></span>
+<span class="codeline" id="line-475"><code>		// recognizable when debugging.</code></span>
+<span class="codeline" id="line-476"><code>		//</code></span>
+<span class="codeline" id="line-477"><code>		// 3. Stack scanning in gccgo is still conservative,</code></span>
+<span class="codeline" id="line-478"><code>		// so it's important that addresses be distinguishable</code></span>
+<span class="codeline" id="line-479"><code>		// from other data.</code></span>
+<span class="codeline" id="line-480"><code>		//</code></span>
+<span class="codeline" id="line-481"><code>		// Starting at 0x00c0 means that the valid memory addresses</code></span>
+<span class="codeline" id="line-482"><code>		// will begin 0x00c0, 0x00c1, ...</code></span>
+<span class="codeline" id="line-483"><code>		// In little-endian, that's c0 00, c1 00, ... None of those are valid</code></span>
+<span class="codeline" id="line-484"><code>		// UTF-8 sequences, and they are otherwise as far away from</code></span>
+<span class="codeline" id="line-485"><code>		// ff (likely a common byte) as possible. If that fails, we try other 0xXXc0</code></span>
+<span class="codeline" id="line-486"><code>		// addresses. An earlier attempt to use 0x11f8 caused out of memory errors</code></span>
+<span class="codeline" id="line-487"><code>		// on OS X during thread allocations.  0x00c0 causes conflicts with</code></span>
+<span class="codeline" id="line-488"><code>		// AddressSanitizer which reserves all memory up to 0x0100.</code></span>
+<span class="codeline" id="line-489"><code>		// These choices reduce the odds of a conservative garbage collector</code></span>
+<span class="codeline" id="line-490"><code>		// not collecting memory because some non-pointer block of memory</code></span>
+<span class="codeline" id="line-491"><code>		// had a bit pattern that matched a memory address.</code></span>
+<span class="codeline" id="line-492"><code>		//</code></span>
+<span class="codeline" id="line-493"><code>		// However, on arm64, we ignore all this advice above and slam the</code></span>
+<span class="codeline" id="line-494"><code>		// allocation at 0x40 &lt;&lt; 32 because when using 4k pages with 3-level</code></span>
+<span class="codeline" id="line-495"><code>		// translation buffers, the user address space is limited to 39 bits</code></span>
+<span class="codeline" id="line-496"><code>		// On ios/arm64, the address space is even smaller.</code></span>
+<span class="codeline" id="line-497"><code>		//</code></span>
+<span class="codeline" id="line-498"><code>		// On AIX, mmaps starts at 0x0A00000000000000 for 64-bit.</code></span>
+<span class="codeline" id="line-499"><code>		// processes.</code></span>
+<span class="codeline" id="line-500"><code>		//</code></span>
+<span class="codeline" id="line-501"><code>		// Space mapped for user arenas comes immediately after the range</code></span>
+<span class="codeline" id="line-502"><code>		// originally reserved for the regular heap when race mode is not</code></span>
+<span class="codeline" id="line-503"><code>		// enabled because user arena chunks can never be used for regular heap</code></span>
+<span class="codeline" id="line-504"><code>		// allocations and we want to avoid fragmenting the address space.</code></span>
+<span class="codeline" id="line-505"><code>		//</code></span>
+<span class="codeline" id="line-506"><code>		// In race mode we have no choice but to just use the same hints because</code></span>
+<span class="codeline" id="line-507"><code>		// the race detector requires that the heap be mapped contiguously.</code></span>
+<span class="codeline" id="line-508"><code>		for i := 0x7f; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-509"><code>			var p uintptr</code></span>
+<span class="codeline" id="line-510"><code>			switch {</code></span>
+<span class="codeline" id="line-511"><code>			case raceenabled:</code></span>
+<span class="codeline" id="line-512"><code>				// The TSAN runtime requires the heap</code></span>
+<span class="codeline" id="line-513"><code>				// to be in the range [0x00c000000000,</code></span>
+<span class="codeline" id="line-514"><code>				// 0x00e000000000).</code></span>
+<span class="codeline" id="line-515"><code>				p = uintptr(i)&lt;&lt;32 | uintptrMask&amp;(0x00c0&lt;&lt;32)</code></span>
+<span class="codeline" id="line-516"><code>				if p &gt;= uintptrMask&amp;0x00e000000000 {</code></span>
+<span class="codeline" id="line-517"><code>					continue</code></span>
+<span class="codeline" id="line-518"><code>				}</code></span>
+<span class="codeline" id="line-519"><code>			case GOARCH == "arm64" &amp;&amp; GOOS == "ios":</code></span>
+<span class="codeline" id="line-520"><code>				p = uintptr(i)&lt;&lt;40 | uintptrMask&amp;(0x0013&lt;&lt;28)</code></span>
+<span class="codeline" id="line-521"><code>			case GOARCH == "arm64":</code></span>
+<span class="codeline" id="line-522"><code>				p = uintptr(i)&lt;&lt;40 | uintptrMask&amp;(0x0040&lt;&lt;32)</code></span>
+<span class="codeline" id="line-523"><code>			case GOOS == "aix":</code></span>
+<span class="codeline" id="line-524"><code>				if i == 0 {</code></span>
+<span class="codeline" id="line-525"><code>					// We don't use addresses directly after 0x0A00000000000000</code></span>
+<span class="codeline" id="line-526"><code>					// to avoid collisions with others mmaps done by non-go programs.</code></span>
+<span class="codeline" id="line-527"><code>					continue</code></span>
+<span class="codeline" id="line-528"><code>				}</code></span>
+<span class="codeline" id="line-529"><code>				p = uintptr(i)&lt;&lt;40 | uintptrMask&amp;(0xa0&lt;&lt;52)</code></span>
+<span class="codeline" id="line-530"><code>			default:</code></span>
+<span class="codeline" id="line-531"><code>				p = uintptr(i)&lt;&lt;40 | uintptrMask&amp;(0x00c0&lt;&lt;32)</code></span>
+<span class="codeline" id="line-532"><code>			}</code></span>
+<span class="codeline" id="line-533"><code>			// Switch to generating hints for user arenas if we've gone</code></span>
+<span class="codeline" id="line-534"><code>			// through about half the hints. In race mode, take only about</code></span>
+<span class="codeline" id="line-535"><code>			// a quarter; we don't have very much space to work with.</code></span>
+<span class="codeline" id="line-536"><code>			hintList := &amp;mheap_.arenaHints</code></span>
+<span class="codeline" id="line-537"><code>			if (!raceenabled &amp;&amp; i &gt; 0x3f) || (raceenabled &amp;&amp; i &gt; 0x5f) {</code></span>
+<span class="codeline" id="line-538"><code>				hintList = &amp;mheap_.userArena.arenaHints</code></span>
+<span class="codeline" id="line-539"><code>			}</code></span>
+<span class="codeline" id="line-540"><code>			hint := (*arenaHint)(mheap_.arenaHintAlloc.alloc())</code></span>
+<span class="codeline" id="line-541"><code>			hint.addr = p</code></span>
+<span class="codeline" id="line-542"><code>			hint.next, *hintList = *hintList, hint</code></span>
+<span class="codeline" id="line-543"><code>		}</code></span>
+<span class="codeline" id="line-544"><code>	} else {</code></span>
+<span class="codeline" id="line-545"><code>		// On a 32-bit machine, we're much more concerned</code></span>
+<span class="codeline" id="line-546"><code>		// about keeping the usable heap contiguous.</code></span>
+<span class="codeline" id="line-547"><code>		// Hence:</code></span>
+<span class="codeline" id="line-548"><code>		//</code></span>
+<span class="codeline" id="line-549"><code>		// 1. We reserve space for all heapArenas up front so</code></span>
+<span class="codeline" id="line-550"><code>		// they don't get interleaved with the heap. They're</code></span>
+<span class="codeline" id="line-551"><code>		// ~258MB, so this isn't too bad. (We could reserve a</code></span>
+<span class="codeline" id="line-552"><code>		// smaller amount of space up front if this is a</code></span>
+<span class="codeline" id="line-553"><code>		// problem.)</code></span>
+<span class="codeline" id="line-554"><code>		//</code></span>
+<span class="codeline" id="line-555"><code>		// 2. We hint the heap to start right above the end of</code></span>
+<span class="codeline" id="line-556"><code>		// the binary so we have the best chance of keeping it</code></span>
+<span class="codeline" id="line-557"><code>		// contiguous.</code></span>
+<span class="codeline" id="line-558"><code>		//</code></span>
+<span class="codeline" id="line-559"><code>		// 3. We try to stake out a reasonably large initial</code></span>
+<span class="codeline" id="line-560"><code>		// heap reservation.</code></span>
+<span class="codeline" id="line-561"><code></code></span>
+<span class="codeline" id="line-562"><code>		const arenaMetaSize = (1 &lt;&lt; arenaBits) * unsafe.Sizeof(heapArena{})</code></span>
+<span class="codeline" id="line-563"><code>		meta := uintptr(sysReserve(nil, arenaMetaSize))</code></span>
+<span class="codeline" id="line-564"><code>		if meta != 0 {</code></span>
+<span class="codeline" id="line-565"><code>			mheap_.heapArenaAlloc.init(meta, arenaMetaSize, true)</code></span>
+<span class="codeline" id="line-566"><code>		}</code></span>
+<span class="codeline" id="line-567"><code></code></span>
+<span class="codeline" id="line-568"><code>		// We want to start the arena low, but if we're linked</code></span>
+<span class="codeline" id="line-569"><code>		// against C code, it's possible global constructors</code></span>
+<span class="codeline" id="line-570"><code>		// have called malloc and adjusted the process' brk.</code></span>
+<span class="codeline" id="line-571"><code>		// Query the brk so we can avoid trying to map the</code></span>
+<span class="codeline" id="line-572"><code>		// region over it (which will cause the kernel to put</code></span>
+<span class="codeline" id="line-573"><code>		// the region somewhere else, likely at a high</code></span>
+<span class="codeline" id="line-574"><code>		// address).</code></span>
+<span class="codeline" id="line-575"><code>		procBrk := sbrk0()</code></span>
+<span class="codeline" id="line-576"><code></code></span>
+<span class="codeline" id="line-577"><code>		// If we ask for the end of the data segment but the</code></span>
+<span class="codeline" id="line-578"><code>		// operating system requires a little more space</code></span>
+<span class="codeline" id="line-579"><code>		// before we can start allocating, it will give out a</code></span>
+<span class="codeline" id="line-580"><code>		// slightly higher pointer. Except QEMU, which is</code></span>
+<span class="codeline" id="line-581"><code>		// buggy, as usual: it won't adjust the pointer</code></span>
+<span class="codeline" id="line-582"><code>		// upward. So adjust it upward a little bit ourselves:</code></span>
+<span class="codeline" id="line-583"><code>		// 1/4 MB to get away from the running binary image.</code></span>
+<span class="codeline" id="line-584"><code>		p := firstmoduledata.end</code></span>
+<span class="codeline" id="line-585"><code>		if p &lt; procBrk {</code></span>
+<span class="codeline" id="line-586"><code>			p = procBrk</code></span>
+<span class="codeline" id="line-587"><code>		}</code></span>
+<span class="codeline" id="line-588"><code>		if mheap_.heapArenaAlloc.next &lt;= p &amp;&amp; p &lt; mheap_.heapArenaAlloc.end {</code></span>
+<span class="codeline" id="line-589"><code>			p = mheap_.heapArenaAlloc.end</code></span>
+<span class="codeline" id="line-590"><code>		}</code></span>
+<span class="codeline" id="line-591"><code>		p = alignUp(p+(256&lt;&lt;10), heapArenaBytes)</code></span>
+<span class="codeline" id="line-592"><code>		// Because we're worried about fragmentation on</code></span>
+<span class="codeline" id="line-593"><code>		// 32-bit, we try to make a large initial reservation.</code></span>
+<span class="codeline" id="line-594"><code>		arenaSizes := []uintptr{</code></span>
+<span class="codeline" id="line-595"><code>			512 &lt;&lt; 20,</code></span>
+<span class="codeline" id="line-596"><code>			256 &lt;&lt; 20,</code></span>
+<span class="codeline" id="line-597"><code>			128 &lt;&lt; 20,</code></span>
+<span class="codeline" id="line-598"><code>		}</code></span>
+<span class="codeline" id="line-599"><code>		for _, arenaSize := range arenaSizes {</code></span>
+<span class="codeline" id="line-600"><code>			a, size := sysReserveAligned(unsafe.Pointer(p), arenaSize, heapArenaBytes)</code></span>
+<span class="codeline" id="line-601"><code>			if a != nil {</code></span>
+<span class="codeline" id="line-602"><code>				mheap_.arena.init(uintptr(a), size, false)</code></span>
+<span class="codeline" id="line-603"><code>				p = mheap_.arena.end // For hint below</code></span>
+<span class="codeline" id="line-604"><code>				break</code></span>
+<span class="codeline" id="line-605"><code>			}</code></span>
+<span class="codeline" id="line-606"><code>		}</code></span>
+<span class="codeline" id="line-607"><code>		hint := (*arenaHint)(mheap_.arenaHintAlloc.alloc())</code></span>
+<span class="codeline" id="line-608"><code>		hint.addr = p</code></span>
+<span class="codeline" id="line-609"><code>		hint.next, mheap_.arenaHints = mheap_.arenaHints, hint</code></span>
+<span class="codeline" id="line-610"><code></code></span>
+<span class="codeline" id="line-611"><code>		// Place the hint for user arenas just after the large reservation.</code></span>
+<span class="codeline" id="line-612"><code>		//</code></span>
+<span class="codeline" id="line-613"><code>		// While this potentially competes with the hint above, in practice we probably</code></span>
+<span class="codeline" id="line-614"><code>		// aren't going to be getting this far anyway on 32-bit platforms.</code></span>
+<span class="codeline" id="line-615"><code>		userArenaHint := (*arenaHint)(mheap_.arenaHintAlloc.alloc())</code></span>
+<span class="codeline" id="line-616"><code>		userArenaHint.addr = p</code></span>
+<span class="codeline" id="line-617"><code>		userArenaHint.next, mheap_.userArena.arenaHints = mheap_.userArena.arenaHints, userArenaHint</code></span>
+<span class="codeline" id="line-618"><code>	}</code></span>
+<span class="codeline" id="line-619"><code>	// Initialize the memory limit here because the allocator is going to look at it</code></span>
+<span class="codeline" id="line-620"><code>	// but we haven't called gcinit yet and we're definitely going to allocate memory before then.</code></span>
+<span class="codeline" id="line-621"><code>	gcController.memoryLimit.Store(maxInt64)</code></span>
+<span class="codeline" id="line-622"><code>}</code></span>
+<span class="codeline" id="line-623"><code></code></span>
+<span class="codeline" id="line-624"><code>// sysAlloc allocates heap arena space for at least n bytes. The</code></span>
+<span class="codeline" id="line-625"><code>// returned pointer is always heapArenaBytes-aligned and backed by</code></span>
+<span class="codeline" id="line-626"><code>// h.arenas metadata. The returned size is always a multiple of</code></span>
+<span class="codeline" id="line-627"><code>// heapArenaBytes. sysAlloc returns nil on failure.</code></span>
+<span class="codeline" id="line-628"><code>// There is no corresponding free function.</code></span>
+<span class="codeline" id="line-629"><code>//</code></span>
+<span class="codeline" id="line-630"><code>// hintList is a list of hint addresses for where to allocate new</code></span>
+<span class="codeline" id="line-631"><code>// heap arenas. It must be non-nil.</code></span>
+<span class="codeline" id="line-632"><code>//</code></span>
+<span class="codeline" id="line-633"><code>// register indicates whether the heap arena should be registered</code></span>
+<span class="codeline" id="line-634"><code>// in allArenas.</code></span>
+<span class="codeline" id="line-635"><code>//</code></span>
+<span class="codeline" id="line-636"><code>// sysAlloc returns a memory region in the Reserved state. This region must</code></span>
+<span class="codeline" id="line-637"><code>// be transitioned to Prepared and then Ready before use.</code></span>
+<span class="codeline" id="line-638"><code>//</code></span>
+<span class="codeline" id="line-639"><code>// h must be locked.</code></span>
+<span class="codeline" id="line-640"><code>func (h *mheap) sysAlloc(n uintptr, hintList **arenaHint, register bool) (v unsafe.Pointer, size uintptr) {</code></span>
+<span class="codeline" id="line-641"><code>	assertLockHeld(&amp;h.lock)</code></span>
+<span class="codeline" id="line-642"><code></code></span>
+<span class="codeline" id="line-643"><code>	n = alignUp(n, heapArenaBytes)</code></span>
+<span class="codeline" id="line-644"><code></code></span>
+<span class="codeline" id="line-645"><code>	if hintList == &amp;h.arenaHints {</code></span>
+<span class="codeline" id="line-646"><code>		// First, try the arena pre-reservation.</code></span>
+<span class="codeline" id="line-647"><code>		// Newly-used mappings are considered released.</code></span>
+<span class="codeline" id="line-648"><code>		//</code></span>
+<span class="codeline" id="line-649"><code>		// Only do this if we're using the regular heap arena hints.</code></span>
+<span class="codeline" id="line-650"><code>		// This behavior is only for the heap.</code></span>
+<span class="codeline" id="line-651"><code>		v = h.arena.alloc(n, heapArenaBytes, &amp;gcController.heapReleased)</code></span>
+<span class="codeline" id="line-652"><code>		if v != nil {</code></span>
+<span class="codeline" id="line-653"><code>			size = n</code></span>
+<span class="codeline" id="line-654"><code>			goto mapped</code></span>
+<span class="codeline" id="line-655"><code>		}</code></span>
+<span class="codeline" id="line-656"><code>	}</code></span>
+<span class="codeline" id="line-657"><code></code></span>
+<span class="codeline" id="line-658"><code>	// Try to grow the heap at a hint address.</code></span>
+<span class="codeline" id="line-659"><code>	for *hintList != nil {</code></span>
+<span class="codeline" id="line-660"><code>		hint := *hintList</code></span>
+<span class="codeline" id="line-661"><code>		p := hint.addr</code></span>
+<span class="codeline" id="line-662"><code>		if hint.down {</code></span>
+<span class="codeline" id="line-663"><code>			p -= n</code></span>
+<span class="codeline" id="line-664"><code>		}</code></span>
+<span class="codeline" id="line-665"><code>		if p+n &lt; p {</code></span>
+<span class="codeline" id="line-666"><code>			// We can't use this, so don't ask.</code></span>
+<span class="codeline" id="line-667"><code>			v = nil</code></span>
+<span class="codeline" id="line-668"><code>		} else if arenaIndex(p+n-1) &gt;= 1&lt;&lt;arenaBits {</code></span>
+<span class="codeline" id="line-669"><code>			// Outside addressable heap. Can't use.</code></span>
+<span class="codeline" id="line-670"><code>			v = nil</code></span>
+<span class="codeline" id="line-671"><code>		} else {</code></span>
+<span class="codeline" id="line-672"><code>			v = sysReserve(unsafe.Pointer(p), n)</code></span>
+<span class="codeline" id="line-673"><code>		}</code></span>
+<span class="codeline" id="line-674"><code>		if p == uintptr(v) {</code></span>
+<span class="codeline" id="line-675"><code>			// Success. Update the hint.</code></span>
+<span class="codeline" id="line-676"><code>			if !hint.down {</code></span>
+<span class="codeline" id="line-677"><code>				p += n</code></span>
+<span class="codeline" id="line-678"><code>			}</code></span>
+<span class="codeline" id="line-679"><code>			hint.addr = p</code></span>
+<span class="codeline" id="line-680"><code>			size = n</code></span>
+<span class="codeline" id="line-681"><code>			break</code></span>
+<span class="codeline" id="line-682"><code>		}</code></span>
+<span class="codeline" id="line-683"><code>		// Failed. Discard this hint and try the next.</code></span>
+<span class="codeline" id="line-684"><code>		//</code></span>
+<span class="codeline" id="line-685"><code>		// TODO: This would be cleaner if sysReserve could be</code></span>
+<span class="codeline" id="line-686"><code>		// told to only return the requested address. In</code></span>
+<span class="codeline" id="line-687"><code>		// particular, this is already how Windows behaves, so</code></span>
+<span class="codeline" id="line-688"><code>		// it would simplify things there.</code></span>
+<span class="codeline" id="line-689"><code>		if v != nil {</code></span>
+<span class="codeline" id="line-690"><code>			sysFreeOS(v, n)</code></span>
+<span class="codeline" id="line-691"><code>		}</code></span>
+<span class="codeline" id="line-692"><code>		*hintList = hint.next</code></span>
+<span class="codeline" id="line-693"><code>		h.arenaHintAlloc.free(unsafe.Pointer(hint))</code></span>
+<span class="codeline" id="line-694"><code>	}</code></span>
+<span class="codeline" id="line-695"><code></code></span>
+<span class="codeline" id="line-696"><code>	if size == 0 {</code></span>
+<span class="codeline" id="line-697"><code>		if raceenabled {</code></span>
+<span class="codeline" id="line-698"><code>			// The race detector assumes the heap lives in</code></span>
+<span class="codeline" id="line-699"><code>			// [0x00c000000000, 0x00e000000000), but we</code></span>
+<span class="codeline" id="line-700"><code>			// just ran out of hints in this region. Give</code></span>
+<span class="codeline" id="line-701"><code>			// a nice failure.</code></span>
+<span class="codeline" id="line-702"><code>			throw("too many address space collisions for -race mode")</code></span>
+<span class="codeline" id="line-703"><code>		}</code></span>
+<span class="codeline" id="line-704"><code></code></span>
+<span class="codeline" id="line-705"><code>		// All of the hints failed, so we'll take any</code></span>
+<span class="codeline" id="line-706"><code>		// (sufficiently aligned) address the kernel will give</code></span>
+<span class="codeline" id="line-707"><code>		// us.</code></span>
+<span class="codeline" id="line-708"><code>		v, size = sysReserveAligned(nil, n, heapArenaBytes)</code></span>
+<span class="codeline" id="line-709"><code>		if v == nil {</code></span>
+<span class="codeline" id="line-710"><code>			return nil, 0</code></span>
+<span class="codeline" id="line-711"><code>		}</code></span>
+<span class="codeline" id="line-712"><code></code></span>
+<span class="codeline" id="line-713"><code>		// Create new hints for extending this region.</code></span>
+<span class="codeline" id="line-714"><code>		hint := (*arenaHint)(h.arenaHintAlloc.alloc())</code></span>
+<span class="codeline" id="line-715"><code>		hint.addr, hint.down = uintptr(v), true</code></span>
+<span class="codeline" id="line-716"><code>		hint.next, mheap_.arenaHints = mheap_.arenaHints, hint</code></span>
+<span class="codeline" id="line-717"><code>		hint = (*arenaHint)(h.arenaHintAlloc.alloc())</code></span>
+<span class="codeline" id="line-718"><code>		hint.addr = uintptr(v) + size</code></span>
+<span class="codeline" id="line-719"><code>		hint.next, mheap_.arenaHints = mheap_.arenaHints, hint</code></span>
+<span class="codeline" id="line-720"><code>	}</code></span>
+<span class="codeline" id="line-721"><code></code></span>
+<span class="codeline" id="line-722"><code>	// Check for bad pointers or pointers we can't use.</code></span>
+<span class="codeline" id="line-723"><code>	{</code></span>
+<span class="codeline" id="line-724"><code>		var bad string</code></span>
+<span class="codeline" id="line-725"><code>		p := uintptr(v)</code></span>
+<span class="codeline" id="line-726"><code>		if p+size &lt; p {</code></span>
+<span class="codeline" id="line-727"><code>			bad = "region exceeds uintptr range"</code></span>
+<span class="codeline" id="line-728"><code>		} else if arenaIndex(p) &gt;= 1&lt;&lt;arenaBits {</code></span>
+<span class="codeline" id="line-729"><code>			bad = "base outside usable address space"</code></span>
+<span class="codeline" id="line-730"><code>		} else if arenaIndex(p+size-1) &gt;= 1&lt;&lt;arenaBits {</code></span>
+<span class="codeline" id="line-731"><code>			bad = "end outside usable address space"</code></span>
+<span class="codeline" id="line-732"><code>		}</code></span>
+<span class="codeline" id="line-733"><code>		if bad != "" {</code></span>
+<span class="codeline" id="line-734"><code>			// This should be impossible on most architectures,</code></span>
+<span class="codeline" id="line-735"><code>			// but it would be really confusing to debug.</code></span>
+<span class="codeline" id="line-736"><code>			print("runtime: memory allocated by OS [", hex(p), ", ", hex(p+size), ") not in usable address space: ", bad, "\n")</code></span>
+<span class="codeline" id="line-737"><code>			throw("memory reservation exceeds address space limit")</code></span>
+<span class="codeline" id="line-738"><code>		}</code></span>
+<span class="codeline" id="line-739"><code>	}</code></span>
+<span class="codeline" id="line-740"><code></code></span>
+<span class="codeline" id="line-741"><code>	if uintptr(v)&amp;(heapArenaBytes-1) != 0 {</code></span>
+<span class="codeline" id="line-742"><code>		throw("misrounded allocation in sysAlloc")</code></span>
+<span class="codeline" id="line-743"><code>	}</code></span>
+<span class="codeline" id="line-744"><code></code></span>
+<span class="codeline" id="line-745"><code>mapped:</code></span>
+<span class="codeline" id="line-746"><code>	// Create arena metadata.</code></span>
+<span class="codeline" id="line-747"><code>	for ri := arenaIndex(uintptr(v)); ri &lt;= arenaIndex(uintptr(v)+size-1); ri++ {</code></span>
+<span class="codeline" id="line-748"><code>		l2 := h.arenas[ri.l1()]</code></span>
+<span class="codeline" id="line-749"><code>		if l2 == nil {</code></span>
+<span class="codeline" id="line-750"><code>			// Allocate an L2 arena map.</code></span>
+<span class="codeline" id="line-751"><code>			//</code></span>
+<span class="codeline" id="line-752"><code>			// Use sysAllocOS instead of sysAlloc or persistentalloc because there's no</code></span>
+<span class="codeline" id="line-753"><code>			// statistic we can comfortably account for this space in. With this structure,</code></span>
+<span class="codeline" id="line-754"><code>			// we rely on demand paging to avoid large overheads, but tracking which memory</code></span>
+<span class="codeline" id="line-755"><code>			// is paged in is too expensive. Trying to account for the whole region means</code></span>
+<span class="codeline" id="line-756"><code>			// that it will appear like an enormous memory overhead in statistics, even though</code></span>
+<span class="codeline" id="line-757"><code>			// it is not.</code></span>
+<span class="codeline" id="line-758"><code>			l2 = (*[1 &lt;&lt; arenaL2Bits]*heapArena)(sysAllocOS(unsafe.Sizeof(*l2)))</code></span>
+<span class="codeline" id="line-759"><code>			if l2 == nil {</code></span>
+<span class="codeline" id="line-760"><code>				throw("out of memory allocating heap arena map")</code></span>
+<span class="codeline" id="line-761"><code>			}</code></span>
+<span class="codeline" id="line-762"><code>			if h.arenasHugePages {</code></span>
+<span class="codeline" id="line-763"><code>				sysHugePage(unsafe.Pointer(l2), unsafe.Sizeof(*l2))</code></span>
+<span class="codeline" id="line-764"><code>			} else {</code></span>
+<span class="codeline" id="line-765"><code>				sysNoHugePage(unsafe.Pointer(l2), unsafe.Sizeof(*l2))</code></span>
+<span class="codeline" id="line-766"><code>			}</code></span>
+<span class="codeline" id="line-767"><code>			atomic.StorepNoWB(unsafe.Pointer(&amp;h.arenas[ri.l1()]), unsafe.Pointer(l2))</code></span>
+<span class="codeline" id="line-768"><code>		}</code></span>
+<span class="codeline" id="line-769"><code></code></span>
+<span class="codeline" id="line-770"><code>		if l2[ri.l2()] != nil {</code></span>
+<span class="codeline" id="line-771"><code>			throw("arena already initialized")</code></span>
+<span class="codeline" id="line-772"><code>		}</code></span>
+<span class="codeline" id="line-773"><code>		var r *heapArena</code></span>
+<span class="codeline" id="line-774"><code>		r = (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), goarch.PtrSize, &amp;memstats.gcMiscSys))</code></span>
+<span class="codeline" id="line-775"><code>		if r == nil {</code></span>
+<span class="codeline" id="line-776"><code>			r = (*heapArena)(persistentalloc(unsafe.Sizeof(*r), goarch.PtrSize, &amp;memstats.gcMiscSys))</code></span>
+<span class="codeline" id="line-777"><code>			if r == nil {</code></span>
+<span class="codeline" id="line-778"><code>				throw("out of memory allocating heap arena metadata")</code></span>
+<span class="codeline" id="line-779"><code>			}</code></span>
+<span class="codeline" id="line-780"><code>		}</code></span>
+<span class="codeline" id="line-781"><code></code></span>
+<span class="codeline" id="line-782"><code>		// Register the arena in allArenas if requested.</code></span>
+<span class="codeline" id="line-783"><code>		if register {</code></span>
+<span class="codeline" id="line-784"><code>			if len(h.allArenas) == cap(h.allArenas) {</code></span>
+<span class="codeline" id="line-785"><code>				size := 2 * uintptr(cap(h.allArenas)) * goarch.PtrSize</code></span>
+<span class="codeline" id="line-786"><code>				if size == 0 {</code></span>
+<span class="codeline" id="line-787"><code>					size = physPageSize</code></span>
+<span class="codeline" id="line-788"><code>				}</code></span>
+<span class="codeline" id="line-789"><code>				newArray := (*notInHeap)(persistentalloc(size, goarch.PtrSize, &amp;memstats.gcMiscSys))</code></span>
+<span class="codeline" id="line-790"><code>				if newArray == nil {</code></span>
+<span class="codeline" id="line-791"><code>					throw("out of memory allocating allArenas")</code></span>
+<span class="codeline" id="line-792"><code>				}</code></span>
+<span class="codeline" id="line-793"><code>				oldSlice := h.allArenas</code></span>
+<span class="codeline" id="line-794"><code>				*(*notInHeapSlice)(unsafe.Pointer(&amp;h.allArenas)) = notInHeapSlice{newArray, len(h.allArenas), int(size / goarch.PtrSize)}</code></span>
+<span class="codeline" id="line-795"><code>				copy(h.allArenas, oldSlice)</code></span>
+<span class="codeline" id="line-796"><code>				// Do not free the old backing array because</code></span>
+<span class="codeline" id="line-797"><code>				// there may be concurrent readers. Since we</code></span>
+<span class="codeline" id="line-798"><code>				// double the array each time, this can lead</code></span>
+<span class="codeline" id="line-799"><code>				// to at most 2x waste.</code></span>
+<span class="codeline" id="line-800"><code>			}</code></span>
+<span class="codeline" id="line-801"><code>			h.allArenas = h.allArenas[:len(h.allArenas)+1]</code></span>
+<span class="codeline" id="line-802"><code>			h.allArenas[len(h.allArenas)-1] = ri</code></span>
+<span class="codeline" id="line-803"><code>		}</code></span>
+<span class="codeline" id="line-804"><code></code></span>
+<span class="codeline" id="line-805"><code>		// Store atomically just in case an object from the</code></span>
+<span class="codeline" id="line-806"><code>		// new heap arena becomes visible before the heap lock</code></span>
+<span class="codeline" id="line-807"><code>		// is released (which shouldn't happen, but there's</code></span>
+<span class="codeline" id="line-808"><code>		// little downside to this).</code></span>
+<span class="codeline" id="line-809"><code>		atomic.StorepNoWB(unsafe.Pointer(&amp;l2[ri.l2()]), unsafe.Pointer(r))</code></span>
+<span class="codeline" id="line-810"><code>	}</code></span>
+<span class="codeline" id="line-811"><code></code></span>
+<span class="codeline" id="line-812"><code>	// Tell the race detector about the new heap memory.</code></span>
+<span class="codeline" id="line-813"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-814"><code>		racemapshadow(v, size)</code></span>
+<span class="codeline" id="line-815"><code>	}</code></span>
+<span class="codeline" id="line-816"><code></code></span>
+<span class="codeline" id="line-817"><code>	return</code></span>
+<span class="codeline" id="line-818"><code>}</code></span>
+<span class="codeline" id="line-819"><code></code></span>
+<span class="codeline" id="line-820"><code>// sysReserveAligned is like sysReserve, but the returned pointer is</code></span>
+<span class="codeline" id="line-821"><code>// aligned to align bytes. It may reserve either n or n+align bytes,</code></span>
+<span class="codeline" id="line-822"><code>// so it returns the size that was reserved.</code></span>
+<span class="codeline" id="line-823"><code>func sysReserveAligned(v unsafe.Pointer, size, align uintptr) (unsafe.Pointer, uintptr) {</code></span>
+<span class="codeline" id="line-824"><code>	// Since the alignment is rather large in uses of this</code></span>
+<span class="codeline" id="line-825"><code>	// function, we're not likely to get it by chance, so we ask</code></span>
+<span class="codeline" id="line-826"><code>	// for a larger region and remove the parts we don't need.</code></span>
+<span class="codeline" id="line-827"><code>	retries := 0</code></span>
+<span class="codeline" id="line-828"><code>retry:</code></span>
+<span class="codeline" id="line-829"><code>	p := uintptr(sysReserve(v, size+align))</code></span>
+<span class="codeline" id="line-830"><code>	switch {</code></span>
+<span class="codeline" id="line-831"><code>	case p == 0:</code></span>
+<span class="codeline" id="line-832"><code>		return nil, 0</code></span>
+<span class="codeline" id="line-833"><code>	case p&amp;(align-1) == 0:</code></span>
+<span class="codeline" id="line-834"><code>		return unsafe.Pointer(p), size + align</code></span>
+<span class="codeline" id="line-835"><code>	case GOOS == "windows":</code></span>
+<span class="codeline" id="line-836"><code>		// On Windows we can't release pieces of a</code></span>
+<span class="codeline" id="line-837"><code>		// reservation, so we release the whole thing and</code></span>
+<span class="codeline" id="line-838"><code>		// re-reserve the aligned sub-region. This may race,</code></span>
+<span class="codeline" id="line-839"><code>		// so we may have to try again.</code></span>
+<span class="codeline" id="line-840"><code>		sysFreeOS(unsafe.Pointer(p), size+align)</code></span>
+<span class="codeline" id="line-841"><code>		p = alignUp(p, align)</code></span>
+<span class="codeline" id="line-842"><code>		p2 := sysReserve(unsafe.Pointer(p), size)</code></span>
+<span class="codeline" id="line-843"><code>		if p != uintptr(p2) {</code></span>
+<span class="codeline" id="line-844"><code>			// Must have raced. Try again.</code></span>
+<span class="codeline" id="line-845"><code>			sysFreeOS(p2, size)</code></span>
+<span class="codeline" id="line-846"><code>			if retries++; retries == 100 {</code></span>
+<span class="codeline" id="line-847"><code>				throw("failed to allocate aligned heap memory; too many retries")</code></span>
+<span class="codeline" id="line-848"><code>			}</code></span>
+<span class="codeline" id="line-849"><code>			goto retry</code></span>
+<span class="codeline" id="line-850"><code>		}</code></span>
+<span class="codeline" id="line-851"><code>		// Success.</code></span>
+<span class="codeline" id="line-852"><code>		return p2, size</code></span>
+<span class="codeline" id="line-853"><code>	default:</code></span>
+<span class="codeline" id="line-854"><code>		// Trim off the unaligned parts.</code></span>
+<span class="codeline" id="line-855"><code>		pAligned := alignUp(p, align)</code></span>
+<span class="codeline" id="line-856"><code>		sysFreeOS(unsafe.Pointer(p), pAligned-p)</code></span>
+<span class="codeline" id="line-857"><code>		end := pAligned + size</code></span>
+<span class="codeline" id="line-858"><code>		endLen := (p + size + align) - end</code></span>
+<span class="codeline" id="line-859"><code>		if endLen &gt; 0 {</code></span>
+<span class="codeline" id="line-860"><code>			sysFreeOS(unsafe.Pointer(end), endLen)</code></span>
+<span class="codeline" id="line-861"><code>		}</code></span>
+<span class="codeline" id="line-862"><code>		return unsafe.Pointer(pAligned), size</code></span>
+<span class="codeline" id="line-863"><code>	}</code></span>
+<span class="codeline" id="line-864"><code>}</code></span>
+<span class="codeline" id="line-865"><code></code></span>
+<span class="codeline" id="line-866"><code>// enableMetadataHugePages enables huge pages for various sources of heap metadata.</code></span>
+<span class="codeline" id="line-867"><code>//</code></span>
+<span class="codeline" id="line-868"><code>// A note on latency: for sufficiently small heaps (&lt;10s of GiB) this function will take constant</code></span>
+<span class="codeline" id="line-869"><code>// time, but may take time proportional to the size of the mapped heap beyond that.</code></span>
+<span class="codeline" id="line-870"><code>//</code></span>
+<span class="codeline" id="line-871"><code>// This function is idempotent.</code></span>
+<span class="codeline" id="line-872"><code>//</code></span>
+<span class="codeline" id="line-873"><code>// The heap lock must not be held over this operation, since it will briefly acquire</code></span>
+<span class="codeline" id="line-874"><code>// the heap lock.</code></span>
+<span class="codeline" id="line-875"><code>//</code></span>
+<span class="codeline" id="line-876"><code>// Must be called on the system stack because it acquires the heap lock.</code></span>
+<span class="codeline" id="line-877"><code>//</code></span>
+<span class="codeline" id="line-878"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-879"><code>func (h *mheap) enableMetadataHugePages() {</code></span>
+<span class="codeline" id="line-880"><code>	// Enable huge pages for page structure.</code></span>
+<span class="codeline" id="line-881"><code>	h.pages.enableChunkHugePages()</code></span>
+<span class="codeline" id="line-882"><code></code></span>
+<span class="codeline" id="line-883"><code>	// Grab the lock and set arenasHugePages if it's not.</code></span>
+<span class="codeline" id="line-884"><code>	//</code></span>
+<span class="codeline" id="line-885"><code>	// Once arenasHugePages is set, all new L2 entries will be eligible for</code></span>
+<span class="codeline" id="line-886"><code>	// huge pages. We'll set all the old entries after we release the lock.</code></span>
+<span class="codeline" id="line-887"><code>	lock(&amp;h.lock)</code></span>
+<span class="codeline" id="line-888"><code>	if h.arenasHugePages {</code></span>
+<span class="codeline" id="line-889"><code>		unlock(&amp;h.lock)</code></span>
+<span class="codeline" id="line-890"><code>		return</code></span>
+<span class="codeline" id="line-891"><code>	}</code></span>
+<span class="codeline" id="line-892"><code>	h.arenasHugePages = true</code></span>
+<span class="codeline" id="line-893"><code>	unlock(&amp;h.lock)</code></span>
+<span class="codeline" id="line-894"><code></code></span>
+<span class="codeline" id="line-895"><code>	// N.B. The arenas L1 map is quite small on all platforms, so it's fine to</code></span>
+<span class="codeline" id="line-896"><code>	// just iterate over the whole thing.</code></span>
+<span class="codeline" id="line-897"><code>	for i := range h.arenas {</code></span>
+<span class="codeline" id="line-898"><code>		l2 := (*[1 &lt;&lt; arenaL2Bits]*heapArena)(atomic.Loadp(unsafe.Pointer(&amp;h.arenas[i])))</code></span>
+<span class="codeline" id="line-899"><code>		if l2 == nil {</code></span>
+<span class="codeline" id="line-900"><code>			continue</code></span>
+<span class="codeline" id="line-901"><code>		}</code></span>
+<span class="codeline" id="line-902"><code>		sysHugePage(unsafe.Pointer(l2), unsafe.Sizeof(*l2))</code></span>
+<span class="codeline" id="line-903"><code>	}</code></span>
+<span class="codeline" id="line-904"><code>}</code></span>
+<span class="codeline" id="line-905"><code></code></span>
+<span class="codeline" id="line-906"><code>// base address for all 0-byte allocations</code></span>
+<span class="codeline" id="line-907"><code>var zerobase uintptr</code></span>
+<span class="codeline" id="line-908"><code></code></span>
+<span class="codeline" id="line-909"><code>// nextFreeFast returns the next free object if one is quickly available.</code></span>
+<span class="codeline" id="line-910"><code>// Otherwise it returns 0.</code></span>
+<span class="codeline" id="line-911"><code>func nextFreeFast(s *mspan) gclinkptr {</code></span>
+<span class="codeline" id="line-912"><code>	theBit := sys.TrailingZeros64(s.allocCache) // Is there a free object in the allocCache?</code></span>
+<span class="codeline" id="line-913"><code>	if theBit &lt; 64 {</code></span>
+<span class="codeline" id="line-914"><code>		result := s.freeindex + uint16(theBit)</code></span>
+<span class="codeline" id="line-915"><code>		if result &lt; s.nelems {</code></span>
+<span class="codeline" id="line-916"><code>			freeidx := result + 1</code></span>
+<span class="codeline" id="line-917"><code>			if freeidx%64 == 0 &amp;&amp; freeidx != s.nelems {</code></span>
+<span class="codeline" id="line-918"><code>				return 0</code></span>
+<span class="codeline" id="line-919"><code>			}</code></span>
+<span class="codeline" id="line-920"><code>			s.allocCache &gt;&gt;= uint(theBit + 1)</code></span>
+<span class="codeline" id="line-921"><code>			s.freeindex = freeidx</code></span>
+<span class="codeline" id="line-922"><code>			s.allocCount++</code></span>
+<span class="codeline" id="line-923"><code>			return gclinkptr(uintptr(result)*s.elemsize + s.base())</code></span>
+<span class="codeline" id="line-924"><code>		}</code></span>
+<span class="codeline" id="line-925"><code>	}</code></span>
+<span class="codeline" id="line-926"><code>	return 0</code></span>
+<span class="codeline" id="line-927"><code>}</code></span>
+<span class="codeline" id="line-928"><code></code></span>
+<span class="codeline" id="line-929"><code>// nextFree returns the next free object from the cached span if one is available.</code></span>
+<span class="codeline" id="line-930"><code>// Otherwise it refills the cache with a span with an available object and</code></span>
+<span class="codeline" id="line-931"><code>// returns that object along with a flag indicating that this was a heavy</code></span>
+<span class="codeline" id="line-932"><code>// weight allocation. If it is a heavy weight allocation the caller must</code></span>
+<span class="codeline" id="line-933"><code>// determine whether a new GC cycle needs to be started or if the GC is active</code></span>
+<span class="codeline" id="line-934"><code>// whether this goroutine needs to assist the GC.</code></span>
+<span class="codeline" id="line-935"><code>//</code></span>
+<span class="codeline" id="line-936"><code>// Must run in a non-preemptible context since otherwise the owner of</code></span>
+<span class="codeline" id="line-937"><code>// c could change.</code></span>
+<span class="codeline" id="line-938"><code>func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {</code></span>
+<span class="codeline" id="line-939"><code>	s = c.alloc[spc]</code></span>
+<span class="codeline" id="line-940"><code>	shouldhelpgc = false</code></span>
+<span class="codeline" id="line-941"><code>	freeIndex := s.nextFreeIndex()</code></span>
+<span class="codeline" id="line-942"><code>	if freeIndex == s.nelems {</code></span>
+<span class="codeline" id="line-943"><code>		// The span is full.</code></span>
+<span class="codeline" id="line-944"><code>		if s.allocCount != s.nelems {</code></span>
+<span class="codeline" id="line-945"><code>			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)</code></span>
+<span class="codeline" id="line-946"><code>			throw("s.allocCount != s.nelems &amp;&amp; freeIndex == s.nelems")</code></span>
+<span class="codeline" id="line-947"><code>		}</code></span>
+<span class="codeline" id="line-948"><code>		c.refill(spc)</code></span>
+<span class="codeline" id="line-949"><code>		shouldhelpgc = true</code></span>
+<span class="codeline" id="line-950"><code>		s = c.alloc[spc]</code></span>
+<span class="codeline" id="line-951"><code></code></span>
+<span class="codeline" id="line-952"><code>		freeIndex = s.nextFreeIndex()</code></span>
+<span class="codeline" id="line-953"><code>	}</code></span>
+<span class="codeline" id="line-954"><code></code></span>
+<span class="codeline" id="line-955"><code>	if freeIndex &gt;= s.nelems {</code></span>
+<span class="codeline" id="line-956"><code>		throw("freeIndex is not valid")</code></span>
+<span class="codeline" id="line-957"><code>	}</code></span>
+<span class="codeline" id="line-958"><code></code></span>
+<span class="codeline" id="line-959"><code>	v = gclinkptr(uintptr(freeIndex)*s.elemsize + s.base())</code></span>
+<span class="codeline" id="line-960"><code>	s.allocCount++</code></span>
+<span class="codeline" id="line-961"><code>	if s.allocCount &gt; s.nelems {</code></span>
+<span class="codeline" id="line-962"><code>		println("s.allocCount=", s.allocCount, "s.nelems=", s.nelems)</code></span>
+<span class="codeline" id="line-963"><code>		throw("s.allocCount &gt; s.nelems")</code></span>
+<span class="codeline" id="line-964"><code>	}</code></span>
+<span class="codeline" id="line-965"><code>	return</code></span>
+<span class="codeline" id="line-966"><code>}</code></span>
+<span class="codeline" id="line-967"><code></code></span>
+<span class="codeline" id="line-968"><code>// Allocate an object of size bytes.</code></span>
+<span class="codeline" id="line-969"><code>// Small objects are allocated from the per-P cache's free lists.</code></span>
+<span class="codeline" id="line-970"><code>// Large objects (&gt; 32 kB) are allocated straight from the heap.</code></span>
+<span class="codeline" id="line-971"><code>func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-972"><code>	if gcphase == _GCmarktermination {</code></span>
+<span class="codeline" id="line-973"><code>		throw("mallocgc called with gcphase == _GCmarktermination")</code></span>
+<span class="codeline" id="line-974"><code>	}</code></span>
+<span class="codeline" id="line-975"><code></code></span>
+<span class="codeline" id="line-976"><code>	if size == 0 {</code></span>
+<span class="codeline" id="line-977"><code>		return unsafe.Pointer(&amp;zerobase)</code></span>
+<span class="codeline" id="line-978"><code>	}</code></span>
+<span class="codeline" id="line-979"><code></code></span>
+<span class="codeline" id="line-980"><code>	// It's possible for any malloc to trigger sweeping, which may in</code></span>
+<span class="codeline" id="line-981"><code>	// turn queue finalizers. Record this dynamic lock edge.</code></span>
+<span class="codeline" id="line-982"><code>	lockRankMayQueueFinalizer()</code></span>
+<span class="codeline" id="line-983"><code></code></span>
+<span class="codeline" id="line-984"><code>	userSize := size</code></span>
+<span class="codeline" id="line-985"><code>	if asanenabled {</code></span>
+<span class="codeline" id="line-986"><code>		// Refer to ASAN runtime library, the malloc() function allocates extra memory,</code></span>
+<span class="codeline" id="line-987"><code>		// the redzone, around the user requested memory region. And the redzones are marked</code></span>
+<span class="codeline" id="line-988"><code>		// as unaddressable. We perform the same operations in Go to detect the overflows or</code></span>
+<span class="codeline" id="line-989"><code>		// underflows.</code></span>
+<span class="codeline" id="line-990"><code>		size += computeRZlog(size)</code></span>
+<span class="codeline" id="line-991"><code>	}</code></span>
+<span class="codeline" id="line-992"><code></code></span>
+<span class="codeline" id="line-993"><code>	if debug.malloc {</code></span>
+<span class="codeline" id="line-994"><code>		if debug.sbrk != 0 {</code></span>
+<span class="codeline" id="line-995"><code>			align := uintptr(16)</code></span>
+<span class="codeline" id="line-996"><code>			if typ != nil {</code></span>
+<span class="codeline" id="line-997"><code>				// TODO(austin): This should be just</code></span>
+<span class="codeline" id="line-998"><code>				//   align = uintptr(typ.align)</code></span>
+<span class="codeline" id="line-999"><code>				// but that's only 4 on 32-bit platforms,</code></span>
+<span class="codeline" id="line-1000"><code>				// even if there's a uint64 field in typ (see #599).</code></span>
+<span class="codeline" id="line-1001"><code>				// This causes 64-bit atomic accesses to panic.</code></span>
+<span class="codeline" id="line-1002"><code>				// Hence, we use stricter alignment that matches</code></span>
+<span class="codeline" id="line-1003"><code>				// the normal allocator better.</code></span>
+<span class="codeline" id="line-1004"><code>				if size&amp;7 == 0 {</code></span>
+<span class="codeline" id="line-1005"><code>					align = 8</code></span>
+<span class="codeline" id="line-1006"><code>				} else if size&amp;3 == 0 {</code></span>
+<span class="codeline" id="line-1007"><code>					align = 4</code></span>
+<span class="codeline" id="line-1008"><code>				} else if size&amp;1 == 0 {</code></span>
+<span class="codeline" id="line-1009"><code>					align = 2</code></span>
+<span class="codeline" id="line-1010"><code>				} else {</code></span>
+<span class="codeline" id="line-1011"><code>					align = 1</code></span>
+<span class="codeline" id="line-1012"><code>				}</code></span>
+<span class="codeline" id="line-1013"><code>			}</code></span>
+<span class="codeline" id="line-1014"><code>			return persistentalloc(size, align, &amp;memstats.other_sys)</code></span>
+<span class="codeline" id="line-1015"><code>		}</code></span>
+<span class="codeline" id="line-1016"><code></code></span>
+<span class="codeline" id="line-1017"><code>		if inittrace.active &amp;&amp; inittrace.id == getg().goid {</code></span>
+<span class="codeline" id="line-1018"><code>			// Init functions are executed sequentially in a single goroutine.</code></span>
+<span class="codeline" id="line-1019"><code>			inittrace.allocs += 1</code></span>
+<span class="codeline" id="line-1020"><code>		}</code></span>
+<span class="codeline" id="line-1021"><code>	}</code></span>
+<span class="codeline" id="line-1022"><code></code></span>
+<span class="codeline" id="line-1023"><code>	// assistG is the G to charge for this allocation, or nil if</code></span>
+<span class="codeline" id="line-1024"><code>	// GC is not currently active.</code></span>
+<span class="codeline" id="line-1025"><code>	assistG := deductAssistCredit(size)</code></span>
+<span class="codeline" id="line-1026"><code></code></span>
+<span class="codeline" id="line-1027"><code>	// Set mp.mallocing to keep from being preempted by GC.</code></span>
+<span class="codeline" id="line-1028"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-1029"><code>	if mp.mallocing != 0 {</code></span>
+<span class="codeline" id="line-1030"><code>		throw("malloc deadlock")</code></span>
+<span class="codeline" id="line-1031"><code>	}</code></span>
+<span class="codeline" id="line-1032"><code>	if mp.gsignal == getg() {</code></span>
+<span class="codeline" id="line-1033"><code>		throw("malloc during signal")</code></span>
+<span class="codeline" id="line-1034"><code>	}</code></span>
+<span class="codeline" id="line-1035"><code>	mp.mallocing = 1</code></span>
+<span class="codeline" id="line-1036"><code></code></span>
+<span class="codeline" id="line-1037"><code>	shouldhelpgc := false</code></span>
+<span class="codeline" id="line-1038"><code>	dataSize := userSize</code></span>
+<span class="codeline" id="line-1039"><code>	c := getMCache(mp)</code></span>
+<span class="codeline" id="line-1040"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1041"><code>		throw("mallocgc called without a P or outside bootstrapping")</code></span>
+<span class="codeline" id="line-1042"><code>	}</code></span>
+<span class="codeline" id="line-1043"><code>	var span *mspan</code></span>
+<span class="codeline" id="line-1044"><code>	var header **_type</code></span>
+<span class="codeline" id="line-1045"><code>	var x unsafe.Pointer</code></span>
+<span class="codeline" id="line-1046"><code>	noscan := typ == nil || typ.PtrBytes == 0</code></span>
+<span class="codeline" id="line-1047"><code>	// In some cases block zeroing can profitably (for latency reduction purposes)</code></span>
+<span class="codeline" id="line-1048"><code>	// be delayed till preemption is possible; delayedZeroing tracks that state.</code></span>
+<span class="codeline" id="line-1049"><code>	delayedZeroing := false</code></span>
+<span class="codeline" id="line-1050"><code>	// Determine if it's a 'small' object that goes into a size-classed span.</code></span>
+<span class="codeline" id="line-1051"><code>	//</code></span>
+<span class="codeline" id="line-1052"><code>	// Note: This comparison looks a little strange, but it exists to smooth out</code></span>
+<span class="codeline" id="line-1053"><code>	// the crossover between the largest size class and large objects that have</code></span>
+<span class="codeline" id="line-1054"><code>	// their own spans. The small window of object sizes between maxSmallSize-mallocHeaderSize</code></span>
+<span class="codeline" id="line-1055"><code>	// and maxSmallSize will be considered large, even though they might fit in</code></span>
+<span class="codeline" id="line-1056"><code>	// a size class. In practice this is completely fine, since the largest small</code></span>
+<span class="codeline" id="line-1057"><code>	// size class has a single object in it already, precisely to make the transition</code></span>
+<span class="codeline" id="line-1058"><code>	// to large objects smooth.</code></span>
+<span class="codeline" id="line-1059"><code>	if size &lt;= maxSmallSize-mallocHeaderSize {</code></span>
+<span class="codeline" id="line-1060"><code>		if noscan &amp;&amp; size &lt; maxTinySize {</code></span>
+<span class="codeline" id="line-1061"><code>			// Tiny allocator.</code></span>
+<span class="codeline" id="line-1062"><code>			//</code></span>
+<span class="codeline" id="line-1063"><code>			// Tiny allocator combines several tiny allocation requests</code></span>
+<span class="codeline" id="line-1064"><code>			// into a single memory block. The resulting memory block</code></span>
+<span class="codeline" id="line-1065"><code>			// is freed when all subobjects are unreachable. The subobjects</code></span>
+<span class="codeline" id="line-1066"><code>			// must be noscan (don't have pointers), this ensures that</code></span>
+<span class="codeline" id="line-1067"><code>			// the amount of potentially wasted memory is bounded.</code></span>
+<span class="codeline" id="line-1068"><code>			//</code></span>
+<span class="codeline" id="line-1069"><code>			// Size of the memory block used for combining (maxTinySize) is tunable.</code></span>
+<span class="codeline" id="line-1070"><code>			// Current setting is 16 bytes, which relates to 2x worst case memory</code></span>
+<span class="codeline" id="line-1071"><code>			// wastage (when all but one subobjects are unreachable).</code></span>
+<span class="codeline" id="line-1072"><code>			// 8 bytes would result in no wastage at all, but provides less</code></span>
+<span class="codeline" id="line-1073"><code>			// opportunities for combining.</code></span>
+<span class="codeline" id="line-1074"><code>			// 32 bytes provides more opportunities for combining,</code></span>
+<span class="codeline" id="line-1075"><code>			// but can lead to 4x worst case wastage.</code></span>
+<span class="codeline" id="line-1076"><code>			// The best case winning is 8x regardless of block size.</code></span>
+<span class="codeline" id="line-1077"><code>			//</code></span>
+<span class="codeline" id="line-1078"><code>			// Objects obtained from tiny allocator must not be freed explicitly.</code></span>
+<span class="codeline" id="line-1079"><code>			// So when an object will be freed explicitly, we ensure that</code></span>
+<span class="codeline" id="line-1080"><code>			// its size &gt;= maxTinySize.</code></span>
+<span class="codeline" id="line-1081"><code>			//</code></span>
+<span class="codeline" id="line-1082"><code>			// SetFinalizer has a special case for objects potentially coming</code></span>
+<span class="codeline" id="line-1083"><code>			// from tiny allocator, it such case it allows to set finalizers</code></span>
+<span class="codeline" id="line-1084"><code>			// for an inner byte of a memory block.</code></span>
+<span class="codeline" id="line-1085"><code>			//</code></span>
+<span class="codeline" id="line-1086"><code>			// The main targets of tiny allocator are small strings and</code></span>
+<span class="codeline" id="line-1087"><code>			// standalone escaping variables. On a json benchmark</code></span>
+<span class="codeline" id="line-1088"><code>			// the allocator reduces number of allocations by ~12% and</code></span>
+<span class="codeline" id="line-1089"><code>			// reduces heap size by ~20%.</code></span>
+<span class="codeline" id="line-1090"><code>			off := c.tinyoffset</code></span>
+<span class="codeline" id="line-1091"><code>			// Align tiny pointer for required (conservative) alignment.</code></span>
+<span class="codeline" id="line-1092"><code>			if size&amp;7 == 0 {</code></span>
+<span class="codeline" id="line-1093"><code>				off = alignUp(off, 8)</code></span>
+<span class="codeline" id="line-1094"><code>			} else if goarch.PtrSize == 4 &amp;&amp; size == 12 {</code></span>
+<span class="codeline" id="line-1095"><code>				// Conservatively align 12-byte objects to 8 bytes on 32-bit</code></span>
+<span class="codeline" id="line-1096"><code>				// systems so that objects whose first field is a 64-bit</code></span>
+<span class="codeline" id="line-1097"><code>				// value is aligned to 8 bytes and does not cause a fault on</code></span>
+<span class="codeline" id="line-1098"><code>				// atomic access. See issue 37262.</code></span>
+<span class="codeline" id="line-1099"><code>				// TODO(mknyszek): Remove this workaround if/when issue 36606</code></span>
+<span class="codeline" id="line-1100"><code>				// is resolved.</code></span>
+<span class="codeline" id="line-1101"><code>				off = alignUp(off, 8)</code></span>
+<span class="codeline" id="line-1102"><code>			} else if size&amp;3 == 0 {</code></span>
+<span class="codeline" id="line-1103"><code>				off = alignUp(off, 4)</code></span>
+<span class="codeline" id="line-1104"><code>			} else if size&amp;1 == 0 {</code></span>
+<span class="codeline" id="line-1105"><code>				off = alignUp(off, 2)</code></span>
+<span class="codeline" id="line-1106"><code>			}</code></span>
+<span class="codeline" id="line-1107"><code>			if off+size &lt;= maxTinySize &amp;&amp; c.tiny != 0 {</code></span>
+<span class="codeline" id="line-1108"><code>				// The object fits into existing tiny block.</code></span>
+<span class="codeline" id="line-1109"><code>				x = unsafe.Pointer(c.tiny + off)</code></span>
+<span class="codeline" id="line-1110"><code>				c.tinyoffset = off + size</code></span>
+<span class="codeline" id="line-1111"><code>				c.tinyAllocs++</code></span>
+<span class="codeline" id="line-1112"><code>				mp.mallocing = 0</code></span>
+<span class="codeline" id="line-1113"><code>				releasem(mp)</code></span>
+<span class="codeline" id="line-1114"><code>				return x</code></span>
+<span class="codeline" id="line-1115"><code>			}</code></span>
+<span class="codeline" id="line-1116"><code>			// Allocate a new maxTinySize block.</code></span>
+<span class="codeline" id="line-1117"><code>			span = c.alloc[tinySpanClass]</code></span>
+<span class="codeline" id="line-1118"><code>			v := nextFreeFast(span)</code></span>
+<span class="codeline" id="line-1119"><code>			if v == 0 {</code></span>
+<span class="codeline" id="line-1120"><code>				v, span, shouldhelpgc = c.nextFree(tinySpanClass)</code></span>
+<span class="codeline" id="line-1121"><code>			}</code></span>
+<span class="codeline" id="line-1122"><code>			x = unsafe.Pointer(v)</code></span>
+<span class="codeline" id="line-1123"><code>			(*[2]uint64)(x)[0] = 0</code></span>
+<span class="codeline" id="line-1124"><code>			(*[2]uint64)(x)[1] = 0</code></span>
+<span class="codeline" id="line-1125"><code>			// See if we need to replace the existing tiny block with the new one</code></span>
+<span class="codeline" id="line-1126"><code>			// based on amount of remaining free space.</code></span>
+<span class="codeline" id="line-1127"><code>			if !raceenabled &amp;&amp; (size &lt; c.tinyoffset || c.tiny == 0) {</code></span>
+<span class="codeline" id="line-1128"><code>				// Note: disabled when race detector is on, see comment near end of this function.</code></span>
+<span class="codeline" id="line-1129"><code>				c.tiny = uintptr(x)</code></span>
+<span class="codeline" id="line-1130"><code>				c.tinyoffset = size</code></span>
+<span class="codeline" id="line-1131"><code>			}</code></span>
+<span class="codeline" id="line-1132"><code>			size = maxTinySize</code></span>
+<span class="codeline" id="line-1133"><code>		} else {</code></span>
+<span class="codeline" id="line-1134"><code>			hasHeader := !noscan &amp;&amp; !heapBitsInSpan(size)</code></span>
+<span class="codeline" id="line-1135"><code>			if goexperiment.AllocHeaders &amp;&amp; hasHeader {</code></span>
+<span class="codeline" id="line-1136"><code>				size += mallocHeaderSize</code></span>
+<span class="codeline" id="line-1137"><code>			}</code></span>
+<span class="codeline" id="line-1138"><code>			var sizeclass uint8</code></span>
+<span class="codeline" id="line-1139"><code>			if size &lt;= smallSizeMax-8 {</code></span>
+<span class="codeline" id="line-1140"><code>				sizeclass = size_to_class8[divRoundUp(size, smallSizeDiv)]</code></span>
+<span class="codeline" id="line-1141"><code>			} else {</code></span>
+<span class="codeline" id="line-1142"><code>				sizeclass = size_to_class128[divRoundUp(size-smallSizeMax, largeSizeDiv)]</code></span>
+<span class="codeline" id="line-1143"><code>			}</code></span>
+<span class="codeline" id="line-1144"><code>			size = uintptr(class_to_size[sizeclass])</code></span>
+<span class="codeline" id="line-1145"><code>			spc := makeSpanClass(sizeclass, noscan)</code></span>
+<span class="codeline" id="line-1146"><code>			span = c.alloc[spc]</code></span>
+<span class="codeline" id="line-1147"><code>			v := nextFreeFast(span)</code></span>
+<span class="codeline" id="line-1148"><code>			if v == 0 {</code></span>
+<span class="codeline" id="line-1149"><code>				v, span, shouldhelpgc = c.nextFree(spc)</code></span>
+<span class="codeline" id="line-1150"><code>			}</code></span>
+<span class="codeline" id="line-1151"><code>			x = unsafe.Pointer(v)</code></span>
+<span class="codeline" id="line-1152"><code>			if needzero &amp;&amp; span.needzero != 0 {</code></span>
+<span class="codeline" id="line-1153"><code>				memclrNoHeapPointers(x, size)</code></span>
+<span class="codeline" id="line-1154"><code>			}</code></span>
+<span class="codeline" id="line-1155"><code>			if goexperiment.AllocHeaders &amp;&amp; hasHeader {</code></span>
+<span class="codeline" id="line-1156"><code>				header = (**_type)(x)</code></span>
+<span class="codeline" id="line-1157"><code>				x = add(x, mallocHeaderSize)</code></span>
+<span class="codeline" id="line-1158"><code>				size -= mallocHeaderSize</code></span>
+<span class="codeline" id="line-1159"><code>			}</code></span>
+<span class="codeline" id="line-1160"><code>		}</code></span>
+<span class="codeline" id="line-1161"><code>	} else {</code></span>
+<span class="codeline" id="line-1162"><code>		shouldhelpgc = true</code></span>
+<span class="codeline" id="line-1163"><code>		// For large allocations, keep track of zeroed state so that</code></span>
+<span class="codeline" id="line-1164"><code>		// bulk zeroing can be happen later in a preemptible context.</code></span>
+<span class="codeline" id="line-1165"><code>		span = c.allocLarge(size, noscan)</code></span>
+<span class="codeline" id="line-1166"><code>		span.freeindex = 1</code></span>
+<span class="codeline" id="line-1167"><code>		span.allocCount = 1</code></span>
+<span class="codeline" id="line-1168"><code>		size = span.elemsize</code></span>
+<span class="codeline" id="line-1169"><code>		x = unsafe.Pointer(span.base())</code></span>
+<span class="codeline" id="line-1170"><code>		if needzero &amp;&amp; span.needzero != 0 {</code></span>
+<span class="codeline" id="line-1171"><code>			if noscan {</code></span>
+<span class="codeline" id="line-1172"><code>				delayedZeroing = true</code></span>
+<span class="codeline" id="line-1173"><code>			} else {</code></span>
+<span class="codeline" id="line-1174"><code>				memclrNoHeapPointers(x, size)</code></span>
+<span class="codeline" id="line-1175"><code>			}</code></span>
+<span class="codeline" id="line-1176"><code>		}</code></span>
+<span class="codeline" id="line-1177"><code>		if goexperiment.AllocHeaders &amp;&amp; !noscan {</code></span>
+<span class="codeline" id="line-1178"><code>			header = &amp;span.largeType</code></span>
+<span class="codeline" id="line-1179"><code>		}</code></span>
+<span class="codeline" id="line-1180"><code>	}</code></span>
+<span class="codeline" id="line-1181"><code>	if !noscan {</code></span>
+<span class="codeline" id="line-1182"><code>		if goexperiment.AllocHeaders {</code></span>
+<span class="codeline" id="line-1183"><code>			c.scanAlloc += heapSetType(uintptr(x), dataSize, typ, header, span)</code></span>
+<span class="codeline" id="line-1184"><code>		} else {</code></span>
+<span class="codeline" id="line-1185"><code>			var scanSize uintptr</code></span>
+<span class="codeline" id="line-1186"><code>			heapBitsSetType(uintptr(x), size, dataSize, typ)</code></span>
+<span class="codeline" id="line-1187"><code>			if dataSize &gt; typ.Size_ {</code></span>
+<span class="codeline" id="line-1188"><code>				// Array allocation. If there are any</code></span>
+<span class="codeline" id="line-1189"><code>				// pointers, GC has to scan to the last</code></span>
+<span class="codeline" id="line-1190"><code>				// element.</code></span>
+<span class="codeline" id="line-1191"><code>				if typ.PtrBytes != 0 {</code></span>
+<span class="codeline" id="line-1192"><code>					scanSize = dataSize - typ.Size_ + typ.PtrBytes</code></span>
+<span class="codeline" id="line-1193"><code>				}</code></span>
+<span class="codeline" id="line-1194"><code>			} else {</code></span>
+<span class="codeline" id="line-1195"><code>				scanSize = typ.PtrBytes</code></span>
+<span class="codeline" id="line-1196"><code>			}</code></span>
+<span class="codeline" id="line-1197"><code>			c.scanAlloc += scanSize</code></span>
+<span class="codeline" id="line-1198"><code>		}</code></span>
+<span class="codeline" id="line-1199"><code>	}</code></span>
+<span class="codeline" id="line-1200"><code></code></span>
+<span class="codeline" id="line-1201"><code>	// Ensure that the stores above that initialize x to</code></span>
+<span class="codeline" id="line-1202"><code>	// type-safe memory and set the heap bits occur before</code></span>
+<span class="codeline" id="line-1203"><code>	// the caller can make x observable to the garbage</code></span>
+<span class="codeline" id="line-1204"><code>	// collector. Otherwise, on weakly ordered machines,</code></span>
+<span class="codeline" id="line-1205"><code>	// the garbage collector could follow a pointer to x,</code></span>
+<span class="codeline" id="line-1206"><code>	// but see uninitialized memory or stale heap bits.</code></span>
+<span class="codeline" id="line-1207"><code>	publicationBarrier()</code></span>
+<span class="codeline" id="line-1208"><code>	// As x and the heap bits are initialized, update</code></span>
+<span class="codeline" id="line-1209"><code>	// freeIndexForScan now so x is seen by the GC</code></span>
+<span class="codeline" id="line-1210"><code>	// (including conservative scan) as an allocated object.</code></span>
+<span class="codeline" id="line-1211"><code>	// While this pointer can't escape into user code as a</code></span>
+<span class="codeline" id="line-1212"><code>	// _live_ pointer until we return, conservative scanning</code></span>
+<span class="codeline" id="line-1213"><code>	// may find a dead pointer that happens to point into this</code></span>
+<span class="codeline" id="line-1214"><code>	// object. Delaying this update until now ensures that</code></span>
+<span class="codeline" id="line-1215"><code>	// conservative scanning considers this pointer dead until</code></span>
+<span class="codeline" id="line-1216"><code>	// this point.</code></span>
+<span class="codeline" id="line-1217"><code>	span.freeIndexForScan = span.freeindex</code></span>
+<span class="codeline" id="line-1218"><code></code></span>
+<span class="codeline" id="line-1219"><code>	// Allocate black during GC.</code></span>
+<span class="codeline" id="line-1220"><code>	// All slots hold nil so no scanning is needed.</code></span>
+<span class="codeline" id="line-1221"><code>	// This may be racing with GC so do it atomically if there can be</code></span>
+<span class="codeline" id="line-1222"><code>	// a race marking the bit.</code></span>
+<span class="codeline" id="line-1223"><code>	if gcphase != _GCoff {</code></span>
+<span class="codeline" id="line-1224"><code>		gcmarknewobject(span, uintptr(x))</code></span>
+<span class="codeline" id="line-1225"><code>	}</code></span>
+<span class="codeline" id="line-1226"><code></code></span>
+<span class="codeline" id="line-1227"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-1228"><code>		racemalloc(x, size)</code></span>
+<span class="codeline" id="line-1229"><code>	}</code></span>
+<span class="codeline" id="line-1230"><code></code></span>
+<span class="codeline" id="line-1231"><code>	if msanenabled {</code></span>
+<span class="codeline" id="line-1232"><code>		msanmalloc(x, size)</code></span>
+<span class="codeline" id="line-1233"><code>	}</code></span>
+<span class="codeline" id="line-1234"><code></code></span>
+<span class="codeline" id="line-1235"><code>	if asanenabled {</code></span>
+<span class="codeline" id="line-1236"><code>		// We should only read/write the memory with the size asked by the user.</code></span>
+<span class="codeline" id="line-1237"><code>		// The rest of the allocated memory should be poisoned, so that we can report</code></span>
+<span class="codeline" id="line-1238"><code>		// errors when accessing poisoned memory.</code></span>
+<span class="codeline" id="line-1239"><code>		// The allocated memory is larger than required userSize, it will also include</code></span>
+<span class="codeline" id="line-1240"><code>		// redzone and some other padding bytes.</code></span>
+<span class="codeline" id="line-1241"><code>		rzBeg := unsafe.Add(x, userSize)</code></span>
+<span class="codeline" id="line-1242"><code>		asanpoison(rzBeg, size-userSize)</code></span>
+<span class="codeline" id="line-1243"><code>		asanunpoison(x, userSize)</code></span>
+<span class="codeline" id="line-1244"><code>	}</code></span>
+<span class="codeline" id="line-1245"><code></code></span>
+<span class="codeline" id="line-1246"><code>	// If !goexperiment.AllocHeaders, "size" doesn't include the</code></span>
+<span class="codeline" id="line-1247"><code>	// allocation header, so use span.elemsize as the "full" size</code></span>
+<span class="codeline" id="line-1248"><code>	// for various computations below.</code></span>
+<span class="codeline" id="line-1249"><code>	//</code></span>
+<span class="codeline" id="line-1250"><code>	// TODO(mknyszek): We should really count the header as part</code></span>
+<span class="codeline" id="line-1251"><code>	// of gc_sys or something, but it's risky to change the</code></span>
+<span class="codeline" id="line-1252"><code>	// accounting so much right now. Just pretend its internal</code></span>
+<span class="codeline" id="line-1253"><code>	// fragmentation and match the GC's accounting by using the</code></span>
+<span class="codeline" id="line-1254"><code>	// whole allocation slot.</code></span>
+<span class="codeline" id="line-1255"><code>	fullSize := size</code></span>
+<span class="codeline" id="line-1256"><code>	if goexperiment.AllocHeaders {</code></span>
+<span class="codeline" id="line-1257"><code>		fullSize = span.elemsize</code></span>
+<span class="codeline" id="line-1258"><code>	}</code></span>
+<span class="codeline" id="line-1259"><code>	if rate := MemProfileRate; rate &gt; 0 {</code></span>
+<span class="codeline" id="line-1260"><code>		// Note cache c only valid while m acquired; see #47302</code></span>
+<span class="codeline" id="line-1261"><code>		//</code></span>
+<span class="codeline" id="line-1262"><code>		// N.B. Use the full size because that matches how the GC</code></span>
+<span class="codeline" id="line-1263"><code>		// will update the mem profile on the "free" side.</code></span>
+<span class="codeline" id="line-1264"><code>		if rate != 1 &amp;&amp; fullSize &lt; c.nextSample {</code></span>
+<span class="codeline" id="line-1265"><code>			c.nextSample -= fullSize</code></span>
+<span class="codeline" id="line-1266"><code>		} else {</code></span>
+<span class="codeline" id="line-1267"><code>			profilealloc(mp, x, fullSize)</code></span>
+<span class="codeline" id="line-1268"><code>		}</code></span>
+<span class="codeline" id="line-1269"><code>	}</code></span>
+<span class="codeline" id="line-1270"><code>	mp.mallocing = 0</code></span>
+<span class="codeline" id="line-1271"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-1272"><code></code></span>
+<span class="codeline" id="line-1273"><code>	// Pointerfree data can be zeroed late in a context where preemption can occur.</code></span>
+<span class="codeline" id="line-1274"><code>	// x will keep the memory alive.</code></span>
+<span class="codeline" id="line-1275"><code>	if delayedZeroing {</code></span>
+<span class="codeline" id="line-1276"><code>		if !noscan {</code></span>
+<span class="codeline" id="line-1277"><code>			throw("delayed zeroing on data that may contain pointers")</code></span>
+<span class="codeline" id="line-1278"><code>		}</code></span>
+<span class="codeline" id="line-1279"><code>		if goexperiment.AllocHeaders &amp;&amp; header != nil {</code></span>
+<span class="codeline" id="line-1280"><code>			throw("unexpected malloc header in delayed zeroing of large object")</code></span>
+<span class="codeline" id="line-1281"><code>		}</code></span>
+<span class="codeline" id="line-1282"><code>		// N.B. size == fullSize always in this case.</code></span>
+<span class="codeline" id="line-1283"><code>		memclrNoHeapPointersChunked(size, x) // This is a possible preemption point: see #47302</code></span>
+<span class="codeline" id="line-1284"><code>	}</code></span>
+<span class="codeline" id="line-1285"><code></code></span>
+<span class="codeline" id="line-1286"><code>	if debug.malloc {</code></span>
+<span class="codeline" id="line-1287"><code>		if debug.allocfreetrace != 0 {</code></span>
+<span class="codeline" id="line-1288"><code>			tracealloc(x, size, typ)</code></span>
+<span class="codeline" id="line-1289"><code>		}</code></span>
+<span class="codeline" id="line-1290"><code></code></span>
+<span class="codeline" id="line-1291"><code>		if inittrace.active &amp;&amp; inittrace.id == getg().goid {</code></span>
+<span class="codeline" id="line-1292"><code>			// Init functions are executed sequentially in a single goroutine.</code></span>
+<span class="codeline" id="line-1293"><code>			inittrace.bytes += uint64(fullSize)</code></span>
+<span class="codeline" id="line-1294"><code>		}</code></span>
+<span class="codeline" id="line-1295"><code>	}</code></span>
+<span class="codeline" id="line-1296"><code></code></span>
+<span class="codeline" id="line-1297"><code>	if assistG != nil {</code></span>
+<span class="codeline" id="line-1298"><code>		// Account for internal fragmentation in the assist</code></span>
+<span class="codeline" id="line-1299"><code>		// debt now that we know it.</code></span>
+<span class="codeline" id="line-1300"><code>		//</code></span>
+<span class="codeline" id="line-1301"><code>		// N.B. Use the full size because that's how the rest</code></span>
+<span class="codeline" id="line-1302"><code>		// of the GC accounts for bytes marked.</code></span>
+<span class="codeline" id="line-1303"><code>		assistG.gcAssistBytes -= int64(fullSize - dataSize)</code></span>
+<span class="codeline" id="line-1304"><code>	}</code></span>
+<span class="codeline" id="line-1305"><code></code></span>
+<span class="codeline" id="line-1306"><code>	if shouldhelpgc {</code></span>
+<span class="codeline" id="line-1307"><code>		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {</code></span>
+<span class="codeline" id="line-1308"><code>			gcStart(t)</code></span>
+<span class="codeline" id="line-1309"><code>		}</code></span>
+<span class="codeline" id="line-1310"><code>	}</code></span>
+<span class="codeline" id="line-1311"><code></code></span>
+<span class="codeline" id="line-1312"><code>	if raceenabled &amp;&amp; noscan &amp;&amp; dataSize &lt; maxTinySize {</code></span>
+<span class="codeline" id="line-1313"><code>		// Pad tinysize allocations so they are aligned with the end</code></span>
+<span class="codeline" id="line-1314"><code>		// of the tinyalloc region. This ensures that any arithmetic</code></span>
+<span class="codeline" id="line-1315"><code>		// that goes off the top end of the object will be detectable</code></span>
+<span class="codeline" id="line-1316"><code>		// by checkptr (issue 38872).</code></span>
+<span class="codeline" id="line-1317"><code>		// Note that we disable tinyalloc when raceenabled for this to work.</code></span>
+<span class="codeline" id="line-1318"><code>		// TODO: This padding is only performed when the race detector</code></span>
+<span class="codeline" id="line-1319"><code>		// is enabled. It would be nice to enable it if any package</code></span>
+<span class="codeline" id="line-1320"><code>		// was compiled with checkptr, but there's no easy way to</code></span>
+<span class="codeline" id="line-1321"><code>		// detect that (especially at compile time).</code></span>
+<span class="codeline" id="line-1322"><code>		// TODO: enable this padding for all allocations, not just</code></span>
+<span class="codeline" id="line-1323"><code>		// tinyalloc ones. It's tricky because of pointer maps.</code></span>
+<span class="codeline" id="line-1324"><code>		// Maybe just all noscan objects?</code></span>
+<span class="codeline" id="line-1325"><code>		x = add(x, size-dataSize)</code></span>
+<span class="codeline" id="line-1326"><code>	}</code></span>
+<span class="codeline" id="line-1327"><code></code></span>
+<span class="codeline" id="line-1328"><code>	return x</code></span>
+<span class="codeline" id="line-1329"><code>}</code></span>
+<span class="codeline" id="line-1330"><code></code></span>
+<span class="codeline" id="line-1331"><code>// deductAssistCredit reduces the current G's assist credit</code></span>
+<span class="codeline" id="line-1332"><code>// by size bytes, and assists the GC if necessary.</code></span>
+<span class="codeline" id="line-1333"><code>//</code></span>
+<span class="codeline" id="line-1334"><code>// Caller must be preemptible.</code></span>
+<span class="codeline" id="line-1335"><code>//</code></span>
+<span class="codeline" id="line-1336"><code>// Returns the G for which the assist credit was accounted.</code></span>
+<span class="codeline" id="line-1337"><code>func deductAssistCredit(size uintptr) *g {</code></span>
+<span class="codeline" id="line-1338"><code>	var assistG *g</code></span>
+<span class="codeline" id="line-1339"><code>	if gcBlackenEnabled != 0 {</code></span>
+<span class="codeline" id="line-1340"><code>		// Charge the current user G for this allocation.</code></span>
+<span class="codeline" id="line-1341"><code>		assistG = getg()</code></span>
+<span class="codeline" id="line-1342"><code>		if assistG.m.curg != nil {</code></span>
+<span class="codeline" id="line-1343"><code>			assistG = assistG.m.curg</code></span>
+<span class="codeline" id="line-1344"><code>		}</code></span>
+<span class="codeline" id="line-1345"><code>		// Charge the allocation against the G. We'll account</code></span>
+<span class="codeline" id="line-1346"><code>		// for internal fragmentation at the end of mallocgc.</code></span>
+<span class="codeline" id="line-1347"><code>		assistG.gcAssistBytes -= int64(size)</code></span>
+<span class="codeline" id="line-1348"><code></code></span>
+<span class="codeline" id="line-1349"><code>		if assistG.gcAssistBytes &lt; 0 {</code></span>
+<span class="codeline" id="line-1350"><code>			// This G is in debt. Assist the GC to correct</code></span>
+<span class="codeline" id="line-1351"><code>			// this before allocating. This must happen</code></span>
+<span class="codeline" id="line-1352"><code>			// before disabling preemption.</code></span>
+<span class="codeline" id="line-1353"><code>			gcAssistAlloc(assistG)</code></span>
+<span class="codeline" id="line-1354"><code>		}</code></span>
+<span class="codeline" id="line-1355"><code>	}</code></span>
+<span class="codeline" id="line-1356"><code>	return assistG</code></span>
+<span class="codeline" id="line-1357"><code>}</code></span>
+<span class="codeline" id="line-1358"><code></code></span>
+<span class="codeline" id="line-1359"><code>// memclrNoHeapPointersChunked repeatedly calls memclrNoHeapPointers</code></span>
+<span class="codeline" id="line-1360"><code>// on chunks of the buffer to be zeroed, with opportunities for preemption</code></span>
+<span class="codeline" id="line-1361"><code>// along the way.  memclrNoHeapPointers contains no safepoints and also</code></span>
+<span class="codeline" id="line-1362"><code>// cannot be preemptively scheduled, so this provides a still-efficient</code></span>
+<span class="codeline" id="line-1363"><code>// block copy that can also be preempted on a reasonable granularity.</code></span>
+<span class="codeline" id="line-1364"><code>//</code></span>
+<span class="codeline" id="line-1365"><code>// Use this with care; if the data being cleared is tagged to contain</code></span>
+<span class="codeline" id="line-1366"><code>// pointers, this allows the GC to run before it is all cleared.</code></span>
+<span class="codeline" id="line-1367"><code>func memclrNoHeapPointersChunked(size uintptr, x unsafe.Pointer) {</code></span>
+<span class="codeline" id="line-1368"><code>	v := uintptr(x)</code></span>
+<span class="codeline" id="line-1369"><code>	// got this from benchmarking. 128k is too small, 512k is too large.</code></span>
+<span class="codeline" id="line-1370"><code>	const chunkBytes = 256 * 1024</code></span>
+<span class="codeline" id="line-1371"><code>	vsize := v + size</code></span>
+<span class="codeline" id="line-1372"><code>	for voff := v; voff &lt; vsize; voff = voff + chunkBytes {</code></span>
+<span class="codeline" id="line-1373"><code>		if getg().preempt {</code></span>
+<span class="codeline" id="line-1374"><code>			// may hold locks, e.g., profiling</code></span>
+<span class="codeline" id="line-1375"><code>			goschedguarded()</code></span>
+<span class="codeline" id="line-1376"><code>		}</code></span>
+<span class="codeline" id="line-1377"><code>		// clear min(avail, lump) bytes</code></span>
+<span class="codeline" id="line-1378"><code>		n := vsize - voff</code></span>
+<span class="codeline" id="line-1379"><code>		if n &gt; chunkBytes {</code></span>
+<span class="codeline" id="line-1380"><code>			n = chunkBytes</code></span>
+<span class="codeline" id="line-1381"><code>		}</code></span>
+<span class="codeline" id="line-1382"><code>		memclrNoHeapPointers(unsafe.Pointer(voff), n)</code></span>
+<span class="codeline" id="line-1383"><code>	}</code></span>
+<span class="codeline" id="line-1384"><code>}</code></span>
+<span class="codeline" id="line-1385"><code></code></span>
+<span class="codeline" id="line-1386"><code>// implementation of new builtin</code></span>
+<span class="codeline" id="line-1387"><code>// compiler (both frontend and SSA backend) knows the signature</code></span>
+<span class="codeline" id="line-1388"><code>// of this function.</code></span>
+<span class="codeline" id="line-1389"><code>func newobject(typ *_type) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1390"><code>	return mallocgc(typ.Size_, typ, true)</code></span>
+<span class="codeline" id="line-1391"><code>}</code></span>
+<span class="codeline" id="line-1392"><code></code></span>
+<span class="codeline" id="line-1393"><code>//go:linkname reflect_unsafe_New reflect.unsafe_New</code></span>
+<span class="codeline" id="line-1394"><code>func reflect_unsafe_New(typ *_type) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1395"><code>	return mallocgc(typ.Size_, typ, true)</code></span>
+<span class="codeline" id="line-1396"><code>}</code></span>
+<span class="codeline" id="line-1397"><code></code></span>
+<span class="codeline" id="line-1398"><code>//go:linkname reflectlite_unsafe_New internal/reflectlite.unsafe_New</code></span>
+<span class="codeline" id="line-1399"><code>func reflectlite_unsafe_New(typ *_type) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1400"><code>	return mallocgc(typ.Size_, typ, true)</code></span>
+<span class="codeline" id="line-1401"><code>}</code></span>
+<span class="codeline" id="line-1402"><code></code></span>
+<span class="codeline" id="line-1403"><code>// newarray allocates an array of n elements of type typ.</code></span>
+<span class="codeline" id="line-1404"><code>func newarray(typ *_type, n int) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1405"><code>	if n == 1 {</code></span>
+<span class="codeline" id="line-1406"><code>		return mallocgc(typ.Size_, typ, true)</code></span>
+<span class="codeline" id="line-1407"><code>	}</code></span>
+<span class="codeline" id="line-1408"><code>	mem, overflow := math.MulUintptr(typ.Size_, uintptr(n))</code></span>
+<span class="codeline" id="line-1409"><code>	if overflow || mem &gt; maxAlloc || n &lt; 0 {</code></span>
+<span class="codeline" id="line-1410"><code>		panic(plainError("runtime: allocation size out of range"))</code></span>
+<span class="codeline" id="line-1411"><code>	}</code></span>
+<span class="codeline" id="line-1412"><code>	return mallocgc(mem, typ, true)</code></span>
+<span class="codeline" id="line-1413"><code>}</code></span>
+<span class="codeline" id="line-1414"><code></code></span>
+<span class="codeline" id="line-1415"><code>//go:linkname reflect_unsafe_NewArray reflect.unsafe_NewArray</code></span>
+<span class="codeline" id="line-1416"><code>func reflect_unsafe_NewArray(typ *_type, n int) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1417"><code>	return newarray(typ, n)</code></span>
+<span class="codeline" id="line-1418"><code>}</code></span>
+<span class="codeline" id="line-1419"><code></code></span>
+<span class="codeline" id="line-1420"><code>func profilealloc(mp *m, x unsafe.Pointer, size uintptr) {</code></span>
+<span class="codeline" id="line-1421"><code>	c := getMCache(mp)</code></span>
+<span class="codeline" id="line-1422"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1423"><code>		throw("profilealloc called without a P or outside bootstrapping")</code></span>
+<span class="codeline" id="line-1424"><code>	}</code></span>
+<span class="codeline" id="line-1425"><code>	c.nextSample = nextSample()</code></span>
+<span class="codeline" id="line-1426"><code>	mProf_Malloc(x, size)</code></span>
+<span class="codeline" id="line-1427"><code>}</code></span>
+<span class="codeline" id="line-1428"><code></code></span>
+<span class="codeline" id="line-1429"><code>// nextSample returns the next sampling point for heap profiling. The goal is</code></span>
+<span class="codeline" id="line-1430"><code>// to sample allocations on average every MemProfileRate bytes, but with a</code></span>
+<span class="codeline" id="line-1431"><code>// completely random distribution over the allocation timeline; this</code></span>
+<span class="codeline" id="line-1432"><code>// corresponds to a Poisson process with parameter MemProfileRate. In Poisson</code></span>
+<span class="codeline" id="line-1433"><code>// processes, the distance between two samples follows the exponential</code></span>
+<span class="codeline" id="line-1434"><code>// distribution (exp(MemProfileRate)), so the best return value is a random</code></span>
+<span class="codeline" id="line-1435"><code>// number taken from an exponential distribution whose mean is MemProfileRate.</code></span>
+<span class="codeline" id="line-1436"><code>func nextSample() uintptr {</code></span>
+<span class="codeline" id="line-1437"><code>	if MemProfileRate == 1 {</code></span>
+<span class="codeline" id="line-1438"><code>		// Callers assign our return value to</code></span>
+<span class="codeline" id="line-1439"><code>		// mcache.next_sample, but next_sample is not used</code></span>
+<span class="codeline" id="line-1440"><code>		// when the rate is 1. So avoid the math below and</code></span>
+<span class="codeline" id="line-1441"><code>		// just return something.</code></span>
+<span class="codeline" id="line-1442"><code>		return 0</code></span>
+<span class="codeline" id="line-1443"><code>	}</code></span>
+<span class="codeline" id="line-1444"><code>	if GOOS == "plan9" {</code></span>
+<span class="codeline" id="line-1445"><code>		// Plan 9 doesn't support floating point in note handler.</code></span>
+<span class="codeline" id="line-1446"><code>		if gp := getg(); gp == gp.m.gsignal {</code></span>
+<span class="codeline" id="line-1447"><code>			return nextSampleNoFP()</code></span>
+<span class="codeline" id="line-1448"><code>		}</code></span>
+<span class="codeline" id="line-1449"><code>	}</code></span>
+<span class="codeline" id="line-1450"><code></code></span>
+<span class="codeline" id="line-1451"><code>	return uintptr(fastexprand(MemProfileRate))</code></span>
+<span class="codeline" id="line-1452"><code>}</code></span>
+<span class="codeline" id="line-1453"><code></code></span>
+<span class="codeline" id="line-1454"><code>// fastexprand returns a random number from an exponential distribution with</code></span>
+<span class="codeline" id="line-1455"><code>// the specified mean.</code></span>
+<span class="codeline" id="line-1456"><code>func fastexprand(mean int) int32 {</code></span>
+<span class="codeline" id="line-1457"><code>	// Avoid overflow. Maximum possible step is</code></span>
+<span class="codeline" id="line-1458"><code>	// -ln(1/(1&lt;&lt;randomBitCount)) * mean, approximately 20 * mean.</code></span>
+<span class="codeline" id="line-1459"><code>	switch {</code></span>
+<span class="codeline" id="line-1460"><code>	case mean &gt; 0x7000000:</code></span>
+<span class="codeline" id="line-1461"><code>		mean = 0x7000000</code></span>
+<span class="codeline" id="line-1462"><code>	case mean == 0:</code></span>
+<span class="codeline" id="line-1463"><code>		return 0</code></span>
+<span class="codeline" id="line-1464"><code>	}</code></span>
+<span class="codeline" id="line-1465"><code></code></span>
+<span class="codeline" id="line-1466"><code>	// Take a random sample of the exponential distribution exp(-mean*x).</code></span>
+<span class="codeline" id="line-1467"><code>	// The probability distribution function is mean*exp(-mean*x), so the CDF is</code></span>
+<span class="codeline" id="line-1468"><code>	// p = 1 - exp(-mean*x), so</code></span>
+<span class="codeline" id="line-1469"><code>	// q = 1 - p == exp(-mean*x)</code></span>
+<span class="codeline" id="line-1470"><code>	// log_e(q) = -mean*x</code></span>
+<span class="codeline" id="line-1471"><code>	// -log_e(q)/mean = x</code></span>
+<span class="codeline" id="line-1472"><code>	// x = -log_e(q) * mean</code></span>
+<span class="codeline" id="line-1473"><code>	// x = log_2(q) * (-log_e(2)) * mean    ; Using log_2 for efficiency</code></span>
+<span class="codeline" id="line-1474"><code>	const randomBitCount = 26</code></span>
+<span class="codeline" id="line-1475"><code>	q := cheaprandn(1&lt;&lt;randomBitCount) + 1</code></span>
+<span class="codeline" id="line-1476"><code>	qlog := fastlog2(float64(q)) - randomBitCount</code></span>
+<span class="codeline" id="line-1477"><code>	if qlog &gt; 0 {</code></span>
+<span class="codeline" id="line-1478"><code>		qlog = 0</code></span>
+<span class="codeline" id="line-1479"><code>	}</code></span>
+<span class="codeline" id="line-1480"><code>	const minusLog2 = -0.6931471805599453 // -ln(2)</code></span>
+<span class="codeline" id="line-1481"><code>	return int32(qlog*(minusLog2*float64(mean))) + 1</code></span>
+<span class="codeline" id="line-1482"><code>}</code></span>
+<span class="codeline" id="line-1483"><code></code></span>
+<span class="codeline" id="line-1484"><code>// nextSampleNoFP is similar to nextSample, but uses older,</code></span>
+<span class="codeline" id="line-1485"><code>// simpler code to avoid floating point.</code></span>
+<span class="codeline" id="line-1486"><code>func nextSampleNoFP() uintptr {</code></span>
+<span class="codeline" id="line-1487"><code>	// Set first allocation sample size.</code></span>
+<span class="codeline" id="line-1488"><code>	rate := MemProfileRate</code></span>
+<span class="codeline" id="line-1489"><code>	if rate &gt; 0x3fffffff { // make 2*rate not overflow</code></span>
+<span class="codeline" id="line-1490"><code>		rate = 0x3fffffff</code></span>
+<span class="codeline" id="line-1491"><code>	}</code></span>
+<span class="codeline" id="line-1492"><code>	if rate != 0 {</code></span>
+<span class="codeline" id="line-1493"><code>		return uintptr(cheaprandn(uint32(2 * rate)))</code></span>
+<span class="codeline" id="line-1494"><code>	}</code></span>
+<span class="codeline" id="line-1495"><code>	return 0</code></span>
+<span class="codeline" id="line-1496"><code>}</code></span>
+<span class="codeline" id="line-1497"><code></code></span>
+<span class="codeline" id="line-1498"><code>type persistentAlloc struct {</code></span>
+<span class="codeline" id="line-1499"><code>	base *notInHeap</code></span>
+<span class="codeline" id="line-1500"><code>	off  uintptr</code></span>
+<span class="codeline" id="line-1501"><code>}</code></span>
+<span class="codeline" id="line-1502"><code></code></span>
+<span class="codeline" id="line-1503"><code>var globalAlloc struct {</code></span>
+<span class="codeline" id="line-1504"><code>	mutex</code></span>
+<span class="codeline" id="line-1505"><code>	persistentAlloc</code></span>
+<span class="codeline" id="line-1506"><code>}</code></span>
+<span class="codeline" id="line-1507"><code></code></span>
+<span class="codeline" id="line-1508"><code>// persistentChunkSize is the number of bytes we allocate when we grow</code></span>
+<span class="codeline" id="line-1509"><code>// a persistentAlloc.</code></span>
+<span class="codeline" id="line-1510"><code>const persistentChunkSize = 256 &lt;&lt; 10</code></span>
+<span class="codeline" id="line-1511"><code></code></span>
+<span class="codeline" id="line-1512"><code>// persistentChunks is a list of all the persistent chunks we have</code></span>
+<span class="codeline" id="line-1513"><code>// allocated. The list is maintained through the first word in the</code></span>
+<span class="codeline" id="line-1514"><code>// persistent chunk. This is updated atomically.</code></span>
+<span class="codeline" id="line-1515"><code>var persistentChunks *notInHeap</code></span>
+<span class="codeline" id="line-1516"><code></code></span>
+<span class="codeline" id="line-1517"><code>// Wrapper around sysAlloc that can allocate small chunks.</code></span>
+<span class="codeline" id="line-1518"><code>// There is no associated free operation.</code></span>
+<span class="codeline" id="line-1519"><code>// Intended for things like function/type/debug-related persistent data.</code></span>
+<span class="codeline" id="line-1520"><code>// If align is 0, uses default align (currently 8).</code></span>
+<span class="codeline" id="line-1521"><code>// The returned memory will be zeroed.</code></span>
+<span class="codeline" id="line-1522"><code>// sysStat must be non-nil.</code></span>
+<span class="codeline" id="line-1523"><code>//</code></span>
+<span class="codeline" id="line-1524"><code>// Consider marking persistentalloc'd types not in heap by embedding</code></span>
+<span class="codeline" id="line-1525"><code>// runtime/internal/sys.NotInHeap.</code></span>
+<span class="codeline" id="line-1526"><code>func persistentalloc(size, align uintptr, sysStat *sysMemStat) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1527"><code>	var p *notInHeap</code></span>
+<span class="codeline" id="line-1528"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1529"><code>		p = persistentalloc1(size, align, sysStat)</code></span>
+<span class="codeline" id="line-1530"><code>	})</code></span>
+<span class="codeline" id="line-1531"><code>	return unsafe.Pointer(p)</code></span>
+<span class="codeline" id="line-1532"><code>}</code></span>
+<span class="codeline" id="line-1533"><code></code></span>
+<span class="codeline" id="line-1534"><code>// Must run on system stack because stack growth can (re)invoke it.</code></span>
+<span class="codeline" id="line-1535"><code>// See issue 9174.</code></span>
+<span class="codeline" id="line-1536"><code>//</code></span>
+<span class="codeline" id="line-1537"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-1538"><code>func persistentalloc1(size, align uintptr, sysStat *sysMemStat) *notInHeap {</code></span>
+<span class="codeline" id="line-1539"><code>	const (</code></span>
+<span class="codeline" id="line-1540"><code>		maxBlock = 64 &lt;&lt; 10 // VM reservation granularity is 64K on windows</code></span>
+<span class="codeline" id="line-1541"><code>	)</code></span>
+<span class="codeline" id="line-1542"><code></code></span>
+<span class="codeline" id="line-1543"><code>	if size == 0 {</code></span>
+<span class="codeline" id="line-1544"><code>		throw("persistentalloc: size == 0")</code></span>
+<span class="codeline" id="line-1545"><code>	}</code></span>
+<span class="codeline" id="line-1546"><code>	if align != 0 {</code></span>
+<span class="codeline" id="line-1547"><code>		if align&amp;(align-1) != 0 {</code></span>
+<span class="codeline" id="line-1548"><code>			throw("persistentalloc: align is not a power of 2")</code></span>
+<span class="codeline" id="line-1549"><code>		}</code></span>
+<span class="codeline" id="line-1550"><code>		if align &gt; _PageSize {</code></span>
+<span class="codeline" id="line-1551"><code>			throw("persistentalloc: align is too large")</code></span>
+<span class="codeline" id="line-1552"><code>		}</code></span>
+<span class="codeline" id="line-1553"><code>	} else {</code></span>
+<span class="codeline" id="line-1554"><code>		align = 8</code></span>
+<span class="codeline" id="line-1555"><code>	}</code></span>
+<span class="codeline" id="line-1556"><code></code></span>
+<span class="codeline" id="line-1557"><code>	if size &gt;= maxBlock {</code></span>
+<span class="codeline" id="line-1558"><code>		return (*notInHeap)(sysAlloc(size, sysStat))</code></span>
+<span class="codeline" id="line-1559"><code>	}</code></span>
+<span class="codeline" id="line-1560"><code></code></span>
+<span class="codeline" id="line-1561"><code>	mp := acquirem()</code></span>
+<span class="codeline" id="line-1562"><code>	var persistent *persistentAlloc</code></span>
+<span class="codeline" id="line-1563"><code>	if mp != nil &amp;&amp; mp.p != 0 {</code></span>
+<span class="codeline" id="line-1564"><code>		persistent = &amp;mp.p.ptr().palloc</code></span>
+<span class="codeline" id="line-1565"><code>	} else {</code></span>
+<span class="codeline" id="line-1566"><code>		lock(&amp;globalAlloc.mutex)</code></span>
+<span class="codeline" id="line-1567"><code>		persistent = &amp;globalAlloc.persistentAlloc</code></span>
+<span class="codeline" id="line-1568"><code>	}</code></span>
+<span class="codeline" id="line-1569"><code>	persistent.off = alignUp(persistent.off, align)</code></span>
+<span class="codeline" id="line-1570"><code>	if persistent.off+size &gt; persistentChunkSize || persistent.base == nil {</code></span>
+<span class="codeline" id="line-1571"><code>		persistent.base = (*notInHeap)(sysAlloc(persistentChunkSize, &amp;memstats.other_sys))</code></span>
+<span class="codeline" id="line-1572"><code>		if persistent.base == nil {</code></span>
+<span class="codeline" id="line-1573"><code>			if persistent == &amp;globalAlloc.persistentAlloc {</code></span>
+<span class="codeline" id="line-1574"><code>				unlock(&amp;globalAlloc.mutex)</code></span>
+<span class="codeline" id="line-1575"><code>			}</code></span>
+<span class="codeline" id="line-1576"><code>			throw("runtime: cannot allocate memory")</code></span>
+<span class="codeline" id="line-1577"><code>		}</code></span>
+<span class="codeline" id="line-1578"><code></code></span>
+<span class="codeline" id="line-1579"><code>		// Add the new chunk to the persistentChunks list.</code></span>
+<span class="codeline" id="line-1580"><code>		for {</code></span>
+<span class="codeline" id="line-1581"><code>			chunks := uintptr(unsafe.Pointer(persistentChunks))</code></span>
+<span class="codeline" id="line-1582"><code>			*(*uintptr)(unsafe.Pointer(persistent.base)) = chunks</code></span>
+<span class="codeline" id="line-1583"><code>			if atomic.Casuintptr((*uintptr)(unsafe.Pointer(&amp;persistentChunks)), chunks, uintptr(unsafe.Pointer(persistent.base))) {</code></span>
+<span class="codeline" id="line-1584"><code>				break</code></span>
+<span class="codeline" id="line-1585"><code>			}</code></span>
+<span class="codeline" id="line-1586"><code>		}</code></span>
+<span class="codeline" id="line-1587"><code>		persistent.off = alignUp(goarch.PtrSize, align)</code></span>
+<span class="codeline" id="line-1588"><code>	}</code></span>
+<span class="codeline" id="line-1589"><code>	p := persistent.base.add(persistent.off)</code></span>
+<span class="codeline" id="line-1590"><code>	persistent.off += size</code></span>
+<span class="codeline" id="line-1591"><code>	releasem(mp)</code></span>
+<span class="codeline" id="line-1592"><code>	if persistent == &amp;globalAlloc.persistentAlloc {</code></span>
+<span class="codeline" id="line-1593"><code>		unlock(&amp;globalAlloc.mutex)</code></span>
+<span class="codeline" id="line-1594"><code>	}</code></span>
+<span class="codeline" id="line-1595"><code></code></span>
+<span class="codeline" id="line-1596"><code>	if sysStat != &amp;memstats.other_sys {</code></span>
+<span class="codeline" id="line-1597"><code>		sysStat.add(int64(size))</code></span>
+<span class="codeline" id="line-1598"><code>		memstats.other_sys.add(-int64(size))</code></span>
+<span class="codeline" id="line-1599"><code>	}</code></span>
+<span class="codeline" id="line-1600"><code>	return p</code></span>
+<span class="codeline" id="line-1601"><code>}</code></span>
+<span class="codeline" id="line-1602"><code></code></span>
+<span class="codeline" id="line-1603"><code>// inPersistentAlloc reports whether p points to memory allocated by</code></span>
+<span class="codeline" id="line-1604"><code>// persistentalloc. This must be nosplit because it is called by the</code></span>
+<span class="codeline" id="line-1605"><code>// cgo checker code, which is called by the write barrier code.</code></span>
+<span class="codeline" id="line-1606"><code>//</code></span>
+<span class="codeline" id="line-1607"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1608"><code>func inPersistentAlloc(p uintptr) bool {</code></span>
+<span class="codeline" id="line-1609"><code>	chunk := atomic.Loaduintptr((*uintptr)(unsafe.Pointer(&amp;persistentChunks)))</code></span>
+<span class="codeline" id="line-1610"><code>	for chunk != 0 {</code></span>
+<span class="codeline" id="line-1611"><code>		if p &gt;= chunk &amp;&amp; p &lt; chunk+persistentChunkSize {</code></span>
+<span class="codeline" id="line-1612"><code>			return true</code></span>
+<span class="codeline" id="line-1613"><code>		}</code></span>
+<span class="codeline" id="line-1614"><code>		chunk = *(*uintptr)(unsafe.Pointer(chunk))</code></span>
+<span class="codeline" id="line-1615"><code>	}</code></span>
+<span class="codeline" id="line-1616"><code>	return false</code></span>
+<span class="codeline" id="line-1617"><code>}</code></span>
+<span class="codeline" id="line-1618"><code></code></span>
+<span class="codeline" id="line-1619"><code>// linearAlloc is a simple linear allocator that pre-reserves a region</code></span>
+<span class="codeline" id="line-1620"><code>// of memory and then optionally maps that region into the Ready state</code></span>
+<span class="codeline" id="line-1621"><code>// as needed.</code></span>
+<span class="codeline" id="line-1622"><code>//</code></span>
+<span class="codeline" id="line-1623"><code>// The caller is responsible for locking.</code></span>
+<span class="codeline" id="line-1624"><code>type linearAlloc struct {</code></span>
+<span class="codeline" id="line-1625"><code>	next   uintptr // next free byte</code></span>
+<span class="codeline" id="line-1626"><code>	mapped uintptr // one byte past end of mapped space</code></span>
+<span class="codeline" id="line-1627"><code>	end    uintptr // end of reserved space</code></span>
+<span class="codeline" id="line-1628"><code></code></span>
+<span class="codeline" id="line-1629"><code>	mapMemory bool // transition memory from Reserved to Ready if true</code></span>
+<span class="codeline" id="line-1630"><code>}</code></span>
+<span class="codeline" id="line-1631"><code></code></span>
+<span class="codeline" id="line-1632"><code>func (l *linearAlloc) init(base, size uintptr, mapMemory bool) {</code></span>
+<span class="codeline" id="line-1633"><code>	if base+size &lt; base {</code></span>
+<span class="codeline" id="line-1634"><code>		// Chop off the last byte. The runtime isn't prepared</code></span>
+<span class="codeline" id="line-1635"><code>		// to deal with situations where the bounds could overflow.</code></span>
+<span class="codeline" id="line-1636"><code>		// Leave that memory reserved, though, so we don't map it</code></span>
+<span class="codeline" id="line-1637"><code>		// later.</code></span>
+<span class="codeline" id="line-1638"><code>		size -= 1</code></span>
+<span class="codeline" id="line-1639"><code>	}</code></span>
+<span class="codeline" id="line-1640"><code>	l.next, l.mapped = base, base</code></span>
+<span class="codeline" id="line-1641"><code>	l.end = base + size</code></span>
+<span class="codeline" id="line-1642"><code>	l.mapMemory = mapMemory</code></span>
+<span class="codeline" id="line-1643"><code>}</code></span>
+<span class="codeline" id="line-1644"><code></code></span>
+<span class="codeline" id="line-1645"><code>func (l *linearAlloc) alloc(size, align uintptr, sysStat *sysMemStat) unsafe.Pointer {</code></span>
+<span class="codeline" id="line-1646"><code>	p := alignUp(l.next, align)</code></span>
+<span class="codeline" id="line-1647"><code>	if p+size &gt; l.end {</code></span>
+<span class="codeline" id="line-1648"><code>		return nil</code></span>
+<span class="codeline" id="line-1649"><code>	}</code></span>
+<span class="codeline" id="line-1650"><code>	l.next = p + size</code></span>
+<span class="codeline" id="line-1651"><code>	if pEnd := alignUp(l.next-1, physPageSize); pEnd &gt; l.mapped {</code></span>
+<span class="codeline" id="line-1652"><code>		if l.mapMemory {</code></span>
+<span class="codeline" id="line-1653"><code>			// Transition from Reserved to Prepared to Ready.</code></span>
+<span class="codeline" id="line-1654"><code>			n := pEnd - l.mapped</code></span>
+<span class="codeline" id="line-1655"><code>			sysMap(unsafe.Pointer(l.mapped), n, sysStat)</code></span>
+<span class="codeline" id="line-1656"><code>			sysUsed(unsafe.Pointer(l.mapped), n, n)</code></span>
+<span class="codeline" id="line-1657"><code>		}</code></span>
+<span class="codeline" id="line-1658"><code>		l.mapped = pEnd</code></span>
+<span class="codeline" id="line-1659"><code>	}</code></span>
+<span class="codeline" id="line-1660"><code>	return unsafe.Pointer(p)</code></span>
+<span class="codeline" id="line-1661"><code>}</code></span>
+<span class="codeline" id="line-1662"><code></code></span>
+<span class="codeline" id="line-1663"><code>// notInHeap is off-heap memory allocated by a lower-level allocator</code></span>
+<span class="codeline" id="line-1664"><code>// like sysAlloc or persistentAlloc.</code></span>
+<span class="codeline" id="line-1665"><code>//</code></span>
+<span class="codeline" id="line-1666"><code>// In general, it's better to use real types which embed</code></span>
+<span class="codeline" id="line-1667"><code>// runtime/internal/sys.NotInHeap, but this serves as a generic type</code></span>
+<span class="codeline" id="line-1668"><code>// for situations where that isn't possible (like in the allocators).</code></span>
+<span class="codeline" id="line-1669"><code>//</code></span>
+<span class="codeline" id="line-1670"><code>// TODO: Use this as the return type of sysAlloc, persistentAlloc, etc?</code></span>
+<span class="codeline" id="line-1671"><code>type notInHeap struct{ _ sys.NotInHeap }</code></span>
+<span class="codeline" id="line-1672"><code></code></span>
+<span class="codeline" id="line-1673"><code>func (p *notInHeap) add(bytes uintptr) *notInHeap {</code></span>
+<span class="codeline" id="line-1674"><code>	return (*notInHeap)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + bytes))</code></span>
+<span class="codeline" id="line-1675"><code>}</code></span>
+<span class="codeline" id="line-1676"><code></code></span>
+<span class="codeline" id="line-1677"><code>// computeRZlog computes the size of the redzone.</code></span>
+<span class="codeline" id="line-1678"><code>// Refer to the implementation of the compiler-rt.</code></span>
+<span class="codeline" id="line-1679"><code>func computeRZlog(userSize uintptr) uintptr {</code></span>
+<span class="codeline" id="line-1680"><code>	switch {</code></span>
+<span class="codeline" id="line-1681"><code>	case userSize &lt;= (64 - 16):</code></span>
+<span class="codeline" id="line-1682"><code>		return 16 &lt;&lt; 0</code></span>
+<span class="codeline" id="line-1683"><code>	case userSize &lt;= (128 - 32):</code></span>
+<span class="codeline" id="line-1684"><code>		return 16 &lt;&lt; 1</code></span>
+<span class="codeline" id="line-1685"><code>	case userSize &lt;= (512 - 64):</code></span>
+<span class="codeline" id="line-1686"><code>		return 16 &lt;&lt; 2</code></span>
+<span class="codeline" id="line-1687"><code>	case userSize &lt;= (4096 - 128):</code></span>
+<span class="codeline" id="line-1688"><code>		return 16 &lt;&lt; 3</code></span>
+<span class="codeline" id="line-1689"><code>	case userSize &lt;= (1&lt;&lt;14)-256:</code></span>
+<span class="codeline" id="line-1690"><code>		return 16 &lt;&lt; 4</code></span>
+<span class="codeline" id="line-1691"><code>	case userSize &lt;= (1&lt;&lt;15)-512:</code></span>
+<span class="codeline" id="line-1692"><code>		return 16 &lt;&lt; 5</code></span>
+<span class="codeline" id="line-1693"><code>	case userSize &lt;= (1&lt;&lt;16)-1024:</code></span>
+<span class="codeline" id="line-1694"><code>		return 16 &lt;&lt; 6</code></span>
+<span class="codeline" id="line-1695"><code>	default:</code></span>
+<span class="codeline" id="line-1696"><code>		return 16 &lt;&lt; 7</code></span>
+<span class="codeline" id="line-1697"><code>	}</code></span>
+<span class="codeline" id="line-1698"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

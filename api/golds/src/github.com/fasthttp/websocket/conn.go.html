@@ -1,0 +1,1392 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: conn.go in package github.com/fasthttp/websocket</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	conn.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/github.com/fasthttp/websocket.html">github.com/fasthttp/websocket</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2013 The Gorilla WebSocket Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package websocket</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bufio"</code></span>
+<span class="codeline" id="line-9"><code>	"crypto/rand"</code></span>
+<span class="codeline" id="line-10"><code>	"encoding/binary"</code></span>
+<span class="codeline" id="line-11"><code>	"errors"</code></span>
+<span class="codeline" id="line-12"><code>	"io"</code></span>
+<span class="codeline" id="line-13"><code>	"log"</code></span>
+<span class="codeline" id="line-14"><code>	"net"</code></span>
+<span class="codeline" id="line-15"><code>	"strconv"</code></span>
+<span class="codeline" id="line-16"><code>	"strings"</code></span>
+<span class="codeline" id="line-17"><code>	"sync"</code></span>
+<span class="codeline" id="line-18"><code>	"time"</code></span>
+<span class="codeline" id="line-19"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-20"><code>)</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>const (</code></span>
+<span class="codeline" id="line-23"><code>	// Frame header byte 0 bits from Section 5.2 of RFC 6455</code></span>
+<span class="codeline" id="line-24"><code>	finalBit = 1 &lt;&lt; 7</code></span>
+<span class="codeline" id="line-25"><code>	rsv1Bit  = 1 &lt;&lt; 6</code></span>
+<span class="codeline" id="line-26"><code>	rsv2Bit  = 1 &lt;&lt; 5</code></span>
+<span class="codeline" id="line-27"><code>	rsv3Bit  = 1 &lt;&lt; 4</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>	// Frame header byte 1 bits from Section 5.2 of RFC 6455</code></span>
+<span class="codeline" id="line-30"><code>	maskBit = 1 &lt;&lt; 7</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>	maxFrameHeaderSize         = 2 + 8 + 4 // Fixed header + length + mask</code></span>
+<span class="codeline" id="line-33"><code>	maxControlFramePayloadSize = 125</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>	writeWait = time.Second</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>	defaultReadBufferSize  = 4096</code></span>
+<span class="codeline" id="line-38"><code>	defaultWriteBufferSize = 4096</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	continuationFrame = 0</code></span>
+<span class="codeline" id="line-41"><code>	noFrame           = -1</code></span>
+<span class="codeline" id="line-42"><code>)</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>// Close codes defined in RFC 6455, section 11.7.</code></span>
+<span class="codeline" id="line-45"><code>const (</code></span>
+<span class="codeline" id="line-46"><code>	CloseNormalClosure           = 1000</code></span>
+<span class="codeline" id="line-47"><code>	CloseGoingAway               = 1001</code></span>
+<span class="codeline" id="line-48"><code>	CloseProtocolError           = 1002</code></span>
+<span class="codeline" id="line-49"><code>	CloseUnsupportedData         = 1003</code></span>
+<span class="codeline" id="line-50"><code>	CloseNoStatusReceived        = 1005</code></span>
+<span class="codeline" id="line-51"><code>	CloseAbnormalClosure         = 1006</code></span>
+<span class="codeline" id="line-52"><code>	CloseInvalidFramePayloadData = 1007</code></span>
+<span class="codeline" id="line-53"><code>	ClosePolicyViolation         = 1008</code></span>
+<span class="codeline" id="line-54"><code>	CloseMessageTooBig           = 1009</code></span>
+<span class="codeline" id="line-55"><code>	CloseMandatoryExtension      = 1010</code></span>
+<span class="codeline" id="line-56"><code>	CloseInternalServerErr       = 1011</code></span>
+<span class="codeline" id="line-57"><code>	CloseServiceRestart          = 1012</code></span>
+<span class="codeline" id="line-58"><code>	CloseTryAgainLater           = 1013</code></span>
+<span class="codeline" id="line-59"><code>	CloseTLSHandshake            = 1015</code></span>
+<span class="codeline" id="line-60"><code>)</code></span>
+<span class="codeline" id="line-61"><code></code></span>
+<span class="codeline" id="line-62"><code>// The message types are defined in RFC 6455, section 11.8.</code></span>
+<span class="codeline" id="line-63"><code>const (</code></span>
+<span class="codeline" id="line-64"><code>	// TextMessage denotes a text data message. The text message payload is</code></span>
+<span class="codeline" id="line-65"><code>	// interpreted as UTF-8 encoded text data.</code></span>
+<span class="codeline" id="line-66"><code>	TextMessage = 1</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>	// BinaryMessage denotes a binary data message.</code></span>
+<span class="codeline" id="line-69"><code>	BinaryMessage = 2</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>	// CloseMessage denotes a close control message. The optional message</code></span>
+<span class="codeline" id="line-72"><code>	// payload contains a numeric code and text. Use the FormatCloseMessage</code></span>
+<span class="codeline" id="line-73"><code>	// function to format a close message payload.</code></span>
+<span class="codeline" id="line-74"><code>	CloseMessage = 8</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>	// PingMessage denotes a ping control message. The optional message payload</code></span>
+<span class="codeline" id="line-77"><code>	// is UTF-8 encoded text.</code></span>
+<span class="codeline" id="line-78"><code>	PingMessage = 9</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>	// PongMessage denotes a pong control message. The optional message payload</code></span>
+<span class="codeline" id="line-81"><code>	// is UTF-8 encoded text.</code></span>
+<span class="codeline" id="line-82"><code>	PongMessage = 10</code></span>
+<span class="codeline" id="line-83"><code>)</code></span>
+<span class="codeline" id="line-84"><code></code></span>
+<span class="codeline" id="line-85"><code>// ErrCloseSent is returned when the application writes a message to the</code></span>
+<span class="codeline" id="line-86"><code>// connection after sending a close message.</code></span>
+<span class="codeline" id="line-87"><code>var ErrCloseSent = errors.New("websocket: close sent")</code></span>
+<span class="codeline" id="line-88"><code></code></span>
+<span class="codeline" id="line-89"><code>// ErrReadLimit is returned when reading a message that is larger than the</code></span>
+<span class="codeline" id="line-90"><code>// read limit set for the connection.</code></span>
+<span class="codeline" id="line-91"><code>var ErrReadLimit = errors.New("websocket: read limit exceeded")</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>// netError satisfies the net Error interface.</code></span>
+<span class="codeline" id="line-94"><code>type netError struct {</code></span>
+<span class="codeline" id="line-95"><code>	msg       string</code></span>
+<span class="codeline" id="line-96"><code>	temporary bool</code></span>
+<span class="codeline" id="line-97"><code>	timeout   bool</code></span>
+<span class="codeline" id="line-98"><code>}</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>func (e *netError) Error() string   { return e.msg }</code></span>
+<span class="codeline" id="line-101"><code>func (e *netError) Temporary() bool { return e.temporary }</code></span>
+<span class="codeline" id="line-102"><code>func (e *netError) Timeout() bool   { return e.timeout }</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>// CloseError represents a close message.</code></span>
+<span class="codeline" id="line-105"><code>type CloseError struct {</code></span>
+<span class="codeline" id="line-106"><code>	// Code is defined in RFC 6455, section 11.7.</code></span>
+<span class="codeline" id="line-107"><code>	Code int</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>	// Text is the optional text payload.</code></span>
+<span class="codeline" id="line-110"><code>	Text string</code></span>
+<span class="codeline" id="line-111"><code>}</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>func (e *CloseError) Error() string {</code></span>
+<span class="codeline" id="line-114"><code>	s := []byte("websocket: close ")</code></span>
+<span class="codeline" id="line-115"><code>	s = strconv.AppendInt(s, int64(e.Code), 10)</code></span>
+<span class="codeline" id="line-116"><code>	switch e.Code {</code></span>
+<span class="codeline" id="line-117"><code>	case CloseNormalClosure:</code></span>
+<span class="codeline" id="line-118"><code>		s = append(s, " (normal)"...)</code></span>
+<span class="codeline" id="line-119"><code>	case CloseGoingAway:</code></span>
+<span class="codeline" id="line-120"><code>		s = append(s, " (going away)"...)</code></span>
+<span class="codeline" id="line-121"><code>	case CloseProtocolError:</code></span>
+<span class="codeline" id="line-122"><code>		s = append(s, " (protocol error)"...)</code></span>
+<span class="codeline" id="line-123"><code>	case CloseUnsupportedData:</code></span>
+<span class="codeline" id="line-124"><code>		s = append(s, " (unsupported data)"...)</code></span>
+<span class="codeline" id="line-125"><code>	case CloseNoStatusReceived:</code></span>
+<span class="codeline" id="line-126"><code>		s = append(s, " (no status)"...)</code></span>
+<span class="codeline" id="line-127"><code>	case CloseAbnormalClosure:</code></span>
+<span class="codeline" id="line-128"><code>		s = append(s, " (abnormal closure)"...)</code></span>
+<span class="codeline" id="line-129"><code>	case CloseInvalidFramePayloadData:</code></span>
+<span class="codeline" id="line-130"><code>		s = append(s, " (invalid payload data)"...)</code></span>
+<span class="codeline" id="line-131"><code>	case ClosePolicyViolation:</code></span>
+<span class="codeline" id="line-132"><code>		s = append(s, " (policy violation)"...)</code></span>
+<span class="codeline" id="line-133"><code>	case CloseMessageTooBig:</code></span>
+<span class="codeline" id="line-134"><code>		s = append(s, " (message too big)"...)</code></span>
+<span class="codeline" id="line-135"><code>	case CloseMandatoryExtension:</code></span>
+<span class="codeline" id="line-136"><code>		s = append(s, " (mandatory extension missing)"...)</code></span>
+<span class="codeline" id="line-137"><code>	case CloseInternalServerErr:</code></span>
+<span class="codeline" id="line-138"><code>		s = append(s, " (internal server error)"...)</code></span>
+<span class="codeline" id="line-139"><code>	case CloseTLSHandshake:</code></span>
+<span class="codeline" id="line-140"><code>		s = append(s, " (TLS handshake error)"...)</code></span>
+<span class="codeline" id="line-141"><code>	}</code></span>
+<span class="codeline" id="line-142"><code>	if e.Text != "" {</code></span>
+<span class="codeline" id="line-143"><code>		s = append(s, ": "...)</code></span>
+<span class="codeline" id="line-144"><code>		s = append(s, e.Text...)</code></span>
+<span class="codeline" id="line-145"><code>	}</code></span>
+<span class="codeline" id="line-146"><code>	return string(s)</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>// IsCloseError returns boolean indicating whether the error is a *CloseError</code></span>
+<span class="codeline" id="line-150"><code>// with one of the specified codes.</code></span>
+<span class="codeline" id="line-151"><code>func IsCloseError(err error, codes ...int) bool {</code></span>
+<span class="codeline" id="line-152"><code>	if e, ok := err.(*CloseError); ok {</code></span>
+<span class="codeline" id="line-153"><code>		for _, code := range codes {</code></span>
+<span class="codeline" id="line-154"><code>			if e.Code == code {</code></span>
+<span class="codeline" id="line-155"><code>				return true</code></span>
+<span class="codeline" id="line-156"><code>			}</code></span>
+<span class="codeline" id="line-157"><code>		}</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>	return false</code></span>
+<span class="codeline" id="line-160"><code>}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>// IsUnexpectedCloseError returns boolean indicating whether the error is a</code></span>
+<span class="codeline" id="line-163"><code>// *CloseError with a code not in the list of expected codes.</code></span>
+<span class="codeline" id="line-164"><code>func IsUnexpectedCloseError(err error, expectedCodes ...int) bool {</code></span>
+<span class="codeline" id="line-165"><code>	if e, ok := err.(*CloseError); ok {</code></span>
+<span class="codeline" id="line-166"><code>		for _, code := range expectedCodes {</code></span>
+<span class="codeline" id="line-167"><code>			if e.Code == code {</code></span>
+<span class="codeline" id="line-168"><code>				return false</code></span>
+<span class="codeline" id="line-169"><code>			}</code></span>
+<span class="codeline" id="line-170"><code>		}</code></span>
+<span class="codeline" id="line-171"><code>		return true</code></span>
+<span class="codeline" id="line-172"><code>	}</code></span>
+<span class="codeline" id="line-173"><code>	return false</code></span>
+<span class="codeline" id="line-174"><code>}</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>var (</code></span>
+<span class="codeline" id="line-177"><code>	errWriteTimeout        = &amp;netError{msg: "websocket: write timeout", timeout: true, temporary: true}</code></span>
+<span class="codeline" id="line-178"><code>	errUnexpectedEOF       = &amp;CloseError{Code: CloseAbnormalClosure, Text: io.ErrUnexpectedEOF.Error()}</code></span>
+<span class="codeline" id="line-179"><code>	errBadWriteOpCode      = errors.New("websocket: bad write message type")</code></span>
+<span class="codeline" id="line-180"><code>	errWriteClosed         = errors.New("websocket: write closed")</code></span>
+<span class="codeline" id="line-181"><code>	errInvalidControlFrame = errors.New("websocket: invalid control frame")</code></span>
+<span class="codeline" id="line-182"><code>)</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>// maskRand is an io.Reader for generating mask bytes. The reader is initialized</code></span>
+<span class="codeline" id="line-185"><code>// to crypto/rand Reader. Tests swap the reader to a math/rand reader for</code></span>
+<span class="codeline" id="line-186"><code>// reproducible results.</code></span>
+<span class="codeline" id="line-187"><code>var maskRand = rand.Reader</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>// newMaskKey returns a new 32 bit value for masking client frames.</code></span>
+<span class="codeline" id="line-190"><code>func newMaskKey() [4]byte {</code></span>
+<span class="codeline" id="line-191"><code>	var k [4]byte</code></span>
+<span class="codeline" id="line-192"><code>	_, _ = io.ReadFull(maskRand, k[:])</code></span>
+<span class="codeline" id="line-193"><code>	return k</code></span>
+<span class="codeline" id="line-194"><code>}</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>func hideTempErr(err error) error {</code></span>
+<span class="codeline" id="line-197"><code>	if e, ok := err.(net.Error); ok {</code></span>
+<span class="codeline" id="line-198"><code>		err = &amp;netError{msg: e.Error(), timeout: e.Timeout()}</code></span>
+<span class="codeline" id="line-199"><code>	}</code></span>
+<span class="codeline" id="line-200"><code>	return err</code></span>
+<span class="codeline" id="line-201"><code>}</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>func isControl(frameType int) bool {</code></span>
+<span class="codeline" id="line-204"><code>	return frameType == CloseMessage || frameType == PingMessage || frameType == PongMessage</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>func isData(frameType int) bool {</code></span>
+<span class="codeline" id="line-208"><code>	return frameType == TextMessage || frameType == BinaryMessage</code></span>
+<span class="codeline" id="line-209"><code>}</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>var validReceivedCloseCodes = map[int]bool{</code></span>
+<span class="codeline" id="line-212"><code>	// see http://www.iana.org/assignments/websocket/websocket.xhtml#close-code-number</code></span>
+<span class="codeline" id="line-213"><code></code></span>
+<span class="codeline" id="line-214"><code>	CloseNormalClosure:           true,</code></span>
+<span class="codeline" id="line-215"><code>	CloseGoingAway:               true,</code></span>
+<span class="codeline" id="line-216"><code>	CloseProtocolError:           true,</code></span>
+<span class="codeline" id="line-217"><code>	CloseUnsupportedData:         true,</code></span>
+<span class="codeline" id="line-218"><code>	CloseNoStatusReceived:        false,</code></span>
+<span class="codeline" id="line-219"><code>	CloseAbnormalClosure:         false,</code></span>
+<span class="codeline" id="line-220"><code>	CloseInvalidFramePayloadData: true,</code></span>
+<span class="codeline" id="line-221"><code>	ClosePolicyViolation:         true,</code></span>
+<span class="codeline" id="line-222"><code>	CloseMessageTooBig:           true,</code></span>
+<span class="codeline" id="line-223"><code>	CloseMandatoryExtension:      true,</code></span>
+<span class="codeline" id="line-224"><code>	CloseInternalServerErr:       true,</code></span>
+<span class="codeline" id="line-225"><code>	CloseServiceRestart:          true,</code></span>
+<span class="codeline" id="line-226"><code>	CloseTryAgainLater:           true,</code></span>
+<span class="codeline" id="line-227"><code>	CloseTLSHandshake:            false,</code></span>
+<span class="codeline" id="line-228"><code>}</code></span>
+<span class="codeline" id="line-229"><code></code></span>
+<span class="codeline" id="line-230"><code>func isValidReceivedCloseCode(code int) bool {</code></span>
+<span class="codeline" id="line-231"><code>	return validReceivedCloseCodes[code] || (code &gt;= 3000 &amp;&amp; code &lt;= 4999)</code></span>
+<span class="codeline" id="line-232"><code>}</code></span>
+<span class="codeline" id="line-233"><code></code></span>
+<span class="codeline" id="line-234"><code>// BufferPool represents a pool of buffers. The *sync.Pool type satisfies this</code></span>
+<span class="codeline" id="line-235"><code>// interface.  The type of the value stored in a pool is not specified.</code></span>
+<span class="codeline" id="line-236"><code>type BufferPool interface {</code></span>
+<span class="codeline" id="line-237"><code>	// Get gets a value from the pool or returns nil if the pool is empty.</code></span>
+<span class="codeline" id="line-238"><code>	Get() interface{}</code></span>
+<span class="codeline" id="line-239"><code>	// Put adds a value to the pool.</code></span>
+<span class="codeline" id="line-240"><code>	Put(interface{})</code></span>
+<span class="codeline" id="line-241"><code>}</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>// writePoolData is the type added to the write buffer pool. This wrapper is</code></span>
+<span class="codeline" id="line-244"><code>// used to prevent applications from peeking at and depending on the values</code></span>
+<span class="codeline" id="line-245"><code>// added to the pool.</code></span>
+<span class="codeline" id="line-246"><code>type writePoolData struct{ buf []byte }</code></span>
+<span class="codeline" id="line-247"><code></code></span>
+<span class="codeline" id="line-248"><code>// The Conn type represents a WebSocket connection.</code></span>
+<span class="codeline" id="line-249"><code>type Conn struct {</code></span>
+<span class="codeline" id="line-250"><code>	conn        net.Conn</code></span>
+<span class="codeline" id="line-251"><code>	isServer    bool</code></span>
+<span class="codeline" id="line-252"><code>	subprotocol string</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>	// Write fields</code></span>
+<span class="codeline" id="line-255"><code>	mu            chan struct{} // used as mutex to protect write to conn</code></span>
+<span class="codeline" id="line-256"><code>	writeBuf      []byte        // frame is constructed in this buffer.</code></span>
+<span class="codeline" id="line-257"><code>	writePool     BufferPool</code></span>
+<span class="codeline" id="line-258"><code>	writeBufSize  int</code></span>
+<span class="codeline" id="line-259"><code>	writeDeadline time.Time</code></span>
+<span class="codeline" id="line-260"><code>	writer        io.WriteCloser // the current writer returned to the application</code></span>
+<span class="codeline" id="line-261"><code>	isWriting     bool           // for best-effort concurrent write detection</code></span>
+<span class="codeline" id="line-262"><code></code></span>
+<span class="codeline" id="line-263"><code>	writeErrMu sync.Mutex</code></span>
+<span class="codeline" id="line-264"><code>	writeErr   error</code></span>
+<span class="codeline" id="line-265"><code></code></span>
+<span class="codeline" id="line-266"><code>	enableWriteCompression bool</code></span>
+<span class="codeline" id="line-267"><code>	compressionLevel       int</code></span>
+<span class="codeline" id="line-268"><code>	newCompressionWriter   func(io.WriteCloser, int) io.WriteCloser</code></span>
+<span class="codeline" id="line-269"><code></code></span>
+<span class="codeline" id="line-270"><code>	// Read fields</code></span>
+<span class="codeline" id="line-271"><code>	reader  io.ReadCloser // the current reader returned to the application</code></span>
+<span class="codeline" id="line-272"><code>	readErr error</code></span>
+<span class="codeline" id="line-273"><code>	br      *bufio.Reader</code></span>
+<span class="codeline" id="line-274"><code>	// bytes remaining in current frame.</code></span>
+<span class="codeline" id="line-275"><code>	// set setReadRemaining to safely update this value and prevent overflow</code></span>
+<span class="codeline" id="line-276"><code>	readRemaining int64</code></span>
+<span class="codeline" id="line-277"><code>	readFinal     bool  // true the current message has more frames.</code></span>
+<span class="codeline" id="line-278"><code>	readLength    int64 // Message size.</code></span>
+<span class="codeline" id="line-279"><code>	readLimit     int64 // Maximum message size.</code></span>
+<span class="codeline" id="line-280"><code>	readMaskPos   int</code></span>
+<span class="codeline" id="line-281"><code>	readMaskKey   [4]byte</code></span>
+<span class="codeline" id="line-282"><code>	handlePong    func(string) error</code></span>
+<span class="codeline" id="line-283"><code>	handlePing    func(string) error</code></span>
+<span class="codeline" id="line-284"><code>	handleClose   func(int, string) error</code></span>
+<span class="codeline" id="line-285"><code>	readErrCount  int</code></span>
+<span class="codeline" id="line-286"><code>	messageReader *messageReader // the current low-level reader</code></span>
+<span class="codeline" id="line-287"><code></code></span>
+<span class="codeline" id="line-288"><code>	readDecompress         bool // whether last read frame had RSV1 set</code></span>
+<span class="codeline" id="line-289"><code>	newDecompressionReader func(io.Reader) io.ReadCloser</code></span>
+<span class="codeline" id="line-290"><code>}</code></span>
+<span class="codeline" id="line-291"><code></code></span>
+<span class="codeline" id="line-292"><code>func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>	if br == nil {</code></span>
+<span class="codeline" id="line-295"><code>		if readBufferSize == 0 {</code></span>
+<span class="codeline" id="line-296"><code>			readBufferSize = defaultReadBufferSize</code></span>
+<span class="codeline" id="line-297"><code>		} else if readBufferSize &lt; maxControlFramePayloadSize {</code></span>
+<span class="codeline" id="line-298"><code>			// must be large enough for control frame</code></span>
+<span class="codeline" id="line-299"><code>			readBufferSize = maxControlFramePayloadSize</code></span>
+<span class="codeline" id="line-300"><code>		}</code></span>
+<span class="codeline" id="line-301"><code>		br = bufio.NewReaderSize(conn, readBufferSize)</code></span>
+<span class="codeline" id="line-302"><code>	}</code></span>
+<span class="codeline" id="line-303"><code></code></span>
+<span class="codeline" id="line-304"><code>	if writeBufferSize &lt;= 0 {</code></span>
+<span class="codeline" id="line-305"><code>		writeBufferSize = defaultWriteBufferSize</code></span>
+<span class="codeline" id="line-306"><code>	}</code></span>
+<span class="codeline" id="line-307"><code>	writeBufferSize += maxFrameHeaderSize</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>	if writeBuf == nil &amp;&amp; writeBufferPool == nil {</code></span>
+<span class="codeline" id="line-310"><code>		writeBuf = make([]byte, writeBufferSize)</code></span>
+<span class="codeline" id="line-311"><code>	}</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>	mu := make(chan struct{}, 1)</code></span>
+<span class="codeline" id="line-314"><code>	mu &lt;- struct{}{}</code></span>
+<span class="codeline" id="line-315"><code>	c := &amp;Conn{</code></span>
+<span class="codeline" id="line-316"><code>		isServer:               isServer,</code></span>
+<span class="codeline" id="line-317"><code>		br:                     br,</code></span>
+<span class="codeline" id="line-318"><code>		conn:                   conn,</code></span>
+<span class="codeline" id="line-319"><code>		mu:                     mu,</code></span>
+<span class="codeline" id="line-320"><code>		readFinal:              true,</code></span>
+<span class="codeline" id="line-321"><code>		writeBuf:               writeBuf,</code></span>
+<span class="codeline" id="line-322"><code>		writePool:              writeBufferPool,</code></span>
+<span class="codeline" id="line-323"><code>		writeBufSize:           writeBufferSize,</code></span>
+<span class="codeline" id="line-324"><code>		enableWriteCompression: true,</code></span>
+<span class="codeline" id="line-325"><code>		compressionLevel:       defaultCompressionLevel,</code></span>
+<span class="codeline" id="line-326"><code>	}</code></span>
+<span class="codeline" id="line-327"><code>	c.SetCloseHandler(nil)</code></span>
+<span class="codeline" id="line-328"><code>	c.SetPingHandler(nil)</code></span>
+<span class="codeline" id="line-329"><code>	c.SetPongHandler(nil)</code></span>
+<span class="codeline" id="line-330"><code>	return c</code></span>
+<span class="codeline" id="line-331"><code>}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>// setReadRemaining tracks the number of bytes remaining on the connection. If n</code></span>
+<span class="codeline" id="line-334"><code>// overflows, an ErrReadLimit is returned.</code></span>
+<span class="codeline" id="line-335"><code>func (c *Conn) setReadRemaining(n int64) error {</code></span>
+<span class="codeline" id="line-336"><code>	if n &lt; 0 {</code></span>
+<span class="codeline" id="line-337"><code>		return ErrReadLimit</code></span>
+<span class="codeline" id="line-338"><code>	}</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>	c.readRemaining = n</code></span>
+<span class="codeline" id="line-341"><code>	return nil</code></span>
+<span class="codeline" id="line-342"><code>}</code></span>
+<span class="codeline" id="line-343"><code></code></span>
+<span class="codeline" id="line-344"><code>// Subprotocol returns the negotiated protocol for the connection.</code></span>
+<span class="codeline" id="line-345"><code>func (c *Conn) Subprotocol() string {</code></span>
+<span class="codeline" id="line-346"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-347"><code>		return ""</code></span>
+<span class="codeline" id="line-348"><code>	}</code></span>
+<span class="codeline" id="line-349"><code>	return c.subprotocol</code></span>
+<span class="codeline" id="line-350"><code>}</code></span>
+<span class="codeline" id="line-351"><code></code></span>
+<span class="codeline" id="line-352"><code>// Close closes the underlying network connection without sending or waiting</code></span>
+<span class="codeline" id="line-353"><code>// for a close message.</code></span>
+<span class="codeline" id="line-354"><code>func (c *Conn) Close() error {</code></span>
+<span class="codeline" id="line-355"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-356"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-357"><code>	}</code></span>
+<span class="codeline" id="line-358"><code>	if c.conn == nil {</code></span>
+<span class="codeline" id="line-359"><code>		return ErrNilNetConn</code></span>
+<span class="codeline" id="line-360"><code>	}</code></span>
+<span class="codeline" id="line-361"><code>	return c.conn.Close()</code></span>
+<span class="codeline" id="line-362"><code>}</code></span>
+<span class="codeline" id="line-363"><code></code></span>
+<span class="codeline" id="line-364"><code>// LocalAddr returns the local network address.</code></span>
+<span class="codeline" id="line-365"><code>func (c *Conn) LocalAddr() net.Addr {</code></span>
+<span class="codeline" id="line-366"><code>	if c == nil || c.conn == nil {</code></span>
+<span class="codeline" id="line-367"><code>		return nil</code></span>
+<span class="codeline" id="line-368"><code>	}</code></span>
+<span class="codeline" id="line-369"><code>	return c.conn.LocalAddr()</code></span>
+<span class="codeline" id="line-370"><code>}</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>// RemoteAddr returns the remote network address.</code></span>
+<span class="codeline" id="line-373"><code>func (c *Conn) RemoteAddr() net.Addr {</code></span>
+<span class="codeline" id="line-374"><code>	if c == nil || c.conn == nil {</code></span>
+<span class="codeline" id="line-375"><code>		return nil</code></span>
+<span class="codeline" id="line-376"><code>	}</code></span>
+<span class="codeline" id="line-377"><code>	return c.conn.RemoteAddr()</code></span>
+<span class="codeline" id="line-378"><code>}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>// Write methods</code></span>
+<span class="codeline" id="line-381"><code></code></span>
+<span class="codeline" id="line-382"><code>func (c *Conn) writeFatal(err error) error {</code></span>
+<span class="codeline" id="line-383"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-384"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-385"><code>	}</code></span>
+<span class="codeline" id="line-386"><code>	err = hideTempErr(err)</code></span>
+<span class="codeline" id="line-387"><code>	c.writeErrMu.Lock()</code></span>
+<span class="codeline" id="line-388"><code>	if c.writeErr == nil {</code></span>
+<span class="codeline" id="line-389"><code>		c.writeErr = err</code></span>
+<span class="codeline" id="line-390"><code>	}</code></span>
+<span class="codeline" id="line-391"><code>	c.writeErrMu.Unlock()</code></span>
+<span class="codeline" id="line-392"><code>	return err</code></span>
+<span class="codeline" id="line-393"><code>}</code></span>
+<span class="codeline" id="line-394"><code></code></span>
+<span class="codeline" id="line-395"><code>func (c *Conn) read(n int) ([]byte, error) {</code></span>
+<span class="codeline" id="line-396"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-397"><code>		return nil, ErrNilConn</code></span>
+<span class="codeline" id="line-398"><code>	}</code></span>
+<span class="codeline" id="line-399"><code>	p, err := c.br.Peek(n)</code></span>
+<span class="codeline" id="line-400"><code>	if err == io.EOF {</code></span>
+<span class="codeline" id="line-401"><code>		err = errUnexpectedEOF</code></span>
+<span class="codeline" id="line-402"><code>	}</code></span>
+<span class="codeline" id="line-403"><code>	if _, err := c.br.Discard(len(p)); err != nil {</code></span>
+<span class="codeline" id="line-404"><code>		return p, err</code></span>
+<span class="codeline" id="line-405"><code>	}</code></span>
+<span class="codeline" id="line-406"><code>	return p, err</code></span>
+<span class="codeline" id="line-407"><code>}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>func (c *Conn) write(frameType int, deadline time.Time, buf0, buf1 []byte) error {</code></span>
+<span class="codeline" id="line-410"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-411"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-412"><code>	}</code></span>
+<span class="codeline" id="line-413"><code>	&lt;-c.mu</code></span>
+<span class="codeline" id="line-414"><code>	defer func() { c.mu &lt;- struct{}{} }()</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>	c.writeErrMu.Lock()</code></span>
+<span class="codeline" id="line-417"><code>	err := c.writeErr</code></span>
+<span class="codeline" id="line-418"><code>	c.writeErrMu.Unlock()</code></span>
+<span class="codeline" id="line-419"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-420"><code>		return err</code></span>
+<span class="codeline" id="line-421"><code>	}</code></span>
+<span class="codeline" id="line-422"><code>	if c.conn == nil {</code></span>
+<span class="codeline" id="line-423"><code>		return ErrNilNetConn</code></span>
+<span class="codeline" id="line-424"><code>	}</code></span>
+<span class="codeline" id="line-425"><code>	if err := c.conn.SetWriteDeadline(deadline); err != nil {</code></span>
+<span class="codeline" id="line-426"><code>		return c.writeFatal(err)</code></span>
+<span class="codeline" id="line-427"><code>	}</code></span>
+<span class="codeline" id="line-428"><code>	if len(buf1) == 0 {</code></span>
+<span class="codeline" id="line-429"><code>		_, err = c.conn.Write(buf0)</code></span>
+<span class="codeline" id="line-430"><code>	} else {</code></span>
+<span class="codeline" id="line-431"><code>		err = c.writeBufs(buf0, buf1)</code></span>
+<span class="codeline" id="line-432"><code>	}</code></span>
+<span class="codeline" id="line-433"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-434"><code>		return c.writeFatal(err)</code></span>
+<span class="codeline" id="line-435"><code>	}</code></span>
+<span class="codeline" id="line-436"><code>	if frameType == CloseMessage {</code></span>
+<span class="codeline" id="line-437"><code>		_ = c.writeFatal(ErrCloseSent)</code></span>
+<span class="codeline" id="line-438"><code>	}</code></span>
+<span class="codeline" id="line-439"><code>	return nil</code></span>
+<span class="codeline" id="line-440"><code>}</code></span>
+<span class="codeline" id="line-441"><code></code></span>
+<span class="codeline" id="line-442"><code>func (c *Conn) writeBufs(bufs ...[]byte) error {</code></span>
+<span class="codeline" id="line-443"><code>	b := net.Buffers(bufs)</code></span>
+<span class="codeline" id="line-444"><code>	_, err := b.WriteTo(c.conn)</code></span>
+<span class="codeline" id="line-445"><code>	return err</code></span>
+<span class="codeline" id="line-446"><code>}</code></span>
+<span class="codeline" id="line-447"><code></code></span>
+<span class="codeline" id="line-448"><code>// WriteControl writes a control message with the given deadline. The allowed</code></span>
+<span class="codeline" id="line-449"><code>// message types are CloseMessage, PingMessage and PongMessage.</code></span>
+<span class="codeline" id="line-450"><code>func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) error {</code></span>
+<span class="codeline" id="line-451"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-452"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-453"><code>	}</code></span>
+<span class="codeline" id="line-454"><code>	if !isControl(messageType) {</code></span>
+<span class="codeline" id="line-455"><code>		return errBadWriteOpCode</code></span>
+<span class="codeline" id="line-456"><code>	}</code></span>
+<span class="codeline" id="line-457"><code>	if len(data) &gt; maxControlFramePayloadSize {</code></span>
+<span class="codeline" id="line-458"><code>		return errInvalidControlFrame</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code></code></span>
+<span class="codeline" id="line-461"><code>	b0 := byte(messageType) | finalBit</code></span>
+<span class="codeline" id="line-462"><code>	b1 := byte(len(data))</code></span>
+<span class="codeline" id="line-463"><code>	if !c.isServer {</code></span>
+<span class="codeline" id="line-464"><code>		b1 |= maskBit</code></span>
+<span class="codeline" id="line-465"><code>	}</code></span>
+<span class="codeline" id="line-466"><code></code></span>
+<span class="codeline" id="line-467"><code>	buf := make([]byte, 0, maxFrameHeaderSize+maxControlFramePayloadSize)</code></span>
+<span class="codeline" id="line-468"><code>	buf = append(buf, b0, b1)</code></span>
+<span class="codeline" id="line-469"><code></code></span>
+<span class="codeline" id="line-470"><code>	if c.isServer {</code></span>
+<span class="codeline" id="line-471"><code>		buf = append(buf, data...)</code></span>
+<span class="codeline" id="line-472"><code>	} else {</code></span>
+<span class="codeline" id="line-473"><code>		key := newMaskKey()</code></span>
+<span class="codeline" id="line-474"><code>		buf = append(buf, key[:]...)</code></span>
+<span class="codeline" id="line-475"><code>		buf = append(buf, data...)</code></span>
+<span class="codeline" id="line-476"><code>		maskBytes(key, 0, buf[6:])</code></span>
+<span class="codeline" id="line-477"><code>	}</code></span>
+<span class="codeline" id="line-478"><code></code></span>
+<span class="codeline" id="line-479"><code>	d := 1000 * time.Hour</code></span>
+<span class="codeline" id="line-480"><code>	if !deadline.IsZero() {</code></span>
+<span class="codeline" id="line-481"><code>		d = time.Until(deadline)</code></span>
+<span class="codeline" id="line-482"><code>		if d &lt; 0 {</code></span>
+<span class="codeline" id="line-483"><code>			return errWriteTimeout</code></span>
+<span class="codeline" id="line-484"><code>		}</code></span>
+<span class="codeline" id="line-485"><code>	}</code></span>
+<span class="codeline" id="line-486"><code></code></span>
+<span class="codeline" id="line-487"><code>	timer := time.NewTimer(d)</code></span>
+<span class="codeline" id="line-488"><code>	select {</code></span>
+<span class="codeline" id="line-489"><code>	case &lt;-c.mu:</code></span>
+<span class="codeline" id="line-490"><code>		timer.Stop()</code></span>
+<span class="codeline" id="line-491"><code>	case &lt;-timer.C:</code></span>
+<span class="codeline" id="line-492"><code>		return errWriteTimeout</code></span>
+<span class="codeline" id="line-493"><code>	}</code></span>
+<span class="codeline" id="line-494"><code>	defer func() { c.mu &lt;- struct{}{} }()</code></span>
+<span class="codeline" id="line-495"><code></code></span>
+<span class="codeline" id="line-496"><code>	c.writeErrMu.Lock()</code></span>
+<span class="codeline" id="line-497"><code>	err := c.writeErr</code></span>
+<span class="codeline" id="line-498"><code>	c.writeErrMu.Unlock()</code></span>
+<span class="codeline" id="line-499"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-500"><code>		return err</code></span>
+<span class="codeline" id="line-501"><code>	}</code></span>
+<span class="codeline" id="line-502"><code>	if c.conn == nil {</code></span>
+<span class="codeline" id="line-503"><code>		return ErrNilNetConn</code></span>
+<span class="codeline" id="line-504"><code>	}</code></span>
+<span class="codeline" id="line-505"><code>	if err := c.conn.SetWriteDeadline(deadline); err != nil {</code></span>
+<span class="codeline" id="line-506"><code>		return c.writeFatal(err)</code></span>
+<span class="codeline" id="line-507"><code>	}</code></span>
+<span class="codeline" id="line-508"><code>	_, err = c.conn.Write(buf)</code></span>
+<span class="codeline" id="line-509"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-510"><code>		return c.writeFatal(err)</code></span>
+<span class="codeline" id="line-511"><code>	}</code></span>
+<span class="codeline" id="line-512"><code>	if messageType == CloseMessage {</code></span>
+<span class="codeline" id="line-513"><code>		_ = c.writeFatal(ErrCloseSent)</code></span>
+<span class="codeline" id="line-514"><code>	}</code></span>
+<span class="codeline" id="line-515"><code>	return err</code></span>
+<span class="codeline" id="line-516"><code>}</code></span>
+<span class="codeline" id="line-517"><code></code></span>
+<span class="codeline" id="line-518"><code>// beginMessage prepares a connection and message writer for a new message.</code></span>
+<span class="codeline" id="line-519"><code>func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {</code></span>
+<span class="codeline" id="line-520"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-521"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code>	// Close previous writer if not already closed by the application. It's</code></span>
+<span class="codeline" id="line-524"><code>	// probably better to return an error in this situation, but we cannot</code></span>
+<span class="codeline" id="line-525"><code>	// change this without breaking existing applications.</code></span>
+<span class="codeline" id="line-526"><code>	if c.writer != nil {</code></span>
+<span class="codeline" id="line-527"><code>		if err := c.writer.Close(); err != nil {</code></span>
+<span class="codeline" id="line-528"><code>			log.Printf("websocket: discarding writer close error: %v", err)</code></span>
+<span class="codeline" id="line-529"><code>		}</code></span>
+<span class="codeline" id="line-530"><code>		c.writer = nil</code></span>
+<span class="codeline" id="line-531"><code>	}</code></span>
+<span class="codeline" id="line-532"><code></code></span>
+<span class="codeline" id="line-533"><code>	if !isControl(messageType) &amp;&amp; !isData(messageType) {</code></span>
+<span class="codeline" id="line-534"><code>		return errBadWriteOpCode</code></span>
+<span class="codeline" id="line-535"><code>	}</code></span>
+<span class="codeline" id="line-536"><code></code></span>
+<span class="codeline" id="line-537"><code>	c.writeErrMu.Lock()</code></span>
+<span class="codeline" id="line-538"><code>	err := c.writeErr</code></span>
+<span class="codeline" id="line-539"><code>	c.writeErrMu.Unlock()</code></span>
+<span class="codeline" id="line-540"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-541"><code>		return err</code></span>
+<span class="codeline" id="line-542"><code>	}</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>	mw.c = c</code></span>
+<span class="codeline" id="line-545"><code>	mw.frameType = messageType</code></span>
+<span class="codeline" id="line-546"><code>	mw.pos = maxFrameHeaderSize</code></span>
+<span class="codeline" id="line-547"><code></code></span>
+<span class="codeline" id="line-548"><code>	if c.writeBuf == nil {</code></span>
+<span class="codeline" id="line-549"><code>		wpd, ok := c.writePool.Get().(writePoolData)</code></span>
+<span class="codeline" id="line-550"><code>		if ok {</code></span>
+<span class="codeline" id="line-551"><code>			c.writeBuf = wpd.buf</code></span>
+<span class="codeline" id="line-552"><code>		} else {</code></span>
+<span class="codeline" id="line-553"><code>			c.writeBuf = make([]byte, c.writeBufSize)</code></span>
+<span class="codeline" id="line-554"><code>		}</code></span>
+<span class="codeline" id="line-555"><code>	}</code></span>
+<span class="codeline" id="line-556"><code>	return nil</code></span>
+<span class="codeline" id="line-557"><code>}</code></span>
+<span class="codeline" id="line-558"><code></code></span>
+<span class="codeline" id="line-559"><code>// NextWriter returns a writer for the next message to send. The writer's Close</code></span>
+<span class="codeline" id="line-560"><code>// method flushes the complete message to the network.</code></span>
+<span class="codeline" id="line-561"><code>//</code></span>
+<span class="codeline" id="line-562"><code>// There can be at most one open writer on a connection. NextWriter closes the</code></span>
+<span class="codeline" id="line-563"><code>// previous writer if the application has not already done so.</code></span>
+<span class="codeline" id="line-564"><code>//</code></span>
+<span class="codeline" id="line-565"><code>// All message types (TextMessage, BinaryMessage, CloseMessage, PingMessage and</code></span>
+<span class="codeline" id="line-566"><code>// PongMessage) are supported.</code></span>
+<span class="codeline" id="line-567"><code>func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {</code></span>
+<span class="codeline" id="line-568"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-569"><code>		return nil, ErrNilConn</code></span>
+<span class="codeline" id="line-570"><code>	}</code></span>
+<span class="codeline" id="line-571"><code>	var mw messageWriter</code></span>
+<span class="codeline" id="line-572"><code>	if err := c.beginMessage(&amp;mw, messageType); err != nil {</code></span>
+<span class="codeline" id="line-573"><code>		return nil, err</code></span>
+<span class="codeline" id="line-574"><code>	}</code></span>
+<span class="codeline" id="line-575"><code>	c.writer = &amp;mw</code></span>
+<span class="codeline" id="line-576"><code>	if c.newCompressionWriter != nil &amp;&amp; c.enableWriteCompression &amp;&amp; isData(messageType) {</code></span>
+<span class="codeline" id="line-577"><code>		w := c.newCompressionWriter(c.writer, c.compressionLevel)</code></span>
+<span class="codeline" id="line-578"><code>		mw.compress = true</code></span>
+<span class="codeline" id="line-579"><code>		c.writer = w</code></span>
+<span class="codeline" id="line-580"><code>	}</code></span>
+<span class="codeline" id="line-581"><code>	return c.writer, nil</code></span>
+<span class="codeline" id="line-582"><code>}</code></span>
+<span class="codeline" id="line-583"><code></code></span>
+<span class="codeline" id="line-584"><code>type messageWriter struct {</code></span>
+<span class="codeline" id="line-585"><code>	c         *Conn</code></span>
+<span class="codeline" id="line-586"><code>	compress  bool // whether next call to flushFrame should set RSV1</code></span>
+<span class="codeline" id="line-587"><code>	pos       int  // end of data in writeBuf.</code></span>
+<span class="codeline" id="line-588"><code>	frameType int  // type of the current frame.</code></span>
+<span class="codeline" id="line-589"><code>	err       error</code></span>
+<span class="codeline" id="line-590"><code>}</code></span>
+<span class="codeline" id="line-591"><code></code></span>
+<span class="codeline" id="line-592"><code>func (w *messageWriter) endMessage(err error) error {</code></span>
+<span class="codeline" id="line-593"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-594"><code>		return err</code></span>
+<span class="codeline" id="line-595"><code>	}</code></span>
+<span class="codeline" id="line-596"><code>	c := w.c</code></span>
+<span class="codeline" id="line-597"><code>	w.err = err</code></span>
+<span class="codeline" id="line-598"><code>	c.writer = nil</code></span>
+<span class="codeline" id="line-599"><code>	if c.writePool != nil {</code></span>
+<span class="codeline" id="line-600"><code>		c.writePool.Put(writePoolData{buf: c.writeBuf})</code></span>
+<span class="codeline" id="line-601"><code>		c.writeBuf = nil</code></span>
+<span class="codeline" id="line-602"><code>	}</code></span>
+<span class="codeline" id="line-603"><code>	return err</code></span>
+<span class="codeline" id="line-604"><code>}</code></span>
+<span class="codeline" id="line-605"><code></code></span>
+<span class="codeline" id="line-606"><code>// flushFrame writes buffered data and extra as a frame to the network. The</code></span>
+<span class="codeline" id="line-607"><code>// final argument indicates that this is the last frame in the message.</code></span>
+<span class="codeline" id="line-608"><code>func (w *messageWriter) flushFrame(final bool, extra []byte) error {</code></span>
+<span class="codeline" id="line-609"><code>	c := w.c</code></span>
+<span class="codeline" id="line-610"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-611"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-612"><code>	}</code></span>
+<span class="codeline" id="line-613"><code>	length := w.pos - maxFrameHeaderSize + len(extra)</code></span>
+<span class="codeline" id="line-614"><code></code></span>
+<span class="codeline" id="line-615"><code>	// Check for invalid control frames.</code></span>
+<span class="codeline" id="line-616"><code>	if isControl(w.frameType) &amp;&amp;</code></span>
+<span class="codeline" id="line-617"><code>		(!final || length &gt; maxControlFramePayloadSize) {</code></span>
+<span class="codeline" id="line-618"><code>		return w.endMessage(errInvalidControlFrame)</code></span>
+<span class="codeline" id="line-619"><code>	}</code></span>
+<span class="codeline" id="line-620"><code></code></span>
+<span class="codeline" id="line-621"><code>	b0 := byte(w.frameType)</code></span>
+<span class="codeline" id="line-622"><code>	if final {</code></span>
+<span class="codeline" id="line-623"><code>		b0 |= finalBit</code></span>
+<span class="codeline" id="line-624"><code>	}</code></span>
+<span class="codeline" id="line-625"><code>	if w.compress {</code></span>
+<span class="codeline" id="line-626"><code>		b0 |= rsv1Bit</code></span>
+<span class="codeline" id="line-627"><code>	}</code></span>
+<span class="codeline" id="line-628"><code>	w.compress = false</code></span>
+<span class="codeline" id="line-629"><code></code></span>
+<span class="codeline" id="line-630"><code>	b1 := byte(0)</code></span>
+<span class="codeline" id="line-631"><code>	if !c.isServer {</code></span>
+<span class="codeline" id="line-632"><code>		b1 |= maskBit</code></span>
+<span class="codeline" id="line-633"><code>	}</code></span>
+<span class="codeline" id="line-634"><code></code></span>
+<span class="codeline" id="line-635"><code>	// Assume that the frame starts at beginning of c.writeBuf.</code></span>
+<span class="codeline" id="line-636"><code>	framePos := 0</code></span>
+<span class="codeline" id="line-637"><code>	if c.isServer {</code></span>
+<span class="codeline" id="line-638"><code>		// Adjust up if mask not included in the header.</code></span>
+<span class="codeline" id="line-639"><code>		framePos = 4</code></span>
+<span class="codeline" id="line-640"><code>	}</code></span>
+<span class="codeline" id="line-641"><code></code></span>
+<span class="codeline" id="line-642"><code>	switch {</code></span>
+<span class="codeline" id="line-643"><code>	case length &gt;= 65536:</code></span>
+<span class="codeline" id="line-644"><code>		c.writeBuf[framePos] = b0</code></span>
+<span class="codeline" id="line-645"><code>		c.writeBuf[framePos+1] = b1 | 127</code></span>
+<span class="codeline" id="line-646"><code>		binary.BigEndian.PutUint64(c.writeBuf[framePos+2:], uint64(length))</code></span>
+<span class="codeline" id="line-647"><code>	case length &gt; 125:</code></span>
+<span class="codeline" id="line-648"><code>		framePos += 6</code></span>
+<span class="codeline" id="line-649"><code>		c.writeBuf[framePos] = b0</code></span>
+<span class="codeline" id="line-650"><code>		c.writeBuf[framePos+1] = b1 | 126</code></span>
+<span class="codeline" id="line-651"><code>		binary.BigEndian.PutUint16(c.writeBuf[framePos+2:], uint16(length))</code></span>
+<span class="codeline" id="line-652"><code>	default:</code></span>
+<span class="codeline" id="line-653"><code>		framePos += 8</code></span>
+<span class="codeline" id="line-654"><code>		c.writeBuf[framePos] = b0</code></span>
+<span class="codeline" id="line-655"><code>		c.writeBuf[framePos+1] = b1 | byte(length)</code></span>
+<span class="codeline" id="line-656"><code>	}</code></span>
+<span class="codeline" id="line-657"><code></code></span>
+<span class="codeline" id="line-658"><code>	if !c.isServer {</code></span>
+<span class="codeline" id="line-659"><code>		key := newMaskKey()</code></span>
+<span class="codeline" id="line-660"><code>		copy(c.writeBuf[maxFrameHeaderSize-4:], key[:])</code></span>
+<span class="codeline" id="line-661"><code>		maskBytes(key, 0, c.writeBuf[maxFrameHeaderSize:w.pos])</code></span>
+<span class="codeline" id="line-662"><code>		if len(extra) &gt; 0 {</code></span>
+<span class="codeline" id="line-663"><code>			return w.endMessage(c.writeFatal(errors.New("websocket: internal error, extra used in client mode")))</code></span>
+<span class="codeline" id="line-664"><code>		}</code></span>
+<span class="codeline" id="line-665"><code>	}</code></span>
+<span class="codeline" id="line-666"><code></code></span>
+<span class="codeline" id="line-667"><code>	// Write the buffers to the connection with best-effort detection of</code></span>
+<span class="codeline" id="line-668"><code>	// concurrent writes. See the concurrency section in the package</code></span>
+<span class="codeline" id="line-669"><code>	// documentation for more info.</code></span>
+<span class="codeline" id="line-670"><code></code></span>
+<span class="codeline" id="line-671"><code>	if c.isWriting {</code></span>
+<span class="codeline" id="line-672"><code>		panic("concurrent write to websocket connection")</code></span>
+<span class="codeline" id="line-673"><code>	}</code></span>
+<span class="codeline" id="line-674"><code>	c.isWriting = true</code></span>
+<span class="codeline" id="line-675"><code></code></span>
+<span class="codeline" id="line-676"><code>	err := c.write(w.frameType, c.writeDeadline, c.writeBuf[framePos:w.pos], extra)</code></span>
+<span class="codeline" id="line-677"><code></code></span>
+<span class="codeline" id="line-678"><code>	if !c.isWriting {</code></span>
+<span class="codeline" id="line-679"><code>		panic("concurrent write to websocket connection")</code></span>
+<span class="codeline" id="line-680"><code>	}</code></span>
+<span class="codeline" id="line-681"><code>	c.isWriting = false</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-684"><code>		return w.endMessage(err)</code></span>
+<span class="codeline" id="line-685"><code>	}</code></span>
+<span class="codeline" id="line-686"><code></code></span>
+<span class="codeline" id="line-687"><code>	if final {</code></span>
+<span class="codeline" id="line-688"><code>		_ = w.endMessage(errWriteClosed)</code></span>
+<span class="codeline" id="line-689"><code>		return nil</code></span>
+<span class="codeline" id="line-690"><code>	}</code></span>
+<span class="codeline" id="line-691"><code></code></span>
+<span class="codeline" id="line-692"><code>	// Setup for next frame.</code></span>
+<span class="codeline" id="line-693"><code>	w.pos = maxFrameHeaderSize</code></span>
+<span class="codeline" id="line-694"><code>	w.frameType = continuationFrame</code></span>
+<span class="codeline" id="line-695"><code>	return nil</code></span>
+<span class="codeline" id="line-696"><code>}</code></span>
+<span class="codeline" id="line-697"><code></code></span>
+<span class="codeline" id="line-698"><code>func (w *messageWriter) ncopy(max int) (int, error) {</code></span>
+<span class="codeline" id="line-699"><code>	n := len(w.c.writeBuf) - w.pos</code></span>
+<span class="codeline" id="line-700"><code>	if n &lt;= 0 {</code></span>
+<span class="codeline" id="line-701"><code>		if err := w.flushFrame(false, nil); err != nil {</code></span>
+<span class="codeline" id="line-702"><code>			return 0, err</code></span>
+<span class="codeline" id="line-703"><code>		}</code></span>
+<span class="codeline" id="line-704"><code>		n = len(w.c.writeBuf) - w.pos</code></span>
+<span class="codeline" id="line-705"><code>	}</code></span>
+<span class="codeline" id="line-706"><code>	if n &gt; max {</code></span>
+<span class="codeline" id="line-707"><code>		n = max</code></span>
+<span class="codeline" id="line-708"><code>	}</code></span>
+<span class="codeline" id="line-709"><code>	return n, nil</code></span>
+<span class="codeline" id="line-710"><code>}</code></span>
+<span class="codeline" id="line-711"><code></code></span>
+<span class="codeline" id="line-712"><code>func (w *messageWriter) Write(p []byte) (int, error) {</code></span>
+<span class="codeline" id="line-713"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-714"><code>		return 0, w.err</code></span>
+<span class="codeline" id="line-715"><code>	}</code></span>
+<span class="codeline" id="line-716"><code></code></span>
+<span class="codeline" id="line-717"><code>	if len(p) &gt; 2*len(w.c.writeBuf) &amp;&amp; w.c.isServer {</code></span>
+<span class="codeline" id="line-718"><code>		// Don't buffer large messages.</code></span>
+<span class="codeline" id="line-719"><code>		err := w.flushFrame(false, p)</code></span>
+<span class="codeline" id="line-720"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-721"><code>			return 0, err</code></span>
+<span class="codeline" id="line-722"><code>		}</code></span>
+<span class="codeline" id="line-723"><code>		return len(p), nil</code></span>
+<span class="codeline" id="line-724"><code>	}</code></span>
+<span class="codeline" id="line-725"><code></code></span>
+<span class="codeline" id="line-726"><code>	nn := len(p)</code></span>
+<span class="codeline" id="line-727"><code>	for len(p) &gt; 0 {</code></span>
+<span class="codeline" id="line-728"><code>		n, err := w.ncopy(len(p))</code></span>
+<span class="codeline" id="line-729"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-730"><code>			return 0, err</code></span>
+<span class="codeline" id="line-731"><code>		}</code></span>
+<span class="codeline" id="line-732"><code>		copy(w.c.writeBuf[w.pos:], p[:n])</code></span>
+<span class="codeline" id="line-733"><code>		w.pos += n</code></span>
+<span class="codeline" id="line-734"><code>		p = p[n:]</code></span>
+<span class="codeline" id="line-735"><code>	}</code></span>
+<span class="codeline" id="line-736"><code>	return nn, nil</code></span>
+<span class="codeline" id="line-737"><code>}</code></span>
+<span class="codeline" id="line-738"><code></code></span>
+<span class="codeline" id="line-739"><code>func (w *messageWriter) WriteString(p string) (int, error) {</code></span>
+<span class="codeline" id="line-740"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-741"><code>		return 0, w.err</code></span>
+<span class="codeline" id="line-742"><code>	}</code></span>
+<span class="codeline" id="line-743"><code></code></span>
+<span class="codeline" id="line-744"><code>	nn := len(p)</code></span>
+<span class="codeline" id="line-745"><code>	for len(p) &gt; 0 {</code></span>
+<span class="codeline" id="line-746"><code>		n, err := w.ncopy(len(p))</code></span>
+<span class="codeline" id="line-747"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-748"><code>			return 0, err</code></span>
+<span class="codeline" id="line-749"><code>		}</code></span>
+<span class="codeline" id="line-750"><code>		copy(w.c.writeBuf[w.pos:], p[:n])</code></span>
+<span class="codeline" id="line-751"><code>		w.pos += n</code></span>
+<span class="codeline" id="line-752"><code>		p = p[n:]</code></span>
+<span class="codeline" id="line-753"><code>	}</code></span>
+<span class="codeline" id="line-754"><code>	return nn, nil</code></span>
+<span class="codeline" id="line-755"><code>}</code></span>
+<span class="codeline" id="line-756"><code></code></span>
+<span class="codeline" id="line-757"><code>func (w *messageWriter) ReadFrom(r io.Reader) (nn int64, err error) {</code></span>
+<span class="codeline" id="line-758"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-759"><code>		return 0, w.err</code></span>
+<span class="codeline" id="line-760"><code>	}</code></span>
+<span class="codeline" id="line-761"><code>	for {</code></span>
+<span class="codeline" id="line-762"><code>		if w.pos == len(w.c.writeBuf) {</code></span>
+<span class="codeline" id="line-763"><code>			err = w.flushFrame(false, nil)</code></span>
+<span class="codeline" id="line-764"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-765"><code>				break</code></span>
+<span class="codeline" id="line-766"><code>			}</code></span>
+<span class="codeline" id="line-767"><code>		}</code></span>
+<span class="codeline" id="line-768"><code>		var n int</code></span>
+<span class="codeline" id="line-769"><code>		n, err = r.Read(w.c.writeBuf[w.pos:])</code></span>
+<span class="codeline" id="line-770"><code>		w.pos += n</code></span>
+<span class="codeline" id="line-771"><code>		nn += int64(n)</code></span>
+<span class="codeline" id="line-772"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-773"><code>			if err == io.EOF {</code></span>
+<span class="codeline" id="line-774"><code>				err = nil</code></span>
+<span class="codeline" id="line-775"><code>			}</code></span>
+<span class="codeline" id="line-776"><code>			break</code></span>
+<span class="codeline" id="line-777"><code>		}</code></span>
+<span class="codeline" id="line-778"><code>	}</code></span>
+<span class="codeline" id="line-779"><code>	return nn, err</code></span>
+<span class="codeline" id="line-780"><code>}</code></span>
+<span class="codeline" id="line-781"><code></code></span>
+<span class="codeline" id="line-782"><code>func (w *messageWriter) Close() error {</code></span>
+<span class="codeline" id="line-783"><code>	if w.err != nil {</code></span>
+<span class="codeline" id="line-784"><code>		return w.err</code></span>
+<span class="codeline" id="line-785"><code>	}</code></span>
+<span class="codeline" id="line-786"><code>	return w.flushFrame(true, nil)</code></span>
+<span class="codeline" id="line-787"><code>}</code></span>
+<span class="codeline" id="line-788"><code></code></span>
+<span class="codeline" id="line-789"><code>// WritePreparedMessage writes prepared message into connection.</code></span>
+<span class="codeline" id="line-790"><code>func (c *Conn) WritePreparedMessage(pm *PreparedMessage) error {</code></span>
+<span class="codeline" id="line-791"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-792"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-793"><code>	}</code></span>
+<span class="codeline" id="line-794"><code>	frameType, frameData, err := pm.frame(prepareKey{</code></span>
+<span class="codeline" id="line-795"><code>		isServer:         c.isServer,</code></span>
+<span class="codeline" id="line-796"><code>		compress:         c.newCompressionWriter != nil &amp;&amp; c.enableWriteCompression &amp;&amp; isData(pm.messageType),</code></span>
+<span class="codeline" id="line-797"><code>		compressionLevel: c.compressionLevel,</code></span>
+<span class="codeline" id="line-798"><code>	})</code></span>
+<span class="codeline" id="line-799"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-800"><code>		return err</code></span>
+<span class="codeline" id="line-801"><code>	}</code></span>
+<span class="codeline" id="line-802"><code>	if c.isWriting {</code></span>
+<span class="codeline" id="line-803"><code>		panic("concurrent write to websocket connection")</code></span>
+<span class="codeline" id="line-804"><code>	}</code></span>
+<span class="codeline" id="line-805"><code>	c.isWriting = true</code></span>
+<span class="codeline" id="line-806"><code>	err = c.write(frameType, c.writeDeadline, frameData, nil)</code></span>
+<span class="codeline" id="line-807"><code>	if !c.isWriting {</code></span>
+<span class="codeline" id="line-808"><code>		panic("concurrent write to websocket connection")</code></span>
+<span class="codeline" id="line-809"><code>	}</code></span>
+<span class="codeline" id="line-810"><code>	c.isWriting = false</code></span>
+<span class="codeline" id="line-811"><code>	return err</code></span>
+<span class="codeline" id="line-812"><code>}</code></span>
+<span class="codeline" id="line-813"><code></code></span>
+<span class="codeline" id="line-814"><code>// WriteMessage is a helper method for getting a writer using NextWriter,</code></span>
+<span class="codeline" id="line-815"><code>// writing the message and closing the writer.</code></span>
+<span class="codeline" id="line-816"><code>func (c *Conn) WriteMessage(messageType int, data []byte) error {</code></span>
+<span class="codeline" id="line-817"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-818"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-819"><code>	}</code></span>
+<span class="codeline" id="line-820"><code>	if c.isServer &amp;&amp; (c.newCompressionWriter == nil || !c.enableWriteCompression) {</code></span>
+<span class="codeline" id="line-821"><code>		// Fast path with no allocations and single frame.</code></span>
+<span class="codeline" id="line-822"><code></code></span>
+<span class="codeline" id="line-823"><code>		var mw messageWriter</code></span>
+<span class="codeline" id="line-824"><code>		if err := c.beginMessage(&amp;mw, messageType); err != nil {</code></span>
+<span class="codeline" id="line-825"><code>			return err</code></span>
+<span class="codeline" id="line-826"><code>		}</code></span>
+<span class="codeline" id="line-827"><code>		n := copy(c.writeBuf[mw.pos:], data)</code></span>
+<span class="codeline" id="line-828"><code>		mw.pos += n</code></span>
+<span class="codeline" id="line-829"><code>		data = data[n:]</code></span>
+<span class="codeline" id="line-830"><code>		return mw.flushFrame(true, data)</code></span>
+<span class="codeline" id="line-831"><code>	}</code></span>
+<span class="codeline" id="line-832"><code></code></span>
+<span class="codeline" id="line-833"><code>	w, err := c.NextWriter(messageType)</code></span>
+<span class="codeline" id="line-834"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-835"><code>		return err</code></span>
+<span class="codeline" id="line-836"><code>	}</code></span>
+<span class="codeline" id="line-837"><code>	if _, err = w.Write(data); err != nil {</code></span>
+<span class="codeline" id="line-838"><code>		return err</code></span>
+<span class="codeline" id="line-839"><code>	}</code></span>
+<span class="codeline" id="line-840"><code>	return w.Close()</code></span>
+<span class="codeline" id="line-841"><code>}</code></span>
+<span class="codeline" id="line-842"><code></code></span>
+<span class="codeline" id="line-843"><code>// SetWriteDeadline sets the write deadline on the underlying network</code></span>
+<span class="codeline" id="line-844"><code>// connection. After a write has timed out, the websocket state is corrupt and</code></span>
+<span class="codeline" id="line-845"><code>// all future writes will return an error. A zero value for t means writes will</code></span>
+<span class="codeline" id="line-846"><code>// not time out.</code></span>
+<span class="codeline" id="line-847"><code>func (c *Conn) SetWriteDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-848"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-849"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-850"><code>	}</code></span>
+<span class="codeline" id="line-851"><code>	c.writeDeadline = t</code></span>
+<span class="codeline" id="line-852"><code>	return nil</code></span>
+<span class="codeline" id="line-853"><code>}</code></span>
+<span class="codeline" id="line-854"><code></code></span>
+<span class="codeline" id="line-855"><code>// Read methods</code></span>
+<span class="codeline" id="line-856"><code></code></span>
+<span class="codeline" id="line-857"><code>func (c *Conn) advanceFrame() (int, error) {</code></span>
+<span class="codeline" id="line-858"><code>	// 1. Skip remainder of previous frame.</code></span>
+<span class="codeline" id="line-859"><code></code></span>
+<span class="codeline" id="line-860"><code>	if c.readRemaining &gt; 0 {</code></span>
+<span class="codeline" id="line-861"><code>		if _, err := io.CopyN(io.Discard, c.br, c.readRemaining); err != nil {</code></span>
+<span class="codeline" id="line-862"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-863"><code>		}</code></span>
+<span class="codeline" id="line-864"><code>	}</code></span>
+<span class="codeline" id="line-865"><code></code></span>
+<span class="codeline" id="line-866"><code>	// 2. Read and parse first two bytes of frame header.</code></span>
+<span class="codeline" id="line-867"><code>	// To aid debugging, collect and report all errors in the first two bytes</code></span>
+<span class="codeline" id="line-868"><code>	// of the header.</code></span>
+<span class="codeline" id="line-869"><code></code></span>
+<span class="codeline" id="line-870"><code>	var errors []string</code></span>
+<span class="codeline" id="line-871"><code></code></span>
+<span class="codeline" id="line-872"><code>	p, err := c.read(2)</code></span>
+<span class="codeline" id="line-873"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-874"><code>		return noFrame, err</code></span>
+<span class="codeline" id="line-875"><code>	}</code></span>
+<span class="codeline" id="line-876"><code></code></span>
+<span class="codeline" id="line-877"><code>	frameType := int(p[0] &amp; 0xf)</code></span>
+<span class="codeline" id="line-878"><code>	final := p[0]&amp;finalBit != 0</code></span>
+<span class="codeline" id="line-879"><code>	rsv1 := p[0]&amp;rsv1Bit != 0</code></span>
+<span class="codeline" id="line-880"><code>	rsv2 := p[0]&amp;rsv2Bit != 0</code></span>
+<span class="codeline" id="line-881"><code>	rsv3 := p[0]&amp;rsv3Bit != 0</code></span>
+<span class="codeline" id="line-882"><code>	mask := p[1]&amp;maskBit != 0</code></span>
+<span class="codeline" id="line-883"><code>	if err := c.setReadRemaining(int64(p[1] &amp; 0x7f)); err != nil {</code></span>
+<span class="codeline" id="line-884"><code>		return noFrame, err</code></span>
+<span class="codeline" id="line-885"><code>	}</code></span>
+<span class="codeline" id="line-886"><code></code></span>
+<span class="codeline" id="line-887"><code>	c.readDecompress = false</code></span>
+<span class="codeline" id="line-888"><code>	if rsv1 {</code></span>
+<span class="codeline" id="line-889"><code>		if c.newDecompressionReader != nil {</code></span>
+<span class="codeline" id="line-890"><code>			c.readDecompress = true</code></span>
+<span class="codeline" id="line-891"><code>		} else {</code></span>
+<span class="codeline" id="line-892"><code>			errors = append(errors, "RSV1 set")</code></span>
+<span class="codeline" id="line-893"><code>		}</code></span>
+<span class="codeline" id="line-894"><code>	}</code></span>
+<span class="codeline" id="line-895"><code></code></span>
+<span class="codeline" id="line-896"><code>	if rsv2 {</code></span>
+<span class="codeline" id="line-897"><code>		errors = append(errors, "RSV2 set")</code></span>
+<span class="codeline" id="line-898"><code>	}</code></span>
+<span class="codeline" id="line-899"><code></code></span>
+<span class="codeline" id="line-900"><code>	if rsv3 {</code></span>
+<span class="codeline" id="line-901"><code>		errors = append(errors, "RSV3 set")</code></span>
+<span class="codeline" id="line-902"><code>	}</code></span>
+<span class="codeline" id="line-903"><code></code></span>
+<span class="codeline" id="line-904"><code>	switch frameType {</code></span>
+<span class="codeline" id="line-905"><code>	case CloseMessage, PingMessage, PongMessage:</code></span>
+<span class="codeline" id="line-906"><code>		if c.readRemaining &gt; maxControlFramePayloadSize {</code></span>
+<span class="codeline" id="line-907"><code>			errors = append(errors, "len &gt; 125 for control")</code></span>
+<span class="codeline" id="line-908"><code>		}</code></span>
+<span class="codeline" id="line-909"><code>		if !final {</code></span>
+<span class="codeline" id="line-910"><code>			errors = append(errors, "FIN not set on control")</code></span>
+<span class="codeline" id="line-911"><code>		}</code></span>
+<span class="codeline" id="line-912"><code>	case TextMessage, BinaryMessage:</code></span>
+<span class="codeline" id="line-913"><code>		if !c.readFinal {</code></span>
+<span class="codeline" id="line-914"><code>			errors = append(errors, "data before FIN")</code></span>
+<span class="codeline" id="line-915"><code>		}</code></span>
+<span class="codeline" id="line-916"><code>		c.readFinal = final</code></span>
+<span class="codeline" id="line-917"><code>	case continuationFrame:</code></span>
+<span class="codeline" id="line-918"><code>		if c.readFinal {</code></span>
+<span class="codeline" id="line-919"><code>			errors = append(errors, "continuation after FIN")</code></span>
+<span class="codeline" id="line-920"><code>		}</code></span>
+<span class="codeline" id="line-921"><code>		c.readFinal = final</code></span>
+<span class="codeline" id="line-922"><code>	default:</code></span>
+<span class="codeline" id="line-923"><code>		errors = append(errors, "bad opcode "+strconv.Itoa(frameType))</code></span>
+<span class="codeline" id="line-924"><code>	}</code></span>
+<span class="codeline" id="line-925"><code></code></span>
+<span class="codeline" id="line-926"><code>	if mask != c.isServer {</code></span>
+<span class="codeline" id="line-927"><code>		errors = append(errors, "bad MASK")</code></span>
+<span class="codeline" id="line-928"><code>	}</code></span>
+<span class="codeline" id="line-929"><code></code></span>
+<span class="codeline" id="line-930"><code>	if len(errors) &gt; 0 {</code></span>
+<span class="codeline" id="line-931"><code>		return noFrame, c.handleProtocolError(strings.Join(errors, ", "))</code></span>
+<span class="codeline" id="line-932"><code>	}</code></span>
+<span class="codeline" id="line-933"><code></code></span>
+<span class="codeline" id="line-934"><code>	// 3. Read and parse frame length as per</code></span>
+<span class="codeline" id="line-935"><code>	// https://tools.ietf.org/html/rfc6455#section-5.2</code></span>
+<span class="codeline" id="line-936"><code>	//</code></span>
+<span class="codeline" id="line-937"><code>	// The length of the "Payload data", in bytes: if 0-125, that is the payload</code></span>
+<span class="codeline" id="line-938"><code>	// length.</code></span>
+<span class="codeline" id="line-939"><code>	// - If 126, the following 2 bytes interpreted as a 16-bit unsigned</code></span>
+<span class="codeline" id="line-940"><code>	// integer are the payload length.</code></span>
+<span class="codeline" id="line-941"><code>	// - If 127, the following 8 bytes interpreted as</code></span>
+<span class="codeline" id="line-942"><code>	// a 64-bit unsigned integer (the most significant bit MUST be 0) are the</code></span>
+<span class="codeline" id="line-943"><code>	// payload length. Multibyte length quantities are expressed in network byte</code></span>
+<span class="codeline" id="line-944"><code>	// order.</code></span>
+<span class="codeline" id="line-945"><code></code></span>
+<span class="codeline" id="line-946"><code>	switch c.readRemaining {</code></span>
+<span class="codeline" id="line-947"><code>	case 126:</code></span>
+<span class="codeline" id="line-948"><code>		p, err := c.read(2)</code></span>
+<span class="codeline" id="line-949"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-950"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-951"><code>		}</code></span>
+<span class="codeline" id="line-952"><code></code></span>
+<span class="codeline" id="line-953"><code>		if err := c.setReadRemaining(int64(binary.BigEndian.Uint16(p))); err != nil {</code></span>
+<span class="codeline" id="line-954"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-955"><code>		}</code></span>
+<span class="codeline" id="line-956"><code>	case 127:</code></span>
+<span class="codeline" id="line-957"><code>		p, err := c.read(8)</code></span>
+<span class="codeline" id="line-958"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-959"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-960"><code>		}</code></span>
+<span class="codeline" id="line-961"><code></code></span>
+<span class="codeline" id="line-962"><code>		if err := c.setReadRemaining(int64(binary.BigEndian.Uint64(p))); err != nil {</code></span>
+<span class="codeline" id="line-963"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-964"><code>		}</code></span>
+<span class="codeline" id="line-965"><code>	}</code></span>
+<span class="codeline" id="line-966"><code></code></span>
+<span class="codeline" id="line-967"><code>	// 4. Handle frame masking.</code></span>
+<span class="codeline" id="line-968"><code></code></span>
+<span class="codeline" id="line-969"><code>	if mask {</code></span>
+<span class="codeline" id="line-970"><code>		c.readMaskPos = 0</code></span>
+<span class="codeline" id="line-971"><code>		p, err := c.read(len(c.readMaskKey))</code></span>
+<span class="codeline" id="line-972"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-973"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-974"><code>		}</code></span>
+<span class="codeline" id="line-975"><code>		copy(c.readMaskKey[:], p)</code></span>
+<span class="codeline" id="line-976"><code>	}</code></span>
+<span class="codeline" id="line-977"><code></code></span>
+<span class="codeline" id="line-978"><code>	// 5. For text and binary messages, enforce read limit and return.</code></span>
+<span class="codeline" id="line-979"><code></code></span>
+<span class="codeline" id="line-980"><code>	if frameType == continuationFrame || frameType == TextMessage || frameType == BinaryMessage {</code></span>
+<span class="codeline" id="line-981"><code></code></span>
+<span class="codeline" id="line-982"><code>		c.readLength += c.readRemaining</code></span>
+<span class="codeline" id="line-983"><code>		// Don't allow readLength to overflow in the presence of a large readRemaining</code></span>
+<span class="codeline" id="line-984"><code>		// counter.</code></span>
+<span class="codeline" id="line-985"><code>		if c.readLength &lt; 0 {</code></span>
+<span class="codeline" id="line-986"><code>			return noFrame, ErrReadLimit</code></span>
+<span class="codeline" id="line-987"><code>		}</code></span>
+<span class="codeline" id="line-988"><code></code></span>
+<span class="codeline" id="line-989"><code>		if c.readLimit &gt; 0 &amp;&amp; c.readLength &gt; c.readLimit {</code></span>
+<span class="codeline" id="line-990"><code>			if err := c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait)); err != nil {</code></span>
+<span class="codeline" id="line-991"><code>				return noFrame, err</code></span>
+<span class="codeline" id="line-992"><code>			}</code></span>
+<span class="codeline" id="line-993"><code>			return noFrame, ErrReadLimit</code></span>
+<span class="codeline" id="line-994"><code>		}</code></span>
+<span class="codeline" id="line-995"><code></code></span>
+<span class="codeline" id="line-996"><code>		return frameType, nil</code></span>
+<span class="codeline" id="line-997"><code>	}</code></span>
+<span class="codeline" id="line-998"><code></code></span>
+<span class="codeline" id="line-999"><code>	// 6. Read control frame payload.</code></span>
+<span class="codeline" id="line-1000"><code></code></span>
+<span class="codeline" id="line-1001"><code>	var payload []byte</code></span>
+<span class="codeline" id="line-1002"><code>	if c.readRemaining &gt; 0 {</code></span>
+<span class="codeline" id="line-1003"><code>		payload, err = c.read(int(c.readRemaining))</code></span>
+<span class="codeline" id="line-1004"><code>		if err := c.setReadRemaining(0); err != nil {</code></span>
+<span class="codeline" id="line-1005"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-1006"><code>		}</code></span>
+<span class="codeline" id="line-1007"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1008"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-1009"><code>		}</code></span>
+<span class="codeline" id="line-1010"><code>		if c.isServer {</code></span>
+<span class="codeline" id="line-1011"><code>			maskBytes(c.readMaskKey, 0, payload)</code></span>
+<span class="codeline" id="line-1012"><code>		}</code></span>
+<span class="codeline" id="line-1013"><code>	}</code></span>
+<span class="codeline" id="line-1014"><code></code></span>
+<span class="codeline" id="line-1015"><code>	// 7. Process control frame payload.</code></span>
+<span class="codeline" id="line-1016"><code></code></span>
+<span class="codeline" id="line-1017"><code>	switch frameType {</code></span>
+<span class="codeline" id="line-1018"><code>	case PongMessage:</code></span>
+<span class="codeline" id="line-1019"><code>		if err := c.handlePong(string(payload)); err != nil {</code></span>
+<span class="codeline" id="line-1020"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-1021"><code>		}</code></span>
+<span class="codeline" id="line-1022"><code>	case PingMessage:</code></span>
+<span class="codeline" id="line-1023"><code>		if err := c.handlePing(string(payload)); err != nil {</code></span>
+<span class="codeline" id="line-1024"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-1025"><code>		}</code></span>
+<span class="codeline" id="line-1026"><code>	case CloseMessage:</code></span>
+<span class="codeline" id="line-1027"><code>		closeCode := CloseNoStatusReceived</code></span>
+<span class="codeline" id="line-1028"><code>		closeText := ""</code></span>
+<span class="codeline" id="line-1029"><code>		if len(payload) &gt;= 2 {</code></span>
+<span class="codeline" id="line-1030"><code>			closeCode = int(binary.BigEndian.Uint16(payload))</code></span>
+<span class="codeline" id="line-1031"><code>			if !isValidReceivedCloseCode(closeCode) {</code></span>
+<span class="codeline" id="line-1032"><code>				return noFrame, c.handleProtocolError("bad close code " + strconv.Itoa(closeCode))</code></span>
+<span class="codeline" id="line-1033"><code>			}</code></span>
+<span class="codeline" id="line-1034"><code>			closeText = string(payload[2:])</code></span>
+<span class="codeline" id="line-1035"><code>			if !utf8.ValidString(closeText) {</code></span>
+<span class="codeline" id="line-1036"><code>				return noFrame, c.handleProtocolError("invalid utf8 payload in close frame")</code></span>
+<span class="codeline" id="line-1037"><code>			}</code></span>
+<span class="codeline" id="line-1038"><code>		}</code></span>
+<span class="codeline" id="line-1039"><code>		if err := c.handleClose(closeCode, closeText); err != nil {</code></span>
+<span class="codeline" id="line-1040"><code>			return noFrame, err</code></span>
+<span class="codeline" id="line-1041"><code>		}</code></span>
+<span class="codeline" id="line-1042"><code>		return noFrame, &amp;CloseError{Code: closeCode, Text: closeText}</code></span>
+<span class="codeline" id="line-1043"><code>	}</code></span>
+<span class="codeline" id="line-1044"><code></code></span>
+<span class="codeline" id="line-1045"><code>	return frameType, nil</code></span>
+<span class="codeline" id="line-1046"><code>}</code></span>
+<span class="codeline" id="line-1047"><code></code></span>
+<span class="codeline" id="line-1048"><code>func (c *Conn) handleProtocolError(message string) error {</code></span>
+<span class="codeline" id="line-1049"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1050"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-1051"><code>	}</code></span>
+<span class="codeline" id="line-1052"><code>	data := FormatCloseMessage(CloseProtocolError, message)</code></span>
+<span class="codeline" id="line-1053"><code>	if len(data) &gt; maxControlFramePayloadSize {</code></span>
+<span class="codeline" id="line-1054"><code>		data = data[:maxControlFramePayloadSize]</code></span>
+<span class="codeline" id="line-1055"><code>	}</code></span>
+<span class="codeline" id="line-1056"><code>	if err := c.WriteControl(CloseMessage, data, time.Now().Add(writeWait)); err != nil {</code></span>
+<span class="codeline" id="line-1057"><code>		return err</code></span>
+<span class="codeline" id="line-1058"><code>	}</code></span>
+<span class="codeline" id="line-1059"><code>	return errors.New("websocket: " + message)</code></span>
+<span class="codeline" id="line-1060"><code>}</code></span>
+<span class="codeline" id="line-1061"><code></code></span>
+<span class="codeline" id="line-1062"><code>// NextReader returns the next data message received from the peer. The</code></span>
+<span class="codeline" id="line-1063"><code>// returned messageType is either TextMessage or BinaryMessage.</code></span>
+<span class="codeline" id="line-1064"><code>//</code></span>
+<span class="codeline" id="line-1065"><code>// There can be at most one open reader on a connection. NextReader discards</code></span>
+<span class="codeline" id="line-1066"><code>// the previous message if the application has not already consumed it.</code></span>
+<span class="codeline" id="line-1067"><code>//</code></span>
+<span class="codeline" id="line-1068"><code>// Applications must break out of the application's read loop when this method</code></span>
+<span class="codeline" id="line-1069"><code>// returns a non-nil error value. Errors returned from this method are</code></span>
+<span class="codeline" id="line-1070"><code>// permanent. Once this method returns a non-nil error, all subsequent calls to</code></span>
+<span class="codeline" id="line-1071"><code>// this method return the same error.</code></span>
+<span class="codeline" id="line-1072"><code>func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {</code></span>
+<span class="codeline" id="line-1073"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1074"><code>		return 0, nil, ErrNilConn</code></span>
+<span class="codeline" id="line-1075"><code>	}</code></span>
+<span class="codeline" id="line-1076"><code>	// Close previous reader, only relevant for decompression.</code></span>
+<span class="codeline" id="line-1077"><code>	if c.reader != nil {</code></span>
+<span class="codeline" id="line-1078"><code>		if err := c.reader.Close(); err != nil {</code></span>
+<span class="codeline" id="line-1079"><code>			log.Printf("websocket: discarding reader close error: %v", err)</code></span>
+<span class="codeline" id="line-1080"><code>		}</code></span>
+<span class="codeline" id="line-1081"><code>		c.reader = nil</code></span>
+<span class="codeline" id="line-1082"><code>	}</code></span>
+<span class="codeline" id="line-1083"><code></code></span>
+<span class="codeline" id="line-1084"><code>	c.messageReader = nil</code></span>
+<span class="codeline" id="line-1085"><code>	c.readLength = 0</code></span>
+<span class="codeline" id="line-1086"><code></code></span>
+<span class="codeline" id="line-1087"><code>	for c.readErr == nil {</code></span>
+<span class="codeline" id="line-1088"><code>		frameType, err := c.advanceFrame()</code></span>
+<span class="codeline" id="line-1089"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-1090"><code>			c.readErr = hideTempErr(err)</code></span>
+<span class="codeline" id="line-1091"><code>			break</code></span>
+<span class="codeline" id="line-1092"><code>		}</code></span>
+<span class="codeline" id="line-1093"><code></code></span>
+<span class="codeline" id="line-1094"><code>		if frameType == TextMessage || frameType == BinaryMessage {</code></span>
+<span class="codeline" id="line-1095"><code>			c.messageReader = &amp;messageReader{c}</code></span>
+<span class="codeline" id="line-1096"><code>			c.reader = c.messageReader</code></span>
+<span class="codeline" id="line-1097"><code>			if c.readDecompress {</code></span>
+<span class="codeline" id="line-1098"><code>				c.reader = c.newDecompressionReader(c.reader)</code></span>
+<span class="codeline" id="line-1099"><code>			}</code></span>
+<span class="codeline" id="line-1100"><code>			return frameType, c.reader, nil</code></span>
+<span class="codeline" id="line-1101"><code>		}</code></span>
+<span class="codeline" id="line-1102"><code>	}</code></span>
+<span class="codeline" id="line-1103"><code></code></span>
+<span class="codeline" id="line-1104"><code>	// Applications that do handle the error returned from this method spin in</code></span>
+<span class="codeline" id="line-1105"><code>	// tight loop on connection failure. To help application developers detect</code></span>
+<span class="codeline" id="line-1106"><code>	// this error, panic on repeated reads to the failed connection.</code></span>
+<span class="codeline" id="line-1107"><code>	c.readErrCount++</code></span>
+<span class="codeline" id="line-1108"><code>	if c.readErrCount &gt;= 1000 {</code></span>
+<span class="codeline" id="line-1109"><code>		panic("repeated read on failed websocket connection")</code></span>
+<span class="codeline" id="line-1110"><code>	}</code></span>
+<span class="codeline" id="line-1111"><code></code></span>
+<span class="codeline" id="line-1112"><code>	return noFrame, nil, c.readErr</code></span>
+<span class="codeline" id="line-1113"><code>}</code></span>
+<span class="codeline" id="line-1114"><code></code></span>
+<span class="codeline" id="line-1115"><code>type messageReader struct{ c *Conn }</code></span>
+<span class="codeline" id="line-1116"><code></code></span>
+<span class="codeline" id="line-1117"><code>func (r *messageReader) Read(b []byte) (int, error) {</code></span>
+<span class="codeline" id="line-1118"><code>	c := r.c</code></span>
+<span class="codeline" id="line-1119"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1120"><code>		return 0, ErrNilConn</code></span>
+<span class="codeline" id="line-1121"><code>	}</code></span>
+<span class="codeline" id="line-1122"><code>	if c.messageReader != r {</code></span>
+<span class="codeline" id="line-1123"><code>		return 0, io.EOF</code></span>
+<span class="codeline" id="line-1124"><code>	}</code></span>
+<span class="codeline" id="line-1125"><code></code></span>
+<span class="codeline" id="line-1126"><code>	for c.readErr == nil {</code></span>
+<span class="codeline" id="line-1127"><code></code></span>
+<span class="codeline" id="line-1128"><code>		if c.readRemaining &gt; 0 {</code></span>
+<span class="codeline" id="line-1129"><code>			if int64(len(b)) &gt; c.readRemaining {</code></span>
+<span class="codeline" id="line-1130"><code>				b = b[:c.readRemaining]</code></span>
+<span class="codeline" id="line-1131"><code>			}</code></span>
+<span class="codeline" id="line-1132"><code>			n, err := c.br.Read(b)</code></span>
+<span class="codeline" id="line-1133"><code>			c.readErr = hideTempErr(err)</code></span>
+<span class="codeline" id="line-1134"><code>			if c.isServer {</code></span>
+<span class="codeline" id="line-1135"><code>				c.readMaskPos = maskBytes(c.readMaskKey, c.readMaskPos, b[:n])</code></span>
+<span class="codeline" id="line-1136"><code>			}</code></span>
+<span class="codeline" id="line-1137"><code>			rem := c.readRemaining</code></span>
+<span class="codeline" id="line-1138"><code>			rem -= int64(n)</code></span>
+<span class="codeline" id="line-1139"><code>			if err := c.setReadRemaining(rem); err != nil {</code></span>
+<span class="codeline" id="line-1140"><code>				return 0, err</code></span>
+<span class="codeline" id="line-1141"><code>			}</code></span>
+<span class="codeline" id="line-1142"><code>			if c.readRemaining &gt; 0 &amp;&amp; c.readErr == io.EOF {</code></span>
+<span class="codeline" id="line-1143"><code>				c.readErr = errUnexpectedEOF</code></span>
+<span class="codeline" id="line-1144"><code>			}</code></span>
+<span class="codeline" id="line-1145"><code>			return n, c.readErr</code></span>
+<span class="codeline" id="line-1146"><code>		}</code></span>
+<span class="codeline" id="line-1147"><code></code></span>
+<span class="codeline" id="line-1148"><code>		if c.readFinal {</code></span>
+<span class="codeline" id="line-1149"><code>			c.messageReader = nil</code></span>
+<span class="codeline" id="line-1150"><code>			return 0, io.EOF</code></span>
+<span class="codeline" id="line-1151"><code>		}</code></span>
+<span class="codeline" id="line-1152"><code></code></span>
+<span class="codeline" id="line-1153"><code>		frameType, err := c.advanceFrame()</code></span>
+<span class="codeline" id="line-1154"><code>		switch {</code></span>
+<span class="codeline" id="line-1155"><code>		case err != nil:</code></span>
+<span class="codeline" id="line-1156"><code>			c.readErr = hideTempErr(err)</code></span>
+<span class="codeline" id="line-1157"><code>		case frameType == TextMessage || frameType == BinaryMessage:</code></span>
+<span class="codeline" id="line-1158"><code>			c.readErr = errors.New("websocket: internal error, unexpected text or binary in Reader")</code></span>
+<span class="codeline" id="line-1159"><code>		}</code></span>
+<span class="codeline" id="line-1160"><code>	}</code></span>
+<span class="codeline" id="line-1161"><code></code></span>
+<span class="codeline" id="line-1162"><code>	err := c.readErr</code></span>
+<span class="codeline" id="line-1163"><code>	if err == io.EOF &amp;&amp; c.messageReader == r {</code></span>
+<span class="codeline" id="line-1164"><code>		err = errUnexpectedEOF</code></span>
+<span class="codeline" id="line-1165"><code>	}</code></span>
+<span class="codeline" id="line-1166"><code>	return 0, err</code></span>
+<span class="codeline" id="line-1167"><code>}</code></span>
+<span class="codeline" id="line-1168"><code></code></span>
+<span class="codeline" id="line-1169"><code>func (r *messageReader) Close() error {</code></span>
+<span class="codeline" id="line-1170"><code>	return nil</code></span>
+<span class="codeline" id="line-1171"><code>}</code></span>
+<span class="codeline" id="line-1172"><code></code></span>
+<span class="codeline" id="line-1173"><code>// ReadMessage is a helper method for getting a reader using NextReader and</code></span>
+<span class="codeline" id="line-1174"><code>// reading from that reader to a buffer.</code></span>
+<span class="codeline" id="line-1175"><code>func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {</code></span>
+<span class="codeline" id="line-1176"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1177"><code>		return 0, nil, ErrNilConn</code></span>
+<span class="codeline" id="line-1178"><code>	}</code></span>
+<span class="codeline" id="line-1179"><code>	var r io.Reader</code></span>
+<span class="codeline" id="line-1180"><code>	messageType, r, err = c.NextReader()</code></span>
+<span class="codeline" id="line-1181"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-1182"><code>		return messageType, nil, err</code></span>
+<span class="codeline" id="line-1183"><code>	}</code></span>
+<span class="codeline" id="line-1184"><code>	p, err = io.ReadAll(r)</code></span>
+<span class="codeline" id="line-1185"><code>	return messageType, p, err</code></span>
+<span class="codeline" id="line-1186"><code>}</code></span>
+<span class="codeline" id="line-1187"><code></code></span>
+<span class="codeline" id="line-1188"><code>// SetReadDeadline sets the read deadline on the underlying network connection.</code></span>
+<span class="codeline" id="line-1189"><code>// After a read has timed out, the websocket connection state is corrupt and</code></span>
+<span class="codeline" id="line-1190"><code>// all future reads will return an error. A zero value for t means reads will</code></span>
+<span class="codeline" id="line-1191"><code>// not time out.</code></span>
+<span class="codeline" id="line-1192"><code>func (c *Conn) SetReadDeadline(t time.Time) error {</code></span>
+<span class="codeline" id="line-1193"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1194"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-1195"><code>	}</code></span>
+<span class="codeline" id="line-1196"><code>	if c.conn == nil {</code></span>
+<span class="codeline" id="line-1197"><code>		return ErrNilNetConn</code></span>
+<span class="codeline" id="line-1198"><code>	}</code></span>
+<span class="codeline" id="line-1199"><code>	return c.conn.SetReadDeadline(t)</code></span>
+<span class="codeline" id="line-1200"><code>}</code></span>
+<span class="codeline" id="line-1201"><code></code></span>
+<span class="codeline" id="line-1202"><code>// SetReadLimit sets the maximum size in bytes for a message read from the peer. If a</code></span>
+<span class="codeline" id="line-1203"><code>// message exceeds the limit, the connection sends a close message to the peer</code></span>
+<span class="codeline" id="line-1204"><code>// and returns ErrReadLimit to the application.</code></span>
+<span class="codeline" id="line-1205"><code>func (c *Conn) SetReadLimit(limit int64) {</code></span>
+<span class="codeline" id="line-1206"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1207"><code>		return</code></span>
+<span class="codeline" id="line-1208"><code>	}</code></span>
+<span class="codeline" id="line-1209"><code>	c.readLimit = limit</code></span>
+<span class="codeline" id="line-1210"><code>}</code></span>
+<span class="codeline" id="line-1211"><code></code></span>
+<span class="codeline" id="line-1212"><code>// CloseHandler returns the current close handler</code></span>
+<span class="codeline" id="line-1213"><code>func (c *Conn) CloseHandler() func(code int, text string) error {</code></span>
+<span class="codeline" id="line-1214"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1215"><code>		return nil</code></span>
+<span class="codeline" id="line-1216"><code>	}</code></span>
+<span class="codeline" id="line-1217"><code>	return c.handleClose</code></span>
+<span class="codeline" id="line-1218"><code>}</code></span>
+<span class="codeline" id="line-1219"><code></code></span>
+<span class="codeline" id="line-1220"><code>// SetCloseHandler sets the handler for close messages received from the peer.</code></span>
+<span class="codeline" id="line-1221"><code>// The code argument to h is the received close code or CloseNoStatusReceived</code></span>
+<span class="codeline" id="line-1222"><code>// if the close message is empty. The default close handler sends a close</code></span>
+<span class="codeline" id="line-1223"><code>// message back to the peer.</code></span>
+<span class="codeline" id="line-1224"><code>//</code></span>
+<span class="codeline" id="line-1225"><code>// The handler function is called from the NextReader, ReadMessage and message</code></span>
+<span class="codeline" id="line-1226"><code>// reader Read methods. The application must read the connection to process</code></span>
+<span class="codeline" id="line-1227"><code>// close messages as described in the section on Control Messages above.</code></span>
+<span class="codeline" id="line-1228"><code>//</code></span>
+<span class="codeline" id="line-1229"><code>// The connection read methods return a CloseError when a close message is</code></span>
+<span class="codeline" id="line-1230"><code>// received. Most applications should handle close messages as part of their</code></span>
+<span class="codeline" id="line-1231"><code>// normal error handling. Applications should only set a close handler when the</code></span>
+<span class="codeline" id="line-1232"><code>// application must perform some action before sending a close message back to</code></span>
+<span class="codeline" id="line-1233"><code>// the peer.</code></span>
+<span class="codeline" id="line-1234"><code>func (c *Conn) SetCloseHandler(h func(code int, text string) error) {</code></span>
+<span class="codeline" id="line-1235"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1236"><code>		return</code></span>
+<span class="codeline" id="line-1237"><code>	}</code></span>
+<span class="codeline" id="line-1238"><code>	if h == nil {</code></span>
+<span class="codeline" id="line-1239"><code>		h = func(code int, text string) error {</code></span>
+<span class="codeline" id="line-1240"><code>			message := FormatCloseMessage(code, "")</code></span>
+<span class="codeline" id="line-1241"><code>			err := c.WriteControl(CloseMessage, message, time.Now().Add(writeWait))</code></span>
+<span class="codeline" id="line-1242"><code>			if err != nil &amp;&amp; err != ErrCloseSent {</code></span>
+<span class="codeline" id="line-1243"><code>				return err</code></span>
+<span class="codeline" id="line-1244"><code>			}</code></span>
+<span class="codeline" id="line-1245"><code>			return nil</code></span>
+<span class="codeline" id="line-1246"><code>		}</code></span>
+<span class="codeline" id="line-1247"><code>	}</code></span>
+<span class="codeline" id="line-1248"><code>	c.handleClose = h</code></span>
+<span class="codeline" id="line-1249"><code>}</code></span>
+<span class="codeline" id="line-1250"><code></code></span>
+<span class="codeline" id="line-1251"><code>// PingHandler returns the current ping handler</code></span>
+<span class="codeline" id="line-1252"><code>func (c *Conn) PingHandler() func(appData string) error {</code></span>
+<span class="codeline" id="line-1253"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1254"><code>		return nil</code></span>
+<span class="codeline" id="line-1255"><code>	}</code></span>
+<span class="codeline" id="line-1256"><code>	return c.handlePing</code></span>
+<span class="codeline" id="line-1257"><code>}</code></span>
+<span class="codeline" id="line-1258"><code></code></span>
+<span class="codeline" id="line-1259"><code>// SetPingHandler sets the handler for ping messages received from the peer.</code></span>
+<span class="codeline" id="line-1260"><code>// The appData argument to h is the PING message application data. The default</code></span>
+<span class="codeline" id="line-1261"><code>// ping handler sends a pong to the peer.</code></span>
+<span class="codeline" id="line-1262"><code>//</code></span>
+<span class="codeline" id="line-1263"><code>// The handler function is called from the NextReader, ReadMessage and message</code></span>
+<span class="codeline" id="line-1264"><code>// reader Read methods. The application must read the connection to process</code></span>
+<span class="codeline" id="line-1265"><code>// ping messages as described in the section on Control Messages above.</code></span>
+<span class="codeline" id="line-1266"><code>func (c *Conn) SetPingHandler(h func(appData string) error) {</code></span>
+<span class="codeline" id="line-1267"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1268"><code>		return</code></span>
+<span class="codeline" id="line-1269"><code>	}</code></span>
+<span class="codeline" id="line-1270"><code>	if h == nil {</code></span>
+<span class="codeline" id="line-1271"><code>		h = func(message string) error {</code></span>
+<span class="codeline" id="line-1272"><code>			err := c.WriteControl(PongMessage, []byte(message), time.Now().Add(writeWait))</code></span>
+<span class="codeline" id="line-1273"><code>			if err == ErrCloseSent {</code></span>
+<span class="codeline" id="line-1274"><code>				return nil</code></span>
+<span class="codeline" id="line-1275"><code>			} else if _, ok := err.(net.Error); ok {</code></span>
+<span class="codeline" id="line-1276"><code>				return nil</code></span>
+<span class="codeline" id="line-1277"><code>			}</code></span>
+<span class="codeline" id="line-1278"><code>			return err</code></span>
+<span class="codeline" id="line-1279"><code>		}</code></span>
+<span class="codeline" id="line-1280"><code>	}</code></span>
+<span class="codeline" id="line-1281"><code>	c.handlePing = h</code></span>
+<span class="codeline" id="line-1282"><code>}</code></span>
+<span class="codeline" id="line-1283"><code></code></span>
+<span class="codeline" id="line-1284"><code>// PongHandler returns the current pong handler</code></span>
+<span class="codeline" id="line-1285"><code>func (c *Conn) PongHandler() func(appData string) error {</code></span>
+<span class="codeline" id="line-1286"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1287"><code>		return nil</code></span>
+<span class="codeline" id="line-1288"><code>	}</code></span>
+<span class="codeline" id="line-1289"><code>	return c.handlePong</code></span>
+<span class="codeline" id="line-1290"><code>}</code></span>
+<span class="codeline" id="line-1291"><code></code></span>
+<span class="codeline" id="line-1292"><code>// SetPongHandler sets the handler for pong messages received from the peer.</code></span>
+<span class="codeline" id="line-1293"><code>// The appData argument to h is the PONG message application data. The default</code></span>
+<span class="codeline" id="line-1294"><code>// pong handler does nothing.</code></span>
+<span class="codeline" id="line-1295"><code>//</code></span>
+<span class="codeline" id="line-1296"><code>// The handler function is called from the NextReader, ReadMessage and message</code></span>
+<span class="codeline" id="line-1297"><code>// reader Read methods. The application must read the connection to process</code></span>
+<span class="codeline" id="line-1298"><code>// pong messages as described in the section on Control Messages above.</code></span>
+<span class="codeline" id="line-1299"><code>func (c *Conn) SetPongHandler(h func(appData string) error) {</code></span>
+<span class="codeline" id="line-1300"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1301"><code>		return</code></span>
+<span class="codeline" id="line-1302"><code>	}</code></span>
+<span class="codeline" id="line-1303"><code>	if h == nil {</code></span>
+<span class="codeline" id="line-1304"><code>		h = func(string) error { return nil }</code></span>
+<span class="codeline" id="line-1305"><code>	}</code></span>
+<span class="codeline" id="line-1306"><code>	c.handlePong = h</code></span>
+<span class="codeline" id="line-1307"><code>}</code></span>
+<span class="codeline" id="line-1308"><code></code></span>
+<span class="codeline" id="line-1309"><code>// NetConn returns the underlying connection that is wrapped by c.</code></span>
+<span class="codeline" id="line-1310"><code>// Note that writing to or reading from this connection directly will corrupt the</code></span>
+<span class="codeline" id="line-1311"><code>// WebSocket connection.</code></span>
+<span class="codeline" id="line-1312"><code>func (c *Conn) NetConn() net.Conn {</code></span>
+<span class="codeline" id="line-1313"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1314"><code>		return nil</code></span>
+<span class="codeline" id="line-1315"><code>	}</code></span>
+<span class="codeline" id="line-1316"><code>	return c.conn</code></span>
+<span class="codeline" id="line-1317"><code>}</code></span>
+<span class="codeline" id="line-1318"><code></code></span>
+<span class="codeline" id="line-1319"><code>// UnderlyingConn returns the internal net.Conn. This can be used to further</code></span>
+<span class="codeline" id="line-1320"><code>// modifications to connection specific flags.</code></span>
+<span class="codeline" id="line-1321"><code>// Deprecated: Use the NetConn method.</code></span>
+<span class="codeline" id="line-1322"><code>func (c *Conn) UnderlyingConn() net.Conn {</code></span>
+<span class="codeline" id="line-1323"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1324"><code>		return nil</code></span>
+<span class="codeline" id="line-1325"><code>	}</code></span>
+<span class="codeline" id="line-1326"><code>	return c.conn</code></span>
+<span class="codeline" id="line-1327"><code>}</code></span>
+<span class="codeline" id="line-1328"><code></code></span>
+<span class="codeline" id="line-1329"><code>// EnableWriteCompression enables and disables write compression of</code></span>
+<span class="codeline" id="line-1330"><code>// subsequent text and binary messages. This function is a noop if</code></span>
+<span class="codeline" id="line-1331"><code>// compression was not negotiated with the peer.</code></span>
+<span class="codeline" id="line-1332"><code>func (c *Conn) EnableWriteCompression(enable bool) {</code></span>
+<span class="codeline" id="line-1333"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1334"><code>		return</code></span>
+<span class="codeline" id="line-1335"><code>	}</code></span>
+<span class="codeline" id="line-1336"><code>	c.enableWriteCompression = enable</code></span>
+<span class="codeline" id="line-1337"><code>}</code></span>
+<span class="codeline" id="line-1338"><code></code></span>
+<span class="codeline" id="line-1339"><code>// SetCompressionLevel sets the flate compression level for subsequent text and</code></span>
+<span class="codeline" id="line-1340"><code>// binary messages. This function is a noop if compression was not negotiated</code></span>
+<span class="codeline" id="line-1341"><code>// with the peer. See the github.com/klauspost/compress/flate package for a description of</code></span>
+<span class="codeline" id="line-1342"><code>// compression levels.</code></span>
+<span class="codeline" id="line-1343"><code>func (c *Conn) SetCompressionLevel(level int) error {</code></span>
+<span class="codeline" id="line-1344"><code>	if c == nil {</code></span>
+<span class="codeline" id="line-1345"><code>		return ErrNilConn</code></span>
+<span class="codeline" id="line-1346"><code>	}</code></span>
+<span class="codeline" id="line-1347"><code>	if !isValidCompressionLevel(level) {</code></span>
+<span class="codeline" id="line-1348"><code>		return errors.New("websocket: invalid compression level")</code></span>
+<span class="codeline" id="line-1349"><code>	}</code></span>
+<span class="codeline" id="line-1350"><code>	c.compressionLevel = level</code></span>
+<span class="codeline" id="line-1351"><code>	return nil</code></span>
+<span class="codeline" id="line-1352"><code>}</code></span>
+<span class="codeline" id="line-1353"><code></code></span>
+<span class="codeline" id="line-1354"><code>// FormatCloseMessage formats closeCode and text as a WebSocket close message.</code></span>
+<span class="codeline" id="line-1355"><code>// An empty message is returned for code CloseNoStatusReceived.</code></span>
+<span class="codeline" id="line-1356"><code>func FormatCloseMessage(closeCode int, text string) []byte {</code></span>
+<span class="codeline" id="line-1357"><code>	if closeCode == CloseNoStatusReceived {</code></span>
+<span class="codeline" id="line-1358"><code>		// Return empty message because it's illegal to send</code></span>
+<span class="codeline" id="line-1359"><code>		// CloseNoStatusReceived. Return non-nil value in case application</code></span>
+<span class="codeline" id="line-1360"><code>		// checks for nil.</code></span>
+<span class="codeline" id="line-1361"><code>		return []byte{}</code></span>
+<span class="codeline" id="line-1362"><code>	}</code></span>
+<span class="codeline" id="line-1363"><code>	buf := make([]byte, 2+len(text))</code></span>
+<span class="codeline" id="line-1364"><code>	binary.BigEndian.PutUint16(buf, uint16(closeCode))</code></span>
+<span class="codeline" id="line-1365"><code>	copy(buf[2:], text)</code></span>
+<span class="codeline" id="line-1366"><code>	return buf</code></span>
+<span class="codeline" id="line-1367"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

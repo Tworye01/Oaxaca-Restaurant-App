@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: fd_unix.go in package net</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	fd_unix.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/net.html">net</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build unix</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package net</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"context"</code></span>
+<span class="codeline" id="line-11"><code>	"internal/poll"</code></span>
+<span class="codeline" id="line-12"><code>	"os"</code></span>
+<span class="codeline" id="line-13"><code>	"runtime"</code></span>
+<span class="codeline" id="line-14"><code>	"syscall"</code></span>
+<span class="codeline" id="line-15"><code>)</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>const (</code></span>
+<span class="codeline" id="line-18"><code>	readSyscallName     = "read"</code></span>
+<span class="codeline" id="line-19"><code>	readFromSyscallName = "recvfrom"</code></span>
+<span class="codeline" id="line-20"><code>	readMsgSyscallName  = "recvmsg"</code></span>
+<span class="codeline" id="line-21"><code>	writeSyscallName    = "write"</code></span>
+<span class="codeline" id="line-22"><code>	writeToSyscallName  = "sendto"</code></span>
+<span class="codeline" id="line-23"><code>	writeMsgSyscallName = "sendmsg"</code></span>
+<span class="codeline" id="line-24"><code>)</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>func newFD(sysfd, family, sotype int, net string) (*netFD, error) {</code></span>
+<span class="codeline" id="line-27"><code>	ret := &amp;netFD{</code></span>
+<span class="codeline" id="line-28"><code>		pfd: poll.FD{</code></span>
+<span class="codeline" id="line-29"><code>			Sysfd:         sysfd,</code></span>
+<span class="codeline" id="line-30"><code>			IsStream:      sotype == syscall.SOCK_STREAM,</code></span>
+<span class="codeline" id="line-31"><code>			ZeroReadIsEOF: sotype != syscall.SOCK_DGRAM &amp;&amp; sotype != syscall.SOCK_RAW,</code></span>
+<span class="codeline" id="line-32"><code>		},</code></span>
+<span class="codeline" id="line-33"><code>		family: family,</code></span>
+<span class="codeline" id="line-34"><code>		sotype: sotype,</code></span>
+<span class="codeline" id="line-35"><code>		net:    net,</code></span>
+<span class="codeline" id="line-36"><code>	}</code></span>
+<span class="codeline" id="line-37"><code>	return ret, nil</code></span>
+<span class="codeline" id="line-38"><code>}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>func (fd *netFD) init() error {</code></span>
+<span class="codeline" id="line-41"><code>	return fd.pfd.Init(fd.net, true)</code></span>
+<span class="codeline" id="line-42"><code>}</code></span>
+<span class="codeline" id="line-43"><code></code></span>
+<span class="codeline" id="line-44"><code>func (fd *netFD) name() string {</code></span>
+<span class="codeline" id="line-45"><code>	var ls, rs string</code></span>
+<span class="codeline" id="line-46"><code>	if fd.laddr != nil {</code></span>
+<span class="codeline" id="line-47"><code>		ls = fd.laddr.String()</code></span>
+<span class="codeline" id="line-48"><code>	}</code></span>
+<span class="codeline" id="line-49"><code>	if fd.raddr != nil {</code></span>
+<span class="codeline" id="line-50"><code>		rs = fd.raddr.String()</code></span>
+<span class="codeline" id="line-51"><code>	}</code></span>
+<span class="codeline" id="line-52"><code>	return fd.net + ":" + ls + "-&gt;" + rs</code></span>
+<span class="codeline" id="line-53"><code>}</code></span>
+<span class="codeline" id="line-54"><code></code></span>
+<span class="codeline" id="line-55"><code>func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, ret error) {</code></span>
+<span class="codeline" id="line-56"><code>	// Do not need to call fd.writeLock here,</code></span>
+<span class="codeline" id="line-57"><code>	// because fd is not yet accessible to user,</code></span>
+<span class="codeline" id="line-58"><code>	// so no concurrent operations are possible.</code></span>
+<span class="codeline" id="line-59"><code>	switch err := connectFunc(fd.pfd.Sysfd, ra); err {</code></span>
+<span class="codeline" id="line-60"><code>	case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:</code></span>
+<span class="codeline" id="line-61"><code>	case nil, syscall.EISCONN:</code></span>
+<span class="codeline" id="line-62"><code>		select {</code></span>
+<span class="codeline" id="line-63"><code>		case &lt;-ctx.Done():</code></span>
+<span class="codeline" id="line-64"><code>			return nil, mapErr(ctx.Err())</code></span>
+<span class="codeline" id="line-65"><code>		default:</code></span>
+<span class="codeline" id="line-66"><code>		}</code></span>
+<span class="codeline" id="line-67"><code>		if err := fd.pfd.Init(fd.net, true); err != nil {</code></span>
+<span class="codeline" id="line-68"><code>			return nil, err</code></span>
+<span class="codeline" id="line-69"><code>		}</code></span>
+<span class="codeline" id="line-70"><code>		runtime.KeepAlive(fd)</code></span>
+<span class="codeline" id="line-71"><code>		return nil, nil</code></span>
+<span class="codeline" id="line-72"><code>	case syscall.EINVAL:</code></span>
+<span class="codeline" id="line-73"><code>		// On Solaris and illumos we can see EINVAL if the socket has</code></span>
+<span class="codeline" id="line-74"><code>		// already been accepted and closed by the server.  Treat this</code></span>
+<span class="codeline" id="line-75"><code>		// as a successful connection--writes to the socket will see</code></span>
+<span class="codeline" id="line-76"><code>		// EOF.  For details and a test case in C see</code></span>
+<span class="codeline" id="line-77"><code>		// https://golang.org/issue/6828.</code></span>
+<span class="codeline" id="line-78"><code>		if runtime.GOOS == "solaris" || runtime.GOOS == "illumos" {</code></span>
+<span class="codeline" id="line-79"><code>			return nil, nil</code></span>
+<span class="codeline" id="line-80"><code>		}</code></span>
+<span class="codeline" id="line-81"><code>		fallthrough</code></span>
+<span class="codeline" id="line-82"><code>	default:</code></span>
+<span class="codeline" id="line-83"><code>		return nil, os.NewSyscallError("connect", err)</code></span>
+<span class="codeline" id="line-84"><code>	}</code></span>
+<span class="codeline" id="line-85"><code>	if err := fd.pfd.Init(fd.net, true); err != nil {</code></span>
+<span class="codeline" id="line-86"><code>		return nil, err</code></span>
+<span class="codeline" id="line-87"><code>	}</code></span>
+<span class="codeline" id="line-88"><code>	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {</code></span>
+<span class="codeline" id="line-89"><code>		fd.pfd.SetWriteDeadline(deadline)</code></span>
+<span class="codeline" id="line-90"><code>		defer fd.pfd.SetWriteDeadline(noDeadline)</code></span>
+<span class="codeline" id="line-91"><code>	}</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>	// Start the "interrupter" goroutine, if this context might be canceled.</code></span>
+<span class="codeline" id="line-94"><code>	//</code></span>
+<span class="codeline" id="line-95"><code>	// The interrupter goroutine waits for the context to be done and</code></span>
+<span class="codeline" id="line-96"><code>	// interrupts the dial (by altering the fd's write deadline, which</code></span>
+<span class="codeline" id="line-97"><code>	// wakes up waitWrite).</code></span>
+<span class="codeline" id="line-98"><code>	ctxDone := ctx.Done()</code></span>
+<span class="codeline" id="line-99"><code>	if ctxDone != nil {</code></span>
+<span class="codeline" id="line-100"><code>		// Wait for the interrupter goroutine to exit before returning</code></span>
+<span class="codeline" id="line-101"><code>		// from connect.</code></span>
+<span class="codeline" id="line-102"><code>		done := make(chan struct{})</code></span>
+<span class="codeline" id="line-103"><code>		interruptRes := make(chan error)</code></span>
+<span class="codeline" id="line-104"><code>		defer func() {</code></span>
+<span class="codeline" id="line-105"><code>			close(done)</code></span>
+<span class="codeline" id="line-106"><code>			if ctxErr := &lt;-interruptRes; ctxErr != nil &amp;&amp; ret == nil {</code></span>
+<span class="codeline" id="line-107"><code>				// The interrupter goroutine called SetWriteDeadline,</code></span>
+<span class="codeline" id="line-108"><code>				// but the connect code below had returned from</code></span>
+<span class="codeline" id="line-109"><code>				// waitWrite already and did a successful connect (ret</code></span>
+<span class="codeline" id="line-110"><code>				// == nil). Because we've now poisoned the connection</code></span>
+<span class="codeline" id="line-111"><code>				// by making it unwritable, don't return a successful</code></span>
+<span class="codeline" id="line-112"><code>				// dial. This was issue 16523.</code></span>
+<span class="codeline" id="line-113"><code>				ret = mapErr(ctxErr)</code></span>
+<span class="codeline" id="line-114"><code>				fd.Close() // prevent a leak</code></span>
+<span class="codeline" id="line-115"><code>			}</code></span>
+<span class="codeline" id="line-116"><code>		}()</code></span>
+<span class="codeline" id="line-117"><code>		go func() {</code></span>
+<span class="codeline" id="line-118"><code>			select {</code></span>
+<span class="codeline" id="line-119"><code>			case &lt;-ctxDone:</code></span>
+<span class="codeline" id="line-120"><code>				// Force the runtime's poller to immediately give up</code></span>
+<span class="codeline" id="line-121"><code>				// waiting for writability, unblocking waitWrite</code></span>
+<span class="codeline" id="line-122"><code>				// below.</code></span>
+<span class="codeline" id="line-123"><code>				fd.pfd.SetWriteDeadline(aLongTimeAgo)</code></span>
+<span class="codeline" id="line-124"><code>				testHookCanceledDial()</code></span>
+<span class="codeline" id="line-125"><code>				interruptRes &lt;- ctx.Err()</code></span>
+<span class="codeline" id="line-126"><code>			case &lt;-done:</code></span>
+<span class="codeline" id="line-127"><code>				interruptRes &lt;- nil</code></span>
+<span class="codeline" id="line-128"><code>			}</code></span>
+<span class="codeline" id="line-129"><code>		}()</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	for {</code></span>
+<span class="codeline" id="line-133"><code>		// Performing multiple connect system calls on a</code></span>
+<span class="codeline" id="line-134"><code>		// non-blocking socket under Unix variants does not</code></span>
+<span class="codeline" id="line-135"><code>		// necessarily result in earlier errors being</code></span>
+<span class="codeline" id="line-136"><code>		// returned. Instead, once runtime-integrated network</code></span>
+<span class="codeline" id="line-137"><code>		// poller tells us that the socket is ready, get the</code></span>
+<span class="codeline" id="line-138"><code>		// SO_ERROR socket option to see if the connection</code></span>
+<span class="codeline" id="line-139"><code>		// succeeded or failed. See issue 7474 for further</code></span>
+<span class="codeline" id="line-140"><code>		// details.</code></span>
+<span class="codeline" id="line-141"><code>		if err := fd.pfd.WaitWrite(); err != nil {</code></span>
+<span class="codeline" id="line-142"><code>			select {</code></span>
+<span class="codeline" id="line-143"><code>			case &lt;-ctxDone:</code></span>
+<span class="codeline" id="line-144"><code>				return nil, mapErr(ctx.Err())</code></span>
+<span class="codeline" id="line-145"><code>			default:</code></span>
+<span class="codeline" id="line-146"><code>			}</code></span>
+<span class="codeline" id="line-147"><code>			return nil, err</code></span>
+<span class="codeline" id="line-148"><code>		}</code></span>
+<span class="codeline" id="line-149"><code>		nerr, err := getsockoptIntFunc(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_ERROR)</code></span>
+<span class="codeline" id="line-150"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-151"><code>			return nil, os.NewSyscallError("getsockopt", err)</code></span>
+<span class="codeline" id="line-152"><code>		}</code></span>
+<span class="codeline" id="line-153"><code>		switch err := syscall.Errno(nerr); err {</code></span>
+<span class="codeline" id="line-154"><code>		case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:</code></span>
+<span class="codeline" id="line-155"><code>		case syscall.EISCONN:</code></span>
+<span class="codeline" id="line-156"><code>			return nil, nil</code></span>
+<span class="codeline" id="line-157"><code>		case syscall.Errno(0):</code></span>
+<span class="codeline" id="line-158"><code>			// The runtime poller can wake us up spuriously;</code></span>
+<span class="codeline" id="line-159"><code>			// see issues 14548 and 19289. Check that we are</code></span>
+<span class="codeline" id="line-160"><code>			// really connected; if not, wait again.</code></span>
+<span class="codeline" id="line-161"><code>			if rsa, err := syscall.Getpeername(fd.pfd.Sysfd); err == nil {</code></span>
+<span class="codeline" id="line-162"><code>				return rsa, nil</code></span>
+<span class="codeline" id="line-163"><code>			}</code></span>
+<span class="codeline" id="line-164"><code>		default:</code></span>
+<span class="codeline" id="line-165"><code>			return nil, os.NewSyscallError("connect", err)</code></span>
+<span class="codeline" id="line-166"><code>		}</code></span>
+<span class="codeline" id="line-167"><code>		runtime.KeepAlive(fd)</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code>}</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>func (fd *netFD) accept() (netfd *netFD, err error) {</code></span>
+<span class="codeline" id="line-172"><code>	d, rsa, errcall, err := fd.pfd.Accept()</code></span>
+<span class="codeline" id="line-173"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-174"><code>		if errcall != "" {</code></span>
+<span class="codeline" id="line-175"><code>			err = wrapSyscallError(errcall, err)</code></span>
+<span class="codeline" id="line-176"><code>		}</code></span>
+<span class="codeline" id="line-177"><code>		return nil, err</code></span>
+<span class="codeline" id="line-178"><code>	}</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>	if netfd, err = newFD(d, fd.family, fd.sotype, fd.net); err != nil {</code></span>
+<span class="codeline" id="line-181"><code>		poll.CloseFunc(d)</code></span>
+<span class="codeline" id="line-182"><code>		return nil, err</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code>	if err = netfd.init(); err != nil {</code></span>
+<span class="codeline" id="line-185"><code>		netfd.Close()</code></span>
+<span class="codeline" id="line-186"><code>		return nil, err</code></span>
+<span class="codeline" id="line-187"><code>	}</code></span>
+<span class="codeline" id="line-188"><code>	lsa, _ := syscall.Getsockname(netfd.pfd.Sysfd)</code></span>
+<span class="codeline" id="line-189"><code>	netfd.setAddr(netfd.addrFunc()(lsa), netfd.addrFunc()(rsa))</code></span>
+<span class="codeline" id="line-190"><code>	return netfd, nil</code></span>
+<span class="codeline" id="line-191"><code>}</code></span>
+<span class="codeline" id="line-192"><code></code></span>
+<span class="codeline" id="line-193"><code>// Defined in os package.</code></span>
+<span class="codeline" id="line-194"><code>func newUnixFile(fd int, name string) *os.File</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>func (fd *netFD) dup() (f *os.File, err error) {</code></span>
+<span class="codeline" id="line-197"><code>	ns, call, err := fd.pfd.Dup()</code></span>
+<span class="codeline" id="line-198"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-199"><code>		if call != "" {</code></span>
+<span class="codeline" id="line-200"><code>			err = os.NewSyscallError(call, err)</code></span>
+<span class="codeline" id="line-201"><code>		}</code></span>
+<span class="codeline" id="line-202"><code>		return nil, err</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>	return newUnixFile(ns, fd.name()), nil</code></span>
+<span class="codeline" id="line-206"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

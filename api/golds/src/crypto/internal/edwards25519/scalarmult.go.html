@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: scalarmult.go in package crypto/internal/edwards25519</title>
+<link href="../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	scalarmult.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../pkg/crypto/internal/edwards25519.html">crypto/internal/edwards25519</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright (c) 2019 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package edwards25519</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import "sync"</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>// basepointTable is a set of 32 affineLookupTables, where table i is generated</code></span>
+<span class="codeline" id="line-10"><code>// from 256i * basepoint. It is precomputed the first time it's used.</code></span>
+<span class="codeline" id="line-11"><code>func basepointTable() *[32]affineLookupTable {</code></span>
+<span class="codeline" id="line-12"><code>	basepointTablePrecomp.initOnce.Do(func() {</code></span>
+<span class="codeline" id="line-13"><code>		p := NewGeneratorPoint()</code></span>
+<span class="codeline" id="line-14"><code>		for i := 0; i &lt; 32; i++ {</code></span>
+<span class="codeline" id="line-15"><code>			basepointTablePrecomp.table[i].FromP3(p)</code></span>
+<span class="codeline" id="line-16"><code>			for j := 0; j &lt; 8; j++ {</code></span>
+<span class="codeline" id="line-17"><code>				p.Add(p, p)</code></span>
+<span class="codeline" id="line-18"><code>			}</code></span>
+<span class="codeline" id="line-19"><code>		}</code></span>
+<span class="codeline" id="line-20"><code>	})</code></span>
+<span class="codeline" id="line-21"><code>	return &amp;basepointTablePrecomp.table</code></span>
+<span class="codeline" id="line-22"><code>}</code></span>
+<span class="codeline" id="line-23"><code></code></span>
+<span class="codeline" id="line-24"><code>var basepointTablePrecomp struct {</code></span>
+<span class="codeline" id="line-25"><code>	table    [32]affineLookupTable</code></span>
+<span class="codeline" id="line-26"><code>	initOnce sync.Once</code></span>
+<span class="codeline" id="line-27"><code>}</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>// ScalarBaseMult sets v = x * B, where B is the canonical generator, and</code></span>
+<span class="codeline" id="line-30"><code>// returns v.</code></span>
+<span class="codeline" id="line-31"><code>//</code></span>
+<span class="codeline" id="line-32"><code>// The scalar multiplication is done in constant time.</code></span>
+<span class="codeline" id="line-33"><code>func (v *Point) ScalarBaseMult(x *Scalar) *Point {</code></span>
+<span class="codeline" id="line-34"><code>	basepointTable := basepointTable()</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>	// Write x = sum(x_i * 16^i) so  x*B = sum( B*x_i*16^i )</code></span>
+<span class="codeline" id="line-37"><code>	// as described in the Ed25519 paper</code></span>
+<span class="codeline" id="line-38"><code>	//</code></span>
+<span class="codeline" id="line-39"><code>	// Group even and odd coefficients</code></span>
+<span class="codeline" id="line-40"><code>	// x*B     = x_0*16^0*B + x_2*16^2*B + ... + x_62*16^62*B</code></span>
+<span class="codeline" id="line-41"><code>	//         + x_1*16^1*B + x_3*16^3*B + ... + x_63*16^63*B</code></span>
+<span class="codeline" id="line-42"><code>	// x*B     = x_0*16^0*B + x_2*16^2*B + ... + x_62*16^62*B</code></span>
+<span class="codeline" id="line-43"><code>	//    + 16*( x_1*16^0*B + x_3*16^2*B + ... + x_63*16^62*B)</code></span>
+<span class="codeline" id="line-44"><code>	//</code></span>
+<span class="codeline" id="line-45"><code>	// We use a lookup table for each i to get x_i*16^(2*i)*B</code></span>
+<span class="codeline" id="line-46"><code>	// and do four doublings to multiply by 16.</code></span>
+<span class="codeline" id="line-47"><code>	digits := x.signedRadix16()</code></span>
+<span class="codeline" id="line-48"><code></code></span>
+<span class="codeline" id="line-49"><code>	multiple := &amp;affineCached{}</code></span>
+<span class="codeline" id="line-50"><code>	tmp1 := &amp;projP1xP1{}</code></span>
+<span class="codeline" id="line-51"><code>	tmp2 := &amp;projP2{}</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>	// Accumulate the odd components first</code></span>
+<span class="codeline" id="line-54"><code>	v.Set(NewIdentityPoint())</code></span>
+<span class="codeline" id="line-55"><code>	for i := 1; i &lt; 64; i += 2 {</code></span>
+<span class="codeline" id="line-56"><code>		basepointTable[i/2].SelectInto(multiple, digits[i])</code></span>
+<span class="codeline" id="line-57"><code>		tmp1.AddAffine(v, multiple)</code></span>
+<span class="codeline" id="line-58"><code>		v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-59"><code>	}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>	// Multiply by 16</code></span>
+<span class="codeline" id="line-62"><code>	tmp2.FromP3(v)       // tmp2 =    v in P2 coords</code></span>
+<span class="codeline" id="line-63"><code>	tmp1.Double(tmp2)    // tmp1 =  2*v in P1xP1 coords</code></span>
+<span class="codeline" id="line-64"><code>	tmp2.FromP1xP1(tmp1) // tmp2 =  2*v in P2 coords</code></span>
+<span class="codeline" id="line-65"><code>	tmp1.Double(tmp2)    // tmp1 =  4*v in P1xP1 coords</code></span>
+<span class="codeline" id="line-66"><code>	tmp2.FromP1xP1(tmp1) // tmp2 =  4*v in P2 coords</code></span>
+<span class="codeline" id="line-67"><code>	tmp1.Double(tmp2)    // tmp1 =  8*v in P1xP1 coords</code></span>
+<span class="codeline" id="line-68"><code>	tmp2.FromP1xP1(tmp1) // tmp2 =  8*v in P2 coords</code></span>
+<span class="codeline" id="line-69"><code>	tmp1.Double(tmp2)    // tmp1 = 16*v in P1xP1 coords</code></span>
+<span class="codeline" id="line-70"><code>	v.fromP1xP1(tmp1)    // now v = 16*(odd components)</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	// Accumulate the even components</code></span>
+<span class="codeline" id="line-73"><code>	for i := 0; i &lt; 64; i += 2 {</code></span>
+<span class="codeline" id="line-74"><code>		basepointTable[i/2].SelectInto(multiple, digits[i])</code></span>
+<span class="codeline" id="line-75"><code>		tmp1.AddAffine(v, multiple)</code></span>
+<span class="codeline" id="line-76"><code>		v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-77"><code>	}</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>	return v</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>// ScalarMult sets v = x * q, and returns v.</code></span>
+<span class="codeline" id="line-83"><code>//</code></span>
+<span class="codeline" id="line-84"><code>// The scalar multiplication is done in constant time.</code></span>
+<span class="codeline" id="line-85"><code>func (v *Point) ScalarMult(x *Scalar, q *Point) *Point {</code></span>
+<span class="codeline" id="line-86"><code>	checkInitialized(q)</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>	var table projLookupTable</code></span>
+<span class="codeline" id="line-89"><code>	table.FromP3(q)</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>	// Write x = sum(x_i * 16^i)</code></span>
+<span class="codeline" id="line-92"><code>	// so  x*Q = sum( Q*x_i*16^i )</code></span>
+<span class="codeline" id="line-93"><code>	//         = Q*x_0 + 16*(Q*x_1 + 16*( ... + Q*x_63) ... )</code></span>
+<span class="codeline" id="line-94"><code>	//           &lt;------compute inside out---------</code></span>
+<span class="codeline" id="line-95"><code>	//</code></span>
+<span class="codeline" id="line-96"><code>	// We use the lookup table to get the x_i*Q values</code></span>
+<span class="codeline" id="line-97"><code>	// and do four doublings to compute 16*Q</code></span>
+<span class="codeline" id="line-98"><code>	digits := x.signedRadix16()</code></span>
+<span class="codeline" id="line-99"><code></code></span>
+<span class="codeline" id="line-100"><code>	// Unwrap first loop iteration to save computing 16*identity</code></span>
+<span class="codeline" id="line-101"><code>	multiple := &amp;projCached{}</code></span>
+<span class="codeline" id="line-102"><code>	tmp1 := &amp;projP1xP1{}</code></span>
+<span class="codeline" id="line-103"><code>	tmp2 := &amp;projP2{}</code></span>
+<span class="codeline" id="line-104"><code>	table.SelectInto(multiple, digits[63])</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>	v.Set(NewIdentityPoint())</code></span>
+<span class="codeline" id="line-107"><code>	tmp1.Add(v, multiple) // tmp1 = x_63*Q in P1xP1 coords</code></span>
+<span class="codeline" id="line-108"><code>	for i := 62; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-109"><code>		tmp2.FromP1xP1(tmp1) // tmp2 =    (prev) in P2 coords</code></span>
+<span class="codeline" id="line-110"><code>		tmp1.Double(tmp2)    // tmp1 =  2*(prev) in P1xP1 coords</code></span>
+<span class="codeline" id="line-111"><code>		tmp2.FromP1xP1(tmp1) // tmp2 =  2*(prev) in P2 coords</code></span>
+<span class="codeline" id="line-112"><code>		tmp1.Double(tmp2)    // tmp1 =  4*(prev) in P1xP1 coords</code></span>
+<span class="codeline" id="line-113"><code>		tmp2.FromP1xP1(tmp1) // tmp2 =  4*(prev) in P2 coords</code></span>
+<span class="codeline" id="line-114"><code>		tmp1.Double(tmp2)    // tmp1 =  8*(prev) in P1xP1 coords</code></span>
+<span class="codeline" id="line-115"><code>		tmp2.FromP1xP1(tmp1) // tmp2 =  8*(prev) in P2 coords</code></span>
+<span class="codeline" id="line-116"><code>		tmp1.Double(tmp2)    // tmp1 = 16*(prev) in P1xP1 coords</code></span>
+<span class="codeline" id="line-117"><code>		v.fromP1xP1(tmp1)    //    v = 16*(prev) in P3 coords</code></span>
+<span class="codeline" id="line-118"><code>		table.SelectInto(multiple, digits[i])</code></span>
+<span class="codeline" id="line-119"><code>		tmp1.Add(v, multiple) // tmp1 = x_i*Q + 16*(prev) in P1xP1 coords</code></span>
+<span class="codeline" id="line-120"><code>	}</code></span>
+<span class="codeline" id="line-121"><code>	v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-122"><code>	return v</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// basepointNafTable is the nafLookupTable8 for the basepoint.</code></span>
+<span class="codeline" id="line-126"><code>// It is precomputed the first time it's used.</code></span>
+<span class="codeline" id="line-127"><code>func basepointNafTable() *nafLookupTable8 {</code></span>
+<span class="codeline" id="line-128"><code>	basepointNafTablePrecomp.initOnce.Do(func() {</code></span>
+<span class="codeline" id="line-129"><code>		basepointNafTablePrecomp.table.FromP3(NewGeneratorPoint())</code></span>
+<span class="codeline" id="line-130"><code>	})</code></span>
+<span class="codeline" id="line-131"><code>	return &amp;basepointNafTablePrecomp.table</code></span>
+<span class="codeline" id="line-132"><code>}</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>var basepointNafTablePrecomp struct {</code></span>
+<span class="codeline" id="line-135"><code>	table    nafLookupTable8</code></span>
+<span class="codeline" id="line-136"><code>	initOnce sync.Once</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>// VarTimeDoubleScalarBaseMult sets v = a * A + b * B, where B is the canonical</code></span>
+<span class="codeline" id="line-140"><code>// generator, and returns v.</code></span>
+<span class="codeline" id="line-141"><code>//</code></span>
+<span class="codeline" id="line-142"><code>// Execution time depends on the inputs.</code></span>
+<span class="codeline" id="line-143"><code>func (v *Point) VarTimeDoubleScalarBaseMult(a *Scalar, A *Point, b *Scalar) *Point {</code></span>
+<span class="codeline" id="line-144"><code>	checkInitialized(A)</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	// Similarly to the single variable-base approach, we compute</code></span>
+<span class="codeline" id="line-147"><code>	// digits and use them with a lookup table.  However, because</code></span>
+<span class="codeline" id="line-148"><code>	// we are allowed to do variable-time operations, we don't</code></span>
+<span class="codeline" id="line-149"><code>	// need constant-time lookups or constant-time digit</code></span>
+<span class="codeline" id="line-150"><code>	// computations.</code></span>
+<span class="codeline" id="line-151"><code>	//</code></span>
+<span class="codeline" id="line-152"><code>	// So we use a non-adjacent form of some width w instead of</code></span>
+<span class="codeline" id="line-153"><code>	// radix 16.  This is like a binary representation (one digit</code></span>
+<span class="codeline" id="line-154"><code>	// for each binary place) but we allow the digits to grow in</code></span>
+<span class="codeline" id="line-155"><code>	// magnitude up to 2^{w-1} so that the nonzero digits are as</code></span>
+<span class="codeline" id="line-156"><code>	// sparse as possible.  Intuitively, this "condenses" the</code></span>
+<span class="codeline" id="line-157"><code>	// "mass" of the scalar onto sparse coefficients (meaning</code></span>
+<span class="codeline" id="line-158"><code>	// fewer additions).</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>	basepointNafTable := basepointNafTable()</code></span>
+<span class="codeline" id="line-161"><code>	var aTable nafLookupTable5</code></span>
+<span class="codeline" id="line-162"><code>	aTable.FromP3(A)</code></span>
+<span class="codeline" id="line-163"><code>	// Because the basepoint is fixed, we can use a wider NAF</code></span>
+<span class="codeline" id="line-164"><code>	// corresponding to a bigger table.</code></span>
+<span class="codeline" id="line-165"><code>	aNaf := a.nonAdjacentForm(5)</code></span>
+<span class="codeline" id="line-166"><code>	bNaf := b.nonAdjacentForm(8)</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>	// Find the first nonzero coefficient.</code></span>
+<span class="codeline" id="line-169"><code>	i := 255</code></span>
+<span class="codeline" id="line-170"><code>	for j := i; j &gt;= 0; j-- {</code></span>
+<span class="codeline" id="line-171"><code>		if aNaf[j] != 0 || bNaf[j] != 0 {</code></span>
+<span class="codeline" id="line-172"><code>			break</code></span>
+<span class="codeline" id="line-173"><code>		}</code></span>
+<span class="codeline" id="line-174"><code>	}</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>	multA := &amp;projCached{}</code></span>
+<span class="codeline" id="line-177"><code>	multB := &amp;affineCached{}</code></span>
+<span class="codeline" id="line-178"><code>	tmp1 := &amp;projP1xP1{}</code></span>
+<span class="codeline" id="line-179"><code>	tmp2 := &amp;projP2{}</code></span>
+<span class="codeline" id="line-180"><code>	tmp2.Zero()</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>	// Move from high to low bits, doubling the accumulator</code></span>
+<span class="codeline" id="line-183"><code>	// at each iteration and checking whether there is a nonzero</code></span>
+<span class="codeline" id="line-184"><code>	// coefficient to look up a multiple of.</code></span>
+<span class="codeline" id="line-185"><code>	for ; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-186"><code>		tmp1.Double(tmp2)</code></span>
+<span class="codeline" id="line-187"><code></code></span>
+<span class="codeline" id="line-188"><code>		// Only update v if we have a nonzero coeff to add in.</code></span>
+<span class="codeline" id="line-189"><code>		if aNaf[i] &gt; 0 {</code></span>
+<span class="codeline" id="line-190"><code>			v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-191"><code>			aTable.SelectInto(multA, aNaf[i])</code></span>
+<span class="codeline" id="line-192"><code>			tmp1.Add(v, multA)</code></span>
+<span class="codeline" id="line-193"><code>		} else if aNaf[i] &lt; 0 {</code></span>
+<span class="codeline" id="line-194"><code>			v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-195"><code>			aTable.SelectInto(multA, -aNaf[i])</code></span>
+<span class="codeline" id="line-196"><code>			tmp1.Sub(v, multA)</code></span>
+<span class="codeline" id="line-197"><code>		}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>		if bNaf[i] &gt; 0 {</code></span>
+<span class="codeline" id="line-200"><code>			v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-201"><code>			basepointNafTable.SelectInto(multB, bNaf[i])</code></span>
+<span class="codeline" id="line-202"><code>			tmp1.AddAffine(v, multB)</code></span>
+<span class="codeline" id="line-203"><code>		} else if bNaf[i] &lt; 0 {</code></span>
+<span class="codeline" id="line-204"><code>			v.fromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-205"><code>			basepointNafTable.SelectInto(multB, -bNaf[i])</code></span>
+<span class="codeline" id="line-206"><code>			tmp1.SubAffine(v, multB)</code></span>
+<span class="codeline" id="line-207"><code>		}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>		tmp2.FromP1xP1(tmp1)</code></span>
+<span class="codeline" id="line-210"><code>	}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>	v.fromP2(tmp2)</code></span>
+<span class="codeline" id="line-213"><code>	return v</code></span>
+<span class="codeline" id="line-214"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: trace2buf.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	trace2buf.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build goexperiment.exectracer2</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// Trace buffer management.</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>package runtime</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>import (</code></span>
+<span class="codeline" id="line-12"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-13"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-14"><code>)</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// Maximum number of bytes required to encode uint64 in base-128.</code></span>
+<span class="codeline" id="line-17"><code>const traceBytesPerNumber = 10</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>// traceWriter is the interface for writing all trace data.</code></span>
+<span class="codeline" id="line-20"><code>//</code></span>
+<span class="codeline" id="line-21"><code>// This type is passed around as a value, and all of its methods return</code></span>
+<span class="codeline" id="line-22"><code>// a new traceWriter. This allows for chaining together calls in a fluent-style</code></span>
+<span class="codeline" id="line-23"><code>// API. This is partly stylistic, and very slightly for performance, since</code></span>
+<span class="codeline" id="line-24"><code>// the compiler can destructure this value and pass it between calls as</code></span>
+<span class="codeline" id="line-25"><code>// just regular arguments. However, this style is not load-bearing, and</code></span>
+<span class="codeline" id="line-26"><code>// we can change it if it's deemed too error-prone.</code></span>
+<span class="codeline" id="line-27"><code>type traceWriter struct {</code></span>
+<span class="codeline" id="line-28"><code>	traceLocker</code></span>
+<span class="codeline" id="line-29"><code>	*traceBuf</code></span>
+<span class="codeline" id="line-30"><code>}</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// write returns an a traceWriter that writes into the current M's stream.</code></span>
+<span class="codeline" id="line-33"><code>func (tl traceLocker) writer() traceWriter {</code></span>
+<span class="codeline" id="line-34"><code>	return traceWriter{traceLocker: tl, traceBuf: tl.mp.trace.buf[tl.gen%2]}</code></span>
+<span class="codeline" id="line-35"><code>}</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// unsafeTraceWriter produces a traceWriter that doesn't lock the trace.</code></span>
+<span class="codeline" id="line-38"><code>//</code></span>
+<span class="codeline" id="line-39"><code>// It should only be used in contexts where either:</code></span>
+<span class="codeline" id="line-40"><code>// - Another traceLocker is held.</code></span>
+<span class="codeline" id="line-41"><code>// - trace.gen is prevented from advancing.</code></span>
+<span class="codeline" id="line-42"><code>//</code></span>
+<span class="codeline" id="line-43"><code>// buf may be nil.</code></span>
+<span class="codeline" id="line-44"><code>func unsafeTraceWriter(gen uintptr, buf *traceBuf) traceWriter {</code></span>
+<span class="codeline" id="line-45"><code>	return traceWriter{traceLocker: traceLocker{gen: gen}, traceBuf: buf}</code></span>
+<span class="codeline" id="line-46"><code>}</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>// end writes the buffer back into the m.</code></span>
+<span class="codeline" id="line-49"><code>func (w traceWriter) end() {</code></span>
+<span class="codeline" id="line-50"><code>	if w.mp == nil {</code></span>
+<span class="codeline" id="line-51"><code>		// Tolerate a nil mp. It makes code that creates traceWriters directly</code></span>
+<span class="codeline" id="line-52"><code>		// less error-prone.</code></span>
+<span class="codeline" id="line-53"><code>		return</code></span>
+<span class="codeline" id="line-54"><code>	}</code></span>
+<span class="codeline" id="line-55"><code>	w.mp.trace.buf[w.gen%2] = w.traceBuf</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// ensure makes sure that at least maxSize bytes are available to write.</code></span>
+<span class="codeline" id="line-59"><code>//</code></span>
+<span class="codeline" id="line-60"><code>// Returns whether the buffer was flushed.</code></span>
+<span class="codeline" id="line-61"><code>func (w traceWriter) ensure(maxSize int) (traceWriter, bool) {</code></span>
+<span class="codeline" id="line-62"><code>	refill := w.traceBuf == nil || !w.available(maxSize)</code></span>
+<span class="codeline" id="line-63"><code>	if refill {</code></span>
+<span class="codeline" id="line-64"><code>		w = w.refill()</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code>	return w, refill</code></span>
+<span class="codeline" id="line-67"><code>}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>// flush puts w.traceBuf on the queue of full buffers.</code></span>
+<span class="codeline" id="line-70"><code>func (w traceWriter) flush() traceWriter {</code></span>
+<span class="codeline" id="line-71"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-72"><code>		lock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-73"><code>		if w.traceBuf != nil {</code></span>
+<span class="codeline" id="line-74"><code>			traceBufFlush(w.traceBuf, w.gen)</code></span>
+<span class="codeline" id="line-75"><code>		}</code></span>
+<span class="codeline" id="line-76"><code>		unlock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-77"><code>	})</code></span>
+<span class="codeline" id="line-78"><code>	w.traceBuf = nil</code></span>
+<span class="codeline" id="line-79"><code>	return w</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>// refill puts w.traceBuf on the queue of full buffers and refresh's w's buffer.</code></span>
+<span class="codeline" id="line-83"><code>func (w traceWriter) refill() traceWriter {</code></span>
+<span class="codeline" id="line-84"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-85"><code>		lock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-86"><code>		if w.traceBuf != nil {</code></span>
+<span class="codeline" id="line-87"><code>			traceBufFlush(w.traceBuf, w.gen)</code></span>
+<span class="codeline" id="line-88"><code>		}</code></span>
+<span class="codeline" id="line-89"><code>		if trace.empty != nil {</code></span>
+<span class="codeline" id="line-90"><code>			w.traceBuf = trace.empty</code></span>
+<span class="codeline" id="line-91"><code>			trace.empty = w.traceBuf.link</code></span>
+<span class="codeline" id="line-92"><code>			unlock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-93"><code>		} else {</code></span>
+<span class="codeline" id="line-94"><code>			unlock(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-95"><code>			w.traceBuf = (*traceBuf)(sysAlloc(unsafe.Sizeof(traceBuf{}), &amp;memstats.other_sys))</code></span>
+<span class="codeline" id="line-96"><code>			if w.traceBuf == nil {</code></span>
+<span class="codeline" id="line-97"><code>				throw("trace: out of memory")</code></span>
+<span class="codeline" id="line-98"><code>			}</code></span>
+<span class="codeline" id="line-99"><code>		}</code></span>
+<span class="codeline" id="line-100"><code>	})</code></span>
+<span class="codeline" id="line-101"><code>	// Initialize the buffer.</code></span>
+<span class="codeline" id="line-102"><code>	ts := traceClockNow()</code></span>
+<span class="codeline" id="line-103"><code>	if ts &lt;= w.traceBuf.lastTime {</code></span>
+<span class="codeline" id="line-104"><code>		ts = w.traceBuf.lastTime + 1</code></span>
+<span class="codeline" id="line-105"><code>	}</code></span>
+<span class="codeline" id="line-106"><code>	w.traceBuf.lastTime = ts</code></span>
+<span class="codeline" id="line-107"><code>	w.traceBuf.link = nil</code></span>
+<span class="codeline" id="line-108"><code>	w.traceBuf.pos = 0</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>	// Tolerate a nil mp.</code></span>
+<span class="codeline" id="line-111"><code>	mID := ^uint64(0)</code></span>
+<span class="codeline" id="line-112"><code>	if w.mp != nil {</code></span>
+<span class="codeline" id="line-113"><code>		mID = uint64(w.mp.procid)</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	// Write the buffer's header.</code></span>
+<span class="codeline" id="line-117"><code>	w.byte(byte(traceEvEventBatch))</code></span>
+<span class="codeline" id="line-118"><code>	w.varint(uint64(w.gen))</code></span>
+<span class="codeline" id="line-119"><code>	w.varint(uint64(mID))</code></span>
+<span class="codeline" id="line-120"><code>	w.varint(uint64(ts))</code></span>
+<span class="codeline" id="line-121"><code>	w.traceBuf.lenPos = w.varintReserve()</code></span>
+<span class="codeline" id="line-122"><code>	return w</code></span>
+<span class="codeline" id="line-123"><code>}</code></span>
+<span class="codeline" id="line-124"><code></code></span>
+<span class="codeline" id="line-125"><code>// traceBufQueue is a FIFO of traceBufs.</code></span>
+<span class="codeline" id="line-126"><code>type traceBufQueue struct {</code></span>
+<span class="codeline" id="line-127"><code>	head, tail *traceBuf</code></span>
+<span class="codeline" id="line-128"><code>}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>// push queues buf into queue of buffers.</code></span>
+<span class="codeline" id="line-131"><code>func (q *traceBufQueue) push(buf *traceBuf) {</code></span>
+<span class="codeline" id="line-132"><code>	buf.link = nil</code></span>
+<span class="codeline" id="line-133"><code>	if q.head == nil {</code></span>
+<span class="codeline" id="line-134"><code>		q.head = buf</code></span>
+<span class="codeline" id="line-135"><code>	} else {</code></span>
+<span class="codeline" id="line-136"><code>		q.tail.link = buf</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code>	q.tail = buf</code></span>
+<span class="codeline" id="line-139"><code>}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>// pop dequeues from the queue of buffers.</code></span>
+<span class="codeline" id="line-142"><code>func (q *traceBufQueue) pop() *traceBuf {</code></span>
+<span class="codeline" id="line-143"><code>	buf := q.head</code></span>
+<span class="codeline" id="line-144"><code>	if buf == nil {</code></span>
+<span class="codeline" id="line-145"><code>		return nil</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	q.head = buf.link</code></span>
+<span class="codeline" id="line-148"><code>	if q.head == nil {</code></span>
+<span class="codeline" id="line-149"><code>		q.tail = nil</code></span>
+<span class="codeline" id="line-150"><code>	}</code></span>
+<span class="codeline" id="line-151"><code>	buf.link = nil</code></span>
+<span class="codeline" id="line-152"><code>	return buf</code></span>
+<span class="codeline" id="line-153"><code>}</code></span>
+<span class="codeline" id="line-154"><code></code></span>
+<span class="codeline" id="line-155"><code>func (q *traceBufQueue) empty() bool {</code></span>
+<span class="codeline" id="line-156"><code>	return q.head == nil</code></span>
+<span class="codeline" id="line-157"><code>}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>// traceBufHeader is per-P tracing buffer.</code></span>
+<span class="codeline" id="line-160"><code>type traceBufHeader struct {</code></span>
+<span class="codeline" id="line-161"><code>	link     *traceBuf // in trace.empty/full</code></span>
+<span class="codeline" id="line-162"><code>	lastTime traceTime // when we wrote the last event</code></span>
+<span class="codeline" id="line-163"><code>	pos      int       // next write offset in arr</code></span>
+<span class="codeline" id="line-164"><code>	lenPos   int       // position of batch length value</code></span>
+<span class="codeline" id="line-165"><code>}</code></span>
+<span class="codeline" id="line-166"><code></code></span>
+<span class="codeline" id="line-167"><code>// traceBuf is per-M tracing buffer.</code></span>
+<span class="codeline" id="line-168"><code>//</code></span>
+<span class="codeline" id="line-169"><code>// TODO(mknyszek): Rename traceBuf to traceBatch, since they map 1:1 with event batches.</code></span>
+<span class="codeline" id="line-170"><code>type traceBuf struct {</code></span>
+<span class="codeline" id="line-171"><code>	_ sys.NotInHeap</code></span>
+<span class="codeline" id="line-172"><code>	traceBufHeader</code></span>
+<span class="codeline" id="line-173"><code>	arr [64&lt;&lt;10 - unsafe.Sizeof(traceBufHeader{})]byte // underlying buffer for traceBufHeader.buf</code></span>
+<span class="codeline" id="line-174"><code>}</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>// byte appends v to buf.</code></span>
+<span class="codeline" id="line-177"><code>func (buf *traceBuf) byte(v byte) {</code></span>
+<span class="codeline" id="line-178"><code>	buf.arr[buf.pos] = v</code></span>
+<span class="codeline" id="line-179"><code>	buf.pos++</code></span>
+<span class="codeline" id="line-180"><code>}</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>// varint appends v to buf in little-endian-base-128 encoding.</code></span>
+<span class="codeline" id="line-183"><code>func (buf *traceBuf) varint(v uint64) {</code></span>
+<span class="codeline" id="line-184"><code>	pos := buf.pos</code></span>
+<span class="codeline" id="line-185"><code>	arr := buf.arr[pos : pos+traceBytesPerNumber]</code></span>
+<span class="codeline" id="line-186"><code>	for i := range arr {</code></span>
+<span class="codeline" id="line-187"><code>		if v &lt; 0x80 {</code></span>
+<span class="codeline" id="line-188"><code>			pos += i + 1</code></span>
+<span class="codeline" id="line-189"><code>			arr[i] = byte(v)</code></span>
+<span class="codeline" id="line-190"><code>			break</code></span>
+<span class="codeline" id="line-191"><code>		}</code></span>
+<span class="codeline" id="line-192"><code>		arr[i] = 0x80 | byte(v)</code></span>
+<span class="codeline" id="line-193"><code>		v &gt;&gt;= 7</code></span>
+<span class="codeline" id="line-194"><code>	}</code></span>
+<span class="codeline" id="line-195"><code>	buf.pos = pos</code></span>
+<span class="codeline" id="line-196"><code>}</code></span>
+<span class="codeline" id="line-197"><code></code></span>
+<span class="codeline" id="line-198"><code>// varintReserve reserves enough space in buf to hold any varint.</code></span>
+<span class="codeline" id="line-199"><code>//</code></span>
+<span class="codeline" id="line-200"><code>// Space reserved this way can be filled in with the varintAt method.</code></span>
+<span class="codeline" id="line-201"><code>func (buf *traceBuf) varintReserve() int {</code></span>
+<span class="codeline" id="line-202"><code>	p := buf.pos</code></span>
+<span class="codeline" id="line-203"><code>	buf.pos += traceBytesPerNumber</code></span>
+<span class="codeline" id="line-204"><code>	return p</code></span>
+<span class="codeline" id="line-205"><code>}</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>// stringData appends s's data directly to buf.</code></span>
+<span class="codeline" id="line-208"><code>func (buf *traceBuf) stringData(s string) {</code></span>
+<span class="codeline" id="line-209"><code>	buf.pos += copy(buf.arr[buf.pos:], s)</code></span>
+<span class="codeline" id="line-210"><code>}</code></span>
+<span class="codeline" id="line-211"><code></code></span>
+<span class="codeline" id="line-212"><code>func (buf *traceBuf) available(size int) bool {</code></span>
+<span class="codeline" id="line-213"><code>	return len(buf.arr)-buf.pos &gt;= size</code></span>
+<span class="codeline" id="line-214"><code>}</code></span>
+<span class="codeline" id="line-215"><code></code></span>
+<span class="codeline" id="line-216"><code>// varintAt writes varint v at byte position pos in buf. This always</code></span>
+<span class="codeline" id="line-217"><code>// consumes traceBytesPerNumber bytes. This is intended for when the caller</code></span>
+<span class="codeline" id="line-218"><code>// needs to reserve space for a varint but can't populate it until later.</code></span>
+<span class="codeline" id="line-219"><code>// Use varintReserve to reserve this space.</code></span>
+<span class="codeline" id="line-220"><code>func (buf *traceBuf) varintAt(pos int, v uint64) {</code></span>
+<span class="codeline" id="line-221"><code>	for i := 0; i &lt; traceBytesPerNumber; i++ {</code></span>
+<span class="codeline" id="line-222"><code>		if i &lt; traceBytesPerNumber-1 {</code></span>
+<span class="codeline" id="line-223"><code>			buf.arr[pos] = 0x80 | byte(v)</code></span>
+<span class="codeline" id="line-224"><code>		} else {</code></span>
+<span class="codeline" id="line-225"><code>			buf.arr[pos] = byte(v)</code></span>
+<span class="codeline" id="line-226"><code>		}</code></span>
+<span class="codeline" id="line-227"><code>		v &gt;&gt;= 7</code></span>
+<span class="codeline" id="line-228"><code>		pos++</code></span>
+<span class="codeline" id="line-229"><code>	}</code></span>
+<span class="codeline" id="line-230"><code>	if v != 0 {</code></span>
+<span class="codeline" id="line-231"><code>		throw("v could not fit in traceBytesPerNumber")</code></span>
+<span class="codeline" id="line-232"><code>	}</code></span>
+<span class="codeline" id="line-233"><code>}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>// traceBufFlush flushes a trace buffer.</code></span>
+<span class="codeline" id="line-236"><code>//</code></span>
+<span class="codeline" id="line-237"><code>// Must run on the system stack because trace.lock must be held.</code></span>
+<span class="codeline" id="line-238"><code>//</code></span>
+<span class="codeline" id="line-239"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-240"><code>func traceBufFlush(buf *traceBuf, gen uintptr) {</code></span>
+<span class="codeline" id="line-241"><code>	assertLockHeld(&amp;trace.lock)</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>	// Write out the non-header length of the batch in the header.</code></span>
+<span class="codeline" id="line-244"><code>	//</code></span>
+<span class="codeline" id="line-245"><code>	// Note: the length of the header is not included to make it easier</code></span>
+<span class="codeline" id="line-246"><code>	// to calculate this value when deserializing and reserializing the</code></span>
+<span class="codeline" id="line-247"><code>	// trace. Varints can have additional padding of zero bits that is</code></span>
+<span class="codeline" id="line-248"><code>	// quite difficult to preserve, and if we include the header we</code></span>
+<span class="codeline" id="line-249"><code>	// force serializers to do more work. Nothing else actually needs</code></span>
+<span class="codeline" id="line-250"><code>	// padding.</code></span>
+<span class="codeline" id="line-251"><code>	buf.varintAt(buf.lenPos, uint64(buf.pos-(buf.lenPos+traceBytesPerNumber)))</code></span>
+<span class="codeline" id="line-252"><code>	trace.full[gen%2].push(buf)</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>	// Notify the scheduler that there's work available and that the trace</code></span>
+<span class="codeline" id="line-255"><code>	// reader should be scheduled.</code></span>
+<span class="codeline" id="line-256"><code>	if !trace.workAvailable.Load() {</code></span>
+<span class="codeline" id="line-257"><code>		trace.workAvailable.Store(true)</code></span>
+<span class="codeline" id="line-258"><code>	}</code></span>
+<span class="codeline" id="line-259"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

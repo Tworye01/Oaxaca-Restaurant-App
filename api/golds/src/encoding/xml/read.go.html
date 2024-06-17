@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: read.go in package encoding/xml</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	read.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/encoding/xml.html">encoding/xml</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package xml</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bytes"</code></span>
+<span class="codeline" id="line-9"><code>	"encoding"</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"reflect"</code></span>
+<span class="codeline" id="line-13"><code>	"runtime"</code></span>
+<span class="codeline" id="line-14"><code>	"strconv"</code></span>
+<span class="codeline" id="line-15"><code>	"strings"</code></span>
+<span class="codeline" id="line-16"><code>)</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>// BUG(rsc): Mapping between XML elements and data structures is inherently flawed:</code></span>
+<span class="codeline" id="line-19"><code>// an XML element is an order-dependent collection of anonymous</code></span>
+<span class="codeline" id="line-20"><code>// values, while a data structure is an order-independent collection</code></span>
+<span class="codeline" id="line-21"><code>// of named values.</code></span>
+<span class="codeline" id="line-22"><code>// See [encoding/json] for a textual representation more suitable</code></span>
+<span class="codeline" id="line-23"><code>// to data structures.</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>// Unmarshal parses the XML-encoded data and stores the result in</code></span>
+<span class="codeline" id="line-26"><code>// the value pointed to by v, which must be an arbitrary struct,</code></span>
+<span class="codeline" id="line-27"><code>// slice, or string. Well-formed data that does not fit into v is</code></span>
+<span class="codeline" id="line-28"><code>// discarded.</code></span>
+<span class="codeline" id="line-29"><code>//</code></span>
+<span class="codeline" id="line-30"><code>// Because Unmarshal uses the reflect package, it can only assign</code></span>
+<span class="codeline" id="line-31"><code>// to exported (upper case) fields. Unmarshal uses a case-sensitive</code></span>
+<span class="codeline" id="line-32"><code>// comparison to match XML element names to tag values and struct</code></span>
+<span class="codeline" id="line-33"><code>// field names.</code></span>
+<span class="codeline" id="line-34"><code>//</code></span>
+<span class="codeline" id="line-35"><code>// Unmarshal maps an XML element to a struct using the following rules.</code></span>
+<span class="codeline" id="line-36"><code>// In the rules, the tag of a field refers to the value associated with the</code></span>
+<span class="codeline" id="line-37"><code>// key 'xml' in the struct field's tag (see the example above).</code></span>
+<span class="codeline" id="line-38"><code>//</code></span>
+<span class="codeline" id="line-39"><code>//   - If the struct has a field of type []byte or string with tag</code></span>
+<span class="codeline" id="line-40"><code>//     ",innerxml", Unmarshal accumulates the raw XML nested inside the</code></span>
+<span class="codeline" id="line-41"><code>//     element in that field. The rest of the rules still apply.</code></span>
+<span class="codeline" id="line-42"><code>//</code></span>
+<span class="codeline" id="line-43"><code>//   - If the struct has a field named XMLName of type Name,</code></span>
+<span class="codeline" id="line-44"><code>//     Unmarshal records the element name in that field.</code></span>
+<span class="codeline" id="line-45"><code>//</code></span>
+<span class="codeline" id="line-46"><code>//   - If the XMLName field has an associated tag of the form</code></span>
+<span class="codeline" id="line-47"><code>//     "name" or "namespace-URL name", the XML element must have</code></span>
+<span class="codeline" id="line-48"><code>//     the given name (and, optionally, name space) or else Unmarshal</code></span>
+<span class="codeline" id="line-49"><code>//     returns an error.</code></span>
+<span class="codeline" id="line-50"><code>//</code></span>
+<span class="codeline" id="line-51"><code>//   - If the XML element has an attribute whose name matches a</code></span>
+<span class="codeline" id="line-52"><code>//     struct field name with an associated tag containing ",attr" or</code></span>
+<span class="codeline" id="line-53"><code>//     the explicit name in a struct field tag of the form "name,attr",</code></span>
+<span class="codeline" id="line-54"><code>//     Unmarshal records the attribute value in that field.</code></span>
+<span class="codeline" id="line-55"><code>//</code></span>
+<span class="codeline" id="line-56"><code>//   - If the XML element has an attribute not handled by the previous</code></span>
+<span class="codeline" id="line-57"><code>//     rule and the struct has a field with an associated tag containing</code></span>
+<span class="codeline" id="line-58"><code>//     ",any,attr", Unmarshal records the attribute value in the first</code></span>
+<span class="codeline" id="line-59"><code>//     such field.</code></span>
+<span class="codeline" id="line-60"><code>//</code></span>
+<span class="codeline" id="line-61"><code>//   - If the XML element contains character data, that data is</code></span>
+<span class="codeline" id="line-62"><code>//     accumulated in the first struct field that has tag ",chardata".</code></span>
+<span class="codeline" id="line-63"><code>//     The struct field may have type []byte or string.</code></span>
+<span class="codeline" id="line-64"><code>//     If there is no such field, the character data is discarded.</code></span>
+<span class="codeline" id="line-65"><code>//</code></span>
+<span class="codeline" id="line-66"><code>//   - If the XML element contains comments, they are accumulated in</code></span>
+<span class="codeline" id="line-67"><code>//     the first struct field that has tag ",comment".  The struct</code></span>
+<span class="codeline" id="line-68"><code>//     field may have type []byte or string. If there is no such</code></span>
+<span class="codeline" id="line-69"><code>//     field, the comments are discarded.</code></span>
+<span class="codeline" id="line-70"><code>//</code></span>
+<span class="codeline" id="line-71"><code>//   - If the XML element contains a sub-element whose name matches</code></span>
+<span class="codeline" id="line-72"><code>//     the prefix of a tag formatted as "a" or "a&gt;b&gt;c", unmarshal</code></span>
+<span class="codeline" id="line-73"><code>//     will descend into the XML structure looking for elements with the</code></span>
+<span class="codeline" id="line-74"><code>//     given names, and will map the innermost elements to that struct</code></span>
+<span class="codeline" id="line-75"><code>//     field. A tag starting with "&gt;" is equivalent to one starting</code></span>
+<span class="codeline" id="line-76"><code>//     with the field name followed by "&gt;".</code></span>
+<span class="codeline" id="line-77"><code>//</code></span>
+<span class="codeline" id="line-78"><code>//   - If the XML element contains a sub-element whose name matches</code></span>
+<span class="codeline" id="line-79"><code>//     a struct field's XMLName tag and the struct field has no</code></span>
+<span class="codeline" id="line-80"><code>//     explicit name tag as per the previous rule, unmarshal maps</code></span>
+<span class="codeline" id="line-81"><code>//     the sub-element to that struct field.</code></span>
+<span class="codeline" id="line-82"><code>//</code></span>
+<span class="codeline" id="line-83"><code>//   - If the XML element contains a sub-element whose name matches a</code></span>
+<span class="codeline" id="line-84"><code>//     field without any mode flags (",attr", ",chardata", etc), Unmarshal</code></span>
+<span class="codeline" id="line-85"><code>//     maps the sub-element to that struct field.</code></span>
+<span class="codeline" id="line-86"><code>//</code></span>
+<span class="codeline" id="line-87"><code>//   - If the XML element contains a sub-element that hasn't matched any</code></span>
+<span class="codeline" id="line-88"><code>//     of the above rules and the struct has a field with tag ",any",</code></span>
+<span class="codeline" id="line-89"><code>//     unmarshal maps the sub-element to that struct field.</code></span>
+<span class="codeline" id="line-90"><code>//</code></span>
+<span class="codeline" id="line-91"><code>//   - An anonymous struct field is handled as if the fields of its</code></span>
+<span class="codeline" id="line-92"><code>//     value were part of the outer struct.</code></span>
+<span class="codeline" id="line-93"><code>//</code></span>
+<span class="codeline" id="line-94"><code>//   - A struct field with tag "-" is never unmarshaled into.</code></span>
+<span class="codeline" id="line-95"><code>//</code></span>
+<span class="codeline" id="line-96"><code>// If Unmarshal encounters a field type that implements the Unmarshaler</code></span>
+<span class="codeline" id="line-97"><code>// interface, Unmarshal calls its UnmarshalXML method to produce the value from</code></span>
+<span class="codeline" id="line-98"><code>// the XML element.  Otherwise, if the value implements</code></span>
+<span class="codeline" id="line-99"><code>// [encoding.TextUnmarshaler], Unmarshal calls that value's UnmarshalText method.</code></span>
+<span class="codeline" id="line-100"><code>//</code></span>
+<span class="codeline" id="line-101"><code>// Unmarshal maps an XML element to a string or []byte by saving the</code></span>
+<span class="codeline" id="line-102"><code>// concatenation of that element's character data in the string or</code></span>
+<span class="codeline" id="line-103"><code>// []byte. The saved []byte is never nil.</code></span>
+<span class="codeline" id="line-104"><code>//</code></span>
+<span class="codeline" id="line-105"><code>// Unmarshal maps an attribute value to a string or []byte by saving</code></span>
+<span class="codeline" id="line-106"><code>// the value in the string or slice.</code></span>
+<span class="codeline" id="line-107"><code>//</code></span>
+<span class="codeline" id="line-108"><code>// Unmarshal maps an attribute value to an [Attr] by saving the attribute,</code></span>
+<span class="codeline" id="line-109"><code>// including its name, in the Attr.</code></span>
+<span class="codeline" id="line-110"><code>//</code></span>
+<span class="codeline" id="line-111"><code>// Unmarshal maps an XML element or attribute value to a slice by</code></span>
+<span class="codeline" id="line-112"><code>// extending the length of the slice and mapping the element or attribute</code></span>
+<span class="codeline" id="line-113"><code>// to the newly created value.</code></span>
+<span class="codeline" id="line-114"><code>//</code></span>
+<span class="codeline" id="line-115"><code>// Unmarshal maps an XML element or attribute value to a bool by</code></span>
+<span class="codeline" id="line-116"><code>// setting it to the boolean value represented by the string. Whitespace</code></span>
+<span class="codeline" id="line-117"><code>// is trimmed and ignored.</code></span>
+<span class="codeline" id="line-118"><code>//</code></span>
+<span class="codeline" id="line-119"><code>// Unmarshal maps an XML element or attribute value to an integer or</code></span>
+<span class="codeline" id="line-120"><code>// floating-point field by setting the field to the result of</code></span>
+<span class="codeline" id="line-121"><code>// interpreting the string value in decimal. There is no check for</code></span>
+<span class="codeline" id="line-122"><code>// overflow. Whitespace is trimmed and ignored.</code></span>
+<span class="codeline" id="line-123"><code>//</code></span>
+<span class="codeline" id="line-124"><code>// Unmarshal maps an XML element to a Name by recording the element</code></span>
+<span class="codeline" id="line-125"><code>// name.</code></span>
+<span class="codeline" id="line-126"><code>//</code></span>
+<span class="codeline" id="line-127"><code>// Unmarshal maps an XML element to a pointer by setting the pointer</code></span>
+<span class="codeline" id="line-128"><code>// to a freshly allocated value and then mapping the element to that value.</code></span>
+<span class="codeline" id="line-129"><code>//</code></span>
+<span class="codeline" id="line-130"><code>// A missing element or empty attribute value will be unmarshaled as a zero value.</code></span>
+<span class="codeline" id="line-131"><code>// If the field is a slice, a zero value will be appended to the field. Otherwise, the</code></span>
+<span class="codeline" id="line-132"><code>// field will be set to its zero value.</code></span>
+<span class="codeline" id="line-133"><code>func Unmarshal(data []byte, v any) error {</code></span>
+<span class="codeline" id="line-134"><code>	return NewDecoder(bytes.NewReader(data)).Decode(v)</code></span>
+<span class="codeline" id="line-135"><code>}</code></span>
+<span class="codeline" id="line-136"><code></code></span>
+<span class="codeline" id="line-137"><code>// Decode works like [Unmarshal], except it reads the decoder</code></span>
+<span class="codeline" id="line-138"><code>// stream to find the start element.</code></span>
+<span class="codeline" id="line-139"><code>func (d *Decoder) Decode(v any) error {</code></span>
+<span class="codeline" id="line-140"><code>	return d.DecodeElement(v, nil)</code></span>
+<span class="codeline" id="line-141"><code>}</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>// DecodeElement works like [Unmarshal] except that it takes</code></span>
+<span class="codeline" id="line-144"><code>// a pointer to the start XML element to decode into v.</code></span>
+<span class="codeline" id="line-145"><code>// It is useful when a client reads some raw XML tokens itself</code></span>
+<span class="codeline" id="line-146"><code>// but also wants to defer to [Unmarshal] for some elements.</code></span>
+<span class="codeline" id="line-147"><code>func (d *Decoder) DecodeElement(v any, start *StartElement) error {</code></span>
+<span class="codeline" id="line-148"><code>	val := reflect.ValueOf(v)</code></span>
+<span class="codeline" id="line-149"><code>	if val.Kind() != reflect.Pointer {</code></span>
+<span class="codeline" id="line-150"><code>		return errors.New("non-pointer passed to Unmarshal")</code></span>
+<span class="codeline" id="line-151"><code>	}</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>	if val.IsNil() {</code></span>
+<span class="codeline" id="line-154"><code>		return errors.New("nil pointer passed to Unmarshal")</code></span>
+<span class="codeline" id="line-155"><code>	}</code></span>
+<span class="codeline" id="line-156"><code>	return d.unmarshal(val.Elem(), start, 0)</code></span>
+<span class="codeline" id="line-157"><code>}</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>// An UnmarshalError represents an error in the unmarshaling process.</code></span>
+<span class="codeline" id="line-160"><code>type UnmarshalError string</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>func (e UnmarshalError) Error() string { return string(e) }</code></span>
+<span class="codeline" id="line-163"><code></code></span>
+<span class="codeline" id="line-164"><code>// Unmarshaler is the interface implemented by objects that can unmarshal</code></span>
+<span class="codeline" id="line-165"><code>// an XML element description of themselves.</code></span>
+<span class="codeline" id="line-166"><code>//</code></span>
+<span class="codeline" id="line-167"><code>// UnmarshalXML decodes a single XML element</code></span>
+<span class="codeline" id="line-168"><code>// beginning with the given start element.</code></span>
+<span class="codeline" id="line-169"><code>// If it returns an error, the outer call to Unmarshal stops and</code></span>
+<span class="codeline" id="line-170"><code>// returns that error.</code></span>
+<span class="codeline" id="line-171"><code>// UnmarshalXML must consume exactly one XML element.</code></span>
+<span class="codeline" id="line-172"><code>// One common implementation strategy is to unmarshal into</code></span>
+<span class="codeline" id="line-173"><code>// a separate value with a layout matching the expected XML</code></span>
+<span class="codeline" id="line-174"><code>// using d.DecodeElement, and then to copy the data from</code></span>
+<span class="codeline" id="line-175"><code>// that value into the receiver.</code></span>
+<span class="codeline" id="line-176"><code>// Another common strategy is to use d.Token to process the</code></span>
+<span class="codeline" id="line-177"><code>// XML object one token at a time.</code></span>
+<span class="codeline" id="line-178"><code>// UnmarshalXML may not use d.RawToken.</code></span>
+<span class="codeline" id="line-179"><code>type Unmarshaler interface {</code></span>
+<span class="codeline" id="line-180"><code>	UnmarshalXML(d *Decoder, start StartElement) error</code></span>
+<span class="codeline" id="line-181"><code>}</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>// UnmarshalerAttr is the interface implemented by objects that can unmarshal</code></span>
+<span class="codeline" id="line-184"><code>// an XML attribute description of themselves.</code></span>
+<span class="codeline" id="line-185"><code>//</code></span>
+<span class="codeline" id="line-186"><code>// UnmarshalXMLAttr decodes a single XML attribute.</code></span>
+<span class="codeline" id="line-187"><code>// If it returns an error, the outer call to [Unmarshal] stops and</code></span>
+<span class="codeline" id="line-188"><code>// returns that error.</code></span>
+<span class="codeline" id="line-189"><code>// UnmarshalXMLAttr is used only for struct fields with the</code></span>
+<span class="codeline" id="line-190"><code>// "attr" option in the field tag.</code></span>
+<span class="codeline" id="line-191"><code>type UnmarshalerAttr interface {</code></span>
+<span class="codeline" id="line-192"><code>	UnmarshalXMLAttr(attr Attr) error</code></span>
+<span class="codeline" id="line-193"><code>}</code></span>
+<span class="codeline" id="line-194"><code></code></span>
+<span class="codeline" id="line-195"><code>// receiverType returns the receiver type to use in an expression like "%s.MethodName".</code></span>
+<span class="codeline" id="line-196"><code>func receiverType(val any) string {</code></span>
+<span class="codeline" id="line-197"><code>	t := reflect.TypeOf(val)</code></span>
+<span class="codeline" id="line-198"><code>	if t.Name() != "" {</code></span>
+<span class="codeline" id="line-199"><code>		return t.String()</code></span>
+<span class="codeline" id="line-200"><code>	}</code></span>
+<span class="codeline" id="line-201"><code>	return "(" + t.String() + ")"</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>// unmarshalInterface unmarshals a single XML element into val.</code></span>
+<span class="codeline" id="line-205"><code>// start is the opening tag of the element.</code></span>
+<span class="codeline" id="line-206"><code>func (d *Decoder) unmarshalInterface(val Unmarshaler, start *StartElement) error {</code></span>
+<span class="codeline" id="line-207"><code>	// Record that decoder must stop at end tag corresponding to start.</code></span>
+<span class="codeline" id="line-208"><code>	d.pushEOF()</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>	d.unmarshalDepth++</code></span>
+<span class="codeline" id="line-211"><code>	err := val.UnmarshalXML(d, *start)</code></span>
+<span class="codeline" id="line-212"><code>	d.unmarshalDepth--</code></span>
+<span class="codeline" id="line-213"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-214"><code>		d.popEOF()</code></span>
+<span class="codeline" id="line-215"><code>		return err</code></span>
+<span class="codeline" id="line-216"><code>	}</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>	if !d.popEOF() {</code></span>
+<span class="codeline" id="line-219"><code>		return fmt.Errorf("xml: %s.UnmarshalXML did not consume entire &lt;%s&gt; element", receiverType(val), start.Name.Local)</code></span>
+<span class="codeline" id="line-220"><code>	}</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>	return nil</code></span>
+<span class="codeline" id="line-223"><code>}</code></span>
+<span class="codeline" id="line-224"><code></code></span>
+<span class="codeline" id="line-225"><code>// unmarshalTextInterface unmarshals a single XML element into val.</code></span>
+<span class="codeline" id="line-226"><code>// The chardata contained in the element (but not its children)</code></span>
+<span class="codeline" id="line-227"><code>// is passed to the text unmarshaler.</code></span>
+<span class="codeline" id="line-228"><code>func (d *Decoder) unmarshalTextInterface(val encoding.TextUnmarshaler) error {</code></span>
+<span class="codeline" id="line-229"><code>	var buf []byte</code></span>
+<span class="codeline" id="line-230"><code>	depth := 1</code></span>
+<span class="codeline" id="line-231"><code>	for depth &gt; 0 {</code></span>
+<span class="codeline" id="line-232"><code>		t, err := d.Token()</code></span>
+<span class="codeline" id="line-233"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-234"><code>			return err</code></span>
+<span class="codeline" id="line-235"><code>		}</code></span>
+<span class="codeline" id="line-236"><code>		switch t := t.(type) {</code></span>
+<span class="codeline" id="line-237"><code>		case CharData:</code></span>
+<span class="codeline" id="line-238"><code>			if depth == 1 {</code></span>
+<span class="codeline" id="line-239"><code>				buf = append(buf, t...)</code></span>
+<span class="codeline" id="line-240"><code>			}</code></span>
+<span class="codeline" id="line-241"><code>		case StartElement:</code></span>
+<span class="codeline" id="line-242"><code>			depth++</code></span>
+<span class="codeline" id="line-243"><code>		case EndElement:</code></span>
+<span class="codeline" id="line-244"><code>			depth--</code></span>
+<span class="codeline" id="line-245"><code>		}</code></span>
+<span class="codeline" id="line-246"><code>	}</code></span>
+<span class="codeline" id="line-247"><code>	return val.UnmarshalText(buf)</code></span>
+<span class="codeline" id="line-248"><code>}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>// unmarshalAttr unmarshals a single XML attribute into val.</code></span>
+<span class="codeline" id="line-251"><code>func (d *Decoder) unmarshalAttr(val reflect.Value, attr Attr) error {</code></span>
+<span class="codeline" id="line-252"><code>	if val.Kind() == reflect.Pointer {</code></span>
+<span class="codeline" id="line-253"><code>		if val.IsNil() {</code></span>
+<span class="codeline" id="line-254"><code>			val.Set(reflect.New(val.Type().Elem()))</code></span>
+<span class="codeline" id="line-255"><code>		}</code></span>
+<span class="codeline" id="line-256"><code>		val = val.Elem()</code></span>
+<span class="codeline" id="line-257"><code>	}</code></span>
+<span class="codeline" id="line-258"><code>	if val.CanInterface() &amp;&amp; val.Type().Implements(unmarshalerAttrType) {</code></span>
+<span class="codeline" id="line-259"><code>		// This is an unmarshaler with a non-pointer receiver,</code></span>
+<span class="codeline" id="line-260"><code>		// so it's likely to be incorrect, but we do what we're told.</code></span>
+<span class="codeline" id="line-261"><code>		return val.Interface().(UnmarshalerAttr).UnmarshalXMLAttr(attr)</code></span>
+<span class="codeline" id="line-262"><code>	}</code></span>
+<span class="codeline" id="line-263"><code>	if val.CanAddr() {</code></span>
+<span class="codeline" id="line-264"><code>		pv := val.Addr()</code></span>
+<span class="codeline" id="line-265"><code>		if pv.CanInterface() &amp;&amp; pv.Type().Implements(unmarshalerAttrType) {</code></span>
+<span class="codeline" id="line-266"><code>			return pv.Interface().(UnmarshalerAttr).UnmarshalXMLAttr(attr)</code></span>
+<span class="codeline" id="line-267"><code>		}</code></span>
+<span class="codeline" id="line-268"><code>	}</code></span>
+<span class="codeline" id="line-269"><code></code></span>
+<span class="codeline" id="line-270"><code>	// Not an UnmarshalerAttr; try encoding.TextUnmarshaler.</code></span>
+<span class="codeline" id="line-271"><code>	if val.CanInterface() &amp;&amp; val.Type().Implements(textUnmarshalerType) {</code></span>
+<span class="codeline" id="line-272"><code>		// This is an unmarshaler with a non-pointer receiver,</code></span>
+<span class="codeline" id="line-273"><code>		// so it's likely to be incorrect, but we do what we're told.</code></span>
+<span class="codeline" id="line-274"><code>		return val.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(attr.Value))</code></span>
+<span class="codeline" id="line-275"><code>	}</code></span>
+<span class="codeline" id="line-276"><code>	if val.CanAddr() {</code></span>
+<span class="codeline" id="line-277"><code>		pv := val.Addr()</code></span>
+<span class="codeline" id="line-278"><code>		if pv.CanInterface() &amp;&amp; pv.Type().Implements(textUnmarshalerType) {</code></span>
+<span class="codeline" id="line-279"><code>			return pv.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(attr.Value))</code></span>
+<span class="codeline" id="line-280"><code>		}</code></span>
+<span class="codeline" id="line-281"><code>	}</code></span>
+<span class="codeline" id="line-282"><code></code></span>
+<span class="codeline" id="line-283"><code>	if val.Type().Kind() == reflect.Slice &amp;&amp; val.Type().Elem().Kind() != reflect.Uint8 {</code></span>
+<span class="codeline" id="line-284"><code>		// Slice of element values.</code></span>
+<span class="codeline" id="line-285"><code>		// Grow slice.</code></span>
+<span class="codeline" id="line-286"><code>		n := val.Len()</code></span>
+<span class="codeline" id="line-287"><code>		val.Grow(1)</code></span>
+<span class="codeline" id="line-288"><code>		val.SetLen(n + 1)</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>		// Recur to read element into slice.</code></span>
+<span class="codeline" id="line-291"><code>		if err := d.unmarshalAttr(val.Index(n), attr); err != nil {</code></span>
+<span class="codeline" id="line-292"><code>			val.SetLen(n)</code></span>
+<span class="codeline" id="line-293"><code>			return err</code></span>
+<span class="codeline" id="line-294"><code>		}</code></span>
+<span class="codeline" id="line-295"><code>		return nil</code></span>
+<span class="codeline" id="line-296"><code>	}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	if val.Type() == attrType {</code></span>
+<span class="codeline" id="line-299"><code>		val.Set(reflect.ValueOf(attr))</code></span>
+<span class="codeline" id="line-300"><code>		return nil</code></span>
+<span class="codeline" id="line-301"><code>	}</code></span>
+<span class="codeline" id="line-302"><code></code></span>
+<span class="codeline" id="line-303"><code>	return copyValue(val, []byte(attr.Value))</code></span>
+<span class="codeline" id="line-304"><code>}</code></span>
+<span class="codeline" id="line-305"><code></code></span>
+<span class="codeline" id="line-306"><code>var (</code></span>
+<span class="codeline" id="line-307"><code>	attrType            = reflect.TypeFor[Attr]()</code></span>
+<span class="codeline" id="line-308"><code>	unmarshalerType     = reflect.TypeFor[Unmarshaler]()</code></span>
+<span class="codeline" id="line-309"><code>	unmarshalerAttrType = reflect.TypeFor[UnmarshalerAttr]()</code></span>
+<span class="codeline" id="line-310"><code>	textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()</code></span>
+<span class="codeline" id="line-311"><code>)</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>const (</code></span>
+<span class="codeline" id="line-314"><code>	maxUnmarshalDepth     = 10000</code></span>
+<span class="codeline" id="line-315"><code>	maxUnmarshalDepthWasm = 5000 // go.dev/issue/56498</code></span>
+<span class="codeline" id="line-316"><code>)</code></span>
+<span class="codeline" id="line-317"><code></code></span>
+<span class="codeline" id="line-318"><code>var errUnmarshalDepth = errors.New("exceeded max depth")</code></span>
+<span class="codeline" id="line-319"><code></code></span>
+<span class="codeline" id="line-320"><code>// Unmarshal a single XML element into val.</code></span>
+<span class="codeline" id="line-321"><code>func (d *Decoder) unmarshal(val reflect.Value, start *StartElement, depth int) error {</code></span>
+<span class="codeline" id="line-322"><code>	if depth &gt;= maxUnmarshalDepth || runtime.GOARCH == "wasm" &amp;&amp; depth &gt;= maxUnmarshalDepthWasm {</code></span>
+<span class="codeline" id="line-323"><code>		return errUnmarshalDepth</code></span>
+<span class="codeline" id="line-324"><code>	}</code></span>
+<span class="codeline" id="line-325"><code>	// Find start element if we need it.</code></span>
+<span class="codeline" id="line-326"><code>	if start == nil {</code></span>
+<span class="codeline" id="line-327"><code>		for {</code></span>
+<span class="codeline" id="line-328"><code>			tok, err := d.Token()</code></span>
+<span class="codeline" id="line-329"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-330"><code>				return err</code></span>
+<span class="codeline" id="line-331"><code>			}</code></span>
+<span class="codeline" id="line-332"><code>			if t, ok := tok.(StartElement); ok {</code></span>
+<span class="codeline" id="line-333"><code>				start = &amp;t</code></span>
+<span class="codeline" id="line-334"><code>				break</code></span>
+<span class="codeline" id="line-335"><code>			}</code></span>
+<span class="codeline" id="line-336"><code>		}</code></span>
+<span class="codeline" id="line-337"><code>	}</code></span>
+<span class="codeline" id="line-338"><code></code></span>
+<span class="codeline" id="line-339"><code>	// Load value from interface, but only if the result will be</code></span>
+<span class="codeline" id="line-340"><code>	// usefully addressable.</code></span>
+<span class="codeline" id="line-341"><code>	if val.Kind() == reflect.Interface &amp;&amp; !val.IsNil() {</code></span>
+<span class="codeline" id="line-342"><code>		e := val.Elem()</code></span>
+<span class="codeline" id="line-343"><code>		if e.Kind() == reflect.Pointer &amp;&amp; !e.IsNil() {</code></span>
+<span class="codeline" id="line-344"><code>			val = e</code></span>
+<span class="codeline" id="line-345"><code>		}</code></span>
+<span class="codeline" id="line-346"><code>	}</code></span>
+<span class="codeline" id="line-347"><code></code></span>
+<span class="codeline" id="line-348"><code>	if val.Kind() == reflect.Pointer {</code></span>
+<span class="codeline" id="line-349"><code>		if val.IsNil() {</code></span>
+<span class="codeline" id="line-350"><code>			val.Set(reflect.New(val.Type().Elem()))</code></span>
+<span class="codeline" id="line-351"><code>		}</code></span>
+<span class="codeline" id="line-352"><code>		val = val.Elem()</code></span>
+<span class="codeline" id="line-353"><code>	}</code></span>
+<span class="codeline" id="line-354"><code></code></span>
+<span class="codeline" id="line-355"><code>	if val.CanInterface() &amp;&amp; val.Type().Implements(unmarshalerType) {</code></span>
+<span class="codeline" id="line-356"><code>		// This is an unmarshaler with a non-pointer receiver,</code></span>
+<span class="codeline" id="line-357"><code>		// so it's likely to be incorrect, but we do what we're told.</code></span>
+<span class="codeline" id="line-358"><code>		return d.unmarshalInterface(val.Interface().(Unmarshaler), start)</code></span>
+<span class="codeline" id="line-359"><code>	}</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>	if val.CanAddr() {</code></span>
+<span class="codeline" id="line-362"><code>		pv := val.Addr()</code></span>
+<span class="codeline" id="line-363"><code>		if pv.CanInterface() &amp;&amp; pv.Type().Implements(unmarshalerType) {</code></span>
+<span class="codeline" id="line-364"><code>			return d.unmarshalInterface(pv.Interface().(Unmarshaler), start)</code></span>
+<span class="codeline" id="line-365"><code>		}</code></span>
+<span class="codeline" id="line-366"><code>	}</code></span>
+<span class="codeline" id="line-367"><code></code></span>
+<span class="codeline" id="line-368"><code>	if val.CanInterface() &amp;&amp; val.Type().Implements(textUnmarshalerType) {</code></span>
+<span class="codeline" id="line-369"><code>		return d.unmarshalTextInterface(val.Interface().(encoding.TextUnmarshaler))</code></span>
+<span class="codeline" id="line-370"><code>	}</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>	if val.CanAddr() {</code></span>
+<span class="codeline" id="line-373"><code>		pv := val.Addr()</code></span>
+<span class="codeline" id="line-374"><code>		if pv.CanInterface() &amp;&amp; pv.Type().Implements(textUnmarshalerType) {</code></span>
+<span class="codeline" id="line-375"><code>			return d.unmarshalTextInterface(pv.Interface().(encoding.TextUnmarshaler))</code></span>
+<span class="codeline" id="line-376"><code>		}</code></span>
+<span class="codeline" id="line-377"><code>	}</code></span>
+<span class="codeline" id="line-378"><code></code></span>
+<span class="codeline" id="line-379"><code>	var (</code></span>
+<span class="codeline" id="line-380"><code>		data         []byte</code></span>
+<span class="codeline" id="line-381"><code>		saveData     reflect.Value</code></span>
+<span class="codeline" id="line-382"><code>		comment      []byte</code></span>
+<span class="codeline" id="line-383"><code>		saveComment  reflect.Value</code></span>
+<span class="codeline" id="line-384"><code>		saveXML      reflect.Value</code></span>
+<span class="codeline" id="line-385"><code>		saveXMLIndex int</code></span>
+<span class="codeline" id="line-386"><code>		saveXMLData  []byte</code></span>
+<span class="codeline" id="line-387"><code>		saveAny      reflect.Value</code></span>
+<span class="codeline" id="line-388"><code>		sv           reflect.Value</code></span>
+<span class="codeline" id="line-389"><code>		tinfo        *typeInfo</code></span>
+<span class="codeline" id="line-390"><code>		err          error</code></span>
+<span class="codeline" id="line-391"><code>	)</code></span>
+<span class="codeline" id="line-392"><code></code></span>
+<span class="codeline" id="line-393"><code>	switch v := val; v.Kind() {</code></span>
+<span class="codeline" id="line-394"><code>	default:</code></span>
+<span class="codeline" id="line-395"><code>		return errors.New("unknown type " + v.Type().String())</code></span>
+<span class="codeline" id="line-396"><code></code></span>
+<span class="codeline" id="line-397"><code>	case reflect.Interface:</code></span>
+<span class="codeline" id="line-398"><code>		// TODO: For now, simply ignore the field. In the near</code></span>
+<span class="codeline" id="line-399"><code>		//       future we may choose to unmarshal the start</code></span>
+<span class="codeline" id="line-400"><code>		//       element on it, if not nil.</code></span>
+<span class="codeline" id="line-401"><code>		return d.Skip()</code></span>
+<span class="codeline" id="line-402"><code></code></span>
+<span class="codeline" id="line-403"><code>	case reflect.Slice:</code></span>
+<span class="codeline" id="line-404"><code>		typ := v.Type()</code></span>
+<span class="codeline" id="line-405"><code>		if typ.Elem().Kind() == reflect.Uint8 {</code></span>
+<span class="codeline" id="line-406"><code>			// []byte</code></span>
+<span class="codeline" id="line-407"><code>			saveData = v</code></span>
+<span class="codeline" id="line-408"><code>			break</code></span>
+<span class="codeline" id="line-409"><code>		}</code></span>
+<span class="codeline" id="line-410"><code></code></span>
+<span class="codeline" id="line-411"><code>		// Slice of element values.</code></span>
+<span class="codeline" id="line-412"><code>		// Grow slice.</code></span>
+<span class="codeline" id="line-413"><code>		n := v.Len()</code></span>
+<span class="codeline" id="line-414"><code>		v.Grow(1)</code></span>
+<span class="codeline" id="line-415"><code>		v.SetLen(n + 1)</code></span>
+<span class="codeline" id="line-416"><code></code></span>
+<span class="codeline" id="line-417"><code>		// Recur to read element into slice.</code></span>
+<span class="codeline" id="line-418"><code>		if err := d.unmarshal(v.Index(n), start, depth+1); err != nil {</code></span>
+<span class="codeline" id="line-419"><code>			v.SetLen(n)</code></span>
+<span class="codeline" id="line-420"><code>			return err</code></span>
+<span class="codeline" id="line-421"><code>		}</code></span>
+<span class="codeline" id="line-422"><code>		return nil</code></span>
+<span class="codeline" id="line-423"><code></code></span>
+<span class="codeline" id="line-424"><code>	case reflect.Bool, reflect.Float32, reflect.Float64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr, reflect.String:</code></span>
+<span class="codeline" id="line-425"><code>		saveData = v</code></span>
+<span class="codeline" id="line-426"><code></code></span>
+<span class="codeline" id="line-427"><code>	case reflect.Struct:</code></span>
+<span class="codeline" id="line-428"><code>		typ := v.Type()</code></span>
+<span class="codeline" id="line-429"><code>		if typ == nameType {</code></span>
+<span class="codeline" id="line-430"><code>			v.Set(reflect.ValueOf(start.Name))</code></span>
+<span class="codeline" id="line-431"><code>			break</code></span>
+<span class="codeline" id="line-432"><code>		}</code></span>
+<span class="codeline" id="line-433"><code></code></span>
+<span class="codeline" id="line-434"><code>		sv = v</code></span>
+<span class="codeline" id="line-435"><code>		tinfo, err = getTypeInfo(typ)</code></span>
+<span class="codeline" id="line-436"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-437"><code>			return err</code></span>
+<span class="codeline" id="line-438"><code>		}</code></span>
+<span class="codeline" id="line-439"><code></code></span>
+<span class="codeline" id="line-440"><code>		// Validate and assign element name.</code></span>
+<span class="codeline" id="line-441"><code>		if tinfo.xmlname != nil {</code></span>
+<span class="codeline" id="line-442"><code>			finfo := tinfo.xmlname</code></span>
+<span class="codeline" id="line-443"><code>			if finfo.name != "" &amp;&amp; finfo.name != start.Name.Local {</code></span>
+<span class="codeline" id="line-444"><code>				return UnmarshalError("expected element type &lt;" + finfo.name + "&gt; but have &lt;" + start.Name.Local + "&gt;")</code></span>
+<span class="codeline" id="line-445"><code>			}</code></span>
+<span class="codeline" id="line-446"><code>			if finfo.xmlns != "" &amp;&amp; finfo.xmlns != start.Name.Space {</code></span>
+<span class="codeline" id="line-447"><code>				e := "expected element &lt;" + finfo.name + "&gt; in name space " + finfo.xmlns + " but have "</code></span>
+<span class="codeline" id="line-448"><code>				if start.Name.Space == "" {</code></span>
+<span class="codeline" id="line-449"><code>					e += "no name space"</code></span>
+<span class="codeline" id="line-450"><code>				} else {</code></span>
+<span class="codeline" id="line-451"><code>					e += start.Name.Space</code></span>
+<span class="codeline" id="line-452"><code>				}</code></span>
+<span class="codeline" id="line-453"><code>				return UnmarshalError(e)</code></span>
+<span class="codeline" id="line-454"><code>			}</code></span>
+<span class="codeline" id="line-455"><code>			fv := finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-456"><code>			if _, ok := fv.Interface().(Name); ok {</code></span>
+<span class="codeline" id="line-457"><code>				fv.Set(reflect.ValueOf(start.Name))</code></span>
+<span class="codeline" id="line-458"><code>			}</code></span>
+<span class="codeline" id="line-459"><code>		}</code></span>
+<span class="codeline" id="line-460"><code></code></span>
+<span class="codeline" id="line-461"><code>		// Assign attributes.</code></span>
+<span class="codeline" id="line-462"><code>		for _, a := range start.Attr {</code></span>
+<span class="codeline" id="line-463"><code>			handled := false</code></span>
+<span class="codeline" id="line-464"><code>			any := -1</code></span>
+<span class="codeline" id="line-465"><code>			for i := range tinfo.fields {</code></span>
+<span class="codeline" id="line-466"><code>				finfo := &amp;tinfo.fields[i]</code></span>
+<span class="codeline" id="line-467"><code>				switch finfo.flags &amp; fMode {</code></span>
+<span class="codeline" id="line-468"><code>				case fAttr:</code></span>
+<span class="codeline" id="line-469"><code>					strv := finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-470"><code>					if a.Name.Local == finfo.name &amp;&amp; (finfo.xmlns == "" || finfo.xmlns == a.Name.Space) {</code></span>
+<span class="codeline" id="line-471"><code>						if err := d.unmarshalAttr(strv, a); err != nil {</code></span>
+<span class="codeline" id="line-472"><code>							return err</code></span>
+<span class="codeline" id="line-473"><code>						}</code></span>
+<span class="codeline" id="line-474"><code>						handled = true</code></span>
+<span class="codeline" id="line-475"><code>					}</code></span>
+<span class="codeline" id="line-476"><code></code></span>
+<span class="codeline" id="line-477"><code>				case fAny | fAttr:</code></span>
+<span class="codeline" id="line-478"><code>					if any == -1 {</code></span>
+<span class="codeline" id="line-479"><code>						any = i</code></span>
+<span class="codeline" id="line-480"><code>					}</code></span>
+<span class="codeline" id="line-481"><code>				}</code></span>
+<span class="codeline" id="line-482"><code>			}</code></span>
+<span class="codeline" id="line-483"><code>			if !handled &amp;&amp; any &gt;= 0 {</code></span>
+<span class="codeline" id="line-484"><code>				finfo := &amp;tinfo.fields[any]</code></span>
+<span class="codeline" id="line-485"><code>				strv := finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-486"><code>				if err := d.unmarshalAttr(strv, a); err != nil {</code></span>
+<span class="codeline" id="line-487"><code>					return err</code></span>
+<span class="codeline" id="line-488"><code>				}</code></span>
+<span class="codeline" id="line-489"><code>			}</code></span>
+<span class="codeline" id="line-490"><code>		}</code></span>
+<span class="codeline" id="line-491"><code></code></span>
+<span class="codeline" id="line-492"><code>		// Determine whether we need to save character data or comments.</code></span>
+<span class="codeline" id="line-493"><code>		for i := range tinfo.fields {</code></span>
+<span class="codeline" id="line-494"><code>			finfo := &amp;tinfo.fields[i]</code></span>
+<span class="codeline" id="line-495"><code>			switch finfo.flags &amp; fMode {</code></span>
+<span class="codeline" id="line-496"><code>			case fCDATA, fCharData:</code></span>
+<span class="codeline" id="line-497"><code>				if !saveData.IsValid() {</code></span>
+<span class="codeline" id="line-498"><code>					saveData = finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-499"><code>				}</code></span>
+<span class="codeline" id="line-500"><code></code></span>
+<span class="codeline" id="line-501"><code>			case fComment:</code></span>
+<span class="codeline" id="line-502"><code>				if !saveComment.IsValid() {</code></span>
+<span class="codeline" id="line-503"><code>					saveComment = finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-504"><code>				}</code></span>
+<span class="codeline" id="line-505"><code></code></span>
+<span class="codeline" id="line-506"><code>			case fAny, fAny | fElement:</code></span>
+<span class="codeline" id="line-507"><code>				if !saveAny.IsValid() {</code></span>
+<span class="codeline" id="line-508"><code>					saveAny = finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-509"><code>				}</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>			case fInnerXML:</code></span>
+<span class="codeline" id="line-512"><code>				if !saveXML.IsValid() {</code></span>
+<span class="codeline" id="line-513"><code>					saveXML = finfo.value(sv, initNilPointers)</code></span>
+<span class="codeline" id="line-514"><code>					if d.saved == nil {</code></span>
+<span class="codeline" id="line-515"><code>						saveXMLIndex = 0</code></span>
+<span class="codeline" id="line-516"><code>						d.saved = new(bytes.Buffer)</code></span>
+<span class="codeline" id="line-517"><code>					} else {</code></span>
+<span class="codeline" id="line-518"><code>						saveXMLIndex = d.savedOffset()</code></span>
+<span class="codeline" id="line-519"><code>					}</code></span>
+<span class="codeline" id="line-520"><code>				}</code></span>
+<span class="codeline" id="line-521"><code>			}</code></span>
+<span class="codeline" id="line-522"><code>		}</code></span>
+<span class="codeline" id="line-523"><code>	}</code></span>
+<span class="codeline" id="line-524"><code></code></span>
+<span class="codeline" id="line-525"><code>	// Find end element.</code></span>
+<span class="codeline" id="line-526"><code>	// Process sub-elements along the way.</code></span>
+<span class="codeline" id="line-527"><code>Loop:</code></span>
+<span class="codeline" id="line-528"><code>	for {</code></span>
+<span class="codeline" id="line-529"><code>		var savedOffset int</code></span>
+<span class="codeline" id="line-530"><code>		if saveXML.IsValid() {</code></span>
+<span class="codeline" id="line-531"><code>			savedOffset = d.savedOffset()</code></span>
+<span class="codeline" id="line-532"><code>		}</code></span>
+<span class="codeline" id="line-533"><code>		tok, err := d.Token()</code></span>
+<span class="codeline" id="line-534"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-535"><code>			return err</code></span>
+<span class="codeline" id="line-536"><code>		}</code></span>
+<span class="codeline" id="line-537"><code>		switch t := tok.(type) {</code></span>
+<span class="codeline" id="line-538"><code>		case StartElement:</code></span>
+<span class="codeline" id="line-539"><code>			consumed := false</code></span>
+<span class="codeline" id="line-540"><code>			if sv.IsValid() {</code></span>
+<span class="codeline" id="line-541"><code>				// unmarshalPath can call unmarshal, so we need to pass the depth through so that</code></span>
+<span class="codeline" id="line-542"><code>				// we can continue to enforce the maximum recursion limit.</code></span>
+<span class="codeline" id="line-543"><code>				consumed, err = d.unmarshalPath(tinfo, sv, nil, &amp;t, depth)</code></span>
+<span class="codeline" id="line-544"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-545"><code>					return err</code></span>
+<span class="codeline" id="line-546"><code>				}</code></span>
+<span class="codeline" id="line-547"><code>				if !consumed &amp;&amp; saveAny.IsValid() {</code></span>
+<span class="codeline" id="line-548"><code>					consumed = true</code></span>
+<span class="codeline" id="line-549"><code>					if err := d.unmarshal(saveAny, &amp;t, depth+1); err != nil {</code></span>
+<span class="codeline" id="line-550"><code>						return err</code></span>
+<span class="codeline" id="line-551"><code>					}</code></span>
+<span class="codeline" id="line-552"><code>				}</code></span>
+<span class="codeline" id="line-553"><code>			}</code></span>
+<span class="codeline" id="line-554"><code>			if !consumed {</code></span>
+<span class="codeline" id="line-555"><code>				if err := d.Skip(); err != nil {</code></span>
+<span class="codeline" id="line-556"><code>					return err</code></span>
+<span class="codeline" id="line-557"><code>				}</code></span>
+<span class="codeline" id="line-558"><code>			}</code></span>
+<span class="codeline" id="line-559"><code></code></span>
+<span class="codeline" id="line-560"><code>		case EndElement:</code></span>
+<span class="codeline" id="line-561"><code>			if saveXML.IsValid() {</code></span>
+<span class="codeline" id="line-562"><code>				saveXMLData = d.saved.Bytes()[saveXMLIndex:savedOffset]</code></span>
+<span class="codeline" id="line-563"><code>				if saveXMLIndex == 0 {</code></span>
+<span class="codeline" id="line-564"><code>					d.saved = nil</code></span>
+<span class="codeline" id="line-565"><code>				}</code></span>
+<span class="codeline" id="line-566"><code>			}</code></span>
+<span class="codeline" id="line-567"><code>			break Loop</code></span>
+<span class="codeline" id="line-568"><code></code></span>
+<span class="codeline" id="line-569"><code>		case CharData:</code></span>
+<span class="codeline" id="line-570"><code>			if saveData.IsValid() {</code></span>
+<span class="codeline" id="line-571"><code>				data = append(data, t...)</code></span>
+<span class="codeline" id="line-572"><code>			}</code></span>
+<span class="codeline" id="line-573"><code></code></span>
+<span class="codeline" id="line-574"><code>		case Comment:</code></span>
+<span class="codeline" id="line-575"><code>			if saveComment.IsValid() {</code></span>
+<span class="codeline" id="line-576"><code>				comment = append(comment, t...)</code></span>
+<span class="codeline" id="line-577"><code>			}</code></span>
+<span class="codeline" id="line-578"><code>		}</code></span>
+<span class="codeline" id="line-579"><code>	}</code></span>
+<span class="codeline" id="line-580"><code></code></span>
+<span class="codeline" id="line-581"><code>	if saveData.IsValid() &amp;&amp; saveData.CanInterface() &amp;&amp; saveData.Type().Implements(textUnmarshalerType) {</code></span>
+<span class="codeline" id="line-582"><code>		if err := saveData.Interface().(encoding.TextUnmarshaler).UnmarshalText(data); err != nil {</code></span>
+<span class="codeline" id="line-583"><code>			return err</code></span>
+<span class="codeline" id="line-584"><code>		}</code></span>
+<span class="codeline" id="line-585"><code>		saveData = reflect.Value{}</code></span>
+<span class="codeline" id="line-586"><code>	}</code></span>
+<span class="codeline" id="line-587"><code></code></span>
+<span class="codeline" id="line-588"><code>	if saveData.IsValid() &amp;&amp; saveData.CanAddr() {</code></span>
+<span class="codeline" id="line-589"><code>		pv := saveData.Addr()</code></span>
+<span class="codeline" id="line-590"><code>		if pv.CanInterface() &amp;&amp; pv.Type().Implements(textUnmarshalerType) {</code></span>
+<span class="codeline" id="line-591"><code>			if err := pv.Interface().(encoding.TextUnmarshaler).UnmarshalText(data); err != nil {</code></span>
+<span class="codeline" id="line-592"><code>				return err</code></span>
+<span class="codeline" id="line-593"><code>			}</code></span>
+<span class="codeline" id="line-594"><code>			saveData = reflect.Value{}</code></span>
+<span class="codeline" id="line-595"><code>		}</code></span>
+<span class="codeline" id="line-596"><code>	}</code></span>
+<span class="codeline" id="line-597"><code></code></span>
+<span class="codeline" id="line-598"><code>	if err := copyValue(saveData, data); err != nil {</code></span>
+<span class="codeline" id="line-599"><code>		return err</code></span>
+<span class="codeline" id="line-600"><code>	}</code></span>
+<span class="codeline" id="line-601"><code></code></span>
+<span class="codeline" id="line-602"><code>	switch t := saveComment; t.Kind() {</code></span>
+<span class="codeline" id="line-603"><code>	case reflect.String:</code></span>
+<span class="codeline" id="line-604"><code>		t.SetString(string(comment))</code></span>
+<span class="codeline" id="line-605"><code>	case reflect.Slice:</code></span>
+<span class="codeline" id="line-606"><code>		t.Set(reflect.ValueOf(comment))</code></span>
+<span class="codeline" id="line-607"><code>	}</code></span>
+<span class="codeline" id="line-608"><code></code></span>
+<span class="codeline" id="line-609"><code>	switch t := saveXML; t.Kind() {</code></span>
+<span class="codeline" id="line-610"><code>	case reflect.String:</code></span>
+<span class="codeline" id="line-611"><code>		t.SetString(string(saveXMLData))</code></span>
+<span class="codeline" id="line-612"><code>	case reflect.Slice:</code></span>
+<span class="codeline" id="line-613"><code>		if t.Type().Elem().Kind() == reflect.Uint8 {</code></span>
+<span class="codeline" id="line-614"><code>			t.Set(reflect.ValueOf(saveXMLData))</code></span>
+<span class="codeline" id="line-615"><code>		}</code></span>
+<span class="codeline" id="line-616"><code>	}</code></span>
+<span class="codeline" id="line-617"><code></code></span>
+<span class="codeline" id="line-618"><code>	return nil</code></span>
+<span class="codeline" id="line-619"><code>}</code></span>
+<span class="codeline" id="line-620"><code></code></span>
+<span class="codeline" id="line-621"><code>func copyValue(dst reflect.Value, src []byte) (err error) {</code></span>
+<span class="codeline" id="line-622"><code>	dst0 := dst</code></span>
+<span class="codeline" id="line-623"><code></code></span>
+<span class="codeline" id="line-624"><code>	if dst.Kind() == reflect.Pointer {</code></span>
+<span class="codeline" id="line-625"><code>		if dst.IsNil() {</code></span>
+<span class="codeline" id="line-626"><code>			dst.Set(reflect.New(dst.Type().Elem()))</code></span>
+<span class="codeline" id="line-627"><code>		}</code></span>
+<span class="codeline" id="line-628"><code>		dst = dst.Elem()</code></span>
+<span class="codeline" id="line-629"><code>	}</code></span>
+<span class="codeline" id="line-630"><code></code></span>
+<span class="codeline" id="line-631"><code>	// Save accumulated data.</code></span>
+<span class="codeline" id="line-632"><code>	switch dst.Kind() {</code></span>
+<span class="codeline" id="line-633"><code>	case reflect.Invalid:</code></span>
+<span class="codeline" id="line-634"><code>		// Probably a comment.</code></span>
+<span class="codeline" id="line-635"><code>	default:</code></span>
+<span class="codeline" id="line-636"><code>		return errors.New("cannot unmarshal into " + dst0.Type().String())</code></span>
+<span class="codeline" id="line-637"><code>	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:</code></span>
+<span class="codeline" id="line-638"><code>		if len(src) == 0 {</code></span>
+<span class="codeline" id="line-639"><code>			dst.SetInt(0)</code></span>
+<span class="codeline" id="line-640"><code>			return nil</code></span>
+<span class="codeline" id="line-641"><code>		}</code></span>
+<span class="codeline" id="line-642"><code>		itmp, err := strconv.ParseInt(strings.TrimSpace(string(src)), 10, dst.Type().Bits())</code></span>
+<span class="codeline" id="line-643"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-644"><code>			return err</code></span>
+<span class="codeline" id="line-645"><code>		}</code></span>
+<span class="codeline" id="line-646"><code>		dst.SetInt(itmp)</code></span>
+<span class="codeline" id="line-647"><code>	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:</code></span>
+<span class="codeline" id="line-648"><code>		if len(src) == 0 {</code></span>
+<span class="codeline" id="line-649"><code>			dst.SetUint(0)</code></span>
+<span class="codeline" id="line-650"><code>			return nil</code></span>
+<span class="codeline" id="line-651"><code>		}</code></span>
+<span class="codeline" id="line-652"><code>		utmp, err := strconv.ParseUint(strings.TrimSpace(string(src)), 10, dst.Type().Bits())</code></span>
+<span class="codeline" id="line-653"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-654"><code>			return err</code></span>
+<span class="codeline" id="line-655"><code>		}</code></span>
+<span class="codeline" id="line-656"><code>		dst.SetUint(utmp)</code></span>
+<span class="codeline" id="line-657"><code>	case reflect.Float32, reflect.Float64:</code></span>
+<span class="codeline" id="line-658"><code>		if len(src) == 0 {</code></span>
+<span class="codeline" id="line-659"><code>			dst.SetFloat(0)</code></span>
+<span class="codeline" id="line-660"><code>			return nil</code></span>
+<span class="codeline" id="line-661"><code>		}</code></span>
+<span class="codeline" id="line-662"><code>		ftmp, err := strconv.ParseFloat(strings.TrimSpace(string(src)), dst.Type().Bits())</code></span>
+<span class="codeline" id="line-663"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-664"><code>			return err</code></span>
+<span class="codeline" id="line-665"><code>		}</code></span>
+<span class="codeline" id="line-666"><code>		dst.SetFloat(ftmp)</code></span>
+<span class="codeline" id="line-667"><code>	case reflect.Bool:</code></span>
+<span class="codeline" id="line-668"><code>		if len(src) == 0 {</code></span>
+<span class="codeline" id="line-669"><code>			dst.SetBool(false)</code></span>
+<span class="codeline" id="line-670"><code>			return nil</code></span>
+<span class="codeline" id="line-671"><code>		}</code></span>
+<span class="codeline" id="line-672"><code>		value, err := strconv.ParseBool(strings.TrimSpace(string(src)))</code></span>
+<span class="codeline" id="line-673"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-674"><code>			return err</code></span>
+<span class="codeline" id="line-675"><code>		}</code></span>
+<span class="codeline" id="line-676"><code>		dst.SetBool(value)</code></span>
+<span class="codeline" id="line-677"><code>	case reflect.String:</code></span>
+<span class="codeline" id="line-678"><code>		dst.SetString(string(src))</code></span>
+<span class="codeline" id="line-679"><code>	case reflect.Slice:</code></span>
+<span class="codeline" id="line-680"><code>		if len(src) == 0 {</code></span>
+<span class="codeline" id="line-681"><code>			// non-nil to flag presence</code></span>
+<span class="codeline" id="line-682"><code>			src = []byte{}</code></span>
+<span class="codeline" id="line-683"><code>		}</code></span>
+<span class="codeline" id="line-684"><code>		dst.SetBytes(src)</code></span>
+<span class="codeline" id="line-685"><code>	}</code></span>
+<span class="codeline" id="line-686"><code>	return nil</code></span>
+<span class="codeline" id="line-687"><code>}</code></span>
+<span class="codeline" id="line-688"><code></code></span>
+<span class="codeline" id="line-689"><code>// unmarshalPath walks down an XML structure looking for wanted</code></span>
+<span class="codeline" id="line-690"><code>// paths, and calls unmarshal on them.</code></span>
+<span class="codeline" id="line-691"><code>// The consumed result tells whether XML elements have been consumed</code></span>
+<span class="codeline" id="line-692"><code>// from the Decoder until start's matching end element, or if it's</code></span>
+<span class="codeline" id="line-693"><code>// still untouched because start is uninteresting for sv's fields.</code></span>
+<span class="codeline" id="line-694"><code>func (d *Decoder) unmarshalPath(tinfo *typeInfo, sv reflect.Value, parents []string, start *StartElement, depth int) (consumed bool, err error) {</code></span>
+<span class="codeline" id="line-695"><code>	recurse := false</code></span>
+<span class="codeline" id="line-696"><code>Loop:</code></span>
+<span class="codeline" id="line-697"><code>	for i := range tinfo.fields {</code></span>
+<span class="codeline" id="line-698"><code>		finfo := &amp;tinfo.fields[i]</code></span>
+<span class="codeline" id="line-699"><code>		if finfo.flags&amp;fElement == 0 || len(finfo.parents) &lt; len(parents) || finfo.xmlns != "" &amp;&amp; finfo.xmlns != start.Name.Space {</code></span>
+<span class="codeline" id="line-700"><code>			continue</code></span>
+<span class="codeline" id="line-701"><code>		}</code></span>
+<span class="codeline" id="line-702"><code>		for j := range parents {</code></span>
+<span class="codeline" id="line-703"><code>			if parents[j] != finfo.parents[j] {</code></span>
+<span class="codeline" id="line-704"><code>				continue Loop</code></span>
+<span class="codeline" id="line-705"><code>			}</code></span>
+<span class="codeline" id="line-706"><code>		}</code></span>
+<span class="codeline" id="line-707"><code>		if len(finfo.parents) == len(parents) &amp;&amp; finfo.name == start.Name.Local {</code></span>
+<span class="codeline" id="line-708"><code>			// It's a perfect match, unmarshal the field.</code></span>
+<span class="codeline" id="line-709"><code>			return true, d.unmarshal(finfo.value(sv, initNilPointers), start, depth+1)</code></span>
+<span class="codeline" id="line-710"><code>		}</code></span>
+<span class="codeline" id="line-711"><code>		if len(finfo.parents) &gt; len(parents) &amp;&amp; finfo.parents[len(parents)] == start.Name.Local {</code></span>
+<span class="codeline" id="line-712"><code>			// It's a prefix for the field. Break and recurse</code></span>
+<span class="codeline" id="line-713"><code>			// since it's not ok for one field path to be itself</code></span>
+<span class="codeline" id="line-714"><code>			// the prefix for another field path.</code></span>
+<span class="codeline" id="line-715"><code>			recurse = true</code></span>
+<span class="codeline" id="line-716"><code></code></span>
+<span class="codeline" id="line-717"><code>			// We can reuse the same slice as long as we</code></span>
+<span class="codeline" id="line-718"><code>			// don't try to append to it.</code></span>
+<span class="codeline" id="line-719"><code>			parents = finfo.parents[:len(parents)+1]</code></span>
+<span class="codeline" id="line-720"><code>			break</code></span>
+<span class="codeline" id="line-721"><code>		}</code></span>
+<span class="codeline" id="line-722"><code>	}</code></span>
+<span class="codeline" id="line-723"><code>	if !recurse {</code></span>
+<span class="codeline" id="line-724"><code>		// We have no business with this element.</code></span>
+<span class="codeline" id="line-725"><code>		return false, nil</code></span>
+<span class="codeline" id="line-726"><code>	}</code></span>
+<span class="codeline" id="line-727"><code>	// The element is not a perfect match for any field, but one</code></span>
+<span class="codeline" id="line-728"><code>	// or more fields have the path to this element as a parent</code></span>
+<span class="codeline" id="line-729"><code>	// prefix. Recurse and attempt to match these.</code></span>
+<span class="codeline" id="line-730"><code>	for {</code></span>
+<span class="codeline" id="line-731"><code>		var tok Token</code></span>
+<span class="codeline" id="line-732"><code>		tok, err = d.Token()</code></span>
+<span class="codeline" id="line-733"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-734"><code>			return true, err</code></span>
+<span class="codeline" id="line-735"><code>		}</code></span>
+<span class="codeline" id="line-736"><code>		switch t := tok.(type) {</code></span>
+<span class="codeline" id="line-737"><code>		case StartElement:</code></span>
+<span class="codeline" id="line-738"><code>			// the recursion depth of unmarshalPath is limited to the path length specified</code></span>
+<span class="codeline" id="line-739"><code>			// by the struct field tag, so we don't increment the depth here.</code></span>
+<span class="codeline" id="line-740"><code>			consumed2, err := d.unmarshalPath(tinfo, sv, parents, &amp;t, depth)</code></span>
+<span class="codeline" id="line-741"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-742"><code>				return true, err</code></span>
+<span class="codeline" id="line-743"><code>			}</code></span>
+<span class="codeline" id="line-744"><code>			if !consumed2 {</code></span>
+<span class="codeline" id="line-745"><code>				if err := d.Skip(); err != nil {</code></span>
+<span class="codeline" id="line-746"><code>					return true, err</code></span>
+<span class="codeline" id="line-747"><code>				}</code></span>
+<span class="codeline" id="line-748"><code>			}</code></span>
+<span class="codeline" id="line-749"><code>		case EndElement:</code></span>
+<span class="codeline" id="line-750"><code>			return true, nil</code></span>
+<span class="codeline" id="line-751"><code>		}</code></span>
+<span class="codeline" id="line-752"><code>	}</code></span>
+<span class="codeline" id="line-753"><code>}</code></span>
+<span class="codeline" id="line-754"><code></code></span>
+<span class="codeline" id="line-755"><code>// Skip reads tokens until it has consumed the end element</code></span>
+<span class="codeline" id="line-756"><code>// matching the most recent start element already consumed,</code></span>
+<span class="codeline" id="line-757"><code>// skipping nested structures.</code></span>
+<span class="codeline" id="line-758"><code>// It returns nil if it finds an end element matching the start</code></span>
+<span class="codeline" id="line-759"><code>// element; otherwise it returns an error describing the problem.</code></span>
+<span class="codeline" id="line-760"><code>func (d *Decoder) Skip() error {</code></span>
+<span class="codeline" id="line-761"><code>	var depth int64</code></span>
+<span class="codeline" id="line-762"><code>	for {</code></span>
+<span class="codeline" id="line-763"><code>		tok, err := d.Token()</code></span>
+<span class="codeline" id="line-764"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-765"><code>			return err</code></span>
+<span class="codeline" id="line-766"><code>		}</code></span>
+<span class="codeline" id="line-767"><code>		switch tok.(type) {</code></span>
+<span class="codeline" id="line-768"><code>		case StartElement:</code></span>
+<span class="codeline" id="line-769"><code>			depth++</code></span>
+<span class="codeline" id="line-770"><code>		case EndElement:</code></span>
+<span class="codeline" id="line-771"><code>			if depth == 0 {</code></span>
+<span class="codeline" id="line-772"><code>				return nil</code></span>
+<span class="codeline" id="line-773"><code>			}</code></span>
+<span class="codeline" id="line-774"><code>			depth--</code></span>
+<span class="codeline" id="line-775"><code>		}</code></span>
+<span class="codeline" id="line-776"><code>	}</code></span>
+<span class="codeline" id="line-777"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

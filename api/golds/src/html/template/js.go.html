@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: js.go in package html/template</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	js.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/html/template.html">html/template</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2011 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package template</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bytes"</code></span>
+<span class="codeline" id="line-9"><code>	"encoding/json"</code></span>
+<span class="codeline" id="line-10"><code>	"fmt"</code></span>
+<span class="codeline" id="line-11"><code>	"reflect"</code></span>
+<span class="codeline" id="line-12"><code>	"strings"</code></span>
+<span class="codeline" id="line-13"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-14"><code>)</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// jsWhitespace contains all of the JS whitespace characters, as defined</code></span>
+<span class="codeline" id="line-17"><code>// by the \s character class.</code></span>
+<span class="codeline" id="line-18"><code>// See https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions/Character_classes.</code></span>
+<span class="codeline" id="line-19"><code>const jsWhitespace = "\f\n\r\t\v\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>// nextJSCtx returns the context that determines whether a slash after the</code></span>
+<span class="codeline" id="line-22"><code>// given run of tokens starts a regular expression instead of a division</code></span>
+<span class="codeline" id="line-23"><code>// operator: / or /=.</code></span>
+<span class="codeline" id="line-24"><code>//</code></span>
+<span class="codeline" id="line-25"><code>// This assumes that the token run does not include any string tokens, comment</code></span>
+<span class="codeline" id="line-26"><code>// tokens, regular expression literal tokens, or division operators.</code></span>
+<span class="codeline" id="line-27"><code>//</code></span>
+<span class="codeline" id="line-28"><code>// This fails on some valid but nonsensical JavaScript programs like</code></span>
+<span class="codeline" id="line-29"><code>// "x = ++/foo/i" which is quite different than "x++/foo/i", but is not known to</code></span>
+<span class="codeline" id="line-30"><code>// fail on any known useful programs. It is based on the draft</code></span>
+<span class="codeline" id="line-31"><code>// JavaScript 2.0 lexical grammar and requires one token of lookbehind:</code></span>
+<span class="codeline" id="line-32"><code>// https://www.mozilla.org/js/language/js20-2000-07/rationale/syntax.html</code></span>
+<span class="codeline" id="line-33"><code>func nextJSCtx(s []byte, preceding jsCtx) jsCtx {</code></span>
+<span class="codeline" id="line-34"><code>	// Trim all JS whitespace characters</code></span>
+<span class="codeline" id="line-35"><code>	s = bytes.TrimRight(s, jsWhitespace)</code></span>
+<span class="codeline" id="line-36"><code>	if len(s) == 0 {</code></span>
+<span class="codeline" id="line-37"><code>		return preceding</code></span>
+<span class="codeline" id="line-38"><code>	}</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	// All cases below are in the single-byte UTF-8 group.</code></span>
+<span class="codeline" id="line-41"><code>	switch c, n := s[len(s)-1], len(s); c {</code></span>
+<span class="codeline" id="line-42"><code>	case '+', '-':</code></span>
+<span class="codeline" id="line-43"><code>		// ++ and -- are not regexp preceders, but + and - are whether</code></span>
+<span class="codeline" id="line-44"><code>		// they are used as infix or prefix operators.</code></span>
+<span class="codeline" id="line-45"><code>		start := n - 1</code></span>
+<span class="codeline" id="line-46"><code>		// Count the number of adjacent dashes or pluses.</code></span>
+<span class="codeline" id="line-47"><code>		for start &gt; 0 &amp;&amp; s[start-1] == c {</code></span>
+<span class="codeline" id="line-48"><code>			start--</code></span>
+<span class="codeline" id="line-49"><code>		}</code></span>
+<span class="codeline" id="line-50"><code>		if (n-start)&amp;1 == 1 {</code></span>
+<span class="codeline" id="line-51"><code>			// Reached for trailing minus signs since "---" is the</code></span>
+<span class="codeline" id="line-52"><code>			// same as "-- -".</code></span>
+<span class="codeline" id="line-53"><code>			return jsCtxRegexp</code></span>
+<span class="codeline" id="line-54"><code>		}</code></span>
+<span class="codeline" id="line-55"><code>		return jsCtxDivOp</code></span>
+<span class="codeline" id="line-56"><code>	case '.':</code></span>
+<span class="codeline" id="line-57"><code>		// Handle "42."</code></span>
+<span class="codeline" id="line-58"><code>		if n != 1 &amp;&amp; '0' &lt;= s[n-2] &amp;&amp; s[n-2] &lt;= '9' {</code></span>
+<span class="codeline" id="line-59"><code>			return jsCtxDivOp</code></span>
+<span class="codeline" id="line-60"><code>		}</code></span>
+<span class="codeline" id="line-61"><code>		return jsCtxRegexp</code></span>
+<span class="codeline" id="line-62"><code>	// Suffixes for all punctuators from section 7.7 of the language spec</code></span>
+<span class="codeline" id="line-63"><code>	// that only end binary operators not handled above.</code></span>
+<span class="codeline" id="line-64"><code>	case ',', '&lt;', '&gt;', '=', '*', '%', '&amp;', '|', '^', '?':</code></span>
+<span class="codeline" id="line-65"><code>		return jsCtxRegexp</code></span>
+<span class="codeline" id="line-66"><code>	// Suffixes for all punctuators from section 7.7 of the language spec</code></span>
+<span class="codeline" id="line-67"><code>	// that are prefix operators not handled above.</code></span>
+<span class="codeline" id="line-68"><code>	case '!', '~':</code></span>
+<span class="codeline" id="line-69"><code>		return jsCtxRegexp</code></span>
+<span class="codeline" id="line-70"><code>	// Matches all the punctuators from section 7.7 of the language spec</code></span>
+<span class="codeline" id="line-71"><code>	// that are open brackets not handled above.</code></span>
+<span class="codeline" id="line-72"><code>	case '(', '[':</code></span>
+<span class="codeline" id="line-73"><code>		return jsCtxRegexp</code></span>
+<span class="codeline" id="line-74"><code>	// Matches all the punctuators from section 7.7 of the language spec</code></span>
+<span class="codeline" id="line-75"><code>	// that precede expression starts.</code></span>
+<span class="codeline" id="line-76"><code>	case ':', ';', '{':</code></span>
+<span class="codeline" id="line-77"><code>		return jsCtxRegexp</code></span>
+<span class="codeline" id="line-78"><code>	// CAVEAT: the close punctuators ('}', ']', ')') precede div ops and</code></span>
+<span class="codeline" id="line-79"><code>	// are handled in the default except for '}' which can precede a</code></span>
+<span class="codeline" id="line-80"><code>	// division op as in</code></span>
+<span class="codeline" id="line-81"><code>	//    ({ valueOf: function () { return 42 } } / 2</code></span>
+<span class="codeline" id="line-82"><code>	// which is valid, but, in practice, developers don't divide object</code></span>
+<span class="codeline" id="line-83"><code>	// literals, so our heuristic works well for code like</code></span>
+<span class="codeline" id="line-84"><code>	//    function () { ... }  /foo/.test(x) &amp;&amp; sideEffect();</code></span>
+<span class="codeline" id="line-85"><code>	// The ')' punctuator can precede a regular expression as in</code></span>
+<span class="codeline" id="line-86"><code>	//     if (b) /foo/.test(x) &amp;&amp; ...</code></span>
+<span class="codeline" id="line-87"><code>	// but this is much less likely than</code></span>
+<span class="codeline" id="line-88"><code>	//     (a + b) / c</code></span>
+<span class="codeline" id="line-89"><code>	case '}':</code></span>
+<span class="codeline" id="line-90"><code>		return jsCtxRegexp</code></span>
+<span class="codeline" id="line-91"><code>	default:</code></span>
+<span class="codeline" id="line-92"><code>		// Look for an IdentifierName and see if it is a keyword that</code></span>
+<span class="codeline" id="line-93"><code>		// can precede a regular expression.</code></span>
+<span class="codeline" id="line-94"><code>		j := n</code></span>
+<span class="codeline" id="line-95"><code>		for j &gt; 0 &amp;&amp; isJSIdentPart(rune(s[j-1])) {</code></span>
+<span class="codeline" id="line-96"><code>			j--</code></span>
+<span class="codeline" id="line-97"><code>		}</code></span>
+<span class="codeline" id="line-98"><code>		if regexpPrecederKeywords[string(s[j:])] {</code></span>
+<span class="codeline" id="line-99"><code>			return jsCtxRegexp</code></span>
+<span class="codeline" id="line-100"><code>		}</code></span>
+<span class="codeline" id="line-101"><code>	}</code></span>
+<span class="codeline" id="line-102"><code>	// Otherwise is a punctuator not listed above, or</code></span>
+<span class="codeline" id="line-103"><code>	// a string which precedes a div op, or an identifier</code></span>
+<span class="codeline" id="line-104"><code>	// which precedes a div op.</code></span>
+<span class="codeline" id="line-105"><code>	return jsCtxDivOp</code></span>
+<span class="codeline" id="line-106"><code>}</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>// regexpPrecederKeywords is a set of reserved JS keywords that can precede a</code></span>
+<span class="codeline" id="line-109"><code>// regular expression in JS source.</code></span>
+<span class="codeline" id="line-110"><code>var regexpPrecederKeywords = map[string]bool{</code></span>
+<span class="codeline" id="line-111"><code>	"break":      true,</code></span>
+<span class="codeline" id="line-112"><code>	"case":       true,</code></span>
+<span class="codeline" id="line-113"><code>	"continue":   true,</code></span>
+<span class="codeline" id="line-114"><code>	"delete":     true,</code></span>
+<span class="codeline" id="line-115"><code>	"do":         true,</code></span>
+<span class="codeline" id="line-116"><code>	"else":       true,</code></span>
+<span class="codeline" id="line-117"><code>	"finally":    true,</code></span>
+<span class="codeline" id="line-118"><code>	"in":         true,</code></span>
+<span class="codeline" id="line-119"><code>	"instanceof": true,</code></span>
+<span class="codeline" id="line-120"><code>	"return":     true,</code></span>
+<span class="codeline" id="line-121"><code>	"throw":      true,</code></span>
+<span class="codeline" id="line-122"><code>	"try":        true,</code></span>
+<span class="codeline" id="line-123"><code>	"typeof":     true,</code></span>
+<span class="codeline" id="line-124"><code>	"void":       true,</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>var jsonMarshalType = reflect.TypeFor[json.Marshaler]()</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>// indirectToJSONMarshaler returns the value, after dereferencing as many times</code></span>
+<span class="codeline" id="line-130"><code>// as necessary to reach the base type (or nil) or an implementation of json.Marshal.</code></span>
+<span class="codeline" id="line-131"><code>func indirectToJSONMarshaler(a any) any {</code></span>
+<span class="codeline" id="line-132"><code>	// text/template now supports passing untyped nil as a func call</code></span>
+<span class="codeline" id="line-133"><code>	// argument, so we must support it. Otherwise we'd panic below, as one</code></span>
+<span class="codeline" id="line-134"><code>	// cannot call the Type or Interface methods on an invalid</code></span>
+<span class="codeline" id="line-135"><code>	// reflect.Value. See golang.org/issue/18716.</code></span>
+<span class="codeline" id="line-136"><code>	if a == nil {</code></span>
+<span class="codeline" id="line-137"><code>		return nil</code></span>
+<span class="codeline" id="line-138"><code>	}</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>	v := reflect.ValueOf(a)</code></span>
+<span class="codeline" id="line-141"><code>	for !v.Type().Implements(jsonMarshalType) &amp;&amp; v.Kind() == reflect.Pointer &amp;&amp; !v.IsNil() {</code></span>
+<span class="codeline" id="line-142"><code>		v = v.Elem()</code></span>
+<span class="codeline" id="line-143"><code>	}</code></span>
+<span class="codeline" id="line-144"><code>	return v.Interface()</code></span>
+<span class="codeline" id="line-145"><code>}</code></span>
+<span class="codeline" id="line-146"><code></code></span>
+<span class="codeline" id="line-147"><code>// jsValEscaper escapes its inputs to a JS Expression (section 11.14) that has</code></span>
+<span class="codeline" id="line-148"><code>// neither side-effects nor free variables outside (NaN, Infinity).</code></span>
+<span class="codeline" id="line-149"><code>func jsValEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-150"><code>	var a any</code></span>
+<span class="codeline" id="line-151"><code>	if len(args) == 1 {</code></span>
+<span class="codeline" id="line-152"><code>		a = indirectToJSONMarshaler(args[0])</code></span>
+<span class="codeline" id="line-153"><code>		switch t := a.(type) {</code></span>
+<span class="codeline" id="line-154"><code>		case JS:</code></span>
+<span class="codeline" id="line-155"><code>			return string(t)</code></span>
+<span class="codeline" id="line-156"><code>		case JSStr:</code></span>
+<span class="codeline" id="line-157"><code>			// TODO: normalize quotes.</code></span>
+<span class="codeline" id="line-158"><code>			return `"` + string(t) + `"`</code></span>
+<span class="codeline" id="line-159"><code>		case json.Marshaler:</code></span>
+<span class="codeline" id="line-160"><code>			// Do not treat as a Stringer.</code></span>
+<span class="codeline" id="line-161"><code>		case fmt.Stringer:</code></span>
+<span class="codeline" id="line-162"><code>			a = t.String()</code></span>
+<span class="codeline" id="line-163"><code>		}</code></span>
+<span class="codeline" id="line-164"><code>	} else {</code></span>
+<span class="codeline" id="line-165"><code>		for i, arg := range args {</code></span>
+<span class="codeline" id="line-166"><code>			args[i] = indirectToJSONMarshaler(arg)</code></span>
+<span class="codeline" id="line-167"><code>		}</code></span>
+<span class="codeline" id="line-168"><code>		a = fmt.Sprint(args...)</code></span>
+<span class="codeline" id="line-169"><code>	}</code></span>
+<span class="codeline" id="line-170"><code>	// TODO: detect cycles before calling Marshal which loops infinitely on</code></span>
+<span class="codeline" id="line-171"><code>	// cyclic data. This may be an unacceptable DoS risk.</code></span>
+<span class="codeline" id="line-172"><code>	b, err := json.Marshal(a)</code></span>
+<span class="codeline" id="line-173"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-174"><code>		// While the standard JSON marshaller does not include user controlled</code></span>
+<span class="codeline" id="line-175"><code>		// information in the error message, if a type has a MarshalJSON method,</code></span>
+<span class="codeline" id="line-176"><code>		// the content of the error message is not guaranteed. Since we insert</code></span>
+<span class="codeline" id="line-177"><code>		// the error into the template, as part of a comment, we attempt to</code></span>
+<span class="codeline" id="line-178"><code>		// prevent the error from either terminating the comment, or the script</code></span>
+<span class="codeline" id="line-179"><code>		// block itself.</code></span>
+<span class="codeline" id="line-180"><code>		//</code></span>
+<span class="codeline" id="line-181"><code>		// In particular we:</code></span>
+<span class="codeline" id="line-182"><code>		//   * replace "*/" comment end tokens with "* /", which does not</code></span>
+<span class="codeline" id="line-183"><code>		//     terminate the comment</code></span>
+<span class="codeline" id="line-184"><code>		//   * replace "&lt;/script" with "\x3C/script", and "&lt;!--" with</code></span>
+<span class="codeline" id="line-185"><code>		//     "\x3C!--", which prevents confusing script block termination</code></span>
+<span class="codeline" id="line-186"><code>		//     semantics</code></span>
+<span class="codeline" id="line-187"><code>		//</code></span>
+<span class="codeline" id="line-188"><code>		// We also put a space before the comment so that if it is flush against</code></span>
+<span class="codeline" id="line-189"><code>		// a division operator it is not turned into a line comment:</code></span>
+<span class="codeline" id="line-190"><code>		//     x/{{y}}</code></span>
+<span class="codeline" id="line-191"><code>		// turning into</code></span>
+<span class="codeline" id="line-192"><code>		//     x//* error marshaling y:</code></span>
+<span class="codeline" id="line-193"><code>		//          second line of error message */null</code></span>
+<span class="codeline" id="line-194"><code>		errStr := err.Error()</code></span>
+<span class="codeline" id="line-195"><code>		errStr = strings.ReplaceAll(errStr, "*/", "* /")</code></span>
+<span class="codeline" id="line-196"><code>		errStr = strings.ReplaceAll(errStr, "&lt;/script", `\x3C/script`)</code></span>
+<span class="codeline" id="line-197"><code>		errStr = strings.ReplaceAll(errStr, "&lt;!--", `\x3C!--`)</code></span>
+<span class="codeline" id="line-198"><code>		return fmt.Sprintf(" /* %s */null ", errStr)</code></span>
+<span class="codeline" id="line-199"><code>	}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>	// TODO: maybe post-process output to prevent it from containing</code></span>
+<span class="codeline" id="line-202"><code>	// "&lt;!--", "--&gt;", "&lt;![CDATA[", "]]&gt;", or "&lt;/script"</code></span>
+<span class="codeline" id="line-203"><code>	// in case custom marshalers produce output containing those.</code></span>
+<span class="codeline" id="line-204"><code>	// Note: Do not use \x escaping to save bytes because it is not JSON compatible and this escaper</code></span>
+<span class="codeline" id="line-205"><code>	// supports ld+json content-type.</code></span>
+<span class="codeline" id="line-206"><code>	if len(b) == 0 {</code></span>
+<span class="codeline" id="line-207"><code>		// In, `x=y/{{.}}*z` a json.Marshaler that produces "" should</code></span>
+<span class="codeline" id="line-208"><code>		// not cause the output `x=y/*z`.</code></span>
+<span class="codeline" id="line-209"><code>		return " null "</code></span>
+<span class="codeline" id="line-210"><code>	}</code></span>
+<span class="codeline" id="line-211"><code>	first, _ := utf8.DecodeRune(b)</code></span>
+<span class="codeline" id="line-212"><code>	last, _ := utf8.DecodeLastRune(b)</code></span>
+<span class="codeline" id="line-213"><code>	var buf strings.Builder</code></span>
+<span class="codeline" id="line-214"><code>	// Prevent IdentifierNames and NumericLiterals from running into</code></span>
+<span class="codeline" id="line-215"><code>	// keywords: in, instanceof, typeof, void</code></span>
+<span class="codeline" id="line-216"><code>	pad := isJSIdentPart(first) || isJSIdentPart(last)</code></span>
+<span class="codeline" id="line-217"><code>	if pad {</code></span>
+<span class="codeline" id="line-218"><code>		buf.WriteByte(' ')</code></span>
+<span class="codeline" id="line-219"><code>	}</code></span>
+<span class="codeline" id="line-220"><code>	written := 0</code></span>
+<span class="codeline" id="line-221"><code>	// Make sure that json.Marshal escapes codepoints U+2028 &amp; U+2029</code></span>
+<span class="codeline" id="line-222"><code>	// so it falls within the subset of JSON which is valid JS.</code></span>
+<span class="codeline" id="line-223"><code>	for i := 0; i &lt; len(b); {</code></span>
+<span class="codeline" id="line-224"><code>		rune, n := utf8.DecodeRune(b[i:])</code></span>
+<span class="codeline" id="line-225"><code>		repl := ""</code></span>
+<span class="codeline" id="line-226"><code>		if rune == 0x2028 {</code></span>
+<span class="codeline" id="line-227"><code>			repl = `\u2028`</code></span>
+<span class="codeline" id="line-228"><code>		} else if rune == 0x2029 {</code></span>
+<span class="codeline" id="line-229"><code>			repl = `\u2029`</code></span>
+<span class="codeline" id="line-230"><code>		}</code></span>
+<span class="codeline" id="line-231"><code>		if repl != "" {</code></span>
+<span class="codeline" id="line-232"><code>			buf.Write(b[written:i])</code></span>
+<span class="codeline" id="line-233"><code>			buf.WriteString(repl)</code></span>
+<span class="codeline" id="line-234"><code>			written = i + n</code></span>
+<span class="codeline" id="line-235"><code>		}</code></span>
+<span class="codeline" id="line-236"><code>		i += n</code></span>
+<span class="codeline" id="line-237"><code>	}</code></span>
+<span class="codeline" id="line-238"><code>	if buf.Len() != 0 {</code></span>
+<span class="codeline" id="line-239"><code>		buf.Write(b[written:])</code></span>
+<span class="codeline" id="line-240"><code>		if pad {</code></span>
+<span class="codeline" id="line-241"><code>			buf.WriteByte(' ')</code></span>
+<span class="codeline" id="line-242"><code>		}</code></span>
+<span class="codeline" id="line-243"><code>		return buf.String()</code></span>
+<span class="codeline" id="line-244"><code>	}</code></span>
+<span class="codeline" id="line-245"><code>	return string(b)</code></span>
+<span class="codeline" id="line-246"><code>}</code></span>
+<span class="codeline" id="line-247"><code></code></span>
+<span class="codeline" id="line-248"><code>// jsStrEscaper produces a string that can be included between quotes in</code></span>
+<span class="codeline" id="line-249"><code>// JavaScript source, in JavaScript embedded in an HTML5 &lt;script&gt; element,</code></span>
+<span class="codeline" id="line-250"><code>// or in an HTML5 event handler attribute such as onclick.</code></span>
+<span class="codeline" id="line-251"><code>func jsStrEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-252"><code>	s, t := stringify(args...)</code></span>
+<span class="codeline" id="line-253"><code>	if t == contentTypeJSStr {</code></span>
+<span class="codeline" id="line-254"><code>		return replace(s, jsStrNormReplacementTable)</code></span>
+<span class="codeline" id="line-255"><code>	}</code></span>
+<span class="codeline" id="line-256"><code>	return replace(s, jsStrReplacementTable)</code></span>
+<span class="codeline" id="line-257"><code>}</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>func jsTmplLitEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-260"><code>	s, _ := stringify(args...)</code></span>
+<span class="codeline" id="line-261"><code>	return replace(s, jsBqStrReplacementTable)</code></span>
+<span class="codeline" id="line-262"><code>}</code></span>
+<span class="codeline" id="line-263"><code></code></span>
+<span class="codeline" id="line-264"><code>// jsRegexpEscaper behaves like jsStrEscaper but escapes regular expression</code></span>
+<span class="codeline" id="line-265"><code>// specials so the result is treated literally when included in a regular</code></span>
+<span class="codeline" id="line-266"><code>// expression literal. /foo{{.X}}bar/ matches the string "foo" followed by</code></span>
+<span class="codeline" id="line-267"><code>// the literal text of {{.X}} followed by the string "bar".</code></span>
+<span class="codeline" id="line-268"><code>func jsRegexpEscaper(args ...any) string {</code></span>
+<span class="codeline" id="line-269"><code>	s, _ := stringify(args...)</code></span>
+<span class="codeline" id="line-270"><code>	s = replace(s, jsRegexpReplacementTable)</code></span>
+<span class="codeline" id="line-271"><code>	if s == "" {</code></span>
+<span class="codeline" id="line-272"><code>		// /{{.X}}/ should not produce a line comment when .X == "".</code></span>
+<span class="codeline" id="line-273"><code>		return "(?:)"</code></span>
+<span class="codeline" id="line-274"><code>	}</code></span>
+<span class="codeline" id="line-275"><code>	return s</code></span>
+<span class="codeline" id="line-276"><code>}</code></span>
+<span class="codeline" id="line-277"><code></code></span>
+<span class="codeline" id="line-278"><code>// replace replaces each rune r of s with replacementTable[r], provided that</code></span>
+<span class="codeline" id="line-279"><code>// r &lt; len(replacementTable). If replacementTable[r] is the empty string then</code></span>
+<span class="codeline" id="line-280"><code>// no replacement is made.</code></span>
+<span class="codeline" id="line-281"><code>// It also replaces runes U+2028 and U+2029 with the raw strings `\u2028` and</code></span>
+<span class="codeline" id="line-282"><code>// `\u2029`.</code></span>
+<span class="codeline" id="line-283"><code>func replace(s string, replacementTable []string) string {</code></span>
+<span class="codeline" id="line-284"><code>	var b strings.Builder</code></span>
+<span class="codeline" id="line-285"><code>	r, w, written := rune(0), 0, 0</code></span>
+<span class="codeline" id="line-286"><code>	for i := 0; i &lt; len(s); i += w {</code></span>
+<span class="codeline" id="line-287"><code>		// See comment in htmlEscaper.</code></span>
+<span class="codeline" id="line-288"><code>		r, w = utf8.DecodeRuneInString(s[i:])</code></span>
+<span class="codeline" id="line-289"><code>		var repl string</code></span>
+<span class="codeline" id="line-290"><code>		switch {</code></span>
+<span class="codeline" id="line-291"><code>		case int(r) &lt; len(lowUnicodeReplacementTable):</code></span>
+<span class="codeline" id="line-292"><code>			repl = lowUnicodeReplacementTable[r]</code></span>
+<span class="codeline" id="line-293"><code>		case int(r) &lt; len(replacementTable) &amp;&amp; replacementTable[r] != "":</code></span>
+<span class="codeline" id="line-294"><code>			repl = replacementTable[r]</code></span>
+<span class="codeline" id="line-295"><code>		case r == '\u2028':</code></span>
+<span class="codeline" id="line-296"><code>			repl = `\u2028`</code></span>
+<span class="codeline" id="line-297"><code>		case r == '\u2029':</code></span>
+<span class="codeline" id="line-298"><code>			repl = `\u2029`</code></span>
+<span class="codeline" id="line-299"><code>		default:</code></span>
+<span class="codeline" id="line-300"><code>			continue</code></span>
+<span class="codeline" id="line-301"><code>		}</code></span>
+<span class="codeline" id="line-302"><code>		if written == 0 {</code></span>
+<span class="codeline" id="line-303"><code>			b.Grow(len(s))</code></span>
+<span class="codeline" id="line-304"><code>		}</code></span>
+<span class="codeline" id="line-305"><code>		b.WriteString(s[written:i])</code></span>
+<span class="codeline" id="line-306"><code>		b.WriteString(repl)</code></span>
+<span class="codeline" id="line-307"><code>		written = i + w</code></span>
+<span class="codeline" id="line-308"><code>	}</code></span>
+<span class="codeline" id="line-309"><code>	if written == 0 {</code></span>
+<span class="codeline" id="line-310"><code>		return s</code></span>
+<span class="codeline" id="line-311"><code>	}</code></span>
+<span class="codeline" id="line-312"><code>	b.WriteString(s[written:])</code></span>
+<span class="codeline" id="line-313"><code>	return b.String()</code></span>
+<span class="codeline" id="line-314"><code>}</code></span>
+<span class="codeline" id="line-315"><code></code></span>
+<span class="codeline" id="line-316"><code>var lowUnicodeReplacementTable = []string{</code></span>
+<span class="codeline" id="line-317"><code>	0: `\u0000`, 1: `\u0001`, 2: `\u0002`, 3: `\u0003`, 4: `\u0004`, 5: `\u0005`, 6: `\u0006`,</code></span>
+<span class="codeline" id="line-318"><code>	'\a': `\u0007`,</code></span>
+<span class="codeline" id="line-319"><code>	'\b': `\u0008`,</code></span>
+<span class="codeline" id="line-320"><code>	'\t': `\t`,</code></span>
+<span class="codeline" id="line-321"><code>	'\n': `\n`,</code></span>
+<span class="codeline" id="line-322"><code>	'\v': `\u000b`, // "\v" == "v" on IE 6.</code></span>
+<span class="codeline" id="line-323"><code>	'\f': `\f`,</code></span>
+<span class="codeline" id="line-324"><code>	'\r': `\r`,</code></span>
+<span class="codeline" id="line-325"><code>	0xe:  `\u000e`, 0xf: `\u000f`, 0x10: `\u0010`, 0x11: `\u0011`, 0x12: `\u0012`, 0x13: `\u0013`,</code></span>
+<span class="codeline" id="line-326"><code>	0x14: `\u0014`, 0x15: `\u0015`, 0x16: `\u0016`, 0x17: `\u0017`, 0x18: `\u0018`, 0x19: `\u0019`,</code></span>
+<span class="codeline" id="line-327"><code>	0x1a: `\u001a`, 0x1b: `\u001b`, 0x1c: `\u001c`, 0x1d: `\u001d`, 0x1e: `\u001e`, 0x1f: `\u001f`,</code></span>
+<span class="codeline" id="line-328"><code>}</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>var jsStrReplacementTable = []string{</code></span>
+<span class="codeline" id="line-331"><code>	0:    `\u0000`,</code></span>
+<span class="codeline" id="line-332"><code>	'\t': `\t`,</code></span>
+<span class="codeline" id="line-333"><code>	'\n': `\n`,</code></span>
+<span class="codeline" id="line-334"><code>	'\v': `\u000b`, // "\v" == "v" on IE 6.</code></span>
+<span class="codeline" id="line-335"><code>	'\f': `\f`,</code></span>
+<span class="codeline" id="line-336"><code>	'\r': `\r`,</code></span>
+<span class="codeline" id="line-337"><code>	// Encode HTML specials as hex so the output can be embedded</code></span>
+<span class="codeline" id="line-338"><code>	// in HTML attributes without further encoding.</code></span>
+<span class="codeline" id="line-339"><code>	'"':  `\u0022`,</code></span>
+<span class="codeline" id="line-340"><code>	'`':  `\u0060`,</code></span>
+<span class="codeline" id="line-341"><code>	'&amp;':  `\u0026`,</code></span>
+<span class="codeline" id="line-342"><code>	'\'': `\u0027`,</code></span>
+<span class="codeline" id="line-343"><code>	'+':  `\u002b`,</code></span>
+<span class="codeline" id="line-344"><code>	'/':  `\/`,</code></span>
+<span class="codeline" id="line-345"><code>	'&lt;':  `\u003c`,</code></span>
+<span class="codeline" id="line-346"><code>	'&gt;':  `\u003e`,</code></span>
+<span class="codeline" id="line-347"><code>	'\\': `\\`,</code></span>
+<span class="codeline" id="line-348"><code>}</code></span>
+<span class="codeline" id="line-349"><code></code></span>
+<span class="codeline" id="line-350"><code>// jsBqStrReplacementTable is like jsStrReplacementTable except it also contains</code></span>
+<span class="codeline" id="line-351"><code>// the special characters for JS template literals: $, {, and }.</code></span>
+<span class="codeline" id="line-352"><code>var jsBqStrReplacementTable = []string{</code></span>
+<span class="codeline" id="line-353"><code>	0:    `\u0000`,</code></span>
+<span class="codeline" id="line-354"><code>	'\t': `\t`,</code></span>
+<span class="codeline" id="line-355"><code>	'\n': `\n`,</code></span>
+<span class="codeline" id="line-356"><code>	'\v': `\u000b`, // "\v" == "v" on IE 6.</code></span>
+<span class="codeline" id="line-357"><code>	'\f': `\f`,</code></span>
+<span class="codeline" id="line-358"><code>	'\r': `\r`,</code></span>
+<span class="codeline" id="line-359"><code>	// Encode HTML specials as hex so the output can be embedded</code></span>
+<span class="codeline" id="line-360"><code>	// in HTML attributes without further encoding.</code></span>
+<span class="codeline" id="line-361"><code>	'"':  `\u0022`,</code></span>
+<span class="codeline" id="line-362"><code>	'`':  `\u0060`,</code></span>
+<span class="codeline" id="line-363"><code>	'&amp;':  `\u0026`,</code></span>
+<span class="codeline" id="line-364"><code>	'\'': `\u0027`,</code></span>
+<span class="codeline" id="line-365"><code>	'+':  `\u002b`,</code></span>
+<span class="codeline" id="line-366"><code>	'/':  `\/`,</code></span>
+<span class="codeline" id="line-367"><code>	'&lt;':  `\u003c`,</code></span>
+<span class="codeline" id="line-368"><code>	'&gt;':  `\u003e`,</code></span>
+<span class="codeline" id="line-369"><code>	'\\': `\\`,</code></span>
+<span class="codeline" id="line-370"><code>	'$':  `\u0024`,</code></span>
+<span class="codeline" id="line-371"><code>	'{':  `\u007b`,</code></span>
+<span class="codeline" id="line-372"><code>	'}':  `\u007d`,</code></span>
+<span class="codeline" id="line-373"><code>}</code></span>
+<span class="codeline" id="line-374"><code></code></span>
+<span class="codeline" id="line-375"><code>// jsStrNormReplacementTable is like jsStrReplacementTable but does not</code></span>
+<span class="codeline" id="line-376"><code>// overencode existing escapes since this table has no entry for `\`.</code></span>
+<span class="codeline" id="line-377"><code>var jsStrNormReplacementTable = []string{</code></span>
+<span class="codeline" id="line-378"><code>	0:    `\u0000`,</code></span>
+<span class="codeline" id="line-379"><code>	'\t': `\t`,</code></span>
+<span class="codeline" id="line-380"><code>	'\n': `\n`,</code></span>
+<span class="codeline" id="line-381"><code>	'\v': `\u000b`, // "\v" == "v" on IE 6.</code></span>
+<span class="codeline" id="line-382"><code>	'\f': `\f`,</code></span>
+<span class="codeline" id="line-383"><code>	'\r': `\r`,</code></span>
+<span class="codeline" id="line-384"><code>	// Encode HTML specials as hex so the output can be embedded</code></span>
+<span class="codeline" id="line-385"><code>	// in HTML attributes without further encoding.</code></span>
+<span class="codeline" id="line-386"><code>	'"':  `\u0022`,</code></span>
+<span class="codeline" id="line-387"><code>	'&amp;':  `\u0026`,</code></span>
+<span class="codeline" id="line-388"><code>	'\'': `\u0027`,</code></span>
+<span class="codeline" id="line-389"><code>	'`':  `\u0060`,</code></span>
+<span class="codeline" id="line-390"><code>	'+':  `\u002b`,</code></span>
+<span class="codeline" id="line-391"><code>	'/':  `\/`,</code></span>
+<span class="codeline" id="line-392"><code>	'&lt;':  `\u003c`,</code></span>
+<span class="codeline" id="line-393"><code>	'&gt;':  `\u003e`,</code></span>
+<span class="codeline" id="line-394"><code>}</code></span>
+<span class="codeline" id="line-395"><code>var jsRegexpReplacementTable = []string{</code></span>
+<span class="codeline" id="line-396"><code>	0:    `\u0000`,</code></span>
+<span class="codeline" id="line-397"><code>	'\t': `\t`,</code></span>
+<span class="codeline" id="line-398"><code>	'\n': `\n`,</code></span>
+<span class="codeline" id="line-399"><code>	'\v': `\u000b`, // "\v" == "v" on IE 6.</code></span>
+<span class="codeline" id="line-400"><code>	'\f': `\f`,</code></span>
+<span class="codeline" id="line-401"><code>	'\r': `\r`,</code></span>
+<span class="codeline" id="line-402"><code>	// Encode HTML specials as hex so the output can be embedded</code></span>
+<span class="codeline" id="line-403"><code>	// in HTML attributes without further encoding.</code></span>
+<span class="codeline" id="line-404"><code>	'"':  `\u0022`,</code></span>
+<span class="codeline" id="line-405"><code>	'$':  `\$`,</code></span>
+<span class="codeline" id="line-406"><code>	'&amp;':  `\u0026`,</code></span>
+<span class="codeline" id="line-407"><code>	'\'': `\u0027`,</code></span>
+<span class="codeline" id="line-408"><code>	'(':  `\(`,</code></span>
+<span class="codeline" id="line-409"><code>	')':  `\)`,</code></span>
+<span class="codeline" id="line-410"><code>	'*':  `\*`,</code></span>
+<span class="codeline" id="line-411"><code>	'+':  `\u002b`,</code></span>
+<span class="codeline" id="line-412"><code>	'-':  `\-`,</code></span>
+<span class="codeline" id="line-413"><code>	'.':  `\.`,</code></span>
+<span class="codeline" id="line-414"><code>	'/':  `\/`,</code></span>
+<span class="codeline" id="line-415"><code>	'&lt;':  `\u003c`,</code></span>
+<span class="codeline" id="line-416"><code>	'&gt;':  `\u003e`,</code></span>
+<span class="codeline" id="line-417"><code>	'?':  `\?`,</code></span>
+<span class="codeline" id="line-418"><code>	'[':  `\[`,</code></span>
+<span class="codeline" id="line-419"><code>	'\\': `\\`,</code></span>
+<span class="codeline" id="line-420"><code>	']':  `\]`,</code></span>
+<span class="codeline" id="line-421"><code>	'^':  `\^`,</code></span>
+<span class="codeline" id="line-422"><code>	'{':  `\{`,</code></span>
+<span class="codeline" id="line-423"><code>	'|':  `\|`,</code></span>
+<span class="codeline" id="line-424"><code>	'}':  `\}`,</code></span>
+<span class="codeline" id="line-425"><code>}</code></span>
+<span class="codeline" id="line-426"><code></code></span>
+<span class="codeline" id="line-427"><code>// isJSIdentPart reports whether the given rune is a JS identifier part.</code></span>
+<span class="codeline" id="line-428"><code>// It does not handle all the non-Latin letters, joiners, and combining marks,</code></span>
+<span class="codeline" id="line-429"><code>// but it does handle every codepoint that can occur in a numeric literal or</code></span>
+<span class="codeline" id="line-430"><code>// a keyword.</code></span>
+<span class="codeline" id="line-431"><code>func isJSIdentPart(r rune) bool {</code></span>
+<span class="codeline" id="line-432"><code>	switch {</code></span>
+<span class="codeline" id="line-433"><code>	case r == '$':</code></span>
+<span class="codeline" id="line-434"><code>		return true</code></span>
+<span class="codeline" id="line-435"><code>	case '0' &lt;= r &amp;&amp; r &lt;= '9':</code></span>
+<span class="codeline" id="line-436"><code>		return true</code></span>
+<span class="codeline" id="line-437"><code>	case 'A' &lt;= r &amp;&amp; r &lt;= 'Z':</code></span>
+<span class="codeline" id="line-438"><code>		return true</code></span>
+<span class="codeline" id="line-439"><code>	case r == '_':</code></span>
+<span class="codeline" id="line-440"><code>		return true</code></span>
+<span class="codeline" id="line-441"><code>	case 'a' &lt;= r &amp;&amp; r &lt;= 'z':</code></span>
+<span class="codeline" id="line-442"><code>		return true</code></span>
+<span class="codeline" id="line-443"><code>	}</code></span>
+<span class="codeline" id="line-444"><code>	return false</code></span>
+<span class="codeline" id="line-445"><code>}</code></span>
+<span class="codeline" id="line-446"><code></code></span>
+<span class="codeline" id="line-447"><code>// isJSType reports whether the given MIME type should be considered JavaScript.</code></span>
+<span class="codeline" id="line-448"><code>//</code></span>
+<span class="codeline" id="line-449"><code>// It is used to determine whether a script tag with a type attribute is a javascript container.</code></span>
+<span class="codeline" id="line-450"><code>func isJSType(mimeType string) bool {</code></span>
+<span class="codeline" id="line-451"><code>	// per</code></span>
+<span class="codeline" id="line-452"><code>	//   https://www.w3.org/TR/html5/scripting-1.html#attr-script-type</code></span>
+<span class="codeline" id="line-453"><code>	//   https://tools.ietf.org/html/rfc7231#section-3.1.1</code></span>
+<span class="codeline" id="line-454"><code>	//   https://tools.ietf.org/html/rfc4329#section-3</code></span>
+<span class="codeline" id="line-455"><code>	//   https://www.ietf.org/rfc/rfc4627.txt</code></span>
+<span class="codeline" id="line-456"><code>	// discard parameters</code></span>
+<span class="codeline" id="line-457"><code>	mimeType, _, _ = strings.Cut(mimeType, ";")</code></span>
+<span class="codeline" id="line-458"><code>	mimeType = strings.ToLower(mimeType)</code></span>
+<span class="codeline" id="line-459"><code>	mimeType = strings.TrimSpace(mimeType)</code></span>
+<span class="codeline" id="line-460"><code>	switch mimeType {</code></span>
+<span class="codeline" id="line-461"><code>	case</code></span>
+<span class="codeline" id="line-462"><code>		"application/ecmascript",</code></span>
+<span class="codeline" id="line-463"><code>		"application/javascript",</code></span>
+<span class="codeline" id="line-464"><code>		"application/json",</code></span>
+<span class="codeline" id="line-465"><code>		"application/ld+json",</code></span>
+<span class="codeline" id="line-466"><code>		"application/x-ecmascript",</code></span>
+<span class="codeline" id="line-467"><code>		"application/x-javascript",</code></span>
+<span class="codeline" id="line-468"><code>		"module",</code></span>
+<span class="codeline" id="line-469"><code>		"text/ecmascript",</code></span>
+<span class="codeline" id="line-470"><code>		"text/javascript",</code></span>
+<span class="codeline" id="line-471"><code>		"text/javascript1.0",</code></span>
+<span class="codeline" id="line-472"><code>		"text/javascript1.1",</code></span>
+<span class="codeline" id="line-473"><code>		"text/javascript1.2",</code></span>
+<span class="codeline" id="line-474"><code>		"text/javascript1.3",</code></span>
+<span class="codeline" id="line-475"><code>		"text/javascript1.4",</code></span>
+<span class="codeline" id="line-476"><code>		"text/javascript1.5",</code></span>
+<span class="codeline" id="line-477"><code>		"text/jscript",</code></span>
+<span class="codeline" id="line-478"><code>		"text/livescript",</code></span>
+<span class="codeline" id="line-479"><code>		"text/x-ecmascript",</code></span>
+<span class="codeline" id="line-480"><code>		"text/x-javascript":</code></span>
+<span class="codeline" id="line-481"><code>		return true</code></span>
+<span class="codeline" id="line-482"><code>	default:</code></span>
+<span class="codeline" id="line-483"><code>		return false</code></span>
+<span class="codeline" id="line-484"><code>	}</code></span>
+<span class="codeline" id="line-485"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

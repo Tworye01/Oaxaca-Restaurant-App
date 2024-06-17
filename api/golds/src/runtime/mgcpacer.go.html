@@ -1,0 +1,1471 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: mgcpacer.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	mgcpacer.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/cpu"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/goexperiment"</code></span>
+<span class="codeline" id="line-10"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-11"><code>	_ "unsafe" // for go:linkname</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>const (</code></span>
+<span class="codeline" id="line-15"><code>	// gcGoalUtilization is the goal CPU utilization for</code></span>
+<span class="codeline" id="line-16"><code>	// marking as a fraction of GOMAXPROCS.</code></span>
+<span class="codeline" id="line-17"><code>	//</code></span>
+<span class="codeline" id="line-18"><code>	// Increasing the goal utilization will shorten GC cycles as the GC</code></span>
+<span class="codeline" id="line-19"><code>	// has more resources behind it, lessening costs from the write barrier,</code></span>
+<span class="codeline" id="line-20"><code>	// but comes at the cost of increasing mutator latency.</code></span>
+<span class="codeline" id="line-21"><code>	gcGoalUtilization = gcBackgroundUtilization</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>	// gcBackgroundUtilization is the fixed CPU utilization for background</code></span>
+<span class="codeline" id="line-24"><code>	// marking. It must be &lt;= gcGoalUtilization. The difference between</code></span>
+<span class="codeline" id="line-25"><code>	// gcGoalUtilization and gcBackgroundUtilization will be made up by</code></span>
+<span class="codeline" id="line-26"><code>	// mark assists. The scheduler will aim to use within 50% of this</code></span>
+<span class="codeline" id="line-27"><code>	// goal.</code></span>
+<span class="codeline" id="line-28"><code>	//</code></span>
+<span class="codeline" id="line-29"><code>	// As a general rule, there's little reason to set gcBackgroundUtilization</code></span>
+<span class="codeline" id="line-30"><code>	// &lt; gcGoalUtilization. One reason might be in mostly idle applications,</code></span>
+<span class="codeline" id="line-31"><code>	// where goroutines are unlikely to assist at all, so the actual</code></span>
+<span class="codeline" id="line-32"><code>	// utilization will be lower than the goal. But this is moot point</code></span>
+<span class="codeline" id="line-33"><code>	// because the idle mark workers already soak up idle CPU resources.</code></span>
+<span class="codeline" id="line-34"><code>	// These two values are still kept separate however because they are</code></span>
+<span class="codeline" id="line-35"><code>	// distinct conceptually, and in previous iterations of the pacer the</code></span>
+<span class="codeline" id="line-36"><code>	// distinction was more important.</code></span>
+<span class="codeline" id="line-37"><code>	gcBackgroundUtilization = 0.25</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>	// gcCreditSlack is the amount of scan work credit that can</code></span>
+<span class="codeline" id="line-40"><code>	// accumulate locally before updating gcController.heapScanWork and,</code></span>
+<span class="codeline" id="line-41"><code>	// optionally, gcController.bgScanCredit. Lower values give a more</code></span>
+<span class="codeline" id="line-42"><code>	// accurate assist ratio and make it more likely that assists will</code></span>
+<span class="codeline" id="line-43"><code>	// successfully steal background credit. Higher values reduce memory</code></span>
+<span class="codeline" id="line-44"><code>	// contention.</code></span>
+<span class="codeline" id="line-45"><code>	gcCreditSlack = 2000</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>	// gcAssistTimeSlack is the nanoseconds of mutator assist time that</code></span>
+<span class="codeline" id="line-48"><code>	// can accumulate on a P before updating gcController.assistTime.</code></span>
+<span class="codeline" id="line-49"><code>	gcAssistTimeSlack = 5000</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>	// gcOverAssistWork determines how many extra units of scan work a GC</code></span>
+<span class="codeline" id="line-52"><code>	// assist does when an assist happens. This amortizes the cost of an</code></span>
+<span class="codeline" id="line-53"><code>	// assist by pre-paying for this many bytes of future allocations.</code></span>
+<span class="codeline" id="line-54"><code>	gcOverAssistWork = 64 &lt;&lt; 10</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>	// defaultHeapMinimum is the value of heapMinimum for GOGC==100.</code></span>
+<span class="codeline" id="line-57"><code>	defaultHeapMinimum = (goexperiment.HeapMinimum512KiBInt)*(512&lt;&lt;10) +</code></span>
+<span class="codeline" id="line-58"><code>		(1-goexperiment.HeapMinimum512KiBInt)*(4&lt;&lt;20)</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// maxStackScanSlack is the bytes of stack space allocated or freed</code></span>
+<span class="codeline" id="line-61"><code>	// that can accumulate on a P before updating gcController.stackSize.</code></span>
+<span class="codeline" id="line-62"><code>	maxStackScanSlack = 8 &lt;&lt; 10</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>	// memoryLimitMinHeapGoalHeadroom is the minimum amount of headroom the</code></span>
+<span class="codeline" id="line-65"><code>	// pacer gives to the heap goal when operating in the memory-limited regime.</code></span>
+<span class="codeline" id="line-66"><code>	// That is, it'll reduce the heap goal by this many extra bytes off of the</code></span>
+<span class="codeline" id="line-67"><code>	// base calculation, at minimum.</code></span>
+<span class="codeline" id="line-68"><code>	memoryLimitMinHeapGoalHeadroom = 1 &lt;&lt; 20</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>	// memoryLimitHeapGoalHeadroomPercent is how headroom the memory-limit-based</code></span>
+<span class="codeline" id="line-71"><code>	// heap goal should have as a percent of the maximum possible heap goal allowed</code></span>
+<span class="codeline" id="line-72"><code>	// to maintain the memory limit.</code></span>
+<span class="codeline" id="line-73"><code>	memoryLimitHeapGoalHeadroomPercent = 3</code></span>
+<span class="codeline" id="line-74"><code>)</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>// gcController implements the GC pacing controller that determines</code></span>
+<span class="codeline" id="line-77"><code>// when to trigger concurrent garbage collection and how much marking</code></span>
+<span class="codeline" id="line-78"><code>// work to do in mutator assists and background marking.</code></span>
+<span class="codeline" id="line-79"><code>//</code></span>
+<span class="codeline" id="line-80"><code>// It calculates the ratio between the allocation rate (in terms of CPU</code></span>
+<span class="codeline" id="line-81"><code>// time) and the GC scan throughput to determine the heap size at which to</code></span>
+<span class="codeline" id="line-82"><code>// trigger a GC cycle such that no GC assists are required to finish on time.</code></span>
+<span class="codeline" id="line-83"><code>// This algorithm thus optimizes GC CPU utilization to the dedicated background</code></span>
+<span class="codeline" id="line-84"><code>// mark utilization of 25% of GOMAXPROCS by minimizing GC assists.</code></span>
+<span class="codeline" id="line-85"><code>// GOMAXPROCS. The high-level design of this algorithm is documented</code></span>
+<span class="codeline" id="line-86"><code>// at https://github.com/golang/proposal/blob/master/design/44167-gc-pacer-redesign.md.</code></span>
+<span class="codeline" id="line-87"><code>// See https://golang.org/s/go15gcpacing for additional historical context.</code></span>
+<span class="codeline" id="line-88"><code>var gcController gcControllerState</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>type gcControllerState struct {</code></span>
+<span class="codeline" id="line-91"><code>	// Initialized from GOGC. GOGC=off means no GC.</code></span>
+<span class="codeline" id="line-92"><code>	gcPercent atomic.Int32</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>	// memoryLimit is the soft memory limit in bytes.</code></span>
+<span class="codeline" id="line-95"><code>	//</code></span>
+<span class="codeline" id="line-96"><code>	// Initialized from GOMEMLIMIT. GOMEMLIMIT=off is equivalent to MaxInt64</code></span>
+<span class="codeline" id="line-97"><code>	// which means no soft memory limit in practice.</code></span>
+<span class="codeline" id="line-98"><code>	//</code></span>
+<span class="codeline" id="line-99"><code>	// This is an int64 instead of a uint64 to more easily maintain parity with</code></span>
+<span class="codeline" id="line-100"><code>	// the SetMemoryLimit API, which sets a maximum at MaxInt64. This value</code></span>
+<span class="codeline" id="line-101"><code>	// should never be negative.</code></span>
+<span class="codeline" id="line-102"><code>	memoryLimit atomic.Int64</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	// heapMinimum is the minimum heap size at which to trigger GC.</code></span>
+<span class="codeline" id="line-105"><code>	// For small heaps, this overrides the usual GOGC*live set rule.</code></span>
+<span class="codeline" id="line-106"><code>	//</code></span>
+<span class="codeline" id="line-107"><code>	// When there is a very small live set but a lot of allocation, simply</code></span>
+<span class="codeline" id="line-108"><code>	// collecting when the heap reaches GOGC*live results in many GC</code></span>
+<span class="codeline" id="line-109"><code>	// cycles and high total per-GC overhead. This minimum amortizes this</code></span>
+<span class="codeline" id="line-110"><code>	// per-GC overhead while keeping the heap reasonably small.</code></span>
+<span class="codeline" id="line-111"><code>	//</code></span>
+<span class="codeline" id="line-112"><code>	// During initialization this is set to 4MB*GOGC/100. In the case of</code></span>
+<span class="codeline" id="line-113"><code>	// GOGC==0, this will set heapMinimum to 0, resulting in constant</code></span>
+<span class="codeline" id="line-114"><code>	// collection even when the heap size is small, which is useful for</code></span>
+<span class="codeline" id="line-115"><code>	// debugging.</code></span>
+<span class="codeline" id="line-116"><code>	heapMinimum uint64</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>	// runway is the amount of runway in heap bytes allocated by the</code></span>
+<span class="codeline" id="line-119"><code>	// application that we want to give the GC once it starts.</code></span>
+<span class="codeline" id="line-120"><code>	//</code></span>
+<span class="codeline" id="line-121"><code>	// This is computed from consMark during mark termination.</code></span>
+<span class="codeline" id="line-122"><code>	runway atomic.Uint64</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>	// consMark is the estimated per-CPU consMark ratio for the application.</code></span>
+<span class="codeline" id="line-125"><code>	//</code></span>
+<span class="codeline" id="line-126"><code>	// It represents the ratio between the application's allocation</code></span>
+<span class="codeline" id="line-127"><code>	// rate, as bytes allocated per CPU-time, and the GC's scan rate,</code></span>
+<span class="codeline" id="line-128"><code>	// as bytes scanned per CPU-time.</code></span>
+<span class="codeline" id="line-129"><code>	// The units of this ratio are (B / cpu-ns) / (B / cpu-ns).</code></span>
+<span class="codeline" id="line-130"><code>	//</code></span>
+<span class="codeline" id="line-131"><code>	// At a high level, this value is computed as the bytes of memory</code></span>
+<span class="codeline" id="line-132"><code>	// allocated (cons) per unit of scan work completed (mark) in a GC</code></span>
+<span class="codeline" id="line-133"><code>	// cycle, divided by the CPU time spent on each activity.</code></span>
+<span class="codeline" id="line-134"><code>	//</code></span>
+<span class="codeline" id="line-135"><code>	// Updated at the end of each GC cycle, in endCycle.</code></span>
+<span class="codeline" id="line-136"><code>	consMark float64</code></span>
+<span class="codeline" id="line-137"><code></code></span>
+<span class="codeline" id="line-138"><code>	// lastConsMark is the computed cons/mark value for the previous 4 GC</code></span>
+<span class="codeline" id="line-139"><code>	// cycles. Note that this is *not* the last value of consMark, but the</code></span>
+<span class="codeline" id="line-140"><code>	// measured cons/mark value in endCycle.</code></span>
+<span class="codeline" id="line-141"><code>	lastConsMark [4]float64</code></span>
+<span class="codeline" id="line-142"><code></code></span>
+<span class="codeline" id="line-143"><code>	// gcPercentHeapGoal is the goal heapLive for when next GC ends derived</code></span>
+<span class="codeline" id="line-144"><code>	// from gcPercent.</code></span>
+<span class="codeline" id="line-145"><code>	//</code></span>
+<span class="codeline" id="line-146"><code>	// Set to ^uint64(0) if gcPercent is disabled.</code></span>
+<span class="codeline" id="line-147"><code>	gcPercentHeapGoal atomic.Uint64</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>	// sweepDistMinTrigger is the minimum trigger to ensure a minimum</code></span>
+<span class="codeline" id="line-150"><code>	// sweep distance.</code></span>
+<span class="codeline" id="line-151"><code>	//</code></span>
+<span class="codeline" id="line-152"><code>	// This bound is also special because it applies to both the trigger</code></span>
+<span class="codeline" id="line-153"><code>	// *and* the goal (all other trigger bounds must be based *on* the goal).</code></span>
+<span class="codeline" id="line-154"><code>	//</code></span>
+<span class="codeline" id="line-155"><code>	// It is computed ahead of time, at commit time. The theory is that,</code></span>
+<span class="codeline" id="line-156"><code>	// absent a sudden change to a parameter like gcPercent, the trigger</code></span>
+<span class="codeline" id="line-157"><code>	// will be chosen to always give the sweeper enough headroom. However,</code></span>
+<span class="codeline" id="line-158"><code>	// such a change might dramatically and suddenly move up the trigger,</code></span>
+<span class="codeline" id="line-159"><code>	// in which case we need to ensure the sweeper still has enough headroom.</code></span>
+<span class="codeline" id="line-160"><code>	sweepDistMinTrigger atomic.Uint64</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>	// triggered is the point at which the current GC cycle actually triggered.</code></span>
+<span class="codeline" id="line-163"><code>	// Only valid during the mark phase of a GC cycle, otherwise set to ^uint64(0).</code></span>
+<span class="codeline" id="line-164"><code>	//</code></span>
+<span class="codeline" id="line-165"><code>	// Updated while the world is stopped.</code></span>
+<span class="codeline" id="line-166"><code>	triggered uint64</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>	// lastHeapGoal is the value of heapGoal at the moment the last GC</code></span>
+<span class="codeline" id="line-169"><code>	// ended. Note that this is distinct from the last value heapGoal had,</code></span>
+<span class="codeline" id="line-170"><code>	// because it could change if e.g. gcPercent changes.</code></span>
+<span class="codeline" id="line-171"><code>	//</code></span>
+<span class="codeline" id="line-172"><code>	// Read and written with the world stopped or with mheap_.lock held.</code></span>
+<span class="codeline" id="line-173"><code>	lastHeapGoal uint64</code></span>
+<span class="codeline" id="line-174"><code></code></span>
+<span class="codeline" id="line-175"><code>	// heapLive is the number of bytes considered live by the GC.</code></span>
+<span class="codeline" id="line-176"><code>	// That is: retained by the most recent GC plus allocated</code></span>
+<span class="codeline" id="line-177"><code>	// since then. heapLive ≤ memstats.totalAlloc-memstats.totalFree, since</code></span>
+<span class="codeline" id="line-178"><code>	// heapAlloc includes unmarked objects that have not yet been swept (and</code></span>
+<span class="codeline" id="line-179"><code>	// hence goes up as we allocate and down as we sweep) while heapLive</code></span>
+<span class="codeline" id="line-180"><code>	// excludes these objects (and hence only goes up between GCs).</code></span>
+<span class="codeline" id="line-181"><code>	//</code></span>
+<span class="codeline" id="line-182"><code>	// To reduce contention, this is updated only when obtaining a span</code></span>
+<span class="codeline" id="line-183"><code>	// from an mcentral and at this point it counts all of the unallocated</code></span>
+<span class="codeline" id="line-184"><code>	// slots in that span (which will be allocated before that mcache</code></span>
+<span class="codeline" id="line-185"><code>	// obtains another span from that mcentral). Hence, it slightly</code></span>
+<span class="codeline" id="line-186"><code>	// overestimates the "true" live heap size. It's better to overestimate</code></span>
+<span class="codeline" id="line-187"><code>	// than to underestimate because 1) this triggers the GC earlier than</code></span>
+<span class="codeline" id="line-188"><code>	// necessary rather than potentially too late and 2) this leads to a</code></span>
+<span class="codeline" id="line-189"><code>	// conservative GC rate rather than a GC rate that is potentially too</code></span>
+<span class="codeline" id="line-190"><code>	// low.</code></span>
+<span class="codeline" id="line-191"><code>	//</code></span>
+<span class="codeline" id="line-192"><code>	// Whenever this is updated, call traceHeapAlloc() and</code></span>
+<span class="codeline" id="line-193"><code>	// this gcControllerState's revise() method.</code></span>
+<span class="codeline" id="line-194"><code>	heapLive atomic.Uint64</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>	// heapScan is the number of bytes of "scannable" heap. This is the</code></span>
+<span class="codeline" id="line-197"><code>	// live heap (as counted by heapLive), but omitting no-scan objects and</code></span>
+<span class="codeline" id="line-198"><code>	// no-scan tails of objects.</code></span>
+<span class="codeline" id="line-199"><code>	//</code></span>
+<span class="codeline" id="line-200"><code>	// This value is fixed at the start of a GC cycle. It represents the</code></span>
+<span class="codeline" id="line-201"><code>	// maximum scannable heap.</code></span>
+<span class="codeline" id="line-202"><code>	heapScan atomic.Uint64</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>	// lastHeapScan is the number of bytes of heap that were scanned</code></span>
+<span class="codeline" id="line-205"><code>	// last GC cycle. It is the same as heapMarked, but only</code></span>
+<span class="codeline" id="line-206"><code>	// includes the "scannable" parts of objects.</code></span>
+<span class="codeline" id="line-207"><code>	//</code></span>
+<span class="codeline" id="line-208"><code>	// Updated when the world is stopped.</code></span>
+<span class="codeline" id="line-209"><code>	lastHeapScan uint64</code></span>
+<span class="codeline" id="line-210"><code></code></span>
+<span class="codeline" id="line-211"><code>	// lastStackScan is the number of bytes of stack that were scanned</code></span>
+<span class="codeline" id="line-212"><code>	// last GC cycle.</code></span>
+<span class="codeline" id="line-213"><code>	lastStackScan atomic.Uint64</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>	// maxStackScan is the amount of allocated goroutine stack space in</code></span>
+<span class="codeline" id="line-216"><code>	// use by goroutines.</code></span>
+<span class="codeline" id="line-217"><code>	//</code></span>
+<span class="codeline" id="line-218"><code>	// This number tracks allocated goroutine stack space rather than used</code></span>
+<span class="codeline" id="line-219"><code>	// goroutine stack space (i.e. what is actually scanned) because used</code></span>
+<span class="codeline" id="line-220"><code>	// goroutine stack space is much harder to measure cheaply. By using</code></span>
+<span class="codeline" id="line-221"><code>	// allocated space, we make an overestimate; this is OK, it's better</code></span>
+<span class="codeline" id="line-222"><code>	// to conservatively overcount than undercount.</code></span>
+<span class="codeline" id="line-223"><code>	maxStackScan atomic.Uint64</code></span>
+<span class="codeline" id="line-224"><code></code></span>
+<span class="codeline" id="line-225"><code>	// globalsScan is the total amount of global variable space</code></span>
+<span class="codeline" id="line-226"><code>	// that is scannable.</code></span>
+<span class="codeline" id="line-227"><code>	globalsScan atomic.Uint64</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>	// heapMarked is the number of bytes marked by the previous</code></span>
+<span class="codeline" id="line-230"><code>	// GC. After mark termination, heapLive == heapMarked, but</code></span>
+<span class="codeline" id="line-231"><code>	// unlike heapLive, heapMarked does not change until the</code></span>
+<span class="codeline" id="line-232"><code>	// next mark termination.</code></span>
+<span class="codeline" id="line-233"><code>	heapMarked uint64</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>	// heapScanWork is the total heap scan work performed this cycle.</code></span>
+<span class="codeline" id="line-236"><code>	// stackScanWork is the total stack scan work performed this cycle.</code></span>
+<span class="codeline" id="line-237"><code>	// globalsScanWork is the total globals scan work performed this cycle.</code></span>
+<span class="codeline" id="line-238"><code>	//</code></span>
+<span class="codeline" id="line-239"><code>	// These are updated atomically during the cycle. Updates occur in</code></span>
+<span class="codeline" id="line-240"><code>	// bounded batches, since they are both written and read</code></span>
+<span class="codeline" id="line-241"><code>	// throughout the cycle. At the end of the cycle, heapScanWork is how</code></span>
+<span class="codeline" id="line-242"><code>	// much of the retained heap is scannable.</code></span>
+<span class="codeline" id="line-243"><code>	//</code></span>
+<span class="codeline" id="line-244"><code>	// Currently these are measured in bytes. For most uses, this is an</code></span>
+<span class="codeline" id="line-245"><code>	// opaque unit of work, but for estimation the definition is important.</code></span>
+<span class="codeline" id="line-246"><code>	//</code></span>
+<span class="codeline" id="line-247"><code>	// Note that stackScanWork includes only stack space scanned, not all</code></span>
+<span class="codeline" id="line-248"><code>	// of the allocated stack.</code></span>
+<span class="codeline" id="line-249"><code>	heapScanWork    atomic.Int64</code></span>
+<span class="codeline" id="line-250"><code>	stackScanWork   atomic.Int64</code></span>
+<span class="codeline" id="line-251"><code>	globalsScanWork atomic.Int64</code></span>
+<span class="codeline" id="line-252"><code></code></span>
+<span class="codeline" id="line-253"><code>	// bgScanCredit is the scan work credit accumulated by the concurrent</code></span>
+<span class="codeline" id="line-254"><code>	// background scan. This credit is accumulated by the background scan</code></span>
+<span class="codeline" id="line-255"><code>	// and stolen by mutator assists.  Updates occur in bounded batches,</code></span>
+<span class="codeline" id="line-256"><code>	// since it is both written and read throughout the cycle.</code></span>
+<span class="codeline" id="line-257"><code>	bgScanCredit atomic.Int64</code></span>
+<span class="codeline" id="line-258"><code></code></span>
+<span class="codeline" id="line-259"><code>	// assistTime is the nanoseconds spent in mutator assists</code></span>
+<span class="codeline" id="line-260"><code>	// during this cycle. This is updated atomically, and must also</code></span>
+<span class="codeline" id="line-261"><code>	// be updated atomically even during a STW, because it is read</code></span>
+<span class="codeline" id="line-262"><code>	// by sysmon. Updates occur in bounded batches, since it is both</code></span>
+<span class="codeline" id="line-263"><code>	// written and read throughout the cycle.</code></span>
+<span class="codeline" id="line-264"><code>	assistTime atomic.Int64</code></span>
+<span class="codeline" id="line-265"><code></code></span>
+<span class="codeline" id="line-266"><code>	// dedicatedMarkTime is the nanoseconds spent in dedicated mark workers</code></span>
+<span class="codeline" id="line-267"><code>	// during this cycle. This is updated at the end of the concurrent mark</code></span>
+<span class="codeline" id="line-268"><code>	// phase.</code></span>
+<span class="codeline" id="line-269"><code>	dedicatedMarkTime atomic.Int64</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>	// fractionalMarkTime is the nanoseconds spent in the fractional mark</code></span>
+<span class="codeline" id="line-272"><code>	// worker during this cycle. This is updated throughout the cycle and</code></span>
+<span class="codeline" id="line-273"><code>	// will be up-to-date if the fractional mark worker is not currently</code></span>
+<span class="codeline" id="line-274"><code>	// running.</code></span>
+<span class="codeline" id="line-275"><code>	fractionalMarkTime atomic.Int64</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>	// idleMarkTime is the nanoseconds spent in idle marking during this</code></span>
+<span class="codeline" id="line-278"><code>	// cycle. This is updated throughout the cycle.</code></span>
+<span class="codeline" id="line-279"><code>	idleMarkTime atomic.Int64</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	// markStartTime is the absolute start time in nanoseconds</code></span>
+<span class="codeline" id="line-282"><code>	// that assists and background mark workers started.</code></span>
+<span class="codeline" id="line-283"><code>	markStartTime int64</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	// dedicatedMarkWorkersNeeded is the number of dedicated mark workers</code></span>
+<span class="codeline" id="line-286"><code>	// that need to be started. This is computed at the beginning of each</code></span>
+<span class="codeline" id="line-287"><code>	// cycle and decremented as dedicated mark workers get started.</code></span>
+<span class="codeline" id="line-288"><code>	dedicatedMarkWorkersNeeded atomic.Int64</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>	// idleMarkWorkers is two packed int32 values in a single uint64.</code></span>
+<span class="codeline" id="line-291"><code>	// These two values are always updated simultaneously.</code></span>
+<span class="codeline" id="line-292"><code>	//</code></span>
+<span class="codeline" id="line-293"><code>	// The bottom int32 is the current number of idle mark workers executing.</code></span>
+<span class="codeline" id="line-294"><code>	//</code></span>
+<span class="codeline" id="line-295"><code>	// The top int32 is the maximum number of idle mark workers allowed to</code></span>
+<span class="codeline" id="line-296"><code>	// execute concurrently. Normally, this number is just gomaxprocs. However,</code></span>
+<span class="codeline" id="line-297"><code>	// during periodic GC cycles it is set to 0 because the system is idle</code></span>
+<span class="codeline" id="line-298"><code>	// anyway; there's no need to go full blast on all of GOMAXPROCS.</code></span>
+<span class="codeline" id="line-299"><code>	//</code></span>
+<span class="codeline" id="line-300"><code>	// The maximum number of idle mark workers is used to prevent new workers</code></span>
+<span class="codeline" id="line-301"><code>	// from starting, but it is not a hard maximum. It is possible (but</code></span>
+<span class="codeline" id="line-302"><code>	// exceedingly rare) for the current number of idle mark workers to</code></span>
+<span class="codeline" id="line-303"><code>	// transiently exceed the maximum. This could happen if the maximum changes</code></span>
+<span class="codeline" id="line-304"><code>	// just after a GC ends, and an M with no P.</code></span>
+<span class="codeline" id="line-305"><code>	//</code></span>
+<span class="codeline" id="line-306"><code>	// Note that if we have no dedicated mark workers, we set this value to</code></span>
+<span class="codeline" id="line-307"><code>	// 1 in this case we only have fractional GC workers which aren't scheduled</code></span>
+<span class="codeline" id="line-308"><code>	// strictly enough to ensure GC progress. As a result, idle-priority mark</code></span>
+<span class="codeline" id="line-309"><code>	// workers are vital to GC progress in these situations.</code></span>
+<span class="codeline" id="line-310"><code>	//</code></span>
+<span class="codeline" id="line-311"><code>	// For example, consider a situation in which goroutines block on the GC</code></span>
+<span class="codeline" id="line-312"><code>	// (such as via runtime.GOMAXPROCS) and only fractional mark workers are</code></span>
+<span class="codeline" id="line-313"><code>	// scheduled (e.g. GOMAXPROCS=1). Without idle-priority mark workers, the</code></span>
+<span class="codeline" id="line-314"><code>	// last running M might skip scheduling a fractional mark worker if its</code></span>
+<span class="codeline" id="line-315"><code>	// utilization goal is met, such that once it goes to sleep (because there's</code></span>
+<span class="codeline" id="line-316"><code>	// nothing to do), there will be nothing else to spin up a new M for the</code></span>
+<span class="codeline" id="line-317"><code>	// fractional worker in the future, stalling GC progress and causing a</code></span>
+<span class="codeline" id="line-318"><code>	// deadlock. However, idle-priority workers will *always* run when there is</code></span>
+<span class="codeline" id="line-319"><code>	// nothing left to do, ensuring the GC makes progress.</code></span>
+<span class="codeline" id="line-320"><code>	//</code></span>
+<span class="codeline" id="line-321"><code>	// See github.com/golang/go/issues/44163 for more details.</code></span>
+<span class="codeline" id="line-322"><code>	idleMarkWorkers atomic.Uint64</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>	// assistWorkPerByte is the ratio of scan work to allocated</code></span>
+<span class="codeline" id="line-325"><code>	// bytes that should be performed by mutator assists. This is</code></span>
+<span class="codeline" id="line-326"><code>	// computed at the beginning of each cycle and updated every</code></span>
+<span class="codeline" id="line-327"><code>	// time heapScan is updated.</code></span>
+<span class="codeline" id="line-328"><code>	assistWorkPerByte atomic.Float64</code></span>
+<span class="codeline" id="line-329"><code></code></span>
+<span class="codeline" id="line-330"><code>	// assistBytesPerWork is 1/assistWorkPerByte.</code></span>
+<span class="codeline" id="line-331"><code>	//</code></span>
+<span class="codeline" id="line-332"><code>	// Note that because this is read and written independently</code></span>
+<span class="codeline" id="line-333"><code>	// from assistWorkPerByte users may notice a skew between</code></span>
+<span class="codeline" id="line-334"><code>	// the two values, and such a state should be safe.</code></span>
+<span class="codeline" id="line-335"><code>	assistBytesPerWork atomic.Float64</code></span>
+<span class="codeline" id="line-336"><code></code></span>
+<span class="codeline" id="line-337"><code>	// fractionalUtilizationGoal is the fraction of wall clock</code></span>
+<span class="codeline" id="line-338"><code>	// time that should be spent in the fractional mark worker on</code></span>
+<span class="codeline" id="line-339"><code>	// each P that isn't running a dedicated worker.</code></span>
+<span class="codeline" id="line-340"><code>	//</code></span>
+<span class="codeline" id="line-341"><code>	// For example, if the utilization goal is 25% and there are</code></span>
+<span class="codeline" id="line-342"><code>	// no dedicated workers, this will be 0.25. If the goal is</code></span>
+<span class="codeline" id="line-343"><code>	// 25%, there is one dedicated worker, and GOMAXPROCS is 5,</code></span>
+<span class="codeline" id="line-344"><code>	// this will be 0.05 to make up the missing 5%.</code></span>
+<span class="codeline" id="line-345"><code>	//</code></span>
+<span class="codeline" id="line-346"><code>	// If this is zero, no fractional workers are needed.</code></span>
+<span class="codeline" id="line-347"><code>	fractionalUtilizationGoal float64</code></span>
+<span class="codeline" id="line-348"><code></code></span>
+<span class="codeline" id="line-349"><code>	// These memory stats are effectively duplicates of fields from</code></span>
+<span class="codeline" id="line-350"><code>	// memstats.heapStats but are updated atomically or with the world</code></span>
+<span class="codeline" id="line-351"><code>	// stopped and don't provide the same consistency guarantees.</code></span>
+<span class="codeline" id="line-352"><code>	//</code></span>
+<span class="codeline" id="line-353"><code>	// Because the runtime is responsible for managing a memory limit, it's</code></span>
+<span class="codeline" id="line-354"><code>	// useful to couple these stats more tightly to the gcController, which</code></span>
+<span class="codeline" id="line-355"><code>	// is intimately connected to how that memory limit is maintained.</code></span>
+<span class="codeline" id="line-356"><code>	heapInUse    sysMemStat    // bytes in mSpanInUse spans</code></span>
+<span class="codeline" id="line-357"><code>	heapReleased sysMemStat    // bytes released to the OS</code></span>
+<span class="codeline" id="line-358"><code>	heapFree     sysMemStat    // bytes not in any span, but not released to the OS</code></span>
+<span class="codeline" id="line-359"><code>	totalAlloc   atomic.Uint64 // total bytes allocated</code></span>
+<span class="codeline" id="line-360"><code>	totalFree    atomic.Uint64 // total bytes freed</code></span>
+<span class="codeline" id="line-361"><code>	mappedReady  atomic.Uint64 // total virtual memory in the Ready state (see mem.go).</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>	// test indicates that this is a test-only copy of gcControllerState.</code></span>
+<span class="codeline" id="line-364"><code>	test bool</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>	_ cpu.CacheLinePad</code></span>
+<span class="codeline" id="line-367"><code>}</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>func (c *gcControllerState) init(gcPercent int32, memoryLimit int64) {</code></span>
+<span class="codeline" id="line-370"><code>	c.heapMinimum = defaultHeapMinimum</code></span>
+<span class="codeline" id="line-371"><code>	c.triggered = ^uint64(0)</code></span>
+<span class="codeline" id="line-372"><code>	c.setGCPercent(gcPercent)</code></span>
+<span class="codeline" id="line-373"><code>	c.setMemoryLimit(memoryLimit)</code></span>
+<span class="codeline" id="line-374"><code>	c.commit(true) // No sweep phase in the first GC cycle.</code></span>
+<span class="codeline" id="line-375"><code>	// N.B. Don't bother calling traceHeapGoal. Tracing is never enabled at</code></span>
+<span class="codeline" id="line-376"><code>	// initialization time.</code></span>
+<span class="codeline" id="line-377"><code>	// N.B. No need to call revise; there's no GC enabled during</code></span>
+<span class="codeline" id="line-378"><code>	// initialization.</code></span>
+<span class="codeline" id="line-379"><code>}</code></span>
+<span class="codeline" id="line-380"><code></code></span>
+<span class="codeline" id="line-381"><code>// startCycle resets the GC controller's state and computes estimates</code></span>
+<span class="codeline" id="line-382"><code>// for a new GC cycle. The caller must hold worldsema and the world</code></span>
+<span class="codeline" id="line-383"><code>// must be stopped.</code></span>
+<span class="codeline" id="line-384"><code>func (c *gcControllerState) startCycle(markStartTime int64, procs int, trigger gcTrigger) {</code></span>
+<span class="codeline" id="line-385"><code>	c.heapScanWork.Store(0)</code></span>
+<span class="codeline" id="line-386"><code>	c.stackScanWork.Store(0)</code></span>
+<span class="codeline" id="line-387"><code>	c.globalsScanWork.Store(0)</code></span>
+<span class="codeline" id="line-388"><code>	c.bgScanCredit.Store(0)</code></span>
+<span class="codeline" id="line-389"><code>	c.assistTime.Store(0)</code></span>
+<span class="codeline" id="line-390"><code>	c.dedicatedMarkTime.Store(0)</code></span>
+<span class="codeline" id="line-391"><code>	c.fractionalMarkTime.Store(0)</code></span>
+<span class="codeline" id="line-392"><code>	c.idleMarkTime.Store(0)</code></span>
+<span class="codeline" id="line-393"><code>	c.markStartTime = markStartTime</code></span>
+<span class="codeline" id="line-394"><code>	c.triggered = c.heapLive.Load()</code></span>
+<span class="codeline" id="line-395"><code></code></span>
+<span class="codeline" id="line-396"><code>	// Compute the background mark utilization goal. In general,</code></span>
+<span class="codeline" id="line-397"><code>	// this may not come out exactly. We round the number of</code></span>
+<span class="codeline" id="line-398"><code>	// dedicated workers so that the utilization is closest to</code></span>
+<span class="codeline" id="line-399"><code>	// 25%. For small GOMAXPROCS, this would introduce too much</code></span>
+<span class="codeline" id="line-400"><code>	// error, so we add fractional workers in that case.</code></span>
+<span class="codeline" id="line-401"><code>	totalUtilizationGoal := float64(procs) * gcBackgroundUtilization</code></span>
+<span class="codeline" id="line-402"><code>	dedicatedMarkWorkersNeeded := int64(totalUtilizationGoal + 0.5)</code></span>
+<span class="codeline" id="line-403"><code>	utilError := float64(dedicatedMarkWorkersNeeded)/totalUtilizationGoal - 1</code></span>
+<span class="codeline" id="line-404"><code>	const maxUtilError = 0.3</code></span>
+<span class="codeline" id="line-405"><code>	if utilError &lt; -maxUtilError || utilError &gt; maxUtilError {</code></span>
+<span class="codeline" id="line-406"><code>		// Rounding put us more than 30% off our goal. With</code></span>
+<span class="codeline" id="line-407"><code>		// gcBackgroundUtilization of 25%, this happens for</code></span>
+<span class="codeline" id="line-408"><code>		// GOMAXPROCS&lt;=3 or GOMAXPROCS=6. Enable fractional</code></span>
+<span class="codeline" id="line-409"><code>		// workers to compensate.</code></span>
+<span class="codeline" id="line-410"><code>		if float64(dedicatedMarkWorkersNeeded) &gt; totalUtilizationGoal {</code></span>
+<span class="codeline" id="line-411"><code>			// Too many dedicated workers.</code></span>
+<span class="codeline" id="line-412"><code>			dedicatedMarkWorkersNeeded--</code></span>
+<span class="codeline" id="line-413"><code>		}</code></span>
+<span class="codeline" id="line-414"><code>		c.fractionalUtilizationGoal = (totalUtilizationGoal - float64(dedicatedMarkWorkersNeeded)) / float64(procs)</code></span>
+<span class="codeline" id="line-415"><code>	} else {</code></span>
+<span class="codeline" id="line-416"><code>		c.fractionalUtilizationGoal = 0</code></span>
+<span class="codeline" id="line-417"><code>	}</code></span>
+<span class="codeline" id="line-418"><code></code></span>
+<span class="codeline" id="line-419"><code>	// In STW mode, we just want dedicated workers.</code></span>
+<span class="codeline" id="line-420"><code>	if debug.gcstoptheworld &gt; 0 {</code></span>
+<span class="codeline" id="line-421"><code>		dedicatedMarkWorkersNeeded = int64(procs)</code></span>
+<span class="codeline" id="line-422"><code>		c.fractionalUtilizationGoal = 0</code></span>
+<span class="codeline" id="line-423"><code>	}</code></span>
+<span class="codeline" id="line-424"><code></code></span>
+<span class="codeline" id="line-425"><code>	// Clear per-P state</code></span>
+<span class="codeline" id="line-426"><code>	for _, p := range allp {</code></span>
+<span class="codeline" id="line-427"><code>		p.gcAssistTime = 0</code></span>
+<span class="codeline" id="line-428"><code>		p.gcFractionalMarkTime = 0</code></span>
+<span class="codeline" id="line-429"><code>	}</code></span>
+<span class="codeline" id="line-430"><code></code></span>
+<span class="codeline" id="line-431"><code>	if trigger.kind == gcTriggerTime {</code></span>
+<span class="codeline" id="line-432"><code>		// During a periodic GC cycle, reduce the number of idle mark workers</code></span>
+<span class="codeline" id="line-433"><code>		// required. However, we need at least one dedicated mark worker or</code></span>
+<span class="codeline" id="line-434"><code>		// idle GC worker to ensure GC progress in some scenarios (see comment</code></span>
+<span class="codeline" id="line-435"><code>		// on maxIdleMarkWorkers).</code></span>
+<span class="codeline" id="line-436"><code>		if dedicatedMarkWorkersNeeded &gt; 0 {</code></span>
+<span class="codeline" id="line-437"><code>			c.setMaxIdleMarkWorkers(0)</code></span>
+<span class="codeline" id="line-438"><code>		} else {</code></span>
+<span class="codeline" id="line-439"><code>			// TODO(mknyszek): The fundamental reason why we need this is because</code></span>
+<span class="codeline" id="line-440"><code>			// we can't count on the fractional mark worker to get scheduled.</code></span>
+<span class="codeline" id="line-441"><code>			// Fix that by ensuring it gets scheduled according to its quota even</code></span>
+<span class="codeline" id="line-442"><code>			// if the rest of the application is idle.</code></span>
+<span class="codeline" id="line-443"><code>			c.setMaxIdleMarkWorkers(1)</code></span>
+<span class="codeline" id="line-444"><code>		}</code></span>
+<span class="codeline" id="line-445"><code>	} else {</code></span>
+<span class="codeline" id="line-446"><code>		// N.B. gomaxprocs and dedicatedMarkWorkersNeeded are guaranteed not to</code></span>
+<span class="codeline" id="line-447"><code>		// change during a GC cycle.</code></span>
+<span class="codeline" id="line-448"><code>		c.setMaxIdleMarkWorkers(int32(procs) - int32(dedicatedMarkWorkersNeeded))</code></span>
+<span class="codeline" id="line-449"><code>	}</code></span>
+<span class="codeline" id="line-450"><code></code></span>
+<span class="codeline" id="line-451"><code>	// Compute initial values for controls that are updated</code></span>
+<span class="codeline" id="line-452"><code>	// throughout the cycle.</code></span>
+<span class="codeline" id="line-453"><code>	c.dedicatedMarkWorkersNeeded.Store(dedicatedMarkWorkersNeeded)</code></span>
+<span class="codeline" id="line-454"><code>	c.revise()</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>	if debug.gcpacertrace &gt; 0 {</code></span>
+<span class="codeline" id="line-457"><code>		heapGoal := c.heapGoal()</code></span>
+<span class="codeline" id="line-458"><code>		assistRatio := c.assistWorkPerByte.Load()</code></span>
+<span class="codeline" id="line-459"><code>		print("pacer: assist ratio=", assistRatio,</code></span>
+<span class="codeline" id="line-460"><code>			" (scan ", gcController.heapScan.Load()&gt;&gt;20, " MB in ",</code></span>
+<span class="codeline" id="line-461"><code>			work.initialHeapLive&gt;&gt;20, "-&gt;",</code></span>
+<span class="codeline" id="line-462"><code>			heapGoal&gt;&gt;20, " MB)",</code></span>
+<span class="codeline" id="line-463"><code>			" workers=", dedicatedMarkWorkersNeeded,</code></span>
+<span class="codeline" id="line-464"><code>			"+", c.fractionalUtilizationGoal, "\n")</code></span>
+<span class="codeline" id="line-465"><code>	}</code></span>
+<span class="codeline" id="line-466"><code>}</code></span>
+<span class="codeline" id="line-467"><code></code></span>
+<span class="codeline" id="line-468"><code>// revise updates the assist ratio during the GC cycle to account for</code></span>
+<span class="codeline" id="line-469"><code>// improved estimates. This should be called whenever gcController.heapScan,</code></span>
+<span class="codeline" id="line-470"><code>// gcController.heapLive, or if any inputs to gcController.heapGoal are</code></span>
+<span class="codeline" id="line-471"><code>// updated. It is safe to call concurrently, but it may race with other</code></span>
+<span class="codeline" id="line-472"><code>// calls to revise.</code></span>
+<span class="codeline" id="line-473"><code>//</code></span>
+<span class="codeline" id="line-474"><code>// The result of this race is that the two assist ratio values may not line</code></span>
+<span class="codeline" id="line-475"><code>// up or may be stale. In practice this is OK because the assist ratio</code></span>
+<span class="codeline" id="line-476"><code>// moves slowly throughout a GC cycle, and the assist ratio is a best-effort</code></span>
+<span class="codeline" id="line-477"><code>// heuristic anyway. Furthermore, no part of the heuristic depends on</code></span>
+<span class="codeline" id="line-478"><code>// the two assist ratio values being exact reciprocals of one another, since</code></span>
+<span class="codeline" id="line-479"><code>// the two values are used to convert values from different sources.</code></span>
+<span class="codeline" id="line-480"><code>//</code></span>
+<span class="codeline" id="line-481"><code>// The worst case result of this raciness is that we may miss a larger shift</code></span>
+<span class="codeline" id="line-482"><code>// in the ratio (say, if we decide to pace more aggressively against the</code></span>
+<span class="codeline" id="line-483"><code>// hard heap goal) but even this "hard goal" is best-effort (see #40460).</code></span>
+<span class="codeline" id="line-484"><code>// The dedicated GC should ensure we don't exceed the hard goal by too much</code></span>
+<span class="codeline" id="line-485"><code>// in the rare case we do exceed it.</code></span>
+<span class="codeline" id="line-486"><code>//</code></span>
+<span class="codeline" id="line-487"><code>// It should only be called when gcBlackenEnabled != 0 (because this</code></span>
+<span class="codeline" id="line-488"><code>// is when assists are enabled and the necessary statistics are</code></span>
+<span class="codeline" id="line-489"><code>// available).</code></span>
+<span class="codeline" id="line-490"><code>func (c *gcControllerState) revise() {</code></span>
+<span class="codeline" id="line-491"><code>	gcPercent := c.gcPercent.Load()</code></span>
+<span class="codeline" id="line-492"><code>	if gcPercent &lt; 0 {</code></span>
+<span class="codeline" id="line-493"><code>		// If GC is disabled but we're running a forced GC,</code></span>
+<span class="codeline" id="line-494"><code>		// act like GOGC is huge for the below calculations.</code></span>
+<span class="codeline" id="line-495"><code>		gcPercent = 100000</code></span>
+<span class="codeline" id="line-496"><code>	}</code></span>
+<span class="codeline" id="line-497"><code>	live := c.heapLive.Load()</code></span>
+<span class="codeline" id="line-498"><code>	scan := c.heapScan.Load()</code></span>
+<span class="codeline" id="line-499"><code>	work := c.heapScanWork.Load() + c.stackScanWork.Load() + c.globalsScanWork.Load()</code></span>
+<span class="codeline" id="line-500"><code></code></span>
+<span class="codeline" id="line-501"><code>	// Assume we're under the soft goal. Pace GC to complete at</code></span>
+<span class="codeline" id="line-502"><code>	// heapGoal assuming the heap is in steady-state.</code></span>
+<span class="codeline" id="line-503"><code>	heapGoal := int64(c.heapGoal())</code></span>
+<span class="codeline" id="line-504"><code></code></span>
+<span class="codeline" id="line-505"><code>	// The expected scan work is computed as the amount of bytes scanned last</code></span>
+<span class="codeline" id="line-506"><code>	// GC cycle (both heap and stack), plus our estimate of globals work for this cycle.</code></span>
+<span class="codeline" id="line-507"><code>	scanWorkExpected := int64(c.lastHeapScan + c.lastStackScan.Load() + c.globalsScan.Load())</code></span>
+<span class="codeline" id="line-508"><code></code></span>
+<span class="codeline" id="line-509"><code>	// maxScanWork is a worst-case estimate of the amount of scan work that</code></span>
+<span class="codeline" id="line-510"><code>	// needs to be performed in this GC cycle. Specifically, it represents</code></span>
+<span class="codeline" id="line-511"><code>	// the case where *all* scannable memory turns out to be live, and</code></span>
+<span class="codeline" id="line-512"><code>	// *all* allocated stack space is scannable.</code></span>
+<span class="codeline" id="line-513"><code>	maxStackScan := c.maxStackScan.Load()</code></span>
+<span class="codeline" id="line-514"><code>	maxScanWork := int64(scan + maxStackScan + c.globalsScan.Load())</code></span>
+<span class="codeline" id="line-515"><code>	if work &gt; scanWorkExpected {</code></span>
+<span class="codeline" id="line-516"><code>		// We've already done more scan work than expected. Because our expectation</code></span>
+<span class="codeline" id="line-517"><code>		// is based on a steady-state scannable heap size, we assume this means our</code></span>
+<span class="codeline" id="line-518"><code>		// heap is growing. Compute a new heap goal that takes our existing runway</code></span>
+<span class="codeline" id="line-519"><code>		// computed for scanWorkExpected and extrapolates it to maxScanWork, the worst-case</code></span>
+<span class="codeline" id="line-520"><code>		// scan work. This keeps our assist ratio stable if the heap continues to grow.</code></span>
+<span class="codeline" id="line-521"><code>		//</code></span>
+<span class="codeline" id="line-522"><code>		// The effect of this mechanism is that assists stay flat in the face of heap</code></span>
+<span class="codeline" id="line-523"><code>		// growths. It's OK to use more memory this cycle to scan all the live heap,</code></span>
+<span class="codeline" id="line-524"><code>		// because the next GC cycle is inevitably going to use *at least* that much</code></span>
+<span class="codeline" id="line-525"><code>		// memory anyway.</code></span>
+<span class="codeline" id="line-526"><code>		extHeapGoal := int64(float64(heapGoal-int64(c.triggered))/float64(scanWorkExpected)*float64(maxScanWork)) + int64(c.triggered)</code></span>
+<span class="codeline" id="line-527"><code>		scanWorkExpected = maxScanWork</code></span>
+<span class="codeline" id="line-528"><code></code></span>
+<span class="codeline" id="line-529"><code>		// hardGoal is a hard limit on the amount that we're willing to push back the</code></span>
+<span class="codeline" id="line-530"><code>		// heap goal, and that's twice the heap goal (i.e. if GOGC=100 and the heap and/or</code></span>
+<span class="codeline" id="line-531"><code>		// stacks and/or globals grow to twice their size, this limits the current GC cycle's</code></span>
+<span class="codeline" id="line-532"><code>		// growth to 4x the original live heap's size).</code></span>
+<span class="codeline" id="line-533"><code>		//</code></span>
+<span class="codeline" id="line-534"><code>		// This maintains the invariant that we use no more memory than the next GC cycle</code></span>
+<span class="codeline" id="line-535"><code>		// will anyway.</code></span>
+<span class="codeline" id="line-536"><code>		hardGoal := int64((1.0 + float64(gcPercent)/100.0) * float64(heapGoal))</code></span>
+<span class="codeline" id="line-537"><code>		if extHeapGoal &gt; hardGoal {</code></span>
+<span class="codeline" id="line-538"><code>			extHeapGoal = hardGoal</code></span>
+<span class="codeline" id="line-539"><code>		}</code></span>
+<span class="codeline" id="line-540"><code>		heapGoal = extHeapGoal</code></span>
+<span class="codeline" id="line-541"><code>	}</code></span>
+<span class="codeline" id="line-542"><code>	if int64(live) &gt; heapGoal {</code></span>
+<span class="codeline" id="line-543"><code>		// We're already past our heap goal, even the extrapolated one.</code></span>
+<span class="codeline" id="line-544"><code>		// Leave ourselves some extra runway, so in the worst case we</code></span>
+<span class="codeline" id="line-545"><code>		// finish by that point.</code></span>
+<span class="codeline" id="line-546"><code>		const maxOvershoot = 1.1</code></span>
+<span class="codeline" id="line-547"><code>		heapGoal = int64(float64(heapGoal) * maxOvershoot)</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>		// Compute the upper bound on the scan work remaining.</code></span>
+<span class="codeline" id="line-550"><code>		scanWorkExpected = maxScanWork</code></span>
+<span class="codeline" id="line-551"><code>	}</code></span>
+<span class="codeline" id="line-552"><code></code></span>
+<span class="codeline" id="line-553"><code>	// Compute the remaining scan work estimate.</code></span>
+<span class="codeline" id="line-554"><code>	//</code></span>
+<span class="codeline" id="line-555"><code>	// Note that we currently count allocations during GC as both</code></span>
+<span class="codeline" id="line-556"><code>	// scannable heap (heapScan) and scan work completed</code></span>
+<span class="codeline" id="line-557"><code>	// (scanWork), so allocation will change this difference</code></span>
+<span class="codeline" id="line-558"><code>	// slowly in the soft regime and not at all in the hard</code></span>
+<span class="codeline" id="line-559"><code>	// regime.</code></span>
+<span class="codeline" id="line-560"><code>	scanWorkRemaining := scanWorkExpected - work</code></span>
+<span class="codeline" id="line-561"><code>	if scanWorkRemaining &lt; 1000 {</code></span>
+<span class="codeline" id="line-562"><code>		// We set a somewhat arbitrary lower bound on</code></span>
+<span class="codeline" id="line-563"><code>		// remaining scan work since if we aim a little high,</code></span>
+<span class="codeline" id="line-564"><code>		// we can miss by a little.</code></span>
+<span class="codeline" id="line-565"><code>		//</code></span>
+<span class="codeline" id="line-566"><code>		// We *do* need to enforce that this is at least 1,</code></span>
+<span class="codeline" id="line-567"><code>		// since marking is racy and double-scanning objects</code></span>
+<span class="codeline" id="line-568"><code>		// may legitimately make the remaining scan work</code></span>
+<span class="codeline" id="line-569"><code>		// negative, even in the hard goal regime.</code></span>
+<span class="codeline" id="line-570"><code>		scanWorkRemaining = 1000</code></span>
+<span class="codeline" id="line-571"><code>	}</code></span>
+<span class="codeline" id="line-572"><code></code></span>
+<span class="codeline" id="line-573"><code>	// Compute the heap distance remaining.</code></span>
+<span class="codeline" id="line-574"><code>	heapRemaining := heapGoal - int64(live)</code></span>
+<span class="codeline" id="line-575"><code>	if heapRemaining &lt;= 0 {</code></span>
+<span class="codeline" id="line-576"><code>		// This shouldn't happen, but if it does, avoid</code></span>
+<span class="codeline" id="line-577"><code>		// dividing by zero or setting the assist negative.</code></span>
+<span class="codeline" id="line-578"><code>		heapRemaining = 1</code></span>
+<span class="codeline" id="line-579"><code>	}</code></span>
+<span class="codeline" id="line-580"><code></code></span>
+<span class="codeline" id="line-581"><code>	// Compute the mutator assist ratio so by the time the mutator</code></span>
+<span class="codeline" id="line-582"><code>	// allocates the remaining heap bytes up to heapGoal, it will</code></span>
+<span class="codeline" id="line-583"><code>	// have done (or stolen) the remaining amount of scan work.</code></span>
+<span class="codeline" id="line-584"><code>	// Note that the assist ratio values are updated atomically</code></span>
+<span class="codeline" id="line-585"><code>	// but not together. This means there may be some degree of</code></span>
+<span class="codeline" id="line-586"><code>	// skew between the two values. This is generally OK as the</code></span>
+<span class="codeline" id="line-587"><code>	// values shift relatively slowly over the course of a GC</code></span>
+<span class="codeline" id="line-588"><code>	// cycle.</code></span>
+<span class="codeline" id="line-589"><code>	assistWorkPerByte := float64(scanWorkRemaining) / float64(heapRemaining)</code></span>
+<span class="codeline" id="line-590"><code>	assistBytesPerWork := float64(heapRemaining) / float64(scanWorkRemaining)</code></span>
+<span class="codeline" id="line-591"><code>	c.assistWorkPerByte.Store(assistWorkPerByte)</code></span>
+<span class="codeline" id="line-592"><code>	c.assistBytesPerWork.Store(assistBytesPerWork)</code></span>
+<span class="codeline" id="line-593"><code>}</code></span>
+<span class="codeline" id="line-594"><code></code></span>
+<span class="codeline" id="line-595"><code>// endCycle computes the consMark estimate for the next cycle.</code></span>
+<span class="codeline" id="line-596"><code>// userForced indicates whether the current GC cycle was forced</code></span>
+<span class="codeline" id="line-597"><code>// by the application.</code></span>
+<span class="codeline" id="line-598"><code>func (c *gcControllerState) endCycle(now int64, procs int, userForced bool) {</code></span>
+<span class="codeline" id="line-599"><code>	// Record last heap goal for the scavenger.</code></span>
+<span class="codeline" id="line-600"><code>	// We'll be updating the heap goal soon.</code></span>
+<span class="codeline" id="line-601"><code>	gcController.lastHeapGoal = c.heapGoal()</code></span>
+<span class="codeline" id="line-602"><code></code></span>
+<span class="codeline" id="line-603"><code>	// Compute the duration of time for which assists were turned on.</code></span>
+<span class="codeline" id="line-604"><code>	assistDuration := now - c.markStartTime</code></span>
+<span class="codeline" id="line-605"><code></code></span>
+<span class="codeline" id="line-606"><code>	// Assume background mark hit its utilization goal.</code></span>
+<span class="codeline" id="line-607"><code>	utilization := gcBackgroundUtilization</code></span>
+<span class="codeline" id="line-608"><code>	// Add assist utilization; avoid divide by zero.</code></span>
+<span class="codeline" id="line-609"><code>	if assistDuration &gt; 0 {</code></span>
+<span class="codeline" id="line-610"><code>		utilization += float64(c.assistTime.Load()) / float64(assistDuration*int64(procs))</code></span>
+<span class="codeline" id="line-611"><code>	}</code></span>
+<span class="codeline" id="line-612"><code></code></span>
+<span class="codeline" id="line-613"><code>	if c.heapLive.Load() &lt;= c.triggered {</code></span>
+<span class="codeline" id="line-614"><code>		// Shouldn't happen, but let's be very safe about this in case the</code></span>
+<span class="codeline" id="line-615"><code>		// GC is somehow extremely short.</code></span>
+<span class="codeline" id="line-616"><code>		//</code></span>
+<span class="codeline" id="line-617"><code>		// In this case though, the only reasonable value for c.heapLive-c.triggered</code></span>
+<span class="codeline" id="line-618"><code>		// would be 0, which isn't really all that useful, i.e. the GC was so short</code></span>
+<span class="codeline" id="line-619"><code>		// that it didn't matter.</code></span>
+<span class="codeline" id="line-620"><code>		//</code></span>
+<span class="codeline" id="line-621"><code>		// Ignore this case and don't update anything.</code></span>
+<span class="codeline" id="line-622"><code>		return</code></span>
+<span class="codeline" id="line-623"><code>	}</code></span>
+<span class="codeline" id="line-624"><code>	idleUtilization := 0.0</code></span>
+<span class="codeline" id="line-625"><code>	if assistDuration &gt; 0 {</code></span>
+<span class="codeline" id="line-626"><code>		idleUtilization = float64(c.idleMarkTime.Load()) / float64(assistDuration*int64(procs))</code></span>
+<span class="codeline" id="line-627"><code>	}</code></span>
+<span class="codeline" id="line-628"><code>	// Determine the cons/mark ratio.</code></span>
+<span class="codeline" id="line-629"><code>	//</code></span>
+<span class="codeline" id="line-630"><code>	// The units we want for the numerator and denominator are both B / cpu-ns.</code></span>
+<span class="codeline" id="line-631"><code>	// We get this by taking the bytes allocated or scanned, and divide by the amount of</code></span>
+<span class="codeline" id="line-632"><code>	// CPU time it took for those operations. For allocations, that CPU time is</code></span>
+<span class="codeline" id="line-633"><code>	//</code></span>
+<span class="codeline" id="line-634"><code>	//    assistDuration * procs * (1 - utilization)</code></span>
+<span class="codeline" id="line-635"><code>	//</code></span>
+<span class="codeline" id="line-636"><code>	// Where utilization includes just background GC workers and assists. It does *not*</code></span>
+<span class="codeline" id="line-637"><code>	// include idle GC work time, because in theory the mutator is free to take that at</code></span>
+<span class="codeline" id="line-638"><code>	// any point.</code></span>
+<span class="codeline" id="line-639"><code>	//</code></span>
+<span class="codeline" id="line-640"><code>	// For scanning, that CPU time is</code></span>
+<span class="codeline" id="line-641"><code>	//</code></span>
+<span class="codeline" id="line-642"><code>	//    assistDuration * procs * (utilization + idleUtilization)</code></span>
+<span class="codeline" id="line-643"><code>	//</code></span>
+<span class="codeline" id="line-644"><code>	// In this case, we *include* idle utilization, because that is additional CPU time that</code></span>
+<span class="codeline" id="line-645"><code>	// the GC had available to it.</code></span>
+<span class="codeline" id="line-646"><code>	//</code></span>
+<span class="codeline" id="line-647"><code>	// In effect, idle GC time is sort of double-counted here, but it's very weird compared</code></span>
+<span class="codeline" id="line-648"><code>	// to other kinds of GC work, because of how fluid it is. Namely, because the mutator is</code></span>
+<span class="codeline" id="line-649"><code>	// *always* free to take it.</code></span>
+<span class="codeline" id="line-650"><code>	//</code></span>
+<span class="codeline" id="line-651"><code>	// So this calculation is really:</code></span>
+<span class="codeline" id="line-652"><code>	//     (heapLive-trigger) / (assistDuration * procs * (1-utilization)) /</code></span>
+<span class="codeline" id="line-653"><code>	//         (scanWork) / (assistDuration * procs * (utilization+idleUtilization))</code></span>
+<span class="codeline" id="line-654"><code>	//</code></span>
+<span class="codeline" id="line-655"><code>	// Note that because we only care about the ratio, assistDuration and procs cancel out.</code></span>
+<span class="codeline" id="line-656"><code>	scanWork := c.heapScanWork.Load() + c.stackScanWork.Load() + c.globalsScanWork.Load()</code></span>
+<span class="codeline" id="line-657"><code>	currentConsMark := (float64(c.heapLive.Load()-c.triggered) * (utilization + idleUtilization)) /</code></span>
+<span class="codeline" id="line-658"><code>		(float64(scanWork) * (1 - utilization))</code></span>
+<span class="codeline" id="line-659"><code></code></span>
+<span class="codeline" id="line-660"><code>	// Update our cons/mark estimate. This is the maximum of the value we just computed and the last</code></span>
+<span class="codeline" id="line-661"><code>	// 4 cons/mark values we measured. The reason we take the maximum here is to bias a noisy</code></span>
+<span class="codeline" id="line-662"><code>	// cons/mark measurement toward fewer assists at the expense of additional GC cycles (starting</code></span>
+<span class="codeline" id="line-663"><code>	// earlier).</code></span>
+<span class="codeline" id="line-664"><code>	oldConsMark := c.consMark</code></span>
+<span class="codeline" id="line-665"><code>	c.consMark = currentConsMark</code></span>
+<span class="codeline" id="line-666"><code>	for i := range c.lastConsMark {</code></span>
+<span class="codeline" id="line-667"><code>		if c.lastConsMark[i] &gt; c.consMark {</code></span>
+<span class="codeline" id="line-668"><code>			c.consMark = c.lastConsMark[i]</code></span>
+<span class="codeline" id="line-669"><code>		}</code></span>
+<span class="codeline" id="line-670"><code>	}</code></span>
+<span class="codeline" id="line-671"><code>	copy(c.lastConsMark[:], c.lastConsMark[1:])</code></span>
+<span class="codeline" id="line-672"><code>	c.lastConsMark[len(c.lastConsMark)-1] = currentConsMark</code></span>
+<span class="codeline" id="line-673"><code></code></span>
+<span class="codeline" id="line-674"><code>	if debug.gcpacertrace &gt; 0 {</code></span>
+<span class="codeline" id="line-675"><code>		printlock()</code></span>
+<span class="codeline" id="line-676"><code>		goal := gcGoalUtilization * 100</code></span>
+<span class="codeline" id="line-677"><code>		print("pacer: ", int(utilization*100), "% CPU (", int(goal), " exp.) for ")</code></span>
+<span class="codeline" id="line-678"><code>		print(c.heapScanWork.Load(), "+", c.stackScanWork.Load(), "+", c.globalsScanWork.Load(), " B work (", c.lastHeapScan+c.lastStackScan.Load()+c.globalsScan.Load(), " B exp.) ")</code></span>
+<span class="codeline" id="line-679"><code>		live := c.heapLive.Load()</code></span>
+<span class="codeline" id="line-680"><code>		print("in ", c.triggered, " B -&gt; ", live, " B (∆goal ", int64(live)-int64(c.lastHeapGoal), ", cons/mark ", oldConsMark, ")")</code></span>
+<span class="codeline" id="line-681"><code>		println()</code></span>
+<span class="codeline" id="line-682"><code>		printunlock()</code></span>
+<span class="codeline" id="line-683"><code>	}</code></span>
+<span class="codeline" id="line-684"><code>}</code></span>
+<span class="codeline" id="line-685"><code></code></span>
+<span class="codeline" id="line-686"><code>// enlistWorker encourages another dedicated mark worker to start on</code></span>
+<span class="codeline" id="line-687"><code>// another P if there are spare worker slots. It is used by putfull</code></span>
+<span class="codeline" id="line-688"><code>// when more work is made available.</code></span>
+<span class="codeline" id="line-689"><code>//</code></span>
+<span class="codeline" id="line-690"><code>//go:nowritebarrier</code></span>
+<span class="codeline" id="line-691"><code>func (c *gcControllerState) enlistWorker() {</code></span>
+<span class="codeline" id="line-692"><code>	// If there are idle Ps, wake one so it will run an idle worker.</code></span>
+<span class="codeline" id="line-693"><code>	// NOTE: This is suspected of causing deadlocks. See golang.org/issue/19112.</code></span>
+<span class="codeline" id="line-694"><code>	//</code></span>
+<span class="codeline" id="line-695"><code>	//	if sched.npidle.Load() != 0 &amp;&amp; sched.nmspinning.Load() == 0 {</code></span>
+<span class="codeline" id="line-696"><code>	//		wakep()</code></span>
+<span class="codeline" id="line-697"><code>	//		return</code></span>
+<span class="codeline" id="line-698"><code>	//	}</code></span>
+<span class="codeline" id="line-699"><code></code></span>
+<span class="codeline" id="line-700"><code>	// There are no idle Ps. If we need more dedicated workers,</code></span>
+<span class="codeline" id="line-701"><code>	// try to preempt a running P so it will switch to a worker.</code></span>
+<span class="codeline" id="line-702"><code>	if c.dedicatedMarkWorkersNeeded.Load() &lt;= 0 {</code></span>
+<span class="codeline" id="line-703"><code>		return</code></span>
+<span class="codeline" id="line-704"><code>	}</code></span>
+<span class="codeline" id="line-705"><code>	// Pick a random other P to preempt.</code></span>
+<span class="codeline" id="line-706"><code>	if gomaxprocs &lt;= 1 {</code></span>
+<span class="codeline" id="line-707"><code>		return</code></span>
+<span class="codeline" id="line-708"><code>	}</code></span>
+<span class="codeline" id="line-709"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-710"><code>	if gp == nil || gp.m == nil || gp.m.p == 0 {</code></span>
+<span class="codeline" id="line-711"><code>		return</code></span>
+<span class="codeline" id="line-712"><code>	}</code></span>
+<span class="codeline" id="line-713"><code>	myID := gp.m.p.ptr().id</code></span>
+<span class="codeline" id="line-714"><code>	for tries := 0; tries &lt; 5; tries++ {</code></span>
+<span class="codeline" id="line-715"><code>		id := int32(cheaprandn(uint32(gomaxprocs - 1)))</code></span>
+<span class="codeline" id="line-716"><code>		if id &gt;= myID {</code></span>
+<span class="codeline" id="line-717"><code>			id++</code></span>
+<span class="codeline" id="line-718"><code>		}</code></span>
+<span class="codeline" id="line-719"><code>		p := allp[id]</code></span>
+<span class="codeline" id="line-720"><code>		if p.status != _Prunning {</code></span>
+<span class="codeline" id="line-721"><code>			continue</code></span>
+<span class="codeline" id="line-722"><code>		}</code></span>
+<span class="codeline" id="line-723"><code>		if preemptone(p) {</code></span>
+<span class="codeline" id="line-724"><code>			return</code></span>
+<span class="codeline" id="line-725"><code>		}</code></span>
+<span class="codeline" id="line-726"><code>	}</code></span>
+<span class="codeline" id="line-727"><code>}</code></span>
+<span class="codeline" id="line-728"><code></code></span>
+<span class="codeline" id="line-729"><code>// findRunnableGCWorker returns a background mark worker for pp if it</code></span>
+<span class="codeline" id="line-730"><code>// should be run. This must only be called when gcBlackenEnabled != 0.</code></span>
+<span class="codeline" id="line-731"><code>func (c *gcControllerState) findRunnableGCWorker(pp *p, now int64) (*g, int64) {</code></span>
+<span class="codeline" id="line-732"><code>	if gcBlackenEnabled == 0 {</code></span>
+<span class="codeline" id="line-733"><code>		throw("gcControllerState.findRunnable: blackening not enabled")</code></span>
+<span class="codeline" id="line-734"><code>	}</code></span>
+<span class="codeline" id="line-735"><code></code></span>
+<span class="codeline" id="line-736"><code>	// Since we have the current time, check if the GC CPU limiter</code></span>
+<span class="codeline" id="line-737"><code>	// hasn't had an update in a while. This check is necessary in</code></span>
+<span class="codeline" id="line-738"><code>	// case the limiter is on but hasn't been checked in a while and</code></span>
+<span class="codeline" id="line-739"><code>	// so may have left sufficient headroom to turn off again.</code></span>
+<span class="codeline" id="line-740"><code>	if now == 0 {</code></span>
+<span class="codeline" id="line-741"><code>		now = nanotime()</code></span>
+<span class="codeline" id="line-742"><code>	}</code></span>
+<span class="codeline" id="line-743"><code>	if gcCPULimiter.needUpdate(now) {</code></span>
+<span class="codeline" id="line-744"><code>		gcCPULimiter.update(now)</code></span>
+<span class="codeline" id="line-745"><code>	}</code></span>
+<span class="codeline" id="line-746"><code></code></span>
+<span class="codeline" id="line-747"><code>	if !gcMarkWorkAvailable(pp) {</code></span>
+<span class="codeline" id="line-748"><code>		// No work to be done right now. This can happen at</code></span>
+<span class="codeline" id="line-749"><code>		// the end of the mark phase when there are still</code></span>
+<span class="codeline" id="line-750"><code>		// assists tapering off. Don't bother running a worker</code></span>
+<span class="codeline" id="line-751"><code>		// now because it'll just return immediately.</code></span>
+<span class="codeline" id="line-752"><code>		return nil, now</code></span>
+<span class="codeline" id="line-753"><code>	}</code></span>
+<span class="codeline" id="line-754"><code></code></span>
+<span class="codeline" id="line-755"><code>	// Grab a worker before we commit to running below.</code></span>
+<span class="codeline" id="line-756"><code>	node := (*gcBgMarkWorkerNode)(gcBgMarkWorkerPool.pop())</code></span>
+<span class="codeline" id="line-757"><code>	if node == nil {</code></span>
+<span class="codeline" id="line-758"><code>		// There is at least one worker per P, so normally there are</code></span>
+<span class="codeline" id="line-759"><code>		// enough workers to run on all Ps, if necessary. However, once</code></span>
+<span class="codeline" id="line-760"><code>		// a worker enters gcMarkDone it may park without rejoining the</code></span>
+<span class="codeline" id="line-761"><code>		// pool, thus freeing a P with no corresponding worker.</code></span>
+<span class="codeline" id="line-762"><code>		// gcMarkDone never depends on another worker doing work, so it</code></span>
+<span class="codeline" id="line-763"><code>		// is safe to simply do nothing here.</code></span>
+<span class="codeline" id="line-764"><code>		//</code></span>
+<span class="codeline" id="line-765"><code>		// If gcMarkDone bails out without completing the mark phase,</code></span>
+<span class="codeline" id="line-766"><code>		// it will always do so with queued global work. Thus, that P</code></span>
+<span class="codeline" id="line-767"><code>		// will be immediately eligible to re-run the worker G it was</code></span>
+<span class="codeline" id="line-768"><code>		// just using, ensuring work can complete.</code></span>
+<span class="codeline" id="line-769"><code>		return nil, now</code></span>
+<span class="codeline" id="line-770"><code>	}</code></span>
+<span class="codeline" id="line-771"><code></code></span>
+<span class="codeline" id="line-772"><code>	decIfPositive := func(val *atomic.Int64) bool {</code></span>
+<span class="codeline" id="line-773"><code>		for {</code></span>
+<span class="codeline" id="line-774"><code>			v := val.Load()</code></span>
+<span class="codeline" id="line-775"><code>			if v &lt;= 0 {</code></span>
+<span class="codeline" id="line-776"><code>				return false</code></span>
+<span class="codeline" id="line-777"><code>			}</code></span>
+<span class="codeline" id="line-778"><code></code></span>
+<span class="codeline" id="line-779"><code>			if val.CompareAndSwap(v, v-1) {</code></span>
+<span class="codeline" id="line-780"><code>				return true</code></span>
+<span class="codeline" id="line-781"><code>			}</code></span>
+<span class="codeline" id="line-782"><code>		}</code></span>
+<span class="codeline" id="line-783"><code>	}</code></span>
+<span class="codeline" id="line-784"><code></code></span>
+<span class="codeline" id="line-785"><code>	if decIfPositive(&amp;c.dedicatedMarkWorkersNeeded) {</code></span>
+<span class="codeline" id="line-786"><code>		// This P is now dedicated to marking until the end of</code></span>
+<span class="codeline" id="line-787"><code>		// the concurrent mark phase.</code></span>
+<span class="codeline" id="line-788"><code>		pp.gcMarkWorkerMode = gcMarkWorkerDedicatedMode</code></span>
+<span class="codeline" id="line-789"><code>	} else if c.fractionalUtilizationGoal == 0 {</code></span>
+<span class="codeline" id="line-790"><code>		// No need for fractional workers.</code></span>
+<span class="codeline" id="line-791"><code>		gcBgMarkWorkerPool.push(&amp;node.node)</code></span>
+<span class="codeline" id="line-792"><code>		return nil, now</code></span>
+<span class="codeline" id="line-793"><code>	} else {</code></span>
+<span class="codeline" id="line-794"><code>		// Is this P behind on the fractional utilization</code></span>
+<span class="codeline" id="line-795"><code>		// goal?</code></span>
+<span class="codeline" id="line-796"><code>		//</code></span>
+<span class="codeline" id="line-797"><code>		// This should be kept in sync with pollFractionalWorkerExit.</code></span>
+<span class="codeline" id="line-798"><code>		delta := now - c.markStartTime</code></span>
+<span class="codeline" id="line-799"><code>		if delta &gt; 0 &amp;&amp; float64(pp.gcFractionalMarkTime)/float64(delta) &gt; c.fractionalUtilizationGoal {</code></span>
+<span class="codeline" id="line-800"><code>			// Nope. No need to run a fractional worker.</code></span>
+<span class="codeline" id="line-801"><code>			gcBgMarkWorkerPool.push(&amp;node.node)</code></span>
+<span class="codeline" id="line-802"><code>			return nil, now</code></span>
+<span class="codeline" id="line-803"><code>		}</code></span>
+<span class="codeline" id="line-804"><code>		// Run a fractional worker.</code></span>
+<span class="codeline" id="line-805"><code>		pp.gcMarkWorkerMode = gcMarkWorkerFractionalMode</code></span>
+<span class="codeline" id="line-806"><code>	}</code></span>
+<span class="codeline" id="line-807"><code></code></span>
+<span class="codeline" id="line-808"><code>	// Run the background mark worker.</code></span>
+<span class="codeline" id="line-809"><code>	gp := node.gp.ptr()</code></span>
+<span class="codeline" id="line-810"><code>	trace := traceAcquire()</code></span>
+<span class="codeline" id="line-811"><code>	casgstatus(gp, _Gwaiting, _Grunnable)</code></span>
+<span class="codeline" id="line-812"><code>	if trace.ok() {</code></span>
+<span class="codeline" id="line-813"><code>		trace.GoUnpark(gp, 0)</code></span>
+<span class="codeline" id="line-814"><code>		traceRelease(trace)</code></span>
+<span class="codeline" id="line-815"><code>	}</code></span>
+<span class="codeline" id="line-816"><code>	return gp, now</code></span>
+<span class="codeline" id="line-817"><code>}</code></span>
+<span class="codeline" id="line-818"><code></code></span>
+<span class="codeline" id="line-819"><code>// resetLive sets up the controller state for the next mark phase after the end</code></span>
+<span class="codeline" id="line-820"><code>// of the previous one. Must be called after endCycle and before commit, before</code></span>
+<span class="codeline" id="line-821"><code>// the world is started.</code></span>
+<span class="codeline" id="line-822"><code>//</code></span>
+<span class="codeline" id="line-823"><code>// The world must be stopped.</code></span>
+<span class="codeline" id="line-824"><code>func (c *gcControllerState) resetLive(bytesMarked uint64) {</code></span>
+<span class="codeline" id="line-825"><code>	c.heapMarked = bytesMarked</code></span>
+<span class="codeline" id="line-826"><code>	c.heapLive.Store(bytesMarked)</code></span>
+<span class="codeline" id="line-827"><code>	c.heapScan.Store(uint64(c.heapScanWork.Load()))</code></span>
+<span class="codeline" id="line-828"><code>	c.lastHeapScan = uint64(c.heapScanWork.Load())</code></span>
+<span class="codeline" id="line-829"><code>	c.lastStackScan.Store(uint64(c.stackScanWork.Load()))</code></span>
+<span class="codeline" id="line-830"><code>	c.triggered = ^uint64(0) // Reset triggered.</code></span>
+<span class="codeline" id="line-831"><code></code></span>
+<span class="codeline" id="line-832"><code>	// heapLive was updated, so emit a trace event.</code></span>
+<span class="codeline" id="line-833"><code>	trace := traceAcquire()</code></span>
+<span class="codeline" id="line-834"><code>	if trace.ok() {</code></span>
+<span class="codeline" id="line-835"><code>		trace.HeapAlloc(bytesMarked)</code></span>
+<span class="codeline" id="line-836"><code>		traceRelease(trace)</code></span>
+<span class="codeline" id="line-837"><code>	}</code></span>
+<span class="codeline" id="line-838"><code>}</code></span>
+<span class="codeline" id="line-839"><code></code></span>
+<span class="codeline" id="line-840"><code>// markWorkerStop must be called whenever a mark worker stops executing.</code></span>
+<span class="codeline" id="line-841"><code>//</code></span>
+<span class="codeline" id="line-842"><code>// It updates mark work accounting in the controller by a duration of</code></span>
+<span class="codeline" id="line-843"><code>// work in nanoseconds and other bookkeeping.</code></span>
+<span class="codeline" id="line-844"><code>//</code></span>
+<span class="codeline" id="line-845"><code>// Safe to execute at any time.</code></span>
+<span class="codeline" id="line-846"><code>func (c *gcControllerState) markWorkerStop(mode gcMarkWorkerMode, duration int64) {</code></span>
+<span class="codeline" id="line-847"><code>	switch mode {</code></span>
+<span class="codeline" id="line-848"><code>	case gcMarkWorkerDedicatedMode:</code></span>
+<span class="codeline" id="line-849"><code>		c.dedicatedMarkTime.Add(duration)</code></span>
+<span class="codeline" id="line-850"><code>		c.dedicatedMarkWorkersNeeded.Add(1)</code></span>
+<span class="codeline" id="line-851"><code>	case gcMarkWorkerFractionalMode:</code></span>
+<span class="codeline" id="line-852"><code>		c.fractionalMarkTime.Add(duration)</code></span>
+<span class="codeline" id="line-853"><code>	case gcMarkWorkerIdleMode:</code></span>
+<span class="codeline" id="line-854"><code>		c.idleMarkTime.Add(duration)</code></span>
+<span class="codeline" id="line-855"><code>		c.removeIdleMarkWorker()</code></span>
+<span class="codeline" id="line-856"><code>	default:</code></span>
+<span class="codeline" id="line-857"><code>		throw("markWorkerStop: unknown mark worker mode")</code></span>
+<span class="codeline" id="line-858"><code>	}</code></span>
+<span class="codeline" id="line-859"><code>}</code></span>
+<span class="codeline" id="line-860"><code></code></span>
+<span class="codeline" id="line-861"><code>func (c *gcControllerState) update(dHeapLive, dHeapScan int64) {</code></span>
+<span class="codeline" id="line-862"><code>	if dHeapLive != 0 {</code></span>
+<span class="codeline" id="line-863"><code>		trace := traceAcquire()</code></span>
+<span class="codeline" id="line-864"><code>		live := gcController.heapLive.Add(dHeapLive)</code></span>
+<span class="codeline" id="line-865"><code>		if trace.ok() {</code></span>
+<span class="codeline" id="line-866"><code>			// gcController.heapLive changed.</code></span>
+<span class="codeline" id="line-867"><code>			trace.HeapAlloc(live)</code></span>
+<span class="codeline" id="line-868"><code>			traceRelease(trace)</code></span>
+<span class="codeline" id="line-869"><code>		}</code></span>
+<span class="codeline" id="line-870"><code>	}</code></span>
+<span class="codeline" id="line-871"><code>	if gcBlackenEnabled == 0 {</code></span>
+<span class="codeline" id="line-872"><code>		// Update heapScan when we're not in a current GC. It is fixed</code></span>
+<span class="codeline" id="line-873"><code>		// at the beginning of a cycle.</code></span>
+<span class="codeline" id="line-874"><code>		if dHeapScan != 0 {</code></span>
+<span class="codeline" id="line-875"><code>			gcController.heapScan.Add(dHeapScan)</code></span>
+<span class="codeline" id="line-876"><code>		}</code></span>
+<span class="codeline" id="line-877"><code>	} else {</code></span>
+<span class="codeline" id="line-878"><code>		// gcController.heapLive changed.</code></span>
+<span class="codeline" id="line-879"><code>		c.revise()</code></span>
+<span class="codeline" id="line-880"><code>	}</code></span>
+<span class="codeline" id="line-881"><code>}</code></span>
+<span class="codeline" id="line-882"><code></code></span>
+<span class="codeline" id="line-883"><code>func (c *gcControllerState) addScannableStack(pp *p, amount int64) {</code></span>
+<span class="codeline" id="line-884"><code>	if pp == nil {</code></span>
+<span class="codeline" id="line-885"><code>		c.maxStackScan.Add(amount)</code></span>
+<span class="codeline" id="line-886"><code>		return</code></span>
+<span class="codeline" id="line-887"><code>	}</code></span>
+<span class="codeline" id="line-888"><code>	pp.maxStackScanDelta += amount</code></span>
+<span class="codeline" id="line-889"><code>	if pp.maxStackScanDelta &gt;= maxStackScanSlack || pp.maxStackScanDelta &lt;= -maxStackScanSlack {</code></span>
+<span class="codeline" id="line-890"><code>		c.maxStackScan.Add(pp.maxStackScanDelta)</code></span>
+<span class="codeline" id="line-891"><code>		pp.maxStackScanDelta = 0</code></span>
+<span class="codeline" id="line-892"><code>	}</code></span>
+<span class="codeline" id="line-893"><code>}</code></span>
+<span class="codeline" id="line-894"><code></code></span>
+<span class="codeline" id="line-895"><code>func (c *gcControllerState) addGlobals(amount int64) {</code></span>
+<span class="codeline" id="line-896"><code>	c.globalsScan.Add(amount)</code></span>
+<span class="codeline" id="line-897"><code>}</code></span>
+<span class="codeline" id="line-898"><code></code></span>
+<span class="codeline" id="line-899"><code>// heapGoal returns the current heap goal.</code></span>
+<span class="codeline" id="line-900"><code>func (c *gcControllerState) heapGoal() uint64 {</code></span>
+<span class="codeline" id="line-901"><code>	goal, _ := c.heapGoalInternal()</code></span>
+<span class="codeline" id="line-902"><code>	return goal</code></span>
+<span class="codeline" id="line-903"><code>}</code></span>
+<span class="codeline" id="line-904"><code></code></span>
+<span class="codeline" id="line-905"><code>// heapGoalInternal is the implementation of heapGoal which returns additional</code></span>
+<span class="codeline" id="line-906"><code>// information that is necessary for computing the trigger.</code></span>
+<span class="codeline" id="line-907"><code>//</code></span>
+<span class="codeline" id="line-908"><code>// The returned minTrigger is always &lt;= goal.</code></span>
+<span class="codeline" id="line-909"><code>func (c *gcControllerState) heapGoalInternal() (goal, minTrigger uint64) {</code></span>
+<span class="codeline" id="line-910"><code>	// Start with the goal calculated for gcPercent.</code></span>
+<span class="codeline" id="line-911"><code>	goal = c.gcPercentHeapGoal.Load()</code></span>
+<span class="codeline" id="line-912"><code></code></span>
+<span class="codeline" id="line-913"><code>	// Check if the memory-limit-based goal is smaller, and if so, pick that.</code></span>
+<span class="codeline" id="line-914"><code>	if newGoal := c.memoryLimitHeapGoal(); newGoal &lt; goal {</code></span>
+<span class="codeline" id="line-915"><code>		goal = newGoal</code></span>
+<span class="codeline" id="line-916"><code>	} else {</code></span>
+<span class="codeline" id="line-917"><code>		// We're not limited by the memory limit goal, so perform a series of</code></span>
+<span class="codeline" id="line-918"><code>		// adjustments that might move the goal forward in a variety of circumstances.</code></span>
+<span class="codeline" id="line-919"><code></code></span>
+<span class="codeline" id="line-920"><code>		sweepDistTrigger := c.sweepDistMinTrigger.Load()</code></span>
+<span class="codeline" id="line-921"><code>		if sweepDistTrigger &gt; goal {</code></span>
+<span class="codeline" id="line-922"><code>			// Set the goal to maintain a minimum sweep distance since</code></span>
+<span class="codeline" id="line-923"><code>			// the last call to commit. Note that we never want to do this</code></span>
+<span class="codeline" id="line-924"><code>			// if we're in the memory limit regime, because it could push</code></span>
+<span class="codeline" id="line-925"><code>			// the goal up.</code></span>
+<span class="codeline" id="line-926"><code>			goal = sweepDistTrigger</code></span>
+<span class="codeline" id="line-927"><code>		}</code></span>
+<span class="codeline" id="line-928"><code>		// Since we ignore the sweep distance trigger in the memory</code></span>
+<span class="codeline" id="line-929"><code>		// limit regime, we need to ensure we don't propagate it to</code></span>
+<span class="codeline" id="line-930"><code>		// the trigger, because it could cause a violation of the</code></span>
+<span class="codeline" id="line-931"><code>		// invariant that the trigger &lt; goal.</code></span>
+<span class="codeline" id="line-932"><code>		minTrigger = sweepDistTrigger</code></span>
+<span class="codeline" id="line-933"><code></code></span>
+<span class="codeline" id="line-934"><code>		// Ensure that the heap goal is at least a little larger than</code></span>
+<span class="codeline" id="line-935"><code>		// the point at which we triggered. This may not be the case if GC</code></span>
+<span class="codeline" id="line-936"><code>		// start is delayed or if the allocation that pushed gcController.heapLive</code></span>
+<span class="codeline" id="line-937"><code>		// over trigger is large or if the trigger is really close to</code></span>
+<span class="codeline" id="line-938"><code>		// GOGC. Assist is proportional to this distance, so enforce a</code></span>
+<span class="codeline" id="line-939"><code>		// minimum distance, even if it means going over the GOGC goal</code></span>
+<span class="codeline" id="line-940"><code>		// by a tiny bit.</code></span>
+<span class="codeline" id="line-941"><code>		//</code></span>
+<span class="codeline" id="line-942"><code>		// Ignore this if we're in the memory limit regime: we'd prefer to</code></span>
+<span class="codeline" id="line-943"><code>		// have the GC respond hard about how close we are to the goal than to</code></span>
+<span class="codeline" id="line-944"><code>		// push the goal back in such a manner that it could cause us to exceed</code></span>
+<span class="codeline" id="line-945"><code>		// the memory limit.</code></span>
+<span class="codeline" id="line-946"><code>		const minRunway = 64 &lt;&lt; 10</code></span>
+<span class="codeline" id="line-947"><code>		if c.triggered != ^uint64(0) &amp;&amp; goal &lt; c.triggered+minRunway {</code></span>
+<span class="codeline" id="line-948"><code>			goal = c.triggered + minRunway</code></span>
+<span class="codeline" id="line-949"><code>		}</code></span>
+<span class="codeline" id="line-950"><code>	}</code></span>
+<span class="codeline" id="line-951"><code>	return</code></span>
+<span class="codeline" id="line-952"><code>}</code></span>
+<span class="codeline" id="line-953"><code></code></span>
+<span class="codeline" id="line-954"><code>// memoryLimitHeapGoal returns a heap goal derived from memoryLimit.</code></span>
+<span class="codeline" id="line-955"><code>func (c *gcControllerState) memoryLimitHeapGoal() uint64 {</code></span>
+<span class="codeline" id="line-956"><code>	// Start by pulling out some values we'll need. Be careful about overflow.</code></span>
+<span class="codeline" id="line-957"><code>	var heapFree, heapAlloc, mappedReady uint64</code></span>
+<span class="codeline" id="line-958"><code>	for {</code></span>
+<span class="codeline" id="line-959"><code>		heapFree = c.heapFree.load()                         // Free and unscavenged memory.</code></span>
+<span class="codeline" id="line-960"><code>		heapAlloc = c.totalAlloc.Load() - c.totalFree.Load() // Heap object bytes in use.</code></span>
+<span class="codeline" id="line-961"><code>		mappedReady = c.mappedReady.Load()                   // Total unreleased mapped memory.</code></span>
+<span class="codeline" id="line-962"><code>		if heapFree+heapAlloc &lt;= mappedReady {</code></span>
+<span class="codeline" id="line-963"><code>			break</code></span>
+<span class="codeline" id="line-964"><code>		}</code></span>
+<span class="codeline" id="line-965"><code>		// It is impossible for total unreleased mapped memory to exceed heap memory, but</code></span>
+<span class="codeline" id="line-966"><code>		// because these stats are updated independently, we may observe a partial update</code></span>
+<span class="codeline" id="line-967"><code>		// including only some values. Thus, we appear to break the invariant. However,</code></span>
+<span class="codeline" id="line-968"><code>		// this condition is necessarily transient, so just try again. In the case of a</code></span>
+<span class="codeline" id="line-969"><code>		// persistent accounting error, we'll deadlock here.</code></span>
+<span class="codeline" id="line-970"><code>	}</code></span>
+<span class="codeline" id="line-971"><code></code></span>
+<span class="codeline" id="line-972"><code>	// Below we compute a goal from memoryLimit. There are a few things to be aware of.</code></span>
+<span class="codeline" id="line-973"><code>	// Firstly, the memoryLimit does not easily compare to the heap goal: the former</code></span>
+<span class="codeline" id="line-974"><code>	// is total mapped memory by the runtime that hasn't been released, while the latter is</code></span>
+<span class="codeline" id="line-975"><code>	// only heap object memory. Intuitively, the way we convert from one to the other is to</code></span>
+<span class="codeline" id="line-976"><code>	// subtract everything from memoryLimit that both contributes to the memory limit (so,</code></span>
+<span class="codeline" id="line-977"><code>	// ignore scavenged memory) and doesn't contain heap objects. This isn't quite what</code></span>
+<span class="codeline" id="line-978"><code>	// lines up with reality, but it's a good starting point.</code></span>
+<span class="codeline" id="line-979"><code>	//</code></span>
+<span class="codeline" id="line-980"><code>	// In practice this computation looks like the following:</code></span>
+<span class="codeline" id="line-981"><code>	//</code></span>
+<span class="codeline" id="line-982"><code>	//    goal := memoryLimit - ((mappedReady - heapFree - heapAlloc) + max(mappedReady - memoryLimit, 0))</code></span>
+<span class="codeline" id="line-983"><code>	//                    ^1                                    ^2</code></span>
+<span class="codeline" id="line-984"><code>	//    goal -= goal / 100 * memoryLimitHeapGoalHeadroomPercent</code></span>
+<span class="codeline" id="line-985"><code>	//    ^3</code></span>
+<span class="codeline" id="line-986"><code>	//</code></span>
+<span class="codeline" id="line-987"><code>	// Let's break this down.</code></span>
+<span class="codeline" id="line-988"><code>	//</code></span>
+<span class="codeline" id="line-989"><code>	// The first term (marker 1) is everything that contributes to the memory limit and isn't</code></span>
+<span class="codeline" id="line-990"><code>	// or couldn't become heap objects. It represents, broadly speaking, non-heap overheads.</code></span>
+<span class="codeline" id="line-991"><code>	// One oddity you may have noticed is that we also subtract out heapFree, i.e. unscavenged</code></span>
+<span class="codeline" id="line-992"><code>	// memory that may contain heap objects in the future.</code></span>
+<span class="codeline" id="line-993"><code>	//</code></span>
+<span class="codeline" id="line-994"><code>	// Let's take a step back. In an ideal world, this term would look something like just</code></span>
+<span class="codeline" id="line-995"><code>	// the heap goal. That is, we "reserve" enough space for the heap to grow to the heap</code></span>
+<span class="codeline" id="line-996"><code>	// goal, and subtract out everything else. This is of course impossible; the definition</code></span>
+<span class="codeline" id="line-997"><code>	// is circular! However, this impossible definition contains a key insight: the amount</code></span>
+<span class="codeline" id="line-998"><code>	// we're *going* to use matters just as much as whatever we're currently using.</code></span>
+<span class="codeline" id="line-999"><code>	//</code></span>
+<span class="codeline" id="line-1000"><code>	// Consider if the heap shrinks to 1/10th its size, leaving behind lots of free and</code></span>
+<span class="codeline" id="line-1001"><code>	// unscavenged memory. mappedReady - heapAlloc will be quite large, because of that free</code></span>
+<span class="codeline" id="line-1002"><code>	// and unscavenged memory, pushing the goal down significantly.</code></span>
+<span class="codeline" id="line-1003"><code>	//</code></span>
+<span class="codeline" id="line-1004"><code>	// heapFree is also safe to exclude from the memory limit because in the steady-state, it's</code></span>
+<span class="codeline" id="line-1005"><code>	// just a pool of memory for future heap allocations, and making new allocations from heapFree</code></span>
+<span class="codeline" id="line-1006"><code>	// memory doesn't increase overall memory use. In transient states, the scavenger and the</code></span>
+<span class="codeline" id="line-1007"><code>	// allocator actively manage the pool of heapFree memory to maintain the memory limit.</code></span>
+<span class="codeline" id="line-1008"><code>	//</code></span>
+<span class="codeline" id="line-1009"><code>	// The second term (marker 2) is the amount of memory we've exceeded the limit by, and is</code></span>
+<span class="codeline" id="line-1010"><code>	// intended to help recover from such a situation. By pushing the heap goal down, we also</code></span>
+<span class="codeline" id="line-1011"><code>	// push the trigger down, triggering and finishing a GC sooner in order to make room for</code></span>
+<span class="codeline" id="line-1012"><code>	// other memory sources. Note that since we're effectively reducing the heap goal by X bytes,</code></span>
+<span class="codeline" id="line-1013"><code>	// we're actually giving more than X bytes of headroom back, because the heap goal is in</code></span>
+<span class="codeline" id="line-1014"><code>	// terms of heap objects, but it takes more than X bytes (e.g. due to fragmentation) to store</code></span>
+<span class="codeline" id="line-1015"><code>	// X bytes worth of objects.</code></span>
+<span class="codeline" id="line-1016"><code>	//</code></span>
+<span class="codeline" id="line-1017"><code>	// The final adjustment (marker 3) reduces the maximum possible memory limit heap goal by</code></span>
+<span class="codeline" id="line-1018"><code>	// memoryLimitHeapGoalPercent. As the name implies, this is to provide additional headroom in</code></span>
+<span class="codeline" id="line-1019"><code>	// the face of pacing inaccuracies, and also to leave a buffer of unscavenged memory so the</code></span>
+<span class="codeline" id="line-1020"><code>	// allocator isn't constantly scavenging. The reduction amount also has a fixed minimum</code></span>
+<span class="codeline" id="line-1021"><code>	// (memoryLimitMinHeapGoalHeadroom, not pictured) because the aforementioned pacing inaccuracies</code></span>
+<span class="codeline" id="line-1022"><code>	// disproportionately affect small heaps: as heaps get smaller, the pacer's inputs get fuzzier.</code></span>
+<span class="codeline" id="line-1023"><code>	// Shorter GC cycles and less GC work means noisy external factors like the OS scheduler have a</code></span>
+<span class="codeline" id="line-1024"><code>	// greater impact.</code></span>
+<span class="codeline" id="line-1025"><code></code></span>
+<span class="codeline" id="line-1026"><code>	memoryLimit := uint64(c.memoryLimit.Load())</code></span>
+<span class="codeline" id="line-1027"><code></code></span>
+<span class="codeline" id="line-1028"><code>	// Compute term 1.</code></span>
+<span class="codeline" id="line-1029"><code>	nonHeapMemory := mappedReady - heapFree - heapAlloc</code></span>
+<span class="codeline" id="line-1030"><code></code></span>
+<span class="codeline" id="line-1031"><code>	// Compute term 2.</code></span>
+<span class="codeline" id="line-1032"><code>	var overage uint64</code></span>
+<span class="codeline" id="line-1033"><code>	if mappedReady &gt; memoryLimit {</code></span>
+<span class="codeline" id="line-1034"><code>		overage = mappedReady - memoryLimit</code></span>
+<span class="codeline" id="line-1035"><code>	}</code></span>
+<span class="codeline" id="line-1036"><code></code></span>
+<span class="codeline" id="line-1037"><code>	if nonHeapMemory+overage &gt;= memoryLimit {</code></span>
+<span class="codeline" id="line-1038"><code>		// We're at a point where non-heap memory exceeds the memory limit on its own.</code></span>
+<span class="codeline" id="line-1039"><code>		// There's honestly not much we can do here but just trigger GCs continuously</code></span>
+<span class="codeline" id="line-1040"><code>		// and let the CPU limiter reign that in. Something has to give at this point.</code></span>
+<span class="codeline" id="line-1041"><code>		// Set it to heapMarked, the lowest possible goal.</code></span>
+<span class="codeline" id="line-1042"><code>		return c.heapMarked</code></span>
+<span class="codeline" id="line-1043"><code>	}</code></span>
+<span class="codeline" id="line-1044"><code></code></span>
+<span class="codeline" id="line-1045"><code>	// Compute the goal.</code></span>
+<span class="codeline" id="line-1046"><code>	goal := memoryLimit - (nonHeapMemory + overage)</code></span>
+<span class="codeline" id="line-1047"><code></code></span>
+<span class="codeline" id="line-1048"><code>	// Apply some headroom to the goal to account for pacing inaccuracies and to reduce</code></span>
+<span class="codeline" id="line-1049"><code>	// the impact of scavenging at allocation time in response to a high allocation rate</code></span>
+<span class="codeline" id="line-1050"><code>	// when GOGC=off. See issue #57069. Also, be careful about small limits.</code></span>
+<span class="codeline" id="line-1051"><code>	headroom := goal / 100 * memoryLimitHeapGoalHeadroomPercent</code></span>
+<span class="codeline" id="line-1052"><code>	if headroom &lt; memoryLimitMinHeapGoalHeadroom {</code></span>
+<span class="codeline" id="line-1053"><code>		// Set a fixed minimum to deal with the particularly large effect pacing inaccuracies</code></span>
+<span class="codeline" id="line-1054"><code>		// have for smaller heaps.</code></span>
+<span class="codeline" id="line-1055"><code>		headroom = memoryLimitMinHeapGoalHeadroom</code></span>
+<span class="codeline" id="line-1056"><code>	}</code></span>
+<span class="codeline" id="line-1057"><code>	if goal &lt; headroom || goal-headroom &lt; headroom {</code></span>
+<span class="codeline" id="line-1058"><code>		goal = headroom</code></span>
+<span class="codeline" id="line-1059"><code>	} else {</code></span>
+<span class="codeline" id="line-1060"><code>		goal = goal - headroom</code></span>
+<span class="codeline" id="line-1061"><code>	}</code></span>
+<span class="codeline" id="line-1062"><code>	// Don't let us go below the live heap. A heap goal below the live heap doesn't make sense.</code></span>
+<span class="codeline" id="line-1063"><code>	if goal &lt; c.heapMarked {</code></span>
+<span class="codeline" id="line-1064"><code>		goal = c.heapMarked</code></span>
+<span class="codeline" id="line-1065"><code>	}</code></span>
+<span class="codeline" id="line-1066"><code>	return goal</code></span>
+<span class="codeline" id="line-1067"><code>}</code></span>
+<span class="codeline" id="line-1068"><code></code></span>
+<span class="codeline" id="line-1069"><code>const (</code></span>
+<span class="codeline" id="line-1070"><code>	// These constants determine the bounds on the GC trigger as a fraction</code></span>
+<span class="codeline" id="line-1071"><code>	// of heap bytes allocated between the start of a GC (heapLive == heapMarked)</code></span>
+<span class="codeline" id="line-1072"><code>	// and the end of a GC (heapLive == heapGoal).</code></span>
+<span class="codeline" id="line-1073"><code>	//</code></span>
+<span class="codeline" id="line-1074"><code>	// The constants are obscured in this way for efficiency. The denominator</code></span>
+<span class="codeline" id="line-1075"><code>	// of the fraction is always a power-of-two for a quick division, so that</code></span>
+<span class="codeline" id="line-1076"><code>	// the numerator is a single constant integer multiplication.</code></span>
+<span class="codeline" id="line-1077"><code>	triggerRatioDen = 64</code></span>
+<span class="codeline" id="line-1078"><code></code></span>
+<span class="codeline" id="line-1079"><code>	// The minimum trigger constant was chosen empirically: given a sufficiently</code></span>
+<span class="codeline" id="line-1080"><code>	// fast/scalable allocator with 48 Ps that could drive the trigger ratio</code></span>
+<span class="codeline" id="line-1081"><code>	// to &lt;0.05, this constant causes applications to retain the same peak</code></span>
+<span class="codeline" id="line-1082"><code>	// RSS compared to not having this allocator.</code></span>
+<span class="codeline" id="line-1083"><code>	minTriggerRatioNum = 45 // ~0.7</code></span>
+<span class="codeline" id="line-1084"><code></code></span>
+<span class="codeline" id="line-1085"><code>	// The maximum trigger constant is chosen somewhat arbitrarily, but the</code></span>
+<span class="codeline" id="line-1086"><code>	// current constant has served us well over the years.</code></span>
+<span class="codeline" id="line-1087"><code>	maxTriggerRatioNum = 61 // ~0.95</code></span>
+<span class="codeline" id="line-1088"><code>)</code></span>
+<span class="codeline" id="line-1089"><code></code></span>
+<span class="codeline" id="line-1090"><code>// trigger returns the current point at which a GC should trigger along with</code></span>
+<span class="codeline" id="line-1091"><code>// the heap goal.</code></span>
+<span class="codeline" id="line-1092"><code>//</code></span>
+<span class="codeline" id="line-1093"><code>// The returned value may be compared against heapLive to determine whether</code></span>
+<span class="codeline" id="line-1094"><code>// the GC should trigger. Thus, the GC trigger condition should be (but may</code></span>
+<span class="codeline" id="line-1095"><code>// not be, in the case of small movements for efficiency) checked whenever</code></span>
+<span class="codeline" id="line-1096"><code>// the heap goal may change.</code></span>
+<span class="codeline" id="line-1097"><code>func (c *gcControllerState) trigger() (uint64, uint64) {</code></span>
+<span class="codeline" id="line-1098"><code>	goal, minTrigger := c.heapGoalInternal()</code></span>
+<span class="codeline" id="line-1099"><code></code></span>
+<span class="codeline" id="line-1100"><code>	// Invariant: the trigger must always be less than the heap goal.</code></span>
+<span class="codeline" id="line-1101"><code>	//</code></span>
+<span class="codeline" id="line-1102"><code>	// Note that the memory limit sets a hard maximum on our heap goal,</code></span>
+<span class="codeline" id="line-1103"><code>	// but the live heap may grow beyond it.</code></span>
+<span class="codeline" id="line-1104"><code></code></span>
+<span class="codeline" id="line-1105"><code>	if c.heapMarked &gt;= goal {</code></span>
+<span class="codeline" id="line-1106"><code>		// The goal should never be smaller than heapMarked, but let's be</code></span>
+<span class="codeline" id="line-1107"><code>		// defensive about it. The only reasonable trigger here is one that</code></span>
+<span class="codeline" id="line-1108"><code>		// causes a continuous GC cycle at heapMarked, but respect the goal</code></span>
+<span class="codeline" id="line-1109"><code>		// if it came out as smaller than that.</code></span>
+<span class="codeline" id="line-1110"><code>		return goal, goal</code></span>
+<span class="codeline" id="line-1111"><code>	}</code></span>
+<span class="codeline" id="line-1112"><code></code></span>
+<span class="codeline" id="line-1113"><code>	// Below this point, c.heapMarked &lt; goal.</code></span>
+<span class="codeline" id="line-1114"><code></code></span>
+<span class="codeline" id="line-1115"><code>	// heapMarked is our absolute minimum, and it's possible the trigger</code></span>
+<span class="codeline" id="line-1116"><code>	// bound we get from heapGoalinternal is less than that.</code></span>
+<span class="codeline" id="line-1117"><code>	if minTrigger &lt; c.heapMarked {</code></span>
+<span class="codeline" id="line-1118"><code>		minTrigger = c.heapMarked</code></span>
+<span class="codeline" id="line-1119"><code>	}</code></span>
+<span class="codeline" id="line-1120"><code></code></span>
+<span class="codeline" id="line-1121"><code>	// If we let the trigger go too low, then if the application</code></span>
+<span class="codeline" id="line-1122"><code>	// is allocating very rapidly we might end up in a situation</code></span>
+<span class="codeline" id="line-1123"><code>	// where we're allocating black during a nearly always-on GC.</code></span>
+<span class="codeline" id="line-1124"><code>	// The result of this is a growing heap and ultimately an</code></span>
+<span class="codeline" id="line-1125"><code>	// increase in RSS. By capping us at a point &gt;0, we're essentially</code></span>
+<span class="codeline" id="line-1126"><code>	// saying that we're OK using more CPU during the GC to prevent</code></span>
+<span class="codeline" id="line-1127"><code>	// this growth in RSS.</code></span>
+<span class="codeline" id="line-1128"><code>	triggerLowerBound := ((goal-c.heapMarked)/triggerRatioDen)*minTriggerRatioNum + c.heapMarked</code></span>
+<span class="codeline" id="line-1129"><code>	if minTrigger &lt; triggerLowerBound {</code></span>
+<span class="codeline" id="line-1130"><code>		minTrigger = triggerLowerBound</code></span>
+<span class="codeline" id="line-1131"><code>	}</code></span>
+<span class="codeline" id="line-1132"><code></code></span>
+<span class="codeline" id="line-1133"><code>	// For small heaps, set the max trigger point at maxTriggerRatio of the way</code></span>
+<span class="codeline" id="line-1134"><code>	// from the live heap to the heap goal. This ensures we always have *some*</code></span>
+<span class="codeline" id="line-1135"><code>	// headroom when the GC actually starts. For larger heaps, set the max trigger</code></span>
+<span class="codeline" id="line-1136"><code>	// point at the goal, minus the minimum heap size.</code></span>
+<span class="codeline" id="line-1137"><code>	//</code></span>
+<span class="codeline" id="line-1138"><code>	// This choice follows from the fact that the minimum heap size is chosen</code></span>
+<span class="codeline" id="line-1139"><code>	// to reflect the costs of a GC with no work to do. With a large heap but</code></span>
+<span class="codeline" id="line-1140"><code>	// very little scan work to perform, this gives us exactly as much runway</code></span>
+<span class="codeline" id="line-1141"><code>	// as we would need, in the worst case.</code></span>
+<span class="codeline" id="line-1142"><code>	maxTrigger := ((goal-c.heapMarked)/triggerRatioDen)*maxTriggerRatioNum + c.heapMarked</code></span>
+<span class="codeline" id="line-1143"><code>	if goal &gt; defaultHeapMinimum &amp;&amp; goal-defaultHeapMinimum &gt; maxTrigger {</code></span>
+<span class="codeline" id="line-1144"><code>		maxTrigger = goal - defaultHeapMinimum</code></span>
+<span class="codeline" id="line-1145"><code>	}</code></span>
+<span class="codeline" id="line-1146"><code>	maxTrigger = max(maxTrigger, minTrigger)</code></span>
+<span class="codeline" id="line-1147"><code></code></span>
+<span class="codeline" id="line-1148"><code>	// Compute the trigger from our bounds and the runway stored by commit.</code></span>
+<span class="codeline" id="line-1149"><code>	var trigger uint64</code></span>
+<span class="codeline" id="line-1150"><code>	runway := c.runway.Load()</code></span>
+<span class="codeline" id="line-1151"><code>	if runway &gt; goal {</code></span>
+<span class="codeline" id="line-1152"><code>		trigger = minTrigger</code></span>
+<span class="codeline" id="line-1153"><code>	} else {</code></span>
+<span class="codeline" id="line-1154"><code>		trigger = goal - runway</code></span>
+<span class="codeline" id="line-1155"><code>	}</code></span>
+<span class="codeline" id="line-1156"><code>	trigger = max(trigger, minTrigger)</code></span>
+<span class="codeline" id="line-1157"><code>	trigger = min(trigger, maxTrigger)</code></span>
+<span class="codeline" id="line-1158"><code>	if trigger &gt; goal {</code></span>
+<span class="codeline" id="line-1159"><code>		print("trigger=", trigger, " heapGoal=", goal, "\n")</code></span>
+<span class="codeline" id="line-1160"><code>		print("minTrigger=", minTrigger, " maxTrigger=", maxTrigger, "\n")</code></span>
+<span class="codeline" id="line-1161"><code>		throw("produced a trigger greater than the heap goal")</code></span>
+<span class="codeline" id="line-1162"><code>	}</code></span>
+<span class="codeline" id="line-1163"><code>	return trigger, goal</code></span>
+<span class="codeline" id="line-1164"><code>}</code></span>
+<span class="codeline" id="line-1165"><code></code></span>
+<span class="codeline" id="line-1166"><code>// commit recomputes all pacing parameters needed to derive the</code></span>
+<span class="codeline" id="line-1167"><code>// trigger and the heap goal. Namely, the gcPercent-based heap goal,</code></span>
+<span class="codeline" id="line-1168"><code>// and the amount of runway we want to give the GC this cycle.</code></span>
+<span class="codeline" id="line-1169"><code>//</code></span>
+<span class="codeline" id="line-1170"><code>// This can be called any time. If GC is the in the middle of a</code></span>
+<span class="codeline" id="line-1171"><code>// concurrent phase, it will adjust the pacing of that phase.</code></span>
+<span class="codeline" id="line-1172"><code>//</code></span>
+<span class="codeline" id="line-1173"><code>// isSweepDone should be the result of calling isSweepDone(),</code></span>
+<span class="codeline" id="line-1174"><code>// unless we're testing or we know we're executing during a GC cycle.</code></span>
+<span class="codeline" id="line-1175"><code>//</code></span>
+<span class="codeline" id="line-1176"><code>// This depends on gcPercent, gcController.heapMarked, and</code></span>
+<span class="codeline" id="line-1177"><code>// gcController.heapLive. These must be up to date.</code></span>
+<span class="codeline" id="line-1178"><code>//</code></span>
+<span class="codeline" id="line-1179"><code>// Callers must call gcControllerState.revise after calling this</code></span>
+<span class="codeline" id="line-1180"><code>// function if the GC is enabled.</code></span>
+<span class="codeline" id="line-1181"><code>//</code></span>
+<span class="codeline" id="line-1182"><code>// mheap_.lock must be held or the world must be stopped.</code></span>
+<span class="codeline" id="line-1183"><code>func (c *gcControllerState) commit(isSweepDone bool) {</code></span>
+<span class="codeline" id="line-1184"><code>	if !c.test {</code></span>
+<span class="codeline" id="line-1185"><code>		assertWorldStoppedOrLockHeld(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1186"><code>	}</code></span>
+<span class="codeline" id="line-1187"><code></code></span>
+<span class="codeline" id="line-1188"><code>	if isSweepDone {</code></span>
+<span class="codeline" id="line-1189"><code>		// The sweep is done, so there aren't any restrictions on the trigger</code></span>
+<span class="codeline" id="line-1190"><code>		// we need to think about.</code></span>
+<span class="codeline" id="line-1191"><code>		c.sweepDistMinTrigger.Store(0)</code></span>
+<span class="codeline" id="line-1192"><code>	} else {</code></span>
+<span class="codeline" id="line-1193"><code>		// Concurrent sweep happens in the heap growth</code></span>
+<span class="codeline" id="line-1194"><code>		// from gcController.heapLive to trigger. Make sure we</code></span>
+<span class="codeline" id="line-1195"><code>		// give the sweeper some runway if it doesn't have enough.</code></span>
+<span class="codeline" id="line-1196"><code>		c.sweepDistMinTrigger.Store(c.heapLive.Load() + sweepMinHeapDistance)</code></span>
+<span class="codeline" id="line-1197"><code>	}</code></span>
+<span class="codeline" id="line-1198"><code></code></span>
+<span class="codeline" id="line-1199"><code>	// Compute the next GC goal, which is when the allocated heap</code></span>
+<span class="codeline" id="line-1200"><code>	// has grown by GOGC/100 over where it started the last cycle,</code></span>
+<span class="codeline" id="line-1201"><code>	// plus additional runway for non-heap sources of GC work.</code></span>
+<span class="codeline" id="line-1202"><code>	gcPercentHeapGoal := ^uint64(0)</code></span>
+<span class="codeline" id="line-1203"><code>	if gcPercent := c.gcPercent.Load(); gcPercent &gt;= 0 {</code></span>
+<span class="codeline" id="line-1204"><code>		gcPercentHeapGoal = c.heapMarked + (c.heapMarked+c.lastStackScan.Load()+c.globalsScan.Load())*uint64(gcPercent)/100</code></span>
+<span class="codeline" id="line-1205"><code>	}</code></span>
+<span class="codeline" id="line-1206"><code>	// Apply the minimum heap size here. It's defined in terms of gcPercent</code></span>
+<span class="codeline" id="line-1207"><code>	// and is only updated by functions that call commit.</code></span>
+<span class="codeline" id="line-1208"><code>	if gcPercentHeapGoal &lt; c.heapMinimum {</code></span>
+<span class="codeline" id="line-1209"><code>		gcPercentHeapGoal = c.heapMinimum</code></span>
+<span class="codeline" id="line-1210"><code>	}</code></span>
+<span class="codeline" id="line-1211"><code>	c.gcPercentHeapGoal.Store(gcPercentHeapGoal)</code></span>
+<span class="codeline" id="line-1212"><code></code></span>
+<span class="codeline" id="line-1213"><code>	// Compute the amount of runway we want the GC to have by using our</code></span>
+<span class="codeline" id="line-1214"><code>	// estimate of the cons/mark ratio.</code></span>
+<span class="codeline" id="line-1215"><code>	//</code></span>
+<span class="codeline" id="line-1216"><code>	// The idea is to take our expected scan work, and multiply it by</code></span>
+<span class="codeline" id="line-1217"><code>	// the cons/mark ratio to determine how long it'll take to complete</code></span>
+<span class="codeline" id="line-1218"><code>	// that scan work in terms of bytes allocated. This gives us our GC's</code></span>
+<span class="codeline" id="line-1219"><code>	// runway.</code></span>
+<span class="codeline" id="line-1220"><code>	//</code></span>
+<span class="codeline" id="line-1221"><code>	// However, the cons/mark ratio is a ratio of rates per CPU-second, but</code></span>
+<span class="codeline" id="line-1222"><code>	// here we care about the relative rates for some division of CPU</code></span>
+<span class="codeline" id="line-1223"><code>	// resources among the mutator and the GC.</code></span>
+<span class="codeline" id="line-1224"><code>	//</code></span>
+<span class="codeline" id="line-1225"><code>	// To summarize, we have B / cpu-ns, and we want B / ns. We get that</code></span>
+<span class="codeline" id="line-1226"><code>	// by multiplying by our desired division of CPU resources. We choose</code></span>
+<span class="codeline" id="line-1227"><code>	// to express CPU resources as GOMAPROCS*fraction. Note that because</code></span>
+<span class="codeline" id="line-1228"><code>	// we're working with a ratio here, we can omit the number of CPU cores,</code></span>
+<span class="codeline" id="line-1229"><code>	// because they'll appear in the numerator and denominator and cancel out.</code></span>
+<span class="codeline" id="line-1230"><code>	// As a result, this is basically just "weighing" the cons/mark ratio by</code></span>
+<span class="codeline" id="line-1231"><code>	// our desired division of resources.</code></span>
+<span class="codeline" id="line-1232"><code>	//</code></span>
+<span class="codeline" id="line-1233"><code>	// Furthermore, by setting the runway so that CPU resources are divided</code></span>
+<span class="codeline" id="line-1234"><code>	// this way, assuming that the cons/mark ratio is correct, we make that</code></span>
+<span class="codeline" id="line-1235"><code>	// division a reality.</code></span>
+<span class="codeline" id="line-1236"><code>	c.runway.Store(uint64((c.consMark * (1 - gcGoalUtilization) / (gcGoalUtilization)) * float64(c.lastHeapScan+c.lastStackScan.Load()+c.globalsScan.Load())))</code></span>
+<span class="codeline" id="line-1237"><code>}</code></span>
+<span class="codeline" id="line-1238"><code></code></span>
+<span class="codeline" id="line-1239"><code>// setGCPercent updates gcPercent. commit must be called after.</code></span>
+<span class="codeline" id="line-1240"><code>// Returns the old value of gcPercent.</code></span>
+<span class="codeline" id="line-1241"><code>//</code></span>
+<span class="codeline" id="line-1242"><code>// The world must be stopped, or mheap_.lock must be held.</code></span>
+<span class="codeline" id="line-1243"><code>func (c *gcControllerState) setGCPercent(in int32) int32 {</code></span>
+<span class="codeline" id="line-1244"><code>	if !c.test {</code></span>
+<span class="codeline" id="line-1245"><code>		assertWorldStoppedOrLockHeld(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1246"><code>	}</code></span>
+<span class="codeline" id="line-1247"><code></code></span>
+<span class="codeline" id="line-1248"><code>	out := c.gcPercent.Load()</code></span>
+<span class="codeline" id="line-1249"><code>	if in &lt; 0 {</code></span>
+<span class="codeline" id="line-1250"><code>		in = -1</code></span>
+<span class="codeline" id="line-1251"><code>	}</code></span>
+<span class="codeline" id="line-1252"><code>	c.heapMinimum = defaultHeapMinimum * uint64(in) / 100</code></span>
+<span class="codeline" id="line-1253"><code>	c.gcPercent.Store(in)</code></span>
+<span class="codeline" id="line-1254"><code></code></span>
+<span class="codeline" id="line-1255"><code>	return out</code></span>
+<span class="codeline" id="line-1256"><code>}</code></span>
+<span class="codeline" id="line-1257"><code></code></span>
+<span class="codeline" id="line-1258"><code>//go:linkname setGCPercent runtime/debug.setGCPercent</code></span>
+<span class="codeline" id="line-1259"><code>func setGCPercent(in int32) (out int32) {</code></span>
+<span class="codeline" id="line-1260"><code>	// Run on the system stack since we grab the heap lock.</code></span>
+<span class="codeline" id="line-1261"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1262"><code>		lock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1263"><code>		out = gcController.setGCPercent(in)</code></span>
+<span class="codeline" id="line-1264"><code>		gcControllerCommit()</code></span>
+<span class="codeline" id="line-1265"><code>		unlock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1266"><code>	})</code></span>
+<span class="codeline" id="line-1267"><code></code></span>
+<span class="codeline" id="line-1268"><code>	// If we just disabled GC, wait for any concurrent GC mark to</code></span>
+<span class="codeline" id="line-1269"><code>	// finish so we always return with no GC running.</code></span>
+<span class="codeline" id="line-1270"><code>	if in &lt; 0 {</code></span>
+<span class="codeline" id="line-1271"><code>		gcWaitOnMark(work.cycles.Load())</code></span>
+<span class="codeline" id="line-1272"><code>	}</code></span>
+<span class="codeline" id="line-1273"><code></code></span>
+<span class="codeline" id="line-1274"><code>	return out</code></span>
+<span class="codeline" id="line-1275"><code>}</code></span>
+<span class="codeline" id="line-1276"><code></code></span>
+<span class="codeline" id="line-1277"><code>func readGOGC() int32 {</code></span>
+<span class="codeline" id="line-1278"><code>	p := gogetenv("GOGC")</code></span>
+<span class="codeline" id="line-1279"><code>	if p == "off" {</code></span>
+<span class="codeline" id="line-1280"><code>		return -1</code></span>
+<span class="codeline" id="line-1281"><code>	}</code></span>
+<span class="codeline" id="line-1282"><code>	if n, ok := atoi32(p); ok {</code></span>
+<span class="codeline" id="line-1283"><code>		return n</code></span>
+<span class="codeline" id="line-1284"><code>	}</code></span>
+<span class="codeline" id="line-1285"><code>	return 100</code></span>
+<span class="codeline" id="line-1286"><code>}</code></span>
+<span class="codeline" id="line-1287"><code></code></span>
+<span class="codeline" id="line-1288"><code>// setMemoryLimit updates memoryLimit. commit must be called after</code></span>
+<span class="codeline" id="line-1289"><code>// Returns the old value of memoryLimit.</code></span>
+<span class="codeline" id="line-1290"><code>//</code></span>
+<span class="codeline" id="line-1291"><code>// The world must be stopped, or mheap_.lock must be held.</code></span>
+<span class="codeline" id="line-1292"><code>func (c *gcControllerState) setMemoryLimit(in int64) int64 {</code></span>
+<span class="codeline" id="line-1293"><code>	if !c.test {</code></span>
+<span class="codeline" id="line-1294"><code>		assertWorldStoppedOrLockHeld(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1295"><code>	}</code></span>
+<span class="codeline" id="line-1296"><code></code></span>
+<span class="codeline" id="line-1297"><code>	out := c.memoryLimit.Load()</code></span>
+<span class="codeline" id="line-1298"><code>	if in &gt;= 0 {</code></span>
+<span class="codeline" id="line-1299"><code>		c.memoryLimit.Store(in)</code></span>
+<span class="codeline" id="line-1300"><code>	}</code></span>
+<span class="codeline" id="line-1301"><code></code></span>
+<span class="codeline" id="line-1302"><code>	return out</code></span>
+<span class="codeline" id="line-1303"><code>}</code></span>
+<span class="codeline" id="line-1304"><code></code></span>
+<span class="codeline" id="line-1305"><code>//go:linkname setMemoryLimit runtime/debug.setMemoryLimit</code></span>
+<span class="codeline" id="line-1306"><code>func setMemoryLimit(in int64) (out int64) {</code></span>
+<span class="codeline" id="line-1307"><code>	// Run on the system stack since we grab the heap lock.</code></span>
+<span class="codeline" id="line-1308"><code>	systemstack(func() {</code></span>
+<span class="codeline" id="line-1309"><code>		lock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1310"><code>		out = gcController.setMemoryLimit(in)</code></span>
+<span class="codeline" id="line-1311"><code>		if in &lt; 0 || out == in {</code></span>
+<span class="codeline" id="line-1312"><code>			// If we're just checking the value or not changing</code></span>
+<span class="codeline" id="line-1313"><code>			// it, there's no point in doing the rest.</code></span>
+<span class="codeline" id="line-1314"><code>			unlock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1315"><code>			return</code></span>
+<span class="codeline" id="line-1316"><code>		}</code></span>
+<span class="codeline" id="line-1317"><code>		gcControllerCommit()</code></span>
+<span class="codeline" id="line-1318"><code>		unlock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1319"><code>	})</code></span>
+<span class="codeline" id="line-1320"><code>	return out</code></span>
+<span class="codeline" id="line-1321"><code>}</code></span>
+<span class="codeline" id="line-1322"><code></code></span>
+<span class="codeline" id="line-1323"><code>func readGOMEMLIMIT() int64 {</code></span>
+<span class="codeline" id="line-1324"><code>	p := gogetenv("GOMEMLIMIT")</code></span>
+<span class="codeline" id="line-1325"><code>	if p == "" || p == "off" {</code></span>
+<span class="codeline" id="line-1326"><code>		return maxInt64</code></span>
+<span class="codeline" id="line-1327"><code>	}</code></span>
+<span class="codeline" id="line-1328"><code>	n, ok := parseByteCount(p)</code></span>
+<span class="codeline" id="line-1329"><code>	if !ok {</code></span>
+<span class="codeline" id="line-1330"><code>		print("GOMEMLIMIT=", p, "\n")</code></span>
+<span class="codeline" id="line-1331"><code>		throw("malformed GOMEMLIMIT; see `go doc runtime/debug.SetMemoryLimit`")</code></span>
+<span class="codeline" id="line-1332"><code>	}</code></span>
+<span class="codeline" id="line-1333"><code>	return n</code></span>
+<span class="codeline" id="line-1334"><code>}</code></span>
+<span class="codeline" id="line-1335"><code></code></span>
+<span class="codeline" id="line-1336"><code>// addIdleMarkWorker attempts to add a new idle mark worker.</code></span>
+<span class="codeline" id="line-1337"><code>//</code></span>
+<span class="codeline" id="line-1338"><code>// If this returns true, the caller must become an idle mark worker unless</code></span>
+<span class="codeline" id="line-1339"><code>// there's no background mark worker goroutines in the pool. This case is</code></span>
+<span class="codeline" id="line-1340"><code>// harmless because there are already background mark workers running.</code></span>
+<span class="codeline" id="line-1341"><code>// If this returns false, the caller must NOT become an idle mark worker.</code></span>
+<span class="codeline" id="line-1342"><code>//</code></span>
+<span class="codeline" id="line-1343"><code>// nosplit because it may be called without a P.</code></span>
+<span class="codeline" id="line-1344"><code>//</code></span>
+<span class="codeline" id="line-1345"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1346"><code>func (c *gcControllerState) addIdleMarkWorker() bool {</code></span>
+<span class="codeline" id="line-1347"><code>	for {</code></span>
+<span class="codeline" id="line-1348"><code>		old := c.idleMarkWorkers.Load()</code></span>
+<span class="codeline" id="line-1349"><code>		n, max := int32(old&amp;uint64(^uint32(0))), int32(old&gt;&gt;32)</code></span>
+<span class="codeline" id="line-1350"><code>		if n &gt;= max {</code></span>
+<span class="codeline" id="line-1351"><code>			// See the comment on idleMarkWorkers for why</code></span>
+<span class="codeline" id="line-1352"><code>			// n &gt; max is tolerated.</code></span>
+<span class="codeline" id="line-1353"><code>			return false</code></span>
+<span class="codeline" id="line-1354"><code>		}</code></span>
+<span class="codeline" id="line-1355"><code>		if n &lt; 0 {</code></span>
+<span class="codeline" id="line-1356"><code>			print("n=", n, " max=", max, "\n")</code></span>
+<span class="codeline" id="line-1357"><code>			throw("negative idle mark workers")</code></span>
+<span class="codeline" id="line-1358"><code>		}</code></span>
+<span class="codeline" id="line-1359"><code>		new := uint64(uint32(n+1)) | (uint64(max) &lt;&lt; 32)</code></span>
+<span class="codeline" id="line-1360"><code>		if c.idleMarkWorkers.CompareAndSwap(old, new) {</code></span>
+<span class="codeline" id="line-1361"><code>			return true</code></span>
+<span class="codeline" id="line-1362"><code>		}</code></span>
+<span class="codeline" id="line-1363"><code>	}</code></span>
+<span class="codeline" id="line-1364"><code>}</code></span>
+<span class="codeline" id="line-1365"><code></code></span>
+<span class="codeline" id="line-1366"><code>// needIdleMarkWorker is a hint as to whether another idle mark worker is needed.</code></span>
+<span class="codeline" id="line-1367"><code>//</code></span>
+<span class="codeline" id="line-1368"><code>// The caller must still call addIdleMarkWorker to become one. This is mainly</code></span>
+<span class="codeline" id="line-1369"><code>// useful for a quick check before an expensive operation.</code></span>
+<span class="codeline" id="line-1370"><code>//</code></span>
+<span class="codeline" id="line-1371"><code>// nosplit because it may be called without a P.</code></span>
+<span class="codeline" id="line-1372"><code>//</code></span>
+<span class="codeline" id="line-1373"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-1374"><code>func (c *gcControllerState) needIdleMarkWorker() bool {</code></span>
+<span class="codeline" id="line-1375"><code>	p := c.idleMarkWorkers.Load()</code></span>
+<span class="codeline" id="line-1376"><code>	n, max := int32(p&amp;uint64(^uint32(0))), int32(p&gt;&gt;32)</code></span>
+<span class="codeline" id="line-1377"><code>	return n &lt; max</code></span>
+<span class="codeline" id="line-1378"><code>}</code></span>
+<span class="codeline" id="line-1379"><code></code></span>
+<span class="codeline" id="line-1380"><code>// removeIdleMarkWorker must be called when a new idle mark worker stops executing.</code></span>
+<span class="codeline" id="line-1381"><code>func (c *gcControllerState) removeIdleMarkWorker() {</code></span>
+<span class="codeline" id="line-1382"><code>	for {</code></span>
+<span class="codeline" id="line-1383"><code>		old := c.idleMarkWorkers.Load()</code></span>
+<span class="codeline" id="line-1384"><code>		n, max := int32(old&amp;uint64(^uint32(0))), int32(old&gt;&gt;32)</code></span>
+<span class="codeline" id="line-1385"><code>		if n-1 &lt; 0 {</code></span>
+<span class="codeline" id="line-1386"><code>			print("n=", n, " max=", max, "\n")</code></span>
+<span class="codeline" id="line-1387"><code>			throw("negative idle mark workers")</code></span>
+<span class="codeline" id="line-1388"><code>		}</code></span>
+<span class="codeline" id="line-1389"><code>		new := uint64(uint32(n-1)) | (uint64(max) &lt;&lt; 32)</code></span>
+<span class="codeline" id="line-1390"><code>		if c.idleMarkWorkers.CompareAndSwap(old, new) {</code></span>
+<span class="codeline" id="line-1391"><code>			return</code></span>
+<span class="codeline" id="line-1392"><code>		}</code></span>
+<span class="codeline" id="line-1393"><code>	}</code></span>
+<span class="codeline" id="line-1394"><code>}</code></span>
+<span class="codeline" id="line-1395"><code></code></span>
+<span class="codeline" id="line-1396"><code>// setMaxIdleMarkWorkers sets the maximum number of idle mark workers allowed.</code></span>
+<span class="codeline" id="line-1397"><code>//</code></span>
+<span class="codeline" id="line-1398"><code>// This method is optimistic in that it does not wait for the number of</code></span>
+<span class="codeline" id="line-1399"><code>// idle mark workers to reduce to max before returning; it assumes the workers</code></span>
+<span class="codeline" id="line-1400"><code>// will deschedule themselves.</code></span>
+<span class="codeline" id="line-1401"><code>func (c *gcControllerState) setMaxIdleMarkWorkers(max int32) {</code></span>
+<span class="codeline" id="line-1402"><code>	for {</code></span>
+<span class="codeline" id="line-1403"><code>		old := c.idleMarkWorkers.Load()</code></span>
+<span class="codeline" id="line-1404"><code>		n := int32(old &amp; uint64(^uint32(0)))</code></span>
+<span class="codeline" id="line-1405"><code>		if n &lt; 0 {</code></span>
+<span class="codeline" id="line-1406"><code>			print("n=", n, " max=", max, "\n")</code></span>
+<span class="codeline" id="line-1407"><code>			throw("negative idle mark workers")</code></span>
+<span class="codeline" id="line-1408"><code>		}</code></span>
+<span class="codeline" id="line-1409"><code>		new := uint64(uint32(n)) | (uint64(max) &lt;&lt; 32)</code></span>
+<span class="codeline" id="line-1410"><code>		if c.idleMarkWorkers.CompareAndSwap(old, new) {</code></span>
+<span class="codeline" id="line-1411"><code>			return</code></span>
+<span class="codeline" id="line-1412"><code>		}</code></span>
+<span class="codeline" id="line-1413"><code>	}</code></span>
+<span class="codeline" id="line-1414"><code>}</code></span>
+<span class="codeline" id="line-1415"><code></code></span>
+<span class="codeline" id="line-1416"><code>// gcControllerCommit is gcController.commit, but passes arguments from live</code></span>
+<span class="codeline" id="line-1417"><code>// (non-test) data. It also updates any consumers of the GC pacing, such as</code></span>
+<span class="codeline" id="line-1418"><code>// sweep pacing and the background scavenger.</code></span>
+<span class="codeline" id="line-1419"><code>//</code></span>
+<span class="codeline" id="line-1420"><code>// Calls gcController.commit.</code></span>
+<span class="codeline" id="line-1421"><code>//</code></span>
+<span class="codeline" id="line-1422"><code>// The heap lock must be held, so this must be executed on the system stack.</code></span>
+<span class="codeline" id="line-1423"><code>//</code></span>
+<span class="codeline" id="line-1424"><code>//go:systemstack</code></span>
+<span class="codeline" id="line-1425"><code>func gcControllerCommit() {</code></span>
+<span class="codeline" id="line-1426"><code>	assertWorldStoppedOrLockHeld(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-1427"><code></code></span>
+<span class="codeline" id="line-1428"><code>	gcController.commit(isSweepDone())</code></span>
+<span class="codeline" id="line-1429"><code></code></span>
+<span class="codeline" id="line-1430"><code>	// Update mark pacing.</code></span>
+<span class="codeline" id="line-1431"><code>	if gcphase != _GCoff {</code></span>
+<span class="codeline" id="line-1432"><code>		gcController.revise()</code></span>
+<span class="codeline" id="line-1433"><code>	}</code></span>
+<span class="codeline" id="line-1434"><code></code></span>
+<span class="codeline" id="line-1435"><code>	// TODO(mknyszek): This isn't really accurate any longer because the heap</code></span>
+<span class="codeline" id="line-1436"><code>	// goal is computed dynamically. Still useful to snapshot, but not as useful.</code></span>
+<span class="codeline" id="line-1437"><code>	trace := traceAcquire()</code></span>
+<span class="codeline" id="line-1438"><code>	if trace.ok() {</code></span>
+<span class="codeline" id="line-1439"><code>		trace.HeapGoal()</code></span>
+<span class="codeline" id="line-1440"><code>		traceRelease(trace)</code></span>
+<span class="codeline" id="line-1441"><code>	}</code></span>
+<span class="codeline" id="line-1442"><code></code></span>
+<span class="codeline" id="line-1443"><code>	trigger, heapGoal := gcController.trigger()</code></span>
+<span class="codeline" id="line-1444"><code>	gcPaceSweeper(trigger)</code></span>
+<span class="codeline" id="line-1445"><code>	gcPaceScavenger(gcController.memoryLimit.Load(), heapGoal, gcController.lastHeapGoal)</code></span>
+<span class="codeline" id="line-1446"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

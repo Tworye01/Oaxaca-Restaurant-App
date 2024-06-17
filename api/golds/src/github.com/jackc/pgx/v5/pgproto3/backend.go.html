@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: backend.go in package github.com/jackc/pgx/v5/pgproto3</title>
+<link href="../../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	backend.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../../pkg/github.com/jackc/pgx/v5/pgproto3.html">github.com/jackc/pgx/v5/pgproto3</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package pgproto3</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"bytes"</code></span>
+<span class="codeline" id="line-5"><code>	"encoding/binary"</code></span>
+<span class="codeline" id="line-6"><code>	"fmt"</code></span>
+<span class="codeline" id="line-7"><code>	"io"</code></span>
+<span class="codeline" id="line-8"><code>)</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>// Backend acts as a server for the PostgreSQL wire protocol version 3.</code></span>
+<span class="codeline" id="line-11"><code>type Backend struct {</code></span>
+<span class="codeline" id="line-12"><code>	cr *chunkReader</code></span>
+<span class="codeline" id="line-13"><code>	w  io.Writer</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>	// tracer is used to trace messages when Send or Receive is called. This means an outbound message is traced</code></span>
+<span class="codeline" id="line-16"><code>	// before it is actually transmitted (i.e. before Flush).</code></span>
+<span class="codeline" id="line-17"><code>	tracer *tracer</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>	wbuf []byte</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>	// Frontend message flyweights</code></span>
+<span class="codeline" id="line-22"><code>	bind           Bind</code></span>
+<span class="codeline" id="line-23"><code>	cancelRequest  CancelRequest</code></span>
+<span class="codeline" id="line-24"><code>	_close         Close</code></span>
+<span class="codeline" id="line-25"><code>	copyFail       CopyFail</code></span>
+<span class="codeline" id="line-26"><code>	copyData       CopyData</code></span>
+<span class="codeline" id="line-27"><code>	copyDone       CopyDone</code></span>
+<span class="codeline" id="line-28"><code>	describe       Describe</code></span>
+<span class="codeline" id="line-29"><code>	execute        Execute</code></span>
+<span class="codeline" id="line-30"><code>	flush          Flush</code></span>
+<span class="codeline" id="line-31"><code>	functionCall   FunctionCall</code></span>
+<span class="codeline" id="line-32"><code>	gssEncRequest  GSSEncRequest</code></span>
+<span class="codeline" id="line-33"><code>	parse          Parse</code></span>
+<span class="codeline" id="line-34"><code>	query          Query</code></span>
+<span class="codeline" id="line-35"><code>	sslRequest     SSLRequest</code></span>
+<span class="codeline" id="line-36"><code>	startupMessage StartupMessage</code></span>
+<span class="codeline" id="line-37"><code>	sync           Sync</code></span>
+<span class="codeline" id="line-38"><code>	terminate      Terminate</code></span>
+<span class="codeline" id="line-39"><code></code></span>
+<span class="codeline" id="line-40"><code>	bodyLen    int</code></span>
+<span class="codeline" id="line-41"><code>	maxBodyLen int // maxBodyLen is the maximum length of a message body in octets. If a message body exceeds this length, Receive will return an error.</code></span>
+<span class="codeline" id="line-42"><code>	msgType    byte</code></span>
+<span class="codeline" id="line-43"><code>	partialMsg bool</code></span>
+<span class="codeline" id="line-44"><code>	authType   uint32</code></span>
+<span class="codeline" id="line-45"><code>}</code></span>
+<span class="codeline" id="line-46"><code></code></span>
+<span class="codeline" id="line-47"><code>const (</code></span>
+<span class="codeline" id="line-48"><code>	minStartupPacketLen = 4     // minStartupPacketLen is a single 32-bit int version or code.</code></span>
+<span class="codeline" id="line-49"><code>	maxStartupPacketLen = 10000 // maxStartupPacketLen is MAX_STARTUP_PACKET_LENGTH from PG source.</code></span>
+<span class="codeline" id="line-50"><code>)</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>// NewBackend creates a new Backend.</code></span>
+<span class="codeline" id="line-53"><code>func NewBackend(r io.Reader, w io.Writer) *Backend {</code></span>
+<span class="codeline" id="line-54"><code>	cr := newChunkReader(r, 0)</code></span>
+<span class="codeline" id="line-55"><code>	return &amp;Backend{cr: cr, w: w}</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>// Send sends a message to the frontend (i.e. the client). The message is not guaranteed to be written until Flush is</code></span>
+<span class="codeline" id="line-59"><code>// called.</code></span>
+<span class="codeline" id="line-60"><code>func (b *Backend) Send(msg BackendMessage) {</code></span>
+<span class="codeline" id="line-61"><code>	prevLen := len(b.wbuf)</code></span>
+<span class="codeline" id="line-62"><code>	b.wbuf = msg.Encode(b.wbuf)</code></span>
+<span class="codeline" id="line-63"><code>	if b.tracer != nil {</code></span>
+<span class="codeline" id="line-64"><code>		b.tracer.traceMessage('B', int32(len(b.wbuf)-prevLen), msg)</code></span>
+<span class="codeline" id="line-65"><code>	}</code></span>
+<span class="codeline" id="line-66"><code>}</code></span>
+<span class="codeline" id="line-67"><code></code></span>
+<span class="codeline" id="line-68"><code>// Flush writes any pending messages to the frontend (i.e. the client).</code></span>
+<span class="codeline" id="line-69"><code>func (b *Backend) Flush() error {</code></span>
+<span class="codeline" id="line-70"><code>	n, err := b.w.Write(b.wbuf)</code></span>
+<span class="codeline" id="line-71"><code></code></span>
+<span class="codeline" id="line-72"><code>	const maxLen = 1024</code></span>
+<span class="codeline" id="line-73"><code>	if len(b.wbuf) &gt; maxLen {</code></span>
+<span class="codeline" id="line-74"><code>		b.wbuf = make([]byte, 0, maxLen)</code></span>
+<span class="codeline" id="line-75"><code>	} else {</code></span>
+<span class="codeline" id="line-76"><code>		b.wbuf = b.wbuf[:0]</code></span>
+<span class="codeline" id="line-77"><code>	}</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-80"><code>		return &amp;writeError{err: err, safeToRetry: n == 0}</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	return nil</code></span>
+<span class="codeline" id="line-84"><code>}</code></span>
+<span class="codeline" id="line-85"><code></code></span>
+<span class="codeline" id="line-86"><code>// Trace starts tracing the message traffic to w. It writes in a similar format to that produced by the libpq function</code></span>
+<span class="codeline" id="line-87"><code>// PQtrace.</code></span>
+<span class="codeline" id="line-88"><code>func (b *Backend) Trace(w io.Writer, options TracerOptions) {</code></span>
+<span class="codeline" id="line-89"><code>	b.tracer = &amp;tracer{</code></span>
+<span class="codeline" id="line-90"><code>		w:             w,</code></span>
+<span class="codeline" id="line-91"><code>		buf:           &amp;bytes.Buffer{},</code></span>
+<span class="codeline" id="line-92"><code>		TracerOptions: options,</code></span>
+<span class="codeline" id="line-93"><code>	}</code></span>
+<span class="codeline" id="line-94"><code>}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// Untrace stops tracing.</code></span>
+<span class="codeline" id="line-97"><code>func (b *Backend) Untrace() {</code></span>
+<span class="codeline" id="line-98"><code>	b.tracer = nil</code></span>
+<span class="codeline" id="line-99"><code>}</code></span>
+<span class="codeline" id="line-100"><code></code></span>
+<span class="codeline" id="line-101"><code>// ReceiveStartupMessage receives the initial connection message. This method is used of the normal Receive method</code></span>
+<span class="codeline" id="line-102"><code>// because the initial connection message is "special" and does not include the message type as the first byte. This</code></span>
+<span class="codeline" id="line-103"><code>// will return either a StartupMessage, SSLRequest, GSSEncRequest, or CancelRequest.</code></span>
+<span class="codeline" id="line-104"><code>func (b *Backend) ReceiveStartupMessage() (FrontendMessage, error) {</code></span>
+<span class="codeline" id="line-105"><code>	buf, err := b.cr.Next(4)</code></span>
+<span class="codeline" id="line-106"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-107"><code>		return nil, err</code></span>
+<span class="codeline" id="line-108"><code>	}</code></span>
+<span class="codeline" id="line-109"><code>	msgSize := int(binary.BigEndian.Uint32(buf) - 4)</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>	if msgSize &lt; minStartupPacketLen || msgSize &gt; maxStartupPacketLen {</code></span>
+<span class="codeline" id="line-112"><code>		return nil, fmt.Errorf("invalid length of startup packet: %d", msgSize)</code></span>
+<span class="codeline" id="line-113"><code>	}</code></span>
+<span class="codeline" id="line-114"><code></code></span>
+<span class="codeline" id="line-115"><code>	buf, err = b.cr.Next(msgSize)</code></span>
+<span class="codeline" id="line-116"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-117"><code>		return nil, translateEOFtoErrUnexpectedEOF(err)</code></span>
+<span class="codeline" id="line-118"><code>	}</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>	code := binary.BigEndian.Uint32(buf)</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	switch code {</code></span>
+<span class="codeline" id="line-123"><code>	case ProtocolVersionNumber:</code></span>
+<span class="codeline" id="line-124"><code>		err = b.startupMessage.Decode(buf)</code></span>
+<span class="codeline" id="line-125"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-126"><code>			return nil, err</code></span>
+<span class="codeline" id="line-127"><code>		}</code></span>
+<span class="codeline" id="line-128"><code>		return &amp;b.startupMessage, nil</code></span>
+<span class="codeline" id="line-129"><code>	case sslRequestNumber:</code></span>
+<span class="codeline" id="line-130"><code>		err = b.sslRequest.Decode(buf)</code></span>
+<span class="codeline" id="line-131"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-132"><code>			return nil, err</code></span>
+<span class="codeline" id="line-133"><code>		}</code></span>
+<span class="codeline" id="line-134"><code>		return &amp;b.sslRequest, nil</code></span>
+<span class="codeline" id="line-135"><code>	case cancelRequestCode:</code></span>
+<span class="codeline" id="line-136"><code>		err = b.cancelRequest.Decode(buf)</code></span>
+<span class="codeline" id="line-137"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-138"><code>			return nil, err</code></span>
+<span class="codeline" id="line-139"><code>		}</code></span>
+<span class="codeline" id="line-140"><code>		return &amp;b.cancelRequest, nil</code></span>
+<span class="codeline" id="line-141"><code>	case gssEncReqNumber:</code></span>
+<span class="codeline" id="line-142"><code>		err = b.gssEncRequest.Decode(buf)</code></span>
+<span class="codeline" id="line-143"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-144"><code>			return nil, err</code></span>
+<span class="codeline" id="line-145"><code>		}</code></span>
+<span class="codeline" id="line-146"><code>		return &amp;b.gssEncRequest, nil</code></span>
+<span class="codeline" id="line-147"><code>	default:</code></span>
+<span class="codeline" id="line-148"><code>		return nil, fmt.Errorf("unknown startup message code: %d", code)</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code>}</code></span>
+<span class="codeline" id="line-151"><code></code></span>
+<span class="codeline" id="line-152"><code>// Receive receives a message from the frontend. The returned message is only valid until the next call to Receive.</code></span>
+<span class="codeline" id="line-153"><code>func (b *Backend) Receive() (FrontendMessage, error) {</code></span>
+<span class="codeline" id="line-154"><code>	if !b.partialMsg {</code></span>
+<span class="codeline" id="line-155"><code>		header, err := b.cr.Next(5)</code></span>
+<span class="codeline" id="line-156"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-157"><code>			return nil, translateEOFtoErrUnexpectedEOF(err)</code></span>
+<span class="codeline" id="line-158"><code>		}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>		b.msgType = header[0]</code></span>
+<span class="codeline" id="line-161"><code>		b.bodyLen = int(binary.BigEndian.Uint32(header[1:])) - 4</code></span>
+<span class="codeline" id="line-162"><code>		if b.maxBodyLen &gt; 0 &amp;&amp; b.bodyLen &gt; b.maxBodyLen {</code></span>
+<span class="codeline" id="line-163"><code>			return nil, &amp;ExceededMaxBodyLenErr{b.maxBodyLen, b.bodyLen}</code></span>
+<span class="codeline" id="line-164"><code>		}</code></span>
+<span class="codeline" id="line-165"><code>		b.partialMsg = true</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code></code></span>
+<span class="codeline" id="line-168"><code>	var msg FrontendMessage</code></span>
+<span class="codeline" id="line-169"><code>	switch b.msgType {</code></span>
+<span class="codeline" id="line-170"><code>	case 'B':</code></span>
+<span class="codeline" id="line-171"><code>		msg = &amp;b.bind</code></span>
+<span class="codeline" id="line-172"><code>	case 'C':</code></span>
+<span class="codeline" id="line-173"><code>		msg = &amp;b._close</code></span>
+<span class="codeline" id="line-174"><code>	case 'D':</code></span>
+<span class="codeline" id="line-175"><code>		msg = &amp;b.describe</code></span>
+<span class="codeline" id="line-176"><code>	case 'E':</code></span>
+<span class="codeline" id="line-177"><code>		msg = &amp;b.execute</code></span>
+<span class="codeline" id="line-178"><code>	case 'F':</code></span>
+<span class="codeline" id="line-179"><code>		msg = &amp;b.functionCall</code></span>
+<span class="codeline" id="line-180"><code>	case 'f':</code></span>
+<span class="codeline" id="line-181"><code>		msg = &amp;b.copyFail</code></span>
+<span class="codeline" id="line-182"><code>	case 'd':</code></span>
+<span class="codeline" id="line-183"><code>		msg = &amp;b.copyData</code></span>
+<span class="codeline" id="line-184"><code>	case 'c':</code></span>
+<span class="codeline" id="line-185"><code>		msg = &amp;b.copyDone</code></span>
+<span class="codeline" id="line-186"><code>	case 'H':</code></span>
+<span class="codeline" id="line-187"><code>		msg = &amp;b.flush</code></span>
+<span class="codeline" id="line-188"><code>	case 'P':</code></span>
+<span class="codeline" id="line-189"><code>		msg = &amp;b.parse</code></span>
+<span class="codeline" id="line-190"><code>	case 'p':</code></span>
+<span class="codeline" id="line-191"><code>		switch b.authType {</code></span>
+<span class="codeline" id="line-192"><code>		case AuthTypeSASL:</code></span>
+<span class="codeline" id="line-193"><code>			msg = &amp;SASLInitialResponse{}</code></span>
+<span class="codeline" id="line-194"><code>		case AuthTypeSASLContinue:</code></span>
+<span class="codeline" id="line-195"><code>			msg = &amp;SASLResponse{}</code></span>
+<span class="codeline" id="line-196"><code>		case AuthTypeSASLFinal:</code></span>
+<span class="codeline" id="line-197"><code>			msg = &amp;SASLResponse{}</code></span>
+<span class="codeline" id="line-198"><code>		case AuthTypeGSS, AuthTypeGSSCont:</code></span>
+<span class="codeline" id="line-199"><code>			msg = &amp;GSSResponse{}</code></span>
+<span class="codeline" id="line-200"><code>		case AuthTypeCleartextPassword, AuthTypeMD5Password:</code></span>
+<span class="codeline" id="line-201"><code>			fallthrough</code></span>
+<span class="codeline" id="line-202"><code>		default:</code></span>
+<span class="codeline" id="line-203"><code>			// to maintain backwards compatibility</code></span>
+<span class="codeline" id="line-204"><code>			msg = &amp;PasswordMessage{}</code></span>
+<span class="codeline" id="line-205"><code>		}</code></span>
+<span class="codeline" id="line-206"><code>	case 'Q':</code></span>
+<span class="codeline" id="line-207"><code>		msg = &amp;b.query</code></span>
+<span class="codeline" id="line-208"><code>	case 'S':</code></span>
+<span class="codeline" id="line-209"><code>		msg = &amp;b.sync</code></span>
+<span class="codeline" id="line-210"><code>	case 'X':</code></span>
+<span class="codeline" id="line-211"><code>		msg = &amp;b.terminate</code></span>
+<span class="codeline" id="line-212"><code>	default:</code></span>
+<span class="codeline" id="line-213"><code>		return nil, fmt.Errorf("unknown message type: %c", b.msgType)</code></span>
+<span class="codeline" id="line-214"><code>	}</code></span>
+<span class="codeline" id="line-215"><code></code></span>
+<span class="codeline" id="line-216"><code>	msgBody, err := b.cr.Next(b.bodyLen)</code></span>
+<span class="codeline" id="line-217"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-218"><code>		return nil, translateEOFtoErrUnexpectedEOF(err)</code></span>
+<span class="codeline" id="line-219"><code>	}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>	b.partialMsg = false</code></span>
+<span class="codeline" id="line-222"><code></code></span>
+<span class="codeline" id="line-223"><code>	err = msg.Decode(msgBody)</code></span>
+<span class="codeline" id="line-224"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-225"><code>		return nil, err</code></span>
+<span class="codeline" id="line-226"><code>	}</code></span>
+<span class="codeline" id="line-227"><code></code></span>
+<span class="codeline" id="line-228"><code>	if b.tracer != nil {</code></span>
+<span class="codeline" id="line-229"><code>		b.tracer.traceMessage('F', int32(5+len(msgBody)), msg)</code></span>
+<span class="codeline" id="line-230"><code>	}</code></span>
+<span class="codeline" id="line-231"><code></code></span>
+<span class="codeline" id="line-232"><code>	return msg, nil</code></span>
+<span class="codeline" id="line-233"><code>}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>// SetAuthType sets the authentication type in the backend.</code></span>
+<span class="codeline" id="line-236"><code>// Since multiple message types can start with 'p', SetAuthType allows</code></span>
+<span class="codeline" id="line-237"><code>// contextual identification of FrontendMessages. For example, in the</code></span>
+<span class="codeline" id="line-238"><code>// PG message flow documentation for PasswordMessage:</code></span>
+<span class="codeline" id="line-239"><code>//</code></span>
+<span class="codeline" id="line-240"><code>//			Byte1('p')</code></span>
+<span class="codeline" id="line-241"><code>//</code></span>
+<span class="codeline" id="line-242"><code>//	     Identifies the message as a password response. Note that this is also used for</code></span>
+<span class="codeline" id="line-243"><code>//			GSSAPI, SSPI and SASL response messages. The exact message type can be deduced from</code></span>
+<span class="codeline" id="line-244"><code>//			the context.</code></span>
+<span class="codeline" id="line-245"><code>//</code></span>
+<span class="codeline" id="line-246"><code>// Since the Frontend does not know about the state of a backend, it is important</code></span>
+<span class="codeline" id="line-247"><code>// to call SetAuthType() after an authentication request is received by the Frontend.</code></span>
+<span class="codeline" id="line-248"><code>func (b *Backend) SetAuthType(authType uint32) error {</code></span>
+<span class="codeline" id="line-249"><code>	switch authType {</code></span>
+<span class="codeline" id="line-250"><code>	case AuthTypeOk,</code></span>
+<span class="codeline" id="line-251"><code>		AuthTypeCleartextPassword,</code></span>
+<span class="codeline" id="line-252"><code>		AuthTypeMD5Password,</code></span>
+<span class="codeline" id="line-253"><code>		AuthTypeSCMCreds,</code></span>
+<span class="codeline" id="line-254"><code>		AuthTypeGSS,</code></span>
+<span class="codeline" id="line-255"><code>		AuthTypeGSSCont,</code></span>
+<span class="codeline" id="line-256"><code>		AuthTypeSSPI,</code></span>
+<span class="codeline" id="line-257"><code>		AuthTypeSASL,</code></span>
+<span class="codeline" id="line-258"><code>		AuthTypeSASLContinue,</code></span>
+<span class="codeline" id="line-259"><code>		AuthTypeSASLFinal:</code></span>
+<span class="codeline" id="line-260"><code>		b.authType = authType</code></span>
+<span class="codeline" id="line-261"><code>	default:</code></span>
+<span class="codeline" id="line-262"><code>		return fmt.Errorf("authType not recognized: %d", authType)</code></span>
+<span class="codeline" id="line-263"><code>	}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>	return nil</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// SetMaxBodyLen sets the maximum length of a message body in octets. If a message body exceeds this length, Receive will return</code></span>
+<span class="codeline" id="line-269"><code>// an error. This is useful for protecting against malicious clients that send large messages with the intent of</code></span>
+<span class="codeline" id="line-270"><code>// causing memory exhaustion.</code></span>
+<span class="codeline" id="line-271"><code>// The default value is 0.</code></span>
+<span class="codeline" id="line-272"><code>// If maxBodyLen is 0, then no maximum is enforced.</code></span>
+<span class="codeline" id="line-273"><code>func (b *Backend) SetMaxBodyLen(maxBodyLen int) {</code></span>
+<span class="codeline" id="line-274"><code>	b.maxBodyLen = maxBodyLen</code></span>
+<span class="codeline" id="line-275"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

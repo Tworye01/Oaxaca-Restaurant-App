@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: pool.go in package github.com/jackc/puddle/v2</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	pool.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/github.com/jackc/puddle/v2.html">github.com/jackc/puddle/v2</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>package puddle</code></span>
+<span class="codeline" id="line-2"><code></code></span>
+<span class="codeline" id="line-3"><code>import (</code></span>
+<span class="codeline" id="line-4"><code>	"context"</code></span>
+<span class="codeline" id="line-5"><code>	"errors"</code></span>
+<span class="codeline" id="line-6"><code>	"sync"</code></span>
+<span class="codeline" id="line-7"><code>	"sync/atomic"</code></span>
+<span class="codeline" id="line-8"><code>	"time"</code></span>
+<span class="codeline" id="line-9"><code></code></span>
+<span class="codeline" id="line-10"><code>	"github.com/jackc/puddle/v2/internal/genstack"</code></span>
+<span class="codeline" id="line-11"><code>	"golang.org/x/sync/semaphore"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>const (</code></span>
+<span class="codeline" id="line-15"><code>	resourceStatusConstructing = 0</code></span>
+<span class="codeline" id="line-16"><code>	resourceStatusIdle         = iota</code></span>
+<span class="codeline" id="line-17"><code>	resourceStatusAcquired     = iota</code></span>
+<span class="codeline" id="line-18"><code>	resourceStatusHijacked     = iota</code></span>
+<span class="codeline" id="line-19"><code>)</code></span>
+<span class="codeline" id="line-20"><code></code></span>
+<span class="codeline" id="line-21"><code>// ErrClosedPool occurs on an attempt to acquire a connection from a closed pool</code></span>
+<span class="codeline" id="line-22"><code>// or a pool that is closed while the acquire is waiting.</code></span>
+<span class="codeline" id="line-23"><code>var ErrClosedPool = errors.New("closed pool")</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>// ErrNotAvailable occurs on an attempt to acquire a resource from a pool</code></span>
+<span class="codeline" id="line-26"><code>// that is at maximum capacity and has no available resources.</code></span>
+<span class="codeline" id="line-27"><code>var ErrNotAvailable = errors.New("resource not available")</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>// Constructor is a function called by the pool to construct a resource.</code></span>
+<span class="codeline" id="line-30"><code>type Constructor[T any] func(ctx context.Context) (res T, err error)</code></span>
+<span class="codeline" id="line-31"><code></code></span>
+<span class="codeline" id="line-32"><code>// Destructor is a function called by the pool to destroy a resource.</code></span>
+<span class="codeline" id="line-33"><code>type Destructor[T any] func(res T)</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>// Resource is the resource handle returned by acquiring from the pool.</code></span>
+<span class="codeline" id="line-36"><code>type Resource[T any] struct {</code></span>
+<span class="codeline" id="line-37"><code>	value          T</code></span>
+<span class="codeline" id="line-38"><code>	pool           *Pool[T]</code></span>
+<span class="codeline" id="line-39"><code>	creationTime   time.Time</code></span>
+<span class="codeline" id="line-40"><code>	lastUsedNano   int64</code></span>
+<span class="codeline" id="line-41"><code>	poolResetCount int</code></span>
+<span class="codeline" id="line-42"><code>	status         byte</code></span>
+<span class="codeline" id="line-43"><code>}</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>// Value returns the resource value.</code></span>
+<span class="codeline" id="line-46"><code>func (res *Resource[T]) Value() T {</code></span>
+<span class="codeline" id="line-47"><code>	if !(res.status == resourceStatusAcquired || res.status == resourceStatusHijacked) {</code></span>
+<span class="codeline" id="line-48"><code>		panic("tried to access resource that is not acquired or hijacked")</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code>	return res.value</code></span>
+<span class="codeline" id="line-51"><code>}</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>// Release returns the resource to the pool. res must not be subsequently used.</code></span>
+<span class="codeline" id="line-54"><code>func (res *Resource[T]) Release() {</code></span>
+<span class="codeline" id="line-55"><code>	if res.status != resourceStatusAcquired {</code></span>
+<span class="codeline" id="line-56"><code>		panic("tried to release resource that is not acquired")</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	res.pool.releaseAcquiredResource(res, nanotime())</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>// ReleaseUnused returns the resource to the pool without updating when it was last used used. i.e. LastUsedNanotime</code></span>
+<span class="codeline" id="line-62"><code>// will not change. res must not be subsequently used.</code></span>
+<span class="codeline" id="line-63"><code>func (res *Resource[T]) ReleaseUnused() {</code></span>
+<span class="codeline" id="line-64"><code>	if res.status != resourceStatusAcquired {</code></span>
+<span class="codeline" id="line-65"><code>		panic("tried to release resource that is not acquired")</code></span>
+<span class="codeline" id="line-66"><code>	}</code></span>
+<span class="codeline" id="line-67"><code>	res.pool.releaseAcquiredResource(res, res.lastUsedNano)</code></span>
+<span class="codeline" id="line-68"><code>}</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>// Destroy returns the resource to the pool for destruction. res must not be</code></span>
+<span class="codeline" id="line-71"><code>// subsequently used.</code></span>
+<span class="codeline" id="line-72"><code>func (res *Resource[T]) Destroy() {</code></span>
+<span class="codeline" id="line-73"><code>	if res.status != resourceStatusAcquired {</code></span>
+<span class="codeline" id="line-74"><code>		panic("tried to destroy resource that is not acquired")</code></span>
+<span class="codeline" id="line-75"><code>	}</code></span>
+<span class="codeline" id="line-76"><code>	go res.pool.destroyAcquiredResource(res)</code></span>
+<span class="codeline" id="line-77"><code>}</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>// Hijack assumes ownership of the resource from the pool. Caller is responsible</code></span>
+<span class="codeline" id="line-80"><code>// for cleanup of resource value.</code></span>
+<span class="codeline" id="line-81"><code>func (res *Resource[T]) Hijack() {</code></span>
+<span class="codeline" id="line-82"><code>	if res.status != resourceStatusAcquired {</code></span>
+<span class="codeline" id="line-83"><code>		panic("tried to hijack resource that is not acquired")</code></span>
+<span class="codeline" id="line-84"><code>	}</code></span>
+<span class="codeline" id="line-85"><code>	res.pool.hijackAcquiredResource(res)</code></span>
+<span class="codeline" id="line-86"><code>}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>// CreationTime returns when the resource was created by the pool.</code></span>
+<span class="codeline" id="line-89"><code>func (res *Resource[T]) CreationTime() time.Time {</code></span>
+<span class="codeline" id="line-90"><code>	if !(res.status == resourceStatusAcquired || res.status == resourceStatusHijacked) {</code></span>
+<span class="codeline" id="line-91"><code>		panic("tried to access resource that is not acquired or hijacked")</code></span>
+<span class="codeline" id="line-92"><code>	}</code></span>
+<span class="codeline" id="line-93"><code>	return res.creationTime</code></span>
+<span class="codeline" id="line-94"><code>}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// LastUsedNanotime returns when Release was last called on the resource measured in nanoseconds from an arbitrary time</code></span>
+<span class="codeline" id="line-97"><code>// (a monotonic time). Returns creation time if Release has never been called. This is only useful to compare with</code></span>
+<span class="codeline" id="line-98"><code>// other calls to LastUsedNanotime. In almost all cases, IdleDuration should be used instead.</code></span>
+<span class="codeline" id="line-99"><code>func (res *Resource[T]) LastUsedNanotime() int64 {</code></span>
+<span class="codeline" id="line-100"><code>	if !(res.status == resourceStatusAcquired || res.status == resourceStatusHijacked) {</code></span>
+<span class="codeline" id="line-101"><code>		panic("tried to access resource that is not acquired or hijacked")</code></span>
+<span class="codeline" id="line-102"><code>	}</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	return res.lastUsedNano</code></span>
+<span class="codeline" id="line-105"><code>}</code></span>
+<span class="codeline" id="line-106"><code></code></span>
+<span class="codeline" id="line-107"><code>// IdleDuration returns the duration since Release was last called on the resource. This is equivalent to subtracting</code></span>
+<span class="codeline" id="line-108"><code>// LastUsedNanotime to the current nanotime.</code></span>
+<span class="codeline" id="line-109"><code>func (res *Resource[T]) IdleDuration() time.Duration {</code></span>
+<span class="codeline" id="line-110"><code>	if !(res.status == resourceStatusAcquired || res.status == resourceStatusHijacked) {</code></span>
+<span class="codeline" id="line-111"><code>		panic("tried to access resource that is not acquired or hijacked")</code></span>
+<span class="codeline" id="line-112"><code>	}</code></span>
+<span class="codeline" id="line-113"><code></code></span>
+<span class="codeline" id="line-114"><code>	return time.Duration(nanotime() - res.lastUsedNano)</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>// Pool is a concurrency-safe resource pool.</code></span>
+<span class="codeline" id="line-118"><code>type Pool[T any] struct {</code></span>
+<span class="codeline" id="line-119"><code>	// mux is the pool internal lock. Any modification of shared state of</code></span>
+<span class="codeline" id="line-120"><code>	// the pool (but Acquires of acquireSem) must be performed only by</code></span>
+<span class="codeline" id="line-121"><code>	// holder of the lock. Long running operations are not allowed when mux</code></span>
+<span class="codeline" id="line-122"><code>	// is held.</code></span>
+<span class="codeline" id="line-123"><code>	mux sync.Mutex</code></span>
+<span class="codeline" id="line-124"><code>	// acquireSem provides an allowance to acquire a resource.</code></span>
+<span class="codeline" id="line-125"><code>	//</code></span>
+<span class="codeline" id="line-126"><code>	// Releases are allowed only when caller holds mux. Acquires have to</code></span>
+<span class="codeline" id="line-127"><code>	// happen before mux is locked (doesn't apply to semaphore.TryAcquire in</code></span>
+<span class="codeline" id="line-128"><code>	// AcquireAllIdle).</code></span>
+<span class="codeline" id="line-129"><code>	acquireSem *semaphore.Weighted</code></span>
+<span class="codeline" id="line-130"><code>	destructWG sync.WaitGroup</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	allResources  resList[T]</code></span>
+<span class="codeline" id="line-133"><code>	idleResources *genstack.GenStack[*Resource[T]]</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>	constructor Constructor[T]</code></span>
+<span class="codeline" id="line-136"><code>	destructor  Destructor[T]</code></span>
+<span class="codeline" id="line-137"><code>	maxSize     int32</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	acquireCount         int64</code></span>
+<span class="codeline" id="line-140"><code>	acquireDuration      time.Duration</code></span>
+<span class="codeline" id="line-141"><code>	emptyAcquireCount    int64</code></span>
+<span class="codeline" id="line-142"><code>	canceledAcquireCount atomic.Int64</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>	resetCount int</code></span>
+<span class="codeline" id="line-145"><code></code></span>
+<span class="codeline" id="line-146"><code>	baseAcquireCtx       context.Context</code></span>
+<span class="codeline" id="line-147"><code>	cancelBaseAcquireCtx context.CancelFunc</code></span>
+<span class="codeline" id="line-148"><code>	closed               bool</code></span>
+<span class="codeline" id="line-149"><code>}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>type Config[T any] struct {</code></span>
+<span class="codeline" id="line-152"><code>	Constructor Constructor[T]</code></span>
+<span class="codeline" id="line-153"><code>	Destructor  Destructor[T]</code></span>
+<span class="codeline" id="line-154"><code>	MaxSize     int32</code></span>
+<span class="codeline" id="line-155"><code>}</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>// NewPool creates a new pool. Panics if maxSize is less than 1.</code></span>
+<span class="codeline" id="line-158"><code>func NewPool[T any](config *Config[T]) (*Pool[T], error) {</code></span>
+<span class="codeline" id="line-159"><code>	if config.MaxSize &lt; 1 {</code></span>
+<span class="codeline" id="line-160"><code>		return nil, errors.New("MaxSize must be &gt;= 1")</code></span>
+<span class="codeline" id="line-161"><code>	}</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>	baseAcquireCtx, cancelBaseAcquireCtx := context.WithCancel(context.Background())</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>	return &amp;Pool[T]{</code></span>
+<span class="codeline" id="line-166"><code>		acquireSem:           semaphore.NewWeighted(int64(config.MaxSize)),</code></span>
+<span class="codeline" id="line-167"><code>		idleResources:        genstack.NewGenStack[*Resource[T]](),</code></span>
+<span class="codeline" id="line-168"><code>		maxSize:              config.MaxSize,</code></span>
+<span class="codeline" id="line-169"><code>		constructor:          config.Constructor,</code></span>
+<span class="codeline" id="line-170"><code>		destructor:           config.Destructor,</code></span>
+<span class="codeline" id="line-171"><code>		baseAcquireCtx:       baseAcquireCtx,</code></span>
+<span class="codeline" id="line-172"><code>		cancelBaseAcquireCtx: cancelBaseAcquireCtx,</code></span>
+<span class="codeline" id="line-173"><code>	}, nil</code></span>
+<span class="codeline" id="line-174"><code>}</code></span>
+<span class="codeline" id="line-175"><code></code></span>
+<span class="codeline" id="line-176"><code>// Close destroys all resources in the pool and rejects future Acquire calls.</code></span>
+<span class="codeline" id="line-177"><code>// Blocks until all resources are returned to pool and destroyed.</code></span>
+<span class="codeline" id="line-178"><code>func (p *Pool[T]) Close() {</code></span>
+<span class="codeline" id="line-179"><code>	defer p.destructWG.Wait()</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-182"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>	if p.closed {</code></span>
+<span class="codeline" id="line-185"><code>		return</code></span>
+<span class="codeline" id="line-186"><code>	}</code></span>
+<span class="codeline" id="line-187"><code>	p.closed = true</code></span>
+<span class="codeline" id="line-188"><code>	p.cancelBaseAcquireCtx()</code></span>
+<span class="codeline" id="line-189"><code></code></span>
+<span class="codeline" id="line-190"><code>	for res, ok := p.idleResources.Pop(); ok; res, ok = p.idleResources.Pop() {</code></span>
+<span class="codeline" id="line-191"><code>		p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-192"><code>		go p.destructResourceValue(res.value)</code></span>
+<span class="codeline" id="line-193"><code>	}</code></span>
+<span class="codeline" id="line-194"><code>}</code></span>
+<span class="codeline" id="line-195"><code></code></span>
+<span class="codeline" id="line-196"><code>// Stat is a snapshot of Pool statistics.</code></span>
+<span class="codeline" id="line-197"><code>type Stat struct {</code></span>
+<span class="codeline" id="line-198"><code>	constructingResources int32</code></span>
+<span class="codeline" id="line-199"><code>	acquiredResources     int32</code></span>
+<span class="codeline" id="line-200"><code>	idleResources         int32</code></span>
+<span class="codeline" id="line-201"><code>	maxResources          int32</code></span>
+<span class="codeline" id="line-202"><code>	acquireCount          int64</code></span>
+<span class="codeline" id="line-203"><code>	acquireDuration       time.Duration</code></span>
+<span class="codeline" id="line-204"><code>	emptyAcquireCount     int64</code></span>
+<span class="codeline" id="line-205"><code>	canceledAcquireCount  int64</code></span>
+<span class="codeline" id="line-206"><code>}</code></span>
+<span class="codeline" id="line-207"><code></code></span>
+<span class="codeline" id="line-208"><code>// TotalResources returns the total number of resources currently in the pool.</code></span>
+<span class="codeline" id="line-209"><code>// The value is the sum of ConstructingResources, AcquiredResources, and</code></span>
+<span class="codeline" id="line-210"><code>// IdleResources.</code></span>
+<span class="codeline" id="line-211"><code>func (s *Stat) TotalResources() int32 {</code></span>
+<span class="codeline" id="line-212"><code>	return s.constructingResources + s.acquiredResources + s.idleResources</code></span>
+<span class="codeline" id="line-213"><code>}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>// ConstructingResources returns the number of resources with construction in progress in</code></span>
+<span class="codeline" id="line-216"><code>// the pool.</code></span>
+<span class="codeline" id="line-217"><code>func (s *Stat) ConstructingResources() int32 {</code></span>
+<span class="codeline" id="line-218"><code>	return s.constructingResources</code></span>
+<span class="codeline" id="line-219"><code>}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>// AcquiredResources returns the number of currently acquired resources in the pool.</code></span>
+<span class="codeline" id="line-222"><code>func (s *Stat) AcquiredResources() int32 {</code></span>
+<span class="codeline" id="line-223"><code>	return s.acquiredResources</code></span>
+<span class="codeline" id="line-224"><code>}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>// IdleResources returns the number of currently idle resources in the pool.</code></span>
+<span class="codeline" id="line-227"><code>func (s *Stat) IdleResources() int32 {</code></span>
+<span class="codeline" id="line-228"><code>	return s.idleResources</code></span>
+<span class="codeline" id="line-229"><code>}</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>// MaxResources returns the maximum size of the pool.</code></span>
+<span class="codeline" id="line-232"><code>func (s *Stat) MaxResources() int32 {</code></span>
+<span class="codeline" id="line-233"><code>	return s.maxResources</code></span>
+<span class="codeline" id="line-234"><code>}</code></span>
+<span class="codeline" id="line-235"><code></code></span>
+<span class="codeline" id="line-236"><code>// AcquireCount returns the cumulative count of successful acquires from the pool.</code></span>
+<span class="codeline" id="line-237"><code>func (s *Stat) AcquireCount() int64 {</code></span>
+<span class="codeline" id="line-238"><code>	return s.acquireCount</code></span>
+<span class="codeline" id="line-239"><code>}</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>// AcquireDuration returns the total duration of all successful acquires from</code></span>
+<span class="codeline" id="line-242"><code>// the pool.</code></span>
+<span class="codeline" id="line-243"><code>func (s *Stat) AcquireDuration() time.Duration {</code></span>
+<span class="codeline" id="line-244"><code>	return s.acquireDuration</code></span>
+<span class="codeline" id="line-245"><code>}</code></span>
+<span class="codeline" id="line-246"><code></code></span>
+<span class="codeline" id="line-247"><code>// EmptyAcquireCount returns the cumulative count of successful acquires from the pool</code></span>
+<span class="codeline" id="line-248"><code>// that waited for a resource to be released or constructed because the pool was</code></span>
+<span class="codeline" id="line-249"><code>// empty.</code></span>
+<span class="codeline" id="line-250"><code>func (s *Stat) EmptyAcquireCount() int64 {</code></span>
+<span class="codeline" id="line-251"><code>	return s.emptyAcquireCount</code></span>
+<span class="codeline" id="line-252"><code>}</code></span>
+<span class="codeline" id="line-253"><code></code></span>
+<span class="codeline" id="line-254"><code>// CanceledAcquireCount returns the cumulative count of acquires from the pool</code></span>
+<span class="codeline" id="line-255"><code>// that were canceled by a context.</code></span>
+<span class="codeline" id="line-256"><code>func (s *Stat) CanceledAcquireCount() int64 {</code></span>
+<span class="codeline" id="line-257"><code>	return s.canceledAcquireCount</code></span>
+<span class="codeline" id="line-258"><code>}</code></span>
+<span class="codeline" id="line-259"><code></code></span>
+<span class="codeline" id="line-260"><code>// Stat returns the current pool statistics.</code></span>
+<span class="codeline" id="line-261"><code>func (p *Pool[T]) Stat() *Stat {</code></span>
+<span class="codeline" id="line-262"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-263"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>	s := &amp;Stat{</code></span>
+<span class="codeline" id="line-266"><code>		maxResources:         p.maxSize,</code></span>
+<span class="codeline" id="line-267"><code>		acquireCount:         p.acquireCount,</code></span>
+<span class="codeline" id="line-268"><code>		emptyAcquireCount:    p.emptyAcquireCount,</code></span>
+<span class="codeline" id="line-269"><code>		canceledAcquireCount: p.canceledAcquireCount.Load(),</code></span>
+<span class="codeline" id="line-270"><code>		acquireDuration:      p.acquireDuration,</code></span>
+<span class="codeline" id="line-271"><code>	}</code></span>
+<span class="codeline" id="line-272"><code></code></span>
+<span class="codeline" id="line-273"><code>	for _, res := range p.allResources {</code></span>
+<span class="codeline" id="line-274"><code>		switch res.status {</code></span>
+<span class="codeline" id="line-275"><code>		case resourceStatusConstructing:</code></span>
+<span class="codeline" id="line-276"><code>			s.constructingResources += 1</code></span>
+<span class="codeline" id="line-277"><code>		case resourceStatusIdle:</code></span>
+<span class="codeline" id="line-278"><code>			s.idleResources += 1</code></span>
+<span class="codeline" id="line-279"><code>		case resourceStatusAcquired:</code></span>
+<span class="codeline" id="line-280"><code>			s.acquiredResources += 1</code></span>
+<span class="codeline" id="line-281"><code>		}</code></span>
+<span class="codeline" id="line-282"><code>	}</code></span>
+<span class="codeline" id="line-283"><code></code></span>
+<span class="codeline" id="line-284"><code>	return s</code></span>
+<span class="codeline" id="line-285"><code>}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>// tryAcquireIdleResource checks if there is any idle resource. If there is</code></span>
+<span class="codeline" id="line-288"><code>// some, this method removes it from idle list and returns it. If the idle pool</code></span>
+<span class="codeline" id="line-289"><code>// is empty, this method returns nil and doesn't modify the idleResources slice.</code></span>
+<span class="codeline" id="line-290"><code>//</code></span>
+<span class="codeline" id="line-291"><code>// WARNING: Caller of this method must hold the pool mutex!</code></span>
+<span class="codeline" id="line-292"><code>func (p *Pool[T]) tryAcquireIdleResource() *Resource[T] {</code></span>
+<span class="codeline" id="line-293"><code>	res, ok := p.idleResources.Pop()</code></span>
+<span class="codeline" id="line-294"><code>	if !ok {</code></span>
+<span class="codeline" id="line-295"><code>		return nil</code></span>
+<span class="codeline" id="line-296"><code>	}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	res.status = resourceStatusAcquired</code></span>
+<span class="codeline" id="line-299"><code>	return res</code></span>
+<span class="codeline" id="line-300"><code>}</code></span>
+<span class="codeline" id="line-301"><code></code></span>
+<span class="codeline" id="line-302"><code>// createNewResource creates a new resource and inserts it into list of pool</code></span>
+<span class="codeline" id="line-303"><code>// resources.</code></span>
+<span class="codeline" id="line-304"><code>//</code></span>
+<span class="codeline" id="line-305"><code>// WARNING: Caller of this method must hold the pool mutex!</code></span>
+<span class="codeline" id="line-306"><code>func (p *Pool[T]) createNewResource() *Resource[T] {</code></span>
+<span class="codeline" id="line-307"><code>	res := &amp;Resource[T]{</code></span>
+<span class="codeline" id="line-308"><code>		pool:           p,</code></span>
+<span class="codeline" id="line-309"><code>		creationTime:   time.Now(),</code></span>
+<span class="codeline" id="line-310"><code>		lastUsedNano:   nanotime(),</code></span>
+<span class="codeline" id="line-311"><code>		poolResetCount: p.resetCount,</code></span>
+<span class="codeline" id="line-312"><code>		status:         resourceStatusConstructing,</code></span>
+<span class="codeline" id="line-313"><code>	}</code></span>
+<span class="codeline" id="line-314"><code></code></span>
+<span class="codeline" id="line-315"><code>	p.allResources.append(res)</code></span>
+<span class="codeline" id="line-316"><code>	p.destructWG.Add(1)</code></span>
+<span class="codeline" id="line-317"><code></code></span>
+<span class="codeline" id="line-318"><code>	return res</code></span>
+<span class="codeline" id="line-319"><code>}</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>// Acquire gets a resource from the pool. If no resources are available and the pool is not at maximum capacity it will</code></span>
+<span class="codeline" id="line-322"><code>// create a new resource. If the pool is at maximum capacity it will block until a resource is available. ctx can be</code></span>
+<span class="codeline" id="line-323"><code>// used to cancel the Acquire.</code></span>
+<span class="codeline" id="line-324"><code>//</code></span>
+<span class="codeline" id="line-325"><code>// If Acquire creates a new resource the resource constructor function will receive a context that delegates Value() to</code></span>
+<span class="codeline" id="line-326"><code>// ctx. Canceling ctx will cause Acquire to return immediately but it will not cancel the resource creation. This avoids</code></span>
+<span class="codeline" id="line-327"><code>// the problem of it being impossible to create resources when the time to create a resource is greater than any one</code></span>
+<span class="codeline" id="line-328"><code>// caller of Acquire is willing to wait.</code></span>
+<span class="codeline" id="line-329"><code>func (p *Pool[T]) Acquire(ctx context.Context) (_ *Resource[T], err error) {</code></span>
+<span class="codeline" id="line-330"><code>	select {</code></span>
+<span class="codeline" id="line-331"><code>	case &lt;-ctx.Done():</code></span>
+<span class="codeline" id="line-332"><code>		p.canceledAcquireCount.Add(1)</code></span>
+<span class="codeline" id="line-333"><code>		return nil, ctx.Err()</code></span>
+<span class="codeline" id="line-334"><code>	default:</code></span>
+<span class="codeline" id="line-335"><code>	}</code></span>
+<span class="codeline" id="line-336"><code></code></span>
+<span class="codeline" id="line-337"><code>	return p.acquire(ctx)</code></span>
+<span class="codeline" id="line-338"><code>}</code></span>
+<span class="codeline" id="line-339"><code></code></span>
+<span class="codeline" id="line-340"><code>// acquire is a continuation of Acquire function that doesn't check context</code></span>
+<span class="codeline" id="line-341"><code>// validity.</code></span>
+<span class="codeline" id="line-342"><code>//</code></span>
+<span class="codeline" id="line-343"><code>// This function exists solely only for benchmarking purposes.</code></span>
+<span class="codeline" id="line-344"><code>func (p *Pool[T]) acquire(ctx context.Context) (*Resource[T], error) {</code></span>
+<span class="codeline" id="line-345"><code>	startNano := nanotime()</code></span>
+<span class="codeline" id="line-346"><code></code></span>
+<span class="codeline" id="line-347"><code>	var waitedForLock bool</code></span>
+<span class="codeline" id="line-348"><code>	if !p.acquireSem.TryAcquire(1) {</code></span>
+<span class="codeline" id="line-349"><code>		waitedForLock = true</code></span>
+<span class="codeline" id="line-350"><code>		err := p.acquireSem.Acquire(ctx, 1)</code></span>
+<span class="codeline" id="line-351"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-352"><code>			p.canceledAcquireCount.Add(1)</code></span>
+<span class="codeline" id="line-353"><code>			return nil, err</code></span>
+<span class="codeline" id="line-354"><code>		}</code></span>
+<span class="codeline" id="line-355"><code>	}</code></span>
+<span class="codeline" id="line-356"><code></code></span>
+<span class="codeline" id="line-357"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-358"><code>	if p.closed {</code></span>
+<span class="codeline" id="line-359"><code>		p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-360"><code>		p.mux.Unlock()</code></span>
+<span class="codeline" id="line-361"><code>		return nil, ErrClosedPool</code></span>
+<span class="codeline" id="line-362"><code>	}</code></span>
+<span class="codeline" id="line-363"><code></code></span>
+<span class="codeline" id="line-364"><code>	// If a resource is available in the pool.</code></span>
+<span class="codeline" id="line-365"><code>	if res := p.tryAcquireIdleResource(); res != nil {</code></span>
+<span class="codeline" id="line-366"><code>		if waitedForLock {</code></span>
+<span class="codeline" id="line-367"><code>			p.emptyAcquireCount += 1</code></span>
+<span class="codeline" id="line-368"><code>		}</code></span>
+<span class="codeline" id="line-369"><code>		p.acquireCount += 1</code></span>
+<span class="codeline" id="line-370"><code>		p.acquireDuration += time.Duration(nanotime() - startNano)</code></span>
+<span class="codeline" id="line-371"><code>		p.mux.Unlock()</code></span>
+<span class="codeline" id="line-372"><code>		return res, nil</code></span>
+<span class="codeline" id="line-373"><code>	}</code></span>
+<span class="codeline" id="line-374"><code></code></span>
+<span class="codeline" id="line-375"><code>	if len(p.allResources) &gt;= int(p.maxSize) {</code></span>
+<span class="codeline" id="line-376"><code>		// Unreachable code.</code></span>
+<span class="codeline" id="line-377"><code>		panic("bug: semaphore allowed more acquires than pool allows")</code></span>
+<span class="codeline" id="line-378"><code>	}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>	// The resource is not idle, but there is enough space to create one.</code></span>
+<span class="codeline" id="line-381"><code>	res := p.createNewResource()</code></span>
+<span class="codeline" id="line-382"><code>	p.mux.Unlock()</code></span>
+<span class="codeline" id="line-383"><code></code></span>
+<span class="codeline" id="line-384"><code>	res, err := p.initResourceValue(ctx, res)</code></span>
+<span class="codeline" id="line-385"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-386"><code>		return nil, err</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code></code></span>
+<span class="codeline" id="line-389"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-390"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-391"><code></code></span>
+<span class="codeline" id="line-392"><code>	p.emptyAcquireCount += 1</code></span>
+<span class="codeline" id="line-393"><code>	p.acquireCount += 1</code></span>
+<span class="codeline" id="line-394"><code>	p.acquireDuration += time.Duration(nanotime() - startNano)</code></span>
+<span class="codeline" id="line-395"><code></code></span>
+<span class="codeline" id="line-396"><code>	return res, nil</code></span>
+<span class="codeline" id="line-397"><code>}</code></span>
+<span class="codeline" id="line-398"><code></code></span>
+<span class="codeline" id="line-399"><code>func (p *Pool[T]) initResourceValue(ctx context.Context, res *Resource[T]) (*Resource[T], error) {</code></span>
+<span class="codeline" id="line-400"><code>	// Create the resource in a goroutine to immediately return from Acquire</code></span>
+<span class="codeline" id="line-401"><code>	// if ctx is canceled without also canceling the constructor.</code></span>
+<span class="codeline" id="line-402"><code>	//</code></span>
+<span class="codeline" id="line-403"><code>	// See:</code></span>
+<span class="codeline" id="line-404"><code>	// - https://github.com/jackc/pgx/issues/1287</code></span>
+<span class="codeline" id="line-405"><code>	// - https://github.com/jackc/pgx/issues/1259</code></span>
+<span class="codeline" id="line-406"><code>	constructErrChan := make(chan error)</code></span>
+<span class="codeline" id="line-407"><code>	go func() {</code></span>
+<span class="codeline" id="line-408"><code>		constructorCtx := newValueCancelCtx(ctx, p.baseAcquireCtx)</code></span>
+<span class="codeline" id="line-409"><code>		value, err := p.constructor(constructorCtx)</code></span>
+<span class="codeline" id="line-410"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-411"><code>			p.mux.Lock()</code></span>
+<span class="codeline" id="line-412"><code>			p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-413"><code>			p.destructWG.Done()</code></span>
+<span class="codeline" id="line-414"><code></code></span>
+<span class="codeline" id="line-415"><code>			// The resource won't be acquired because its</code></span>
+<span class="codeline" id="line-416"><code>			// construction failed. We have to allow someone else to</code></span>
+<span class="codeline" id="line-417"><code>			// take that resouce.</code></span>
+<span class="codeline" id="line-418"><code>			p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-419"><code>			p.mux.Unlock()</code></span>
+<span class="codeline" id="line-420"><code></code></span>
+<span class="codeline" id="line-421"><code>			select {</code></span>
+<span class="codeline" id="line-422"><code>			case constructErrChan &lt;- err:</code></span>
+<span class="codeline" id="line-423"><code>			case &lt;-ctx.Done():</code></span>
+<span class="codeline" id="line-424"><code>				// The caller is cancelled, so no-one awaits the</code></span>
+<span class="codeline" id="line-425"><code>				// error. This branch avoid goroutine leak.</code></span>
+<span class="codeline" id="line-426"><code>			}</code></span>
+<span class="codeline" id="line-427"><code>			return</code></span>
+<span class="codeline" id="line-428"><code>		}</code></span>
+<span class="codeline" id="line-429"><code></code></span>
+<span class="codeline" id="line-430"><code>		// The resource is already in p.allResources where it might be read. So we need to acquire the lock to update its</code></span>
+<span class="codeline" id="line-431"><code>		// status.</code></span>
+<span class="codeline" id="line-432"><code>		p.mux.Lock()</code></span>
+<span class="codeline" id="line-433"><code>		res.value = value</code></span>
+<span class="codeline" id="line-434"><code>		res.status = resourceStatusAcquired</code></span>
+<span class="codeline" id="line-435"><code>		p.mux.Unlock()</code></span>
+<span class="codeline" id="line-436"><code></code></span>
+<span class="codeline" id="line-437"><code>		// This select works because the channel is unbuffered.</code></span>
+<span class="codeline" id="line-438"><code>		select {</code></span>
+<span class="codeline" id="line-439"><code>		case constructErrChan &lt;- nil:</code></span>
+<span class="codeline" id="line-440"><code>		case &lt;-ctx.Done():</code></span>
+<span class="codeline" id="line-441"><code>			p.releaseAcquiredResource(res, res.lastUsedNano)</code></span>
+<span class="codeline" id="line-442"><code>		}</code></span>
+<span class="codeline" id="line-443"><code>	}()</code></span>
+<span class="codeline" id="line-444"><code></code></span>
+<span class="codeline" id="line-445"><code>	select {</code></span>
+<span class="codeline" id="line-446"><code>	case &lt;-ctx.Done():</code></span>
+<span class="codeline" id="line-447"><code>		p.canceledAcquireCount.Add(1)</code></span>
+<span class="codeline" id="line-448"><code>		return nil, ctx.Err()</code></span>
+<span class="codeline" id="line-449"><code>	case err := &lt;-constructErrChan:</code></span>
+<span class="codeline" id="line-450"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-451"><code>			return nil, err</code></span>
+<span class="codeline" id="line-452"><code>		}</code></span>
+<span class="codeline" id="line-453"><code>		return res, nil</code></span>
+<span class="codeline" id="line-454"><code>	}</code></span>
+<span class="codeline" id="line-455"><code>}</code></span>
+<span class="codeline" id="line-456"><code></code></span>
+<span class="codeline" id="line-457"><code>// TryAcquire gets a resource from the pool if one is immediately available. If not, it returns ErrNotAvailable. If no</code></span>
+<span class="codeline" id="line-458"><code>// resources are available but the pool has room to grow, a resource will be created in the background. ctx is only</code></span>
+<span class="codeline" id="line-459"><code>// used to cancel the background creation.</code></span>
+<span class="codeline" id="line-460"><code>func (p *Pool[T]) TryAcquire(ctx context.Context) (*Resource[T], error) {</code></span>
+<span class="codeline" id="line-461"><code>	if !p.acquireSem.TryAcquire(1) {</code></span>
+<span class="codeline" id="line-462"><code>		return nil, ErrNotAvailable</code></span>
+<span class="codeline" id="line-463"><code>	}</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-466"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-467"><code></code></span>
+<span class="codeline" id="line-468"><code>	if p.closed {</code></span>
+<span class="codeline" id="line-469"><code>		p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-470"><code>		return nil, ErrClosedPool</code></span>
+<span class="codeline" id="line-471"><code>	}</code></span>
+<span class="codeline" id="line-472"><code></code></span>
+<span class="codeline" id="line-473"><code>	// If a resource is available now</code></span>
+<span class="codeline" id="line-474"><code>	if res := p.tryAcquireIdleResource(); res != nil {</code></span>
+<span class="codeline" id="line-475"><code>		p.acquireCount += 1</code></span>
+<span class="codeline" id="line-476"><code>		return res, nil</code></span>
+<span class="codeline" id="line-477"><code>	}</code></span>
+<span class="codeline" id="line-478"><code></code></span>
+<span class="codeline" id="line-479"><code>	if len(p.allResources) &gt;= int(p.maxSize) {</code></span>
+<span class="codeline" id="line-480"><code>		// Unreachable code.</code></span>
+<span class="codeline" id="line-481"><code>		panic("bug: semaphore allowed more acquires than pool allows")</code></span>
+<span class="codeline" id="line-482"><code>	}</code></span>
+<span class="codeline" id="line-483"><code></code></span>
+<span class="codeline" id="line-484"><code>	res := p.createNewResource()</code></span>
+<span class="codeline" id="line-485"><code>	go func() {</code></span>
+<span class="codeline" id="line-486"><code>		value, err := p.constructor(ctx)</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>		p.mux.Lock()</code></span>
+<span class="codeline" id="line-489"><code>		defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-490"><code>		// We have to create the resource and only then release the</code></span>
+<span class="codeline" id="line-491"><code>		// semaphore - For the time being there is no resource that</code></span>
+<span class="codeline" id="line-492"><code>		// someone could acquire.</code></span>
+<span class="codeline" id="line-493"><code>		defer p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-496"><code>			p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-497"><code>			p.destructWG.Done()</code></span>
+<span class="codeline" id="line-498"><code>			return</code></span>
+<span class="codeline" id="line-499"><code>		}</code></span>
+<span class="codeline" id="line-500"><code></code></span>
+<span class="codeline" id="line-501"><code>		res.value = value</code></span>
+<span class="codeline" id="line-502"><code>		res.status = resourceStatusIdle</code></span>
+<span class="codeline" id="line-503"><code>		p.idleResources.Push(res)</code></span>
+<span class="codeline" id="line-504"><code>	}()</code></span>
+<span class="codeline" id="line-505"><code></code></span>
+<span class="codeline" id="line-506"><code>	return nil, ErrNotAvailable</code></span>
+<span class="codeline" id="line-507"><code>}</code></span>
+<span class="codeline" id="line-508"><code></code></span>
+<span class="codeline" id="line-509"><code>// acquireSemAll tries to acquire num free tokens from sem. This function is</code></span>
+<span class="codeline" id="line-510"><code>// guaranteed to acquire at least the lowest number of tokens that has been</code></span>
+<span class="codeline" id="line-511"><code>// available in the semaphore during runtime of this function.</code></span>
+<span class="codeline" id="line-512"><code>//</code></span>
+<span class="codeline" id="line-513"><code>// For the time being, semaphore doesn't allow to acquire all tokens atomically</code></span>
+<span class="codeline" id="line-514"><code>// (see https://github.com/golang/sync/pull/19). We simulate this by trying all</code></span>
+<span class="codeline" id="line-515"><code>// powers of 2 that are less or equal to num.</code></span>
+<span class="codeline" id="line-516"><code>//</code></span>
+<span class="codeline" id="line-517"><code>// For example, let's immagine we have 19 free tokens in the semaphore which in</code></span>
+<span class="codeline" id="line-518"><code>// total has 24 tokens (i.e. the maxSize of the pool is 24 resources). Then if</code></span>
+<span class="codeline" id="line-519"><code>// num is 24, the log2Uint(24) is 4 and we try to acquire 16, 8, 4, 2 and 1</code></span>
+<span class="codeline" id="line-520"><code>// tokens. Out of those, the acquire of 16, 2 and 1 tokens will succeed.</code></span>
+<span class="codeline" id="line-521"><code>//</code></span>
+<span class="codeline" id="line-522"><code>// Naturally, Acquires and Releases of the semaphore might take place</code></span>
+<span class="codeline" id="line-523"><code>// concurrently. For this reason, it's not guaranteed that absolutely all free</code></span>
+<span class="codeline" id="line-524"><code>// tokens in the semaphore will be acquired. But it's guaranteed that at least</code></span>
+<span class="codeline" id="line-525"><code>// the minimal number of tokens that has been present over the whole process</code></span>
+<span class="codeline" id="line-526"><code>// will be acquired. This is sufficient for the use-case we have in this</code></span>
+<span class="codeline" id="line-527"><code>// package.</code></span>
+<span class="codeline" id="line-528"><code>//</code></span>
+<span class="codeline" id="line-529"><code>// TODO: Replace this with acquireSem.TryAcquireAll() if it gets to</code></span>
+<span class="codeline" id="line-530"><code>// upstream. https://github.com/golang/sync/pull/19</code></span>
+<span class="codeline" id="line-531"><code>func acquireSemAll(sem *semaphore.Weighted, num int) int {</code></span>
+<span class="codeline" id="line-532"><code>	if sem.TryAcquire(int64(num)) {</code></span>
+<span class="codeline" id="line-533"><code>		return num</code></span>
+<span class="codeline" id="line-534"><code>	}</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>	var acquired int</code></span>
+<span class="codeline" id="line-537"><code>	for i := int(log2Int(num)); i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-538"><code>		val := 1 &lt;&lt; i</code></span>
+<span class="codeline" id="line-539"><code>		if sem.TryAcquire(int64(val)) {</code></span>
+<span class="codeline" id="line-540"><code>			acquired += val</code></span>
+<span class="codeline" id="line-541"><code>		}</code></span>
+<span class="codeline" id="line-542"><code>	}</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>	return acquired</code></span>
+<span class="codeline" id="line-545"><code>}</code></span>
+<span class="codeline" id="line-546"><code></code></span>
+<span class="codeline" id="line-547"><code>// AcquireAllIdle acquires all currently idle resources. Its intended use is for</code></span>
+<span class="codeline" id="line-548"><code>// health check and keep-alive functionality. It does not update pool</code></span>
+<span class="codeline" id="line-549"><code>// statistics.</code></span>
+<span class="codeline" id="line-550"><code>func (p *Pool[T]) AcquireAllIdle() []*Resource[T] {</code></span>
+<span class="codeline" id="line-551"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-552"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-553"><code></code></span>
+<span class="codeline" id="line-554"><code>	if p.closed {</code></span>
+<span class="codeline" id="line-555"><code>		return nil</code></span>
+<span class="codeline" id="line-556"><code>	}</code></span>
+<span class="codeline" id="line-557"><code></code></span>
+<span class="codeline" id="line-558"><code>	numIdle := p.idleResources.Len()</code></span>
+<span class="codeline" id="line-559"><code>	if numIdle == 0 {</code></span>
+<span class="codeline" id="line-560"><code>		return nil</code></span>
+<span class="codeline" id="line-561"><code>	}</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>	// In acquireSemAll we use only TryAcquire and not Acquire. Because</code></span>
+<span class="codeline" id="line-564"><code>	// TryAcquire cannot block, the fact that we hold mutex locked and try</code></span>
+<span class="codeline" id="line-565"><code>	// to acquire semaphore cannot result in dead-lock.</code></span>
+<span class="codeline" id="line-566"><code>	//</code></span>
+<span class="codeline" id="line-567"><code>	// Because the mutex is locked, no parallel Release can run. This</code></span>
+<span class="codeline" id="line-568"><code>	// implies that the number of tokens can only decrease because some</code></span>
+<span class="codeline" id="line-569"><code>	// Acquire/TryAcquire call can consume the semaphore token. Consequently</code></span>
+<span class="codeline" id="line-570"><code>	// acquired is always less or equal to numIdle. Moreover if acquired &lt;</code></span>
+<span class="codeline" id="line-571"><code>	// numIdle, then there are some parallel Acquire/TryAcquire calls that</code></span>
+<span class="codeline" id="line-572"><code>	// will take the remaining idle connections.</code></span>
+<span class="codeline" id="line-573"><code>	acquired := acquireSemAll(p.acquireSem, numIdle)</code></span>
+<span class="codeline" id="line-574"><code></code></span>
+<span class="codeline" id="line-575"><code>	idle := make([]*Resource[T], acquired)</code></span>
+<span class="codeline" id="line-576"><code>	for i := range idle {</code></span>
+<span class="codeline" id="line-577"><code>		res, _ := p.idleResources.Pop()</code></span>
+<span class="codeline" id="line-578"><code>		res.status = resourceStatusAcquired</code></span>
+<span class="codeline" id="line-579"><code>		idle[i] = res</code></span>
+<span class="codeline" id="line-580"><code>	}</code></span>
+<span class="codeline" id="line-581"><code></code></span>
+<span class="codeline" id="line-582"><code>	// We have to bump the generation to ensure that Acquire/TryAcquire</code></span>
+<span class="codeline" id="line-583"><code>	// calls running in parallel (those which caused acquired &lt; numIdle)</code></span>
+<span class="codeline" id="line-584"><code>	// will consume old connections and not freshly released connections</code></span>
+<span class="codeline" id="line-585"><code>	// instead.</code></span>
+<span class="codeline" id="line-586"><code>	p.idleResources.NextGen()</code></span>
+<span class="codeline" id="line-587"><code></code></span>
+<span class="codeline" id="line-588"><code>	return idle</code></span>
+<span class="codeline" id="line-589"><code>}</code></span>
+<span class="codeline" id="line-590"><code></code></span>
+<span class="codeline" id="line-591"><code>// CreateResource constructs a new resource without acquiring it. It goes straight in the IdlePool. If the pool is full</code></span>
+<span class="codeline" id="line-592"><code>// it returns an error. It can be useful to maintain warm resources under little load.</code></span>
+<span class="codeline" id="line-593"><code>func (p *Pool[T]) CreateResource(ctx context.Context) error {</code></span>
+<span class="codeline" id="line-594"><code>	if !p.acquireSem.TryAcquire(1) {</code></span>
+<span class="codeline" id="line-595"><code>		return ErrNotAvailable</code></span>
+<span class="codeline" id="line-596"><code>	}</code></span>
+<span class="codeline" id="line-597"><code></code></span>
+<span class="codeline" id="line-598"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-599"><code>	if p.closed {</code></span>
+<span class="codeline" id="line-600"><code>		p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-601"><code>		p.mux.Unlock()</code></span>
+<span class="codeline" id="line-602"><code>		return ErrClosedPool</code></span>
+<span class="codeline" id="line-603"><code>	}</code></span>
+<span class="codeline" id="line-604"><code></code></span>
+<span class="codeline" id="line-605"><code>	if len(p.allResources) &gt;= int(p.maxSize) {</code></span>
+<span class="codeline" id="line-606"><code>		p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-607"><code>		p.mux.Unlock()</code></span>
+<span class="codeline" id="line-608"><code>		return ErrNotAvailable</code></span>
+<span class="codeline" id="line-609"><code>	}</code></span>
+<span class="codeline" id="line-610"><code></code></span>
+<span class="codeline" id="line-611"><code>	res := p.createNewResource()</code></span>
+<span class="codeline" id="line-612"><code>	p.mux.Unlock()</code></span>
+<span class="codeline" id="line-613"><code></code></span>
+<span class="codeline" id="line-614"><code>	value, err := p.constructor(ctx)</code></span>
+<span class="codeline" id="line-615"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-616"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-617"><code>	defer p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-618"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-619"><code>		p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-620"><code>		p.destructWG.Done()</code></span>
+<span class="codeline" id="line-621"><code>		return err</code></span>
+<span class="codeline" id="line-622"><code>	}</code></span>
+<span class="codeline" id="line-623"><code></code></span>
+<span class="codeline" id="line-624"><code>	res.value = value</code></span>
+<span class="codeline" id="line-625"><code>	res.status = resourceStatusIdle</code></span>
+<span class="codeline" id="line-626"><code></code></span>
+<span class="codeline" id="line-627"><code>	// If closed while constructing resource then destroy it and return an error</code></span>
+<span class="codeline" id="line-628"><code>	if p.closed {</code></span>
+<span class="codeline" id="line-629"><code>		go p.destructResourceValue(res.value)</code></span>
+<span class="codeline" id="line-630"><code>		return ErrClosedPool</code></span>
+<span class="codeline" id="line-631"><code>	}</code></span>
+<span class="codeline" id="line-632"><code></code></span>
+<span class="codeline" id="line-633"><code>	p.idleResources.Push(res)</code></span>
+<span class="codeline" id="line-634"><code></code></span>
+<span class="codeline" id="line-635"><code>	return nil</code></span>
+<span class="codeline" id="line-636"><code>}</code></span>
+<span class="codeline" id="line-637"><code></code></span>
+<span class="codeline" id="line-638"><code>// Reset destroys all resources, but leaves the pool open. It is intended for use when an error is detected that would</code></span>
+<span class="codeline" id="line-639"><code>// disrupt all resources (such as a network interruption or a server state change).</code></span>
+<span class="codeline" id="line-640"><code>//</code></span>
+<span class="codeline" id="line-641"><code>// It is safe to reset a pool while resources are checked out. Those resources will be destroyed when they are returned</code></span>
+<span class="codeline" id="line-642"><code>// to the pool.</code></span>
+<span class="codeline" id="line-643"><code>func (p *Pool[T]) Reset() {</code></span>
+<span class="codeline" id="line-644"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-645"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-646"><code></code></span>
+<span class="codeline" id="line-647"><code>	p.resetCount++</code></span>
+<span class="codeline" id="line-648"><code></code></span>
+<span class="codeline" id="line-649"><code>	for res, ok := p.idleResources.Pop(); ok; res, ok = p.idleResources.Pop() {</code></span>
+<span class="codeline" id="line-650"><code>		p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-651"><code>		go p.destructResourceValue(res.value)</code></span>
+<span class="codeline" id="line-652"><code>	}</code></span>
+<span class="codeline" id="line-653"><code>}</code></span>
+<span class="codeline" id="line-654"><code></code></span>
+<span class="codeline" id="line-655"><code>// releaseAcquiredResource returns res to the the pool.</code></span>
+<span class="codeline" id="line-656"><code>func (p *Pool[T]) releaseAcquiredResource(res *Resource[T], lastUsedNano int64) {</code></span>
+<span class="codeline" id="line-657"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-658"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-659"><code>	defer p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-660"><code></code></span>
+<span class="codeline" id="line-661"><code>	if p.closed || res.poolResetCount != p.resetCount {</code></span>
+<span class="codeline" id="line-662"><code>		p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-663"><code>		go p.destructResourceValue(res.value)</code></span>
+<span class="codeline" id="line-664"><code>	} else {</code></span>
+<span class="codeline" id="line-665"><code>		res.lastUsedNano = lastUsedNano</code></span>
+<span class="codeline" id="line-666"><code>		res.status = resourceStatusIdle</code></span>
+<span class="codeline" id="line-667"><code>		p.idleResources.Push(res)</code></span>
+<span class="codeline" id="line-668"><code>	}</code></span>
+<span class="codeline" id="line-669"><code>}</code></span>
+<span class="codeline" id="line-670"><code></code></span>
+<span class="codeline" id="line-671"><code>// Remove removes res from the pool and closes it. If res is not part of the</code></span>
+<span class="codeline" id="line-672"><code>// pool Remove will panic.</code></span>
+<span class="codeline" id="line-673"><code>func (p *Pool[T]) destroyAcquiredResource(res *Resource[T]) {</code></span>
+<span class="codeline" id="line-674"><code>	p.destructResourceValue(res.value)</code></span>
+<span class="codeline" id="line-675"><code></code></span>
+<span class="codeline" id="line-676"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-677"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-678"><code>	defer p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-679"><code></code></span>
+<span class="codeline" id="line-680"><code>	p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-681"><code>}</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>func (p *Pool[T]) hijackAcquiredResource(res *Resource[T]) {</code></span>
+<span class="codeline" id="line-684"><code>	p.mux.Lock()</code></span>
+<span class="codeline" id="line-685"><code>	defer p.mux.Unlock()</code></span>
+<span class="codeline" id="line-686"><code>	defer p.acquireSem.Release(1)</code></span>
+<span class="codeline" id="line-687"><code></code></span>
+<span class="codeline" id="line-688"><code>	p.allResources.remove(res)</code></span>
+<span class="codeline" id="line-689"><code>	res.status = resourceStatusHijacked</code></span>
+<span class="codeline" id="line-690"><code>	p.destructWG.Done() // not responsible for destructing hijacked resources</code></span>
+<span class="codeline" id="line-691"><code>}</code></span>
+<span class="codeline" id="line-692"><code></code></span>
+<span class="codeline" id="line-693"><code>func (p *Pool[T]) destructResourceValue(value T) {</code></span>
+<span class="codeline" id="line-694"><code>	p.destructor(value)</code></span>
+<span class="codeline" id="line-695"><code>	p.destructWG.Done()</code></span>
+<span class="codeline" id="line-696"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

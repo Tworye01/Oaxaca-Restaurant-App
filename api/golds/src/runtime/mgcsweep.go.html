@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: mgcsweep.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	mgcsweep.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>// Garbage collector: sweeping</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// The sweeper consists of two different algorithms:</code></span>
+<span class="codeline" id="line-8"><code>//</code></span>
+<span class="codeline" id="line-9"><code>// * The object reclaimer finds and frees unmarked slots in spans. It</code></span>
+<span class="codeline" id="line-10"><code>//   can free a whole span if none of the objects are marked, but that</code></span>
+<span class="codeline" id="line-11"><code>//   isn't its goal. This can be driven either synchronously by</code></span>
+<span class="codeline" id="line-12"><code>//   mcentral.cacheSpan for mcentral spans, or asynchronously by</code></span>
+<span class="codeline" id="line-13"><code>//   sweepone, which looks at all the mcentral lists.</code></span>
+<span class="codeline" id="line-14"><code>//</code></span>
+<span class="codeline" id="line-15"><code>// * The span reclaimer looks for spans that contain no marked objects</code></span>
+<span class="codeline" id="line-16"><code>//   and frees whole spans. This is a separate algorithm because</code></span>
+<span class="codeline" id="line-17"><code>//   freeing whole spans is the hardest task for the object reclaimer,</code></span>
+<span class="codeline" id="line-18"><code>//   but is critical when allocating new spans. The entry point for</code></span>
+<span class="codeline" id="line-19"><code>//   this is mheap_.reclaim and it's driven by a sequential scan of</code></span>
+<span class="codeline" id="line-20"><code>//   the page marks bitmap in the heap arenas.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// Both algorithms ultimately call mspan.sweep, which sweeps a single</code></span>
+<span class="codeline" id="line-23"><code>// heap span.</code></span>
+<span class="codeline" id="line-24"><code></code></span>
+<span class="codeline" id="line-25"><code>package runtime</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>import (</code></span>
+<span class="codeline" id="line-28"><code>	"internal/abi"</code></span>
+<span class="codeline" id="line-29"><code>	"internal/goexperiment"</code></span>
+<span class="codeline" id="line-30"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-31"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-32"><code>)</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>var sweep sweepdata</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// State of background sweep.</code></span>
+<span class="codeline" id="line-37"><code>type sweepdata struct {</code></span>
+<span class="codeline" id="line-38"><code>	lock   mutex</code></span>
+<span class="codeline" id="line-39"><code>	g      *g</code></span>
+<span class="codeline" id="line-40"><code>	parked bool</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>	// active tracks outstanding sweepers and the sweep</code></span>
+<span class="codeline" id="line-43"><code>	// termination condition.</code></span>
+<span class="codeline" id="line-44"><code>	active activeSweep</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>	// centralIndex is the current unswept span class.</code></span>
+<span class="codeline" id="line-47"><code>	// It represents an index into the mcentral span</code></span>
+<span class="codeline" id="line-48"><code>	// sets. Accessed and updated via its load and</code></span>
+<span class="codeline" id="line-49"><code>	// update methods. Not protected by a lock.</code></span>
+<span class="codeline" id="line-50"><code>	//</code></span>
+<span class="codeline" id="line-51"><code>	// Reset at mark termination.</code></span>
+<span class="codeline" id="line-52"><code>	// Used by mheap.nextSpanForSweep.</code></span>
+<span class="codeline" id="line-53"><code>	centralIndex sweepClass</code></span>
+<span class="codeline" id="line-54"><code>}</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>// sweepClass is a spanClass and one bit to represent whether we're currently</code></span>
+<span class="codeline" id="line-57"><code>// sweeping partial or full spans.</code></span>
+<span class="codeline" id="line-58"><code>type sweepClass uint32</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>const (</code></span>
+<span class="codeline" id="line-61"><code>	numSweepClasses            = numSpanClasses * 2</code></span>
+<span class="codeline" id="line-62"><code>	sweepClassDone  sweepClass = sweepClass(^uint32(0))</code></span>
+<span class="codeline" id="line-63"><code>)</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>func (s *sweepClass) load() sweepClass {</code></span>
+<span class="codeline" id="line-66"><code>	return sweepClass(atomic.Load((*uint32)(s)))</code></span>
+<span class="codeline" id="line-67"><code>}</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>func (s *sweepClass) update(sNew sweepClass) {</code></span>
+<span class="codeline" id="line-70"><code>	// Only update *s if its current value is less than sNew,</code></span>
+<span class="codeline" id="line-71"><code>	// since *s increases monotonically.</code></span>
+<span class="codeline" id="line-72"><code>	sOld := s.load()</code></span>
+<span class="codeline" id="line-73"><code>	for sOld &lt; sNew &amp;&amp; !atomic.Cas((*uint32)(s), uint32(sOld), uint32(sNew)) {</code></span>
+<span class="codeline" id="line-74"><code>		sOld = s.load()</code></span>
+<span class="codeline" id="line-75"><code>	}</code></span>
+<span class="codeline" id="line-76"><code>	// TODO(mknyszek): This isn't the only place we have</code></span>
+<span class="codeline" id="line-77"><code>	// an atomic monotonically increasing counter. It would</code></span>
+<span class="codeline" id="line-78"><code>	// be nice to have an "atomic max" which is just implemented</code></span>
+<span class="codeline" id="line-79"><code>	// as the above on most architectures. Some architectures</code></span>
+<span class="codeline" id="line-80"><code>	// like RISC-V however have native support for an atomic max.</code></span>
+<span class="codeline" id="line-81"><code>}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>func (s *sweepClass) clear() {</code></span>
+<span class="codeline" id="line-84"><code>	atomic.Store((*uint32)(s), 0)</code></span>
+<span class="codeline" id="line-85"><code>}</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>// split returns the underlying span class as well as</code></span>
+<span class="codeline" id="line-88"><code>// whether we're interested in the full or partial</code></span>
+<span class="codeline" id="line-89"><code>// unswept lists for that class, indicated as a boolean</code></span>
+<span class="codeline" id="line-90"><code>// (true means "full").</code></span>
+<span class="codeline" id="line-91"><code>func (s sweepClass) split() (spc spanClass, full bool) {</code></span>
+<span class="codeline" id="line-92"><code>	return spanClass(s &gt;&gt; 1), s&amp;1 == 0</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>// nextSpanForSweep finds and pops the next span for sweeping from the</code></span>
+<span class="codeline" id="line-96"><code>// central sweep buffers. It returns ownership of the span to the caller.</code></span>
+<span class="codeline" id="line-97"><code>// Returns nil if no such span exists.</code></span>
+<span class="codeline" id="line-98"><code>func (h *mheap) nextSpanForSweep() *mspan {</code></span>
+<span class="codeline" id="line-99"><code>	sg := h.sweepgen</code></span>
+<span class="codeline" id="line-100"><code>	for sc := sweep.centralIndex.load(); sc &lt; numSweepClasses; sc++ {</code></span>
+<span class="codeline" id="line-101"><code>		spc, full := sc.split()</code></span>
+<span class="codeline" id="line-102"><code>		c := &amp;h.central[spc].mcentral</code></span>
+<span class="codeline" id="line-103"><code>		var s *mspan</code></span>
+<span class="codeline" id="line-104"><code>		if full {</code></span>
+<span class="codeline" id="line-105"><code>			s = c.fullUnswept(sg).pop()</code></span>
+<span class="codeline" id="line-106"><code>		} else {</code></span>
+<span class="codeline" id="line-107"><code>			s = c.partialUnswept(sg).pop()</code></span>
+<span class="codeline" id="line-108"><code>		}</code></span>
+<span class="codeline" id="line-109"><code>		if s != nil {</code></span>
+<span class="codeline" id="line-110"><code>			// Write down that we found something so future sweepers</code></span>
+<span class="codeline" id="line-111"><code>			// can start from here.</code></span>
+<span class="codeline" id="line-112"><code>			sweep.centralIndex.update(sc)</code></span>
+<span class="codeline" id="line-113"><code>			return s</code></span>
+<span class="codeline" id="line-114"><code>		}</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	// Write down that we found nothing.</code></span>
+<span class="codeline" id="line-117"><code>	sweep.centralIndex.update(sweepClassDone)</code></span>
+<span class="codeline" id="line-118"><code>	return nil</code></span>
+<span class="codeline" id="line-119"><code>}</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>const sweepDrainedMask = 1 &lt;&lt; 31</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>// activeSweep is a type that captures whether sweeping</code></span>
+<span class="codeline" id="line-124"><code>// is done, and whether there are any outstanding sweepers.</code></span>
+<span class="codeline" id="line-125"><code>//</code></span>
+<span class="codeline" id="line-126"><code>// Every potential sweeper must call begin() before they look</code></span>
+<span class="codeline" id="line-127"><code>// for work, and end() after they've finished sweeping.</code></span>
+<span class="codeline" id="line-128"><code>type activeSweep struct {</code></span>
+<span class="codeline" id="line-129"><code>	// state is divided into two parts.</code></span>
+<span class="codeline" id="line-130"><code>	//</code></span>
+<span class="codeline" id="line-131"><code>	// The top bit (masked by sweepDrainedMask) is a boolean</code></span>
+<span class="codeline" id="line-132"><code>	// value indicating whether all the sweep work has been</code></span>
+<span class="codeline" id="line-133"><code>	// drained from the queue.</code></span>
+<span class="codeline" id="line-134"><code>	//</code></span>
+<span class="codeline" id="line-135"><code>	// The rest of the bits are a counter, indicating the</code></span>
+<span class="codeline" id="line-136"><code>	// number of outstanding concurrent sweepers.</code></span>
+<span class="codeline" id="line-137"><code>	state atomic.Uint32</code></span>
+<span class="codeline" id="line-138"><code>}</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>// begin registers a new sweeper. Returns a sweepLocker</code></span>
+<span class="codeline" id="line-141"><code>// for acquiring spans for sweeping. Any outstanding sweeper blocks</code></span>
+<span class="codeline" id="line-142"><code>// sweep termination.</code></span>
+<span class="codeline" id="line-143"><code>//</code></span>
+<span class="codeline" id="line-144"><code>// If the sweepLocker is invalid, the caller can be sure that all</code></span>
+<span class="codeline" id="line-145"><code>// outstanding sweep work has been drained, so there is nothing left</code></span>
+<span class="codeline" id="line-146"><code>// to sweep. Note that there may be sweepers currently running, so</code></span>
+<span class="codeline" id="line-147"><code>// this does not indicate that all sweeping has completed.</code></span>
+<span class="codeline" id="line-148"><code>//</code></span>
+<span class="codeline" id="line-149"><code>// Even if the sweepLocker is invalid, its sweepGen is always valid.</code></span>
+<span class="codeline" id="line-150"><code>func (a *activeSweep) begin() sweepLocker {</code></span>
+<span class="codeline" id="line-151"><code>	for {</code></span>
+<span class="codeline" id="line-152"><code>		state := a.state.Load()</code></span>
+<span class="codeline" id="line-153"><code>		if state&amp;sweepDrainedMask != 0 {</code></span>
+<span class="codeline" id="line-154"><code>			return sweepLocker{mheap_.sweepgen, false}</code></span>
+<span class="codeline" id="line-155"><code>		}</code></span>
+<span class="codeline" id="line-156"><code>		if a.state.CompareAndSwap(state, state+1) {</code></span>
+<span class="codeline" id="line-157"><code>			return sweepLocker{mheap_.sweepgen, true}</code></span>
+<span class="codeline" id="line-158"><code>		}</code></span>
+<span class="codeline" id="line-159"><code>	}</code></span>
+<span class="codeline" id="line-160"><code>}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>// end deregisters a sweeper. Must be called once for each time</code></span>
+<span class="codeline" id="line-163"><code>// begin is called if the sweepLocker is valid.</code></span>
+<span class="codeline" id="line-164"><code>func (a *activeSweep) end(sl sweepLocker) {</code></span>
+<span class="codeline" id="line-165"><code>	if sl.sweepGen != mheap_.sweepgen {</code></span>
+<span class="codeline" id="line-166"><code>		throw("sweeper left outstanding across sweep generations")</code></span>
+<span class="codeline" id="line-167"><code>	}</code></span>
+<span class="codeline" id="line-168"><code>	for {</code></span>
+<span class="codeline" id="line-169"><code>		state := a.state.Load()</code></span>
+<span class="codeline" id="line-170"><code>		if (state&amp;^sweepDrainedMask)-1 &gt;= sweepDrainedMask {</code></span>
+<span class="codeline" id="line-171"><code>			throw("mismatched begin/end of activeSweep")</code></span>
+<span class="codeline" id="line-172"><code>		}</code></span>
+<span class="codeline" id="line-173"><code>		if a.state.CompareAndSwap(state, state-1) {</code></span>
+<span class="codeline" id="line-174"><code>			if state != sweepDrainedMask {</code></span>
+<span class="codeline" id="line-175"><code>				return</code></span>
+<span class="codeline" id="line-176"><code>			}</code></span>
+<span class="codeline" id="line-177"><code>			if debug.gcpacertrace &gt; 0 {</code></span>
+<span class="codeline" id="line-178"><code>				live := gcController.heapLive.Load()</code></span>
+<span class="codeline" id="line-179"><code>				print("pacer: sweep done at heap size ", live&gt;&gt;20, "MB; allocated ", (live-mheap_.sweepHeapLiveBasis)&gt;&gt;20, "MB during sweep; swept ", mheap_.pagesSwept.Load(), " pages at ", mheap_.sweepPagesPerByte, " pages/byte\n")</code></span>
+<span class="codeline" id="line-180"><code>			}</code></span>
+<span class="codeline" id="line-181"><code>			return</code></span>
+<span class="codeline" id="line-182"><code>		}</code></span>
+<span class="codeline" id="line-183"><code>	}</code></span>
+<span class="codeline" id="line-184"><code>}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>// markDrained marks the active sweep cycle as having drained</code></span>
+<span class="codeline" id="line-187"><code>// all remaining work. This is safe to be called concurrently</code></span>
+<span class="codeline" id="line-188"><code>// with all other methods of activeSweep, though may race.</code></span>
+<span class="codeline" id="line-189"><code>//</code></span>
+<span class="codeline" id="line-190"><code>// Returns true if this call was the one that actually performed</code></span>
+<span class="codeline" id="line-191"><code>// the mark.</code></span>
+<span class="codeline" id="line-192"><code>func (a *activeSweep) markDrained() bool {</code></span>
+<span class="codeline" id="line-193"><code>	for {</code></span>
+<span class="codeline" id="line-194"><code>		state := a.state.Load()</code></span>
+<span class="codeline" id="line-195"><code>		if state&amp;sweepDrainedMask != 0 {</code></span>
+<span class="codeline" id="line-196"><code>			return false</code></span>
+<span class="codeline" id="line-197"><code>		}</code></span>
+<span class="codeline" id="line-198"><code>		if a.state.CompareAndSwap(state, state|sweepDrainedMask) {</code></span>
+<span class="codeline" id="line-199"><code>			return true</code></span>
+<span class="codeline" id="line-200"><code>		}</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code>}</code></span>
+<span class="codeline" id="line-203"><code></code></span>
+<span class="codeline" id="line-204"><code>// sweepers returns the current number of active sweepers.</code></span>
+<span class="codeline" id="line-205"><code>func (a *activeSweep) sweepers() uint32 {</code></span>
+<span class="codeline" id="line-206"><code>	return a.state.Load() &amp;^ sweepDrainedMask</code></span>
+<span class="codeline" id="line-207"><code>}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>// isDone returns true if all sweep work has been drained and no more</code></span>
+<span class="codeline" id="line-210"><code>// outstanding sweepers exist. That is, when the sweep phase is</code></span>
+<span class="codeline" id="line-211"><code>// completely done.</code></span>
+<span class="codeline" id="line-212"><code>func (a *activeSweep) isDone() bool {</code></span>
+<span class="codeline" id="line-213"><code>	return a.state.Load() == sweepDrainedMask</code></span>
+<span class="codeline" id="line-214"><code>}</code></span>
+<span class="codeline" id="line-215"><code></code></span>
+<span class="codeline" id="line-216"><code>// reset sets up the activeSweep for the next sweep cycle.</code></span>
+<span class="codeline" id="line-217"><code>//</code></span>
+<span class="codeline" id="line-218"><code>// The world must be stopped.</code></span>
+<span class="codeline" id="line-219"><code>func (a *activeSweep) reset() {</code></span>
+<span class="codeline" id="line-220"><code>	assertWorldStopped()</code></span>
+<span class="codeline" id="line-221"><code>	a.state.Store(0)</code></span>
+<span class="codeline" id="line-222"><code>}</code></span>
+<span class="codeline" id="line-223"><code></code></span>
+<span class="codeline" id="line-224"><code>// finishsweep_m ensures that all spans are swept.</code></span>
+<span class="codeline" id="line-225"><code>//</code></span>
+<span class="codeline" id="line-226"><code>// The world must be stopped. This ensures there are no sweeps in</code></span>
+<span class="codeline" id="line-227"><code>// progress.</code></span>
+<span class="codeline" id="line-228"><code>//</code></span>
+<span class="codeline" id="line-229"><code>//go:nowritebarrier</code></span>
+<span class="codeline" id="line-230"><code>func finishsweep_m() {</code></span>
+<span class="codeline" id="line-231"><code>	assertWorldStopped()</code></span>
+<span class="codeline" id="line-232"><code></code></span>
+<span class="codeline" id="line-233"><code>	// Sweeping must be complete before marking commences, so</code></span>
+<span class="codeline" id="line-234"><code>	// sweep any unswept spans. If this is a concurrent GC, there</code></span>
+<span class="codeline" id="line-235"><code>	// shouldn't be any spans left to sweep, so this should finish</code></span>
+<span class="codeline" id="line-236"><code>	// instantly. If GC was forced before the concurrent sweep</code></span>
+<span class="codeline" id="line-237"><code>	// finished, there may be spans to sweep.</code></span>
+<span class="codeline" id="line-238"><code>	for sweepone() != ^uintptr(0) {</code></span>
+<span class="codeline" id="line-239"><code>	}</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>	// Make sure there aren't any outstanding sweepers left.</code></span>
+<span class="codeline" id="line-242"><code>	// At this point, with the world stopped, it means one of two</code></span>
+<span class="codeline" id="line-243"><code>	// things. Either we were able to preempt a sweeper, or that</code></span>
+<span class="codeline" id="line-244"><code>	// a sweeper didn't call sweep.active.end when it should have.</code></span>
+<span class="codeline" id="line-245"><code>	// Both cases indicate a bug, so throw.</code></span>
+<span class="codeline" id="line-246"><code>	if sweep.active.sweepers() != 0 {</code></span>
+<span class="codeline" id="line-247"><code>		throw("active sweepers found at start of mark phase")</code></span>
+<span class="codeline" id="line-248"><code>	}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>	// Reset all the unswept buffers, which should be empty.</code></span>
+<span class="codeline" id="line-251"><code>	// Do this in sweep termination as opposed to mark termination</code></span>
+<span class="codeline" id="line-252"><code>	// so that we can catch unswept spans and reclaim blocks as</code></span>
+<span class="codeline" id="line-253"><code>	// soon as possible.</code></span>
+<span class="codeline" id="line-254"><code>	sg := mheap_.sweepgen</code></span>
+<span class="codeline" id="line-255"><code>	for i := range mheap_.central {</code></span>
+<span class="codeline" id="line-256"><code>		c := &amp;mheap_.central[i].mcentral</code></span>
+<span class="codeline" id="line-257"><code>		c.partialUnswept(sg).reset()</code></span>
+<span class="codeline" id="line-258"><code>		c.fullUnswept(sg).reset()</code></span>
+<span class="codeline" id="line-259"><code>	}</code></span>
+<span class="codeline" id="line-260"><code></code></span>
+<span class="codeline" id="line-261"><code>	// Sweeping is done, so there won't be any new memory to</code></span>
+<span class="codeline" id="line-262"><code>	// scavenge for a bit.</code></span>
+<span class="codeline" id="line-263"><code>	//</code></span>
+<span class="codeline" id="line-264"><code>	// If the scavenger isn't already awake, wake it up. There's</code></span>
+<span class="codeline" id="line-265"><code>	// definitely work for it to do at this point.</code></span>
+<span class="codeline" id="line-266"><code>	scavenger.wake()</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>	nextMarkBitArenaEpoch()</code></span>
+<span class="codeline" id="line-269"><code>}</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>func bgsweep(c chan int) {</code></span>
+<span class="codeline" id="line-272"><code>	sweep.g = getg()</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>	lockInit(&amp;sweep.lock, lockRankSweep)</code></span>
+<span class="codeline" id="line-275"><code>	lock(&amp;sweep.lock)</code></span>
+<span class="codeline" id="line-276"><code>	sweep.parked = true</code></span>
+<span class="codeline" id="line-277"><code>	c &lt;- 1</code></span>
+<span class="codeline" id="line-278"><code>	goparkunlock(&amp;sweep.lock, waitReasonGCSweepWait, traceBlockGCSweep, 1)</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>	for {</code></span>
+<span class="codeline" id="line-281"><code>		// bgsweep attempts to be a "low priority" goroutine by intentionally</code></span>
+<span class="codeline" id="line-282"><code>		// yielding time. It's OK if it doesn't run, because goroutines allocating</code></span>
+<span class="codeline" id="line-283"><code>		// memory will sweep and ensure that all spans are swept before the next</code></span>
+<span class="codeline" id="line-284"><code>		// GC cycle. We really only want to run when we're idle.</code></span>
+<span class="codeline" id="line-285"><code>		//</code></span>
+<span class="codeline" id="line-286"><code>		// However, calling Gosched after each span swept produces a tremendous</code></span>
+<span class="codeline" id="line-287"><code>		// amount of tracing events, sometimes up to 50% of events in a trace. It's</code></span>
+<span class="codeline" id="line-288"><code>		// also inefficient to call into the scheduler so much because sweeping a</code></span>
+<span class="codeline" id="line-289"><code>		// single span is in general a very fast operation, taking as little as 30 ns</code></span>
+<span class="codeline" id="line-290"><code>		// on modern hardware. (See #54767.)</code></span>
+<span class="codeline" id="line-291"><code>		//</code></span>
+<span class="codeline" id="line-292"><code>		// As a result, bgsweep sweeps in batches, and only calls into the scheduler</code></span>
+<span class="codeline" id="line-293"><code>		// at the end of every batch. Furthermore, it only yields its time if there</code></span>
+<span class="codeline" id="line-294"><code>		// isn't spare idle time available on other cores. If there's available idle</code></span>
+<span class="codeline" id="line-295"><code>		// time, helping to sweep can reduce allocation latencies by getting ahead of</code></span>
+<span class="codeline" id="line-296"><code>		// the proportional sweeper and having spans ready to go for allocation.</code></span>
+<span class="codeline" id="line-297"><code>		const sweepBatchSize = 10</code></span>
+<span class="codeline" id="line-298"><code>		nSwept := 0</code></span>
+<span class="codeline" id="line-299"><code>		for sweepone() != ^uintptr(0) {</code></span>
+<span class="codeline" id="line-300"><code>			nSwept++</code></span>
+<span class="codeline" id="line-301"><code>			if nSwept%sweepBatchSize == 0 {</code></span>
+<span class="codeline" id="line-302"><code>				goschedIfBusy()</code></span>
+<span class="codeline" id="line-303"><code>			}</code></span>
+<span class="codeline" id="line-304"><code>		}</code></span>
+<span class="codeline" id="line-305"><code>		for freeSomeWbufs(true) {</code></span>
+<span class="codeline" id="line-306"><code>			// N.B. freeSomeWbufs is already batched internally.</code></span>
+<span class="codeline" id="line-307"><code>			goschedIfBusy()</code></span>
+<span class="codeline" id="line-308"><code>		}</code></span>
+<span class="codeline" id="line-309"><code>		lock(&amp;sweep.lock)</code></span>
+<span class="codeline" id="line-310"><code>		if !isSweepDone() {</code></span>
+<span class="codeline" id="line-311"><code>			// This can happen if a GC runs between</code></span>
+<span class="codeline" id="line-312"><code>			// gosweepone returning ^0 above</code></span>
+<span class="codeline" id="line-313"><code>			// and the lock being acquired.</code></span>
+<span class="codeline" id="line-314"><code>			unlock(&amp;sweep.lock)</code></span>
+<span class="codeline" id="line-315"><code>			continue</code></span>
+<span class="codeline" id="line-316"><code>		}</code></span>
+<span class="codeline" id="line-317"><code>		sweep.parked = true</code></span>
+<span class="codeline" id="line-318"><code>		goparkunlock(&amp;sweep.lock, waitReasonGCSweepWait, traceBlockGCSweep, 1)</code></span>
+<span class="codeline" id="line-319"><code>	}</code></span>
+<span class="codeline" id="line-320"><code>}</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>// sweepLocker acquires sweep ownership of spans.</code></span>
+<span class="codeline" id="line-323"><code>type sweepLocker struct {</code></span>
+<span class="codeline" id="line-324"><code>	// sweepGen is the sweep generation of the heap.</code></span>
+<span class="codeline" id="line-325"><code>	sweepGen uint32</code></span>
+<span class="codeline" id="line-326"><code>	valid    bool</code></span>
+<span class="codeline" id="line-327"><code>}</code></span>
+<span class="codeline" id="line-328"><code></code></span>
+<span class="codeline" id="line-329"><code>// sweepLocked represents sweep ownership of a span.</code></span>
+<span class="codeline" id="line-330"><code>type sweepLocked struct {</code></span>
+<span class="codeline" id="line-331"><code>	*mspan</code></span>
+<span class="codeline" id="line-332"><code>}</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>// tryAcquire attempts to acquire sweep ownership of span s. If it</code></span>
+<span class="codeline" id="line-335"><code>// successfully acquires ownership, it blocks sweep completion.</code></span>
+<span class="codeline" id="line-336"><code>func (l *sweepLocker) tryAcquire(s *mspan) (sweepLocked, bool) {</code></span>
+<span class="codeline" id="line-337"><code>	if !l.valid {</code></span>
+<span class="codeline" id="line-338"><code>		throw("use of invalid sweepLocker")</code></span>
+<span class="codeline" id="line-339"><code>	}</code></span>
+<span class="codeline" id="line-340"><code>	// Check before attempting to CAS.</code></span>
+<span class="codeline" id="line-341"><code>	if atomic.Load(&amp;s.sweepgen) != l.sweepGen-2 {</code></span>
+<span class="codeline" id="line-342"><code>		return sweepLocked{}, false</code></span>
+<span class="codeline" id="line-343"><code>	}</code></span>
+<span class="codeline" id="line-344"><code>	// Attempt to acquire sweep ownership of s.</code></span>
+<span class="codeline" id="line-345"><code>	if !atomic.Cas(&amp;s.sweepgen, l.sweepGen-2, l.sweepGen-1) {</code></span>
+<span class="codeline" id="line-346"><code>		return sweepLocked{}, false</code></span>
+<span class="codeline" id="line-347"><code>	}</code></span>
+<span class="codeline" id="line-348"><code>	return sweepLocked{s}, true</code></span>
+<span class="codeline" id="line-349"><code>}</code></span>
+<span class="codeline" id="line-350"><code></code></span>
+<span class="codeline" id="line-351"><code>// sweepone sweeps some unswept heap span and returns the number of pages returned</code></span>
+<span class="codeline" id="line-352"><code>// to the heap, or ^uintptr(0) if there was nothing to sweep.</code></span>
+<span class="codeline" id="line-353"><code>func sweepone() uintptr {</code></span>
+<span class="codeline" id="line-354"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-355"><code></code></span>
+<span class="codeline" id="line-356"><code>	// Increment locks to ensure that the goroutine is not preempted</code></span>
+<span class="codeline" id="line-357"><code>	// in the middle of sweep thus leaving the span in an inconsistent state for next GC</code></span>
+<span class="codeline" id="line-358"><code>	gp.m.locks++</code></span>
+<span class="codeline" id="line-359"><code></code></span>
+<span class="codeline" id="line-360"><code>	// TODO(austin): sweepone is almost always called in a loop;</code></span>
+<span class="codeline" id="line-361"><code>	// lift the sweepLocker into its callers.</code></span>
+<span class="codeline" id="line-362"><code>	sl := sweep.active.begin()</code></span>
+<span class="codeline" id="line-363"><code>	if !sl.valid {</code></span>
+<span class="codeline" id="line-364"><code>		gp.m.locks--</code></span>
+<span class="codeline" id="line-365"><code>		return ^uintptr(0)</code></span>
+<span class="codeline" id="line-366"><code>	}</code></span>
+<span class="codeline" id="line-367"><code></code></span>
+<span class="codeline" id="line-368"><code>	// Find a span to sweep.</code></span>
+<span class="codeline" id="line-369"><code>	npages := ^uintptr(0)</code></span>
+<span class="codeline" id="line-370"><code>	var noMoreWork bool</code></span>
+<span class="codeline" id="line-371"><code>	for {</code></span>
+<span class="codeline" id="line-372"><code>		s := mheap_.nextSpanForSweep()</code></span>
+<span class="codeline" id="line-373"><code>		if s == nil {</code></span>
+<span class="codeline" id="line-374"><code>			noMoreWork = sweep.active.markDrained()</code></span>
+<span class="codeline" id="line-375"><code>			break</code></span>
+<span class="codeline" id="line-376"><code>		}</code></span>
+<span class="codeline" id="line-377"><code>		if state := s.state.get(); state != mSpanInUse {</code></span>
+<span class="codeline" id="line-378"><code>			// This can happen if direct sweeping already</code></span>
+<span class="codeline" id="line-379"><code>			// swept this span, but in that case the sweep</code></span>
+<span class="codeline" id="line-380"><code>			// generation should always be up-to-date.</code></span>
+<span class="codeline" id="line-381"><code>			if !(s.sweepgen == sl.sweepGen || s.sweepgen == sl.sweepGen+3) {</code></span>
+<span class="codeline" id="line-382"><code>				print("runtime: bad span s.state=", state, " s.sweepgen=", s.sweepgen, " sweepgen=", sl.sweepGen, "\n")</code></span>
+<span class="codeline" id="line-383"><code>				throw("non in-use span in unswept list")</code></span>
+<span class="codeline" id="line-384"><code>			}</code></span>
+<span class="codeline" id="line-385"><code>			continue</code></span>
+<span class="codeline" id="line-386"><code>		}</code></span>
+<span class="codeline" id="line-387"><code>		if s, ok := sl.tryAcquire(s); ok {</code></span>
+<span class="codeline" id="line-388"><code>			// Sweep the span we found.</code></span>
+<span class="codeline" id="line-389"><code>			npages = s.npages</code></span>
+<span class="codeline" id="line-390"><code>			if s.sweep(false) {</code></span>
+<span class="codeline" id="line-391"><code>				// Whole span was freed. Count it toward the</code></span>
+<span class="codeline" id="line-392"><code>				// page reclaimer credit since these pages can</code></span>
+<span class="codeline" id="line-393"><code>				// now be used for span allocation.</code></span>
+<span class="codeline" id="line-394"><code>				mheap_.reclaimCredit.Add(npages)</code></span>
+<span class="codeline" id="line-395"><code>			} else {</code></span>
+<span class="codeline" id="line-396"><code>				// Span is still in-use, so this returned no</code></span>
+<span class="codeline" id="line-397"><code>				// pages to the heap and the span needs to</code></span>
+<span class="codeline" id="line-398"><code>				// move to the swept in-use list.</code></span>
+<span class="codeline" id="line-399"><code>				npages = 0</code></span>
+<span class="codeline" id="line-400"><code>			}</code></span>
+<span class="codeline" id="line-401"><code>			break</code></span>
+<span class="codeline" id="line-402"><code>		}</code></span>
+<span class="codeline" id="line-403"><code>	}</code></span>
+<span class="codeline" id="line-404"><code>	sweep.active.end(sl)</code></span>
+<span class="codeline" id="line-405"><code></code></span>
+<span class="codeline" id="line-406"><code>	if noMoreWork {</code></span>
+<span class="codeline" id="line-407"><code>		// The sweep list is empty. There may still be</code></span>
+<span class="codeline" id="line-408"><code>		// concurrent sweeps running, but we're at least very</code></span>
+<span class="codeline" id="line-409"><code>		// close to done sweeping.</code></span>
+<span class="codeline" id="line-410"><code></code></span>
+<span class="codeline" id="line-411"><code>		// Move the scavenge gen forward (signaling</code></span>
+<span class="codeline" id="line-412"><code>		// that there's new work to do) and wake the scavenger.</code></span>
+<span class="codeline" id="line-413"><code>		//</code></span>
+<span class="codeline" id="line-414"><code>		// The scavenger is signaled by the last sweeper because once</code></span>
+<span class="codeline" id="line-415"><code>		// sweeping is done, we will definitely have useful work for</code></span>
+<span class="codeline" id="line-416"><code>		// the scavenger to do, since the scavenger only runs over the</code></span>
+<span class="codeline" id="line-417"><code>		// heap once per GC cycle. This update is not done during sweep</code></span>
+<span class="codeline" id="line-418"><code>		// termination because in some cases there may be a long delay</code></span>
+<span class="codeline" id="line-419"><code>		// between sweep done and sweep termination (e.g. not enough</code></span>
+<span class="codeline" id="line-420"><code>		// allocations to trigger a GC) which would be nice to fill in</code></span>
+<span class="codeline" id="line-421"><code>		// with scavenging work.</code></span>
+<span class="codeline" id="line-422"><code>		if debug.scavtrace &gt; 0 {</code></span>
+<span class="codeline" id="line-423"><code>			systemstack(func() {</code></span>
+<span class="codeline" id="line-424"><code>				lock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>				// Get released stats.</code></span>
+<span class="codeline" id="line-427"><code>				releasedBg := mheap_.pages.scav.releasedBg.Load()</code></span>
+<span class="codeline" id="line-428"><code>				releasedEager := mheap_.pages.scav.releasedEager.Load()</code></span>
+<span class="codeline" id="line-429"><code></code></span>
+<span class="codeline" id="line-430"><code>				// Print the line.</code></span>
+<span class="codeline" id="line-431"><code>				printScavTrace(releasedBg, releasedEager, false)</code></span>
+<span class="codeline" id="line-432"><code></code></span>
+<span class="codeline" id="line-433"><code>				// Update the stats.</code></span>
+<span class="codeline" id="line-434"><code>				mheap_.pages.scav.releasedBg.Add(-releasedBg)</code></span>
+<span class="codeline" id="line-435"><code>				mheap_.pages.scav.releasedEager.Add(-releasedEager)</code></span>
+<span class="codeline" id="line-436"><code>				unlock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-437"><code>			})</code></span>
+<span class="codeline" id="line-438"><code>		}</code></span>
+<span class="codeline" id="line-439"><code>		scavenger.ready()</code></span>
+<span class="codeline" id="line-440"><code>	}</code></span>
+<span class="codeline" id="line-441"><code></code></span>
+<span class="codeline" id="line-442"><code>	gp.m.locks--</code></span>
+<span class="codeline" id="line-443"><code>	return npages</code></span>
+<span class="codeline" id="line-444"><code>}</code></span>
+<span class="codeline" id="line-445"><code></code></span>
+<span class="codeline" id="line-446"><code>// isSweepDone reports whether all spans are swept.</code></span>
+<span class="codeline" id="line-447"><code>//</code></span>
+<span class="codeline" id="line-448"><code>// Note that this condition may transition from false to true at any</code></span>
+<span class="codeline" id="line-449"><code>// time as the sweeper runs. It may transition from true to false if a</code></span>
+<span class="codeline" id="line-450"><code>// GC runs; to prevent that the caller must be non-preemptible or must</code></span>
+<span class="codeline" id="line-451"><code>// somehow block GC progress.</code></span>
+<span class="codeline" id="line-452"><code>func isSweepDone() bool {</code></span>
+<span class="codeline" id="line-453"><code>	return sweep.active.isDone()</code></span>
+<span class="codeline" id="line-454"><code>}</code></span>
+<span class="codeline" id="line-455"><code></code></span>
+<span class="codeline" id="line-456"><code>// Returns only when span s has been swept.</code></span>
+<span class="codeline" id="line-457"><code>//</code></span>
+<span class="codeline" id="line-458"><code>//go:nowritebarrier</code></span>
+<span class="codeline" id="line-459"><code>func (s *mspan) ensureSwept() {</code></span>
+<span class="codeline" id="line-460"><code>	// Caller must disable preemption.</code></span>
+<span class="codeline" id="line-461"><code>	// Otherwise when this function returns the span can become unswept again</code></span>
+<span class="codeline" id="line-462"><code>	// (if GC is triggered on another goroutine).</code></span>
+<span class="codeline" id="line-463"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-464"><code>	if gp.m.locks == 0 &amp;&amp; gp.m.mallocing == 0 &amp;&amp; gp != gp.m.g0 {</code></span>
+<span class="codeline" id="line-465"><code>		throw("mspan.ensureSwept: m is not locked")</code></span>
+<span class="codeline" id="line-466"><code>	}</code></span>
+<span class="codeline" id="line-467"><code></code></span>
+<span class="codeline" id="line-468"><code>	// If this operation fails, then that means that there are</code></span>
+<span class="codeline" id="line-469"><code>	// no more spans to be swept. In this case, either s has already</code></span>
+<span class="codeline" id="line-470"><code>	// been swept, or is about to be acquired for sweeping and swept.</code></span>
+<span class="codeline" id="line-471"><code>	sl := sweep.active.begin()</code></span>
+<span class="codeline" id="line-472"><code>	if sl.valid {</code></span>
+<span class="codeline" id="line-473"><code>		// The caller must be sure that the span is a mSpanInUse span.</code></span>
+<span class="codeline" id="line-474"><code>		if s, ok := sl.tryAcquire(s); ok {</code></span>
+<span class="codeline" id="line-475"><code>			s.sweep(false)</code></span>
+<span class="codeline" id="line-476"><code>			sweep.active.end(sl)</code></span>
+<span class="codeline" id="line-477"><code>			return</code></span>
+<span class="codeline" id="line-478"><code>		}</code></span>
+<span class="codeline" id="line-479"><code>		sweep.active.end(sl)</code></span>
+<span class="codeline" id="line-480"><code>	}</code></span>
+<span class="codeline" id="line-481"><code></code></span>
+<span class="codeline" id="line-482"><code>	// Unfortunately we can't sweep the span ourselves. Somebody else</code></span>
+<span class="codeline" id="line-483"><code>	// got to it first. We don't have efficient means to wait, but that's</code></span>
+<span class="codeline" id="line-484"><code>	// OK, it will be swept fairly soon.</code></span>
+<span class="codeline" id="line-485"><code>	for {</code></span>
+<span class="codeline" id="line-486"><code>		spangen := atomic.Load(&amp;s.sweepgen)</code></span>
+<span class="codeline" id="line-487"><code>		if spangen == sl.sweepGen || spangen == sl.sweepGen+3 {</code></span>
+<span class="codeline" id="line-488"><code>			break</code></span>
+<span class="codeline" id="line-489"><code>		}</code></span>
+<span class="codeline" id="line-490"><code>		osyield()</code></span>
+<span class="codeline" id="line-491"><code>	}</code></span>
+<span class="codeline" id="line-492"><code>}</code></span>
+<span class="codeline" id="line-493"><code></code></span>
+<span class="codeline" id="line-494"><code>// sweep frees or collects finalizers for blocks not marked in the mark phase.</code></span>
+<span class="codeline" id="line-495"><code>// It clears the mark bits in preparation for the next GC round.</code></span>
+<span class="codeline" id="line-496"><code>// Returns true if the span was returned to heap.</code></span>
+<span class="codeline" id="line-497"><code>// If preserve=true, don't return it to heap nor relink in mcentral lists;</code></span>
+<span class="codeline" id="line-498"><code>// caller takes care of it.</code></span>
+<span class="codeline" id="line-499"><code>func (sl *sweepLocked) sweep(preserve bool) bool {</code></span>
+<span class="codeline" id="line-500"><code>	// It's critical that we enter this function with preemption disabled,</code></span>
+<span class="codeline" id="line-501"><code>	// GC must not start while we are in the middle of this function.</code></span>
+<span class="codeline" id="line-502"><code>	gp := getg()</code></span>
+<span class="codeline" id="line-503"><code>	if gp.m.locks == 0 &amp;&amp; gp.m.mallocing == 0 &amp;&amp; gp != gp.m.g0 {</code></span>
+<span class="codeline" id="line-504"><code>		throw("mspan.sweep: m is not locked")</code></span>
+<span class="codeline" id="line-505"><code>	}</code></span>
+<span class="codeline" id="line-506"><code></code></span>
+<span class="codeline" id="line-507"><code>	s := sl.mspan</code></span>
+<span class="codeline" id="line-508"><code>	if !preserve {</code></span>
+<span class="codeline" id="line-509"><code>		// We'll release ownership of this span. Nil it out to</code></span>
+<span class="codeline" id="line-510"><code>		// prevent the caller from accidentally using it.</code></span>
+<span class="codeline" id="line-511"><code>		sl.mspan = nil</code></span>
+<span class="codeline" id="line-512"><code>	}</code></span>
+<span class="codeline" id="line-513"><code></code></span>
+<span class="codeline" id="line-514"><code>	sweepgen := mheap_.sweepgen</code></span>
+<span class="codeline" id="line-515"><code>	if state := s.state.get(); state != mSpanInUse || s.sweepgen != sweepgen-1 {</code></span>
+<span class="codeline" id="line-516"><code>		print("mspan.sweep: state=", state, " sweepgen=", s.sweepgen, " mheap.sweepgen=", sweepgen, "\n")</code></span>
+<span class="codeline" id="line-517"><code>		throw("mspan.sweep: bad span state")</code></span>
+<span class="codeline" id="line-518"><code>	}</code></span>
+<span class="codeline" id="line-519"><code></code></span>
+<span class="codeline" id="line-520"><code>	trace := traceAcquire()</code></span>
+<span class="codeline" id="line-521"><code>	if trace.ok() {</code></span>
+<span class="codeline" id="line-522"><code>		trace.GCSweepSpan(s.npages * _PageSize)</code></span>
+<span class="codeline" id="line-523"><code>		traceRelease(trace)</code></span>
+<span class="codeline" id="line-524"><code>	}</code></span>
+<span class="codeline" id="line-525"><code></code></span>
+<span class="codeline" id="line-526"><code>	mheap_.pagesSwept.Add(int64(s.npages))</code></span>
+<span class="codeline" id="line-527"><code></code></span>
+<span class="codeline" id="line-528"><code>	spc := s.spanclass</code></span>
+<span class="codeline" id="line-529"><code>	size := s.elemsize</code></span>
+<span class="codeline" id="line-530"><code></code></span>
+<span class="codeline" id="line-531"><code>	// The allocBits indicate which unmarked objects don't need to be</code></span>
+<span class="codeline" id="line-532"><code>	// processed since they were free at the end of the last GC cycle</code></span>
+<span class="codeline" id="line-533"><code>	// and were not allocated since then.</code></span>
+<span class="codeline" id="line-534"><code>	// If the allocBits index is &gt;= s.freeindex and the bit</code></span>
+<span class="codeline" id="line-535"><code>	// is not marked then the object remains unallocated</code></span>
+<span class="codeline" id="line-536"><code>	// since the last GC.</code></span>
+<span class="codeline" id="line-537"><code>	// This situation is analogous to being on a freelist.</code></span>
+<span class="codeline" id="line-538"><code></code></span>
+<span class="codeline" id="line-539"><code>	// Unlink &amp; free special records for any objects we're about to free.</code></span>
+<span class="codeline" id="line-540"><code>	// Two complications here:</code></span>
+<span class="codeline" id="line-541"><code>	// 1. An object can have both finalizer and profile special records.</code></span>
+<span class="codeline" id="line-542"><code>	//    In such case we need to queue finalizer for execution,</code></span>
+<span class="codeline" id="line-543"><code>	//    mark the object as live and preserve the profile special.</code></span>
+<span class="codeline" id="line-544"><code>	// 2. A tiny object can have several finalizers setup for different offsets.</code></span>
+<span class="codeline" id="line-545"><code>	//    If such object is not marked, we need to queue all finalizers at once.</code></span>
+<span class="codeline" id="line-546"><code>	// Both 1 and 2 are possible at the same time.</code></span>
+<span class="codeline" id="line-547"><code>	hadSpecials := s.specials != nil</code></span>
+<span class="codeline" id="line-548"><code>	siter := newSpecialsIter(s)</code></span>
+<span class="codeline" id="line-549"><code>	for siter.valid() {</code></span>
+<span class="codeline" id="line-550"><code>		// A finalizer can be set for an inner byte of an object, find object beginning.</code></span>
+<span class="codeline" id="line-551"><code>		objIndex := uintptr(siter.s.offset) / size</code></span>
+<span class="codeline" id="line-552"><code>		p := s.base() + objIndex*size</code></span>
+<span class="codeline" id="line-553"><code>		mbits := s.markBitsForIndex(objIndex)</code></span>
+<span class="codeline" id="line-554"><code>		if !mbits.isMarked() {</code></span>
+<span class="codeline" id="line-555"><code>			// This object is not marked and has at least one special record.</code></span>
+<span class="codeline" id="line-556"><code>			// Pass 1: see if it has at least one finalizer.</code></span>
+<span class="codeline" id="line-557"><code>			hasFin := false</code></span>
+<span class="codeline" id="line-558"><code>			endOffset := p - s.base() + size</code></span>
+<span class="codeline" id="line-559"><code>			for tmp := siter.s; tmp != nil &amp;&amp; uintptr(tmp.offset) &lt; endOffset; tmp = tmp.next {</code></span>
+<span class="codeline" id="line-560"><code>				if tmp.kind == _KindSpecialFinalizer {</code></span>
+<span class="codeline" id="line-561"><code>					// Stop freeing of object if it has a finalizer.</code></span>
+<span class="codeline" id="line-562"><code>					mbits.setMarkedNonAtomic()</code></span>
+<span class="codeline" id="line-563"><code>					hasFin = true</code></span>
+<span class="codeline" id="line-564"><code>					break</code></span>
+<span class="codeline" id="line-565"><code>				}</code></span>
+<span class="codeline" id="line-566"><code>			}</code></span>
+<span class="codeline" id="line-567"><code>			// Pass 2: queue all finalizers _or_ handle profile record.</code></span>
+<span class="codeline" id="line-568"><code>			for siter.valid() &amp;&amp; uintptr(siter.s.offset) &lt; endOffset {</code></span>
+<span class="codeline" id="line-569"><code>				// Find the exact byte for which the special was setup</code></span>
+<span class="codeline" id="line-570"><code>				// (as opposed to object beginning).</code></span>
+<span class="codeline" id="line-571"><code>				special := siter.s</code></span>
+<span class="codeline" id="line-572"><code>				p := s.base() + uintptr(special.offset)</code></span>
+<span class="codeline" id="line-573"><code>				if special.kind == _KindSpecialFinalizer || !hasFin {</code></span>
+<span class="codeline" id="line-574"><code>					siter.unlinkAndNext()</code></span>
+<span class="codeline" id="line-575"><code>					freeSpecial(special, unsafe.Pointer(p), size)</code></span>
+<span class="codeline" id="line-576"><code>				} else {</code></span>
+<span class="codeline" id="line-577"><code>					// The object has finalizers, so we're keeping it alive.</code></span>
+<span class="codeline" id="line-578"><code>					// All other specials only apply when an object is freed,</code></span>
+<span class="codeline" id="line-579"><code>					// so just keep the special record.</code></span>
+<span class="codeline" id="line-580"><code>					siter.next()</code></span>
+<span class="codeline" id="line-581"><code>				}</code></span>
+<span class="codeline" id="line-582"><code>			}</code></span>
+<span class="codeline" id="line-583"><code>		} else {</code></span>
+<span class="codeline" id="line-584"><code>			// object is still live</code></span>
+<span class="codeline" id="line-585"><code>			if siter.s.kind == _KindSpecialReachable {</code></span>
+<span class="codeline" id="line-586"><code>				special := siter.unlinkAndNext()</code></span>
+<span class="codeline" id="line-587"><code>				(*specialReachable)(unsafe.Pointer(special)).reachable = true</code></span>
+<span class="codeline" id="line-588"><code>				freeSpecial(special, unsafe.Pointer(p), size)</code></span>
+<span class="codeline" id="line-589"><code>			} else {</code></span>
+<span class="codeline" id="line-590"><code>				// keep special record</code></span>
+<span class="codeline" id="line-591"><code>				siter.next()</code></span>
+<span class="codeline" id="line-592"><code>			}</code></span>
+<span class="codeline" id="line-593"><code>		}</code></span>
+<span class="codeline" id="line-594"><code>	}</code></span>
+<span class="codeline" id="line-595"><code>	if hadSpecials &amp;&amp; s.specials == nil {</code></span>
+<span class="codeline" id="line-596"><code>		spanHasNoSpecials(s)</code></span>
+<span class="codeline" id="line-597"><code>	}</code></span>
+<span class="codeline" id="line-598"><code></code></span>
+<span class="codeline" id="line-599"><code>	if debug.allocfreetrace != 0 || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {</code></span>
+<span class="codeline" id="line-600"><code>		// Find all newly freed objects. This doesn't have to</code></span>
+<span class="codeline" id="line-601"><code>		// efficient; allocfreetrace has massive overhead.</code></span>
+<span class="codeline" id="line-602"><code>		mbits := s.markBitsForBase()</code></span>
+<span class="codeline" id="line-603"><code>		abits := s.allocBitsForIndex(0)</code></span>
+<span class="codeline" id="line-604"><code>		for i := uintptr(0); i &lt; uintptr(s.nelems); i++ {</code></span>
+<span class="codeline" id="line-605"><code>			if !mbits.isMarked() &amp;&amp; (abits.index &lt; uintptr(s.freeindex) || abits.isMarked()) {</code></span>
+<span class="codeline" id="line-606"><code>				x := s.base() + i*s.elemsize</code></span>
+<span class="codeline" id="line-607"><code>				if debug.allocfreetrace != 0 {</code></span>
+<span class="codeline" id="line-608"><code>					tracefree(unsafe.Pointer(x), size)</code></span>
+<span class="codeline" id="line-609"><code>				}</code></span>
+<span class="codeline" id="line-610"><code>				if debug.clobberfree != 0 {</code></span>
+<span class="codeline" id="line-611"><code>					clobberfree(unsafe.Pointer(x), size)</code></span>
+<span class="codeline" id="line-612"><code>				}</code></span>
+<span class="codeline" id="line-613"><code>				// User arenas are handled on explicit free.</code></span>
+<span class="codeline" id="line-614"><code>				if raceenabled &amp;&amp; !s.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-615"><code>					racefree(unsafe.Pointer(x), size)</code></span>
+<span class="codeline" id="line-616"><code>				}</code></span>
+<span class="codeline" id="line-617"><code>				if msanenabled &amp;&amp; !s.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-618"><code>					msanfree(unsafe.Pointer(x), size)</code></span>
+<span class="codeline" id="line-619"><code>				}</code></span>
+<span class="codeline" id="line-620"><code>				if asanenabled &amp;&amp; !s.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-621"><code>					asanpoison(unsafe.Pointer(x), size)</code></span>
+<span class="codeline" id="line-622"><code>				}</code></span>
+<span class="codeline" id="line-623"><code>			}</code></span>
+<span class="codeline" id="line-624"><code>			mbits.advance()</code></span>
+<span class="codeline" id="line-625"><code>			abits.advance()</code></span>
+<span class="codeline" id="line-626"><code>		}</code></span>
+<span class="codeline" id="line-627"><code>	}</code></span>
+<span class="codeline" id="line-628"><code></code></span>
+<span class="codeline" id="line-629"><code>	// Check for zombie objects.</code></span>
+<span class="codeline" id="line-630"><code>	if s.freeindex &lt; s.nelems {</code></span>
+<span class="codeline" id="line-631"><code>		// Everything &lt; freeindex is allocated and hence</code></span>
+<span class="codeline" id="line-632"><code>		// cannot be zombies.</code></span>
+<span class="codeline" id="line-633"><code>		//</code></span>
+<span class="codeline" id="line-634"><code>		// Check the first bitmap byte, where we have to be</code></span>
+<span class="codeline" id="line-635"><code>		// careful with freeindex.</code></span>
+<span class="codeline" id="line-636"><code>		obj := uintptr(s.freeindex)</code></span>
+<span class="codeline" id="line-637"><code>		if (*s.gcmarkBits.bytep(obj / 8)&amp;^*s.allocBits.bytep(obj / 8))&gt;&gt;(obj%8) != 0 {</code></span>
+<span class="codeline" id="line-638"><code>			s.reportZombies()</code></span>
+<span class="codeline" id="line-639"><code>		}</code></span>
+<span class="codeline" id="line-640"><code>		// Check remaining bytes.</code></span>
+<span class="codeline" id="line-641"><code>		for i := obj/8 + 1; i &lt; divRoundUp(uintptr(s.nelems), 8); i++ {</code></span>
+<span class="codeline" id="line-642"><code>			if *s.gcmarkBits.bytep(i)&amp;^*s.allocBits.bytep(i) != 0 {</code></span>
+<span class="codeline" id="line-643"><code>				s.reportZombies()</code></span>
+<span class="codeline" id="line-644"><code>			}</code></span>
+<span class="codeline" id="line-645"><code>		}</code></span>
+<span class="codeline" id="line-646"><code>	}</code></span>
+<span class="codeline" id="line-647"><code></code></span>
+<span class="codeline" id="line-648"><code>	// Count the number of free objects in this span.</code></span>
+<span class="codeline" id="line-649"><code>	nalloc := uint16(s.countAlloc())</code></span>
+<span class="codeline" id="line-650"><code>	nfreed := s.allocCount - nalloc</code></span>
+<span class="codeline" id="line-651"><code>	if nalloc &gt; s.allocCount {</code></span>
+<span class="codeline" id="line-652"><code>		// The zombie check above should have caught this in</code></span>
+<span class="codeline" id="line-653"><code>		// more detail.</code></span>
+<span class="codeline" id="line-654"><code>		print("runtime: nelems=", s.nelems, " nalloc=", nalloc, " previous allocCount=", s.allocCount, " nfreed=", nfreed, "\n")</code></span>
+<span class="codeline" id="line-655"><code>		throw("sweep increased allocation count")</code></span>
+<span class="codeline" id="line-656"><code>	}</code></span>
+<span class="codeline" id="line-657"><code></code></span>
+<span class="codeline" id="line-658"><code>	s.allocCount = nalloc</code></span>
+<span class="codeline" id="line-659"><code>	s.freeindex = 0 // reset allocation index to start of span.</code></span>
+<span class="codeline" id="line-660"><code>	s.freeIndexForScan = 0</code></span>
+<span class="codeline" id="line-661"><code>	if traceEnabled() {</code></span>
+<span class="codeline" id="line-662"><code>		getg().m.p.ptr().trace.reclaimed += uintptr(nfreed) * s.elemsize</code></span>
+<span class="codeline" id="line-663"><code>	}</code></span>
+<span class="codeline" id="line-664"><code></code></span>
+<span class="codeline" id="line-665"><code>	// gcmarkBits becomes the allocBits.</code></span>
+<span class="codeline" id="line-666"><code>	// get a fresh cleared gcmarkBits in preparation for next GC</code></span>
+<span class="codeline" id="line-667"><code>	s.allocBits = s.gcmarkBits</code></span>
+<span class="codeline" id="line-668"><code>	s.gcmarkBits = newMarkBits(uintptr(s.nelems))</code></span>
+<span class="codeline" id="line-669"><code></code></span>
+<span class="codeline" id="line-670"><code>	// refresh pinnerBits if they exists</code></span>
+<span class="codeline" id="line-671"><code>	if s.pinnerBits != nil {</code></span>
+<span class="codeline" id="line-672"><code>		s.refreshPinnerBits()</code></span>
+<span class="codeline" id="line-673"><code>	}</code></span>
+<span class="codeline" id="line-674"><code></code></span>
+<span class="codeline" id="line-675"><code>	// Initialize alloc bits cache.</code></span>
+<span class="codeline" id="line-676"><code>	s.refillAllocCache(0)</code></span>
+<span class="codeline" id="line-677"><code></code></span>
+<span class="codeline" id="line-678"><code>	// The span must be in our exclusive ownership until we update sweepgen,</code></span>
+<span class="codeline" id="line-679"><code>	// check for potential races.</code></span>
+<span class="codeline" id="line-680"><code>	if state := s.state.get(); state != mSpanInUse || s.sweepgen != sweepgen-1 {</code></span>
+<span class="codeline" id="line-681"><code>		print("mspan.sweep: state=", state, " sweepgen=", s.sweepgen, " mheap.sweepgen=", sweepgen, "\n")</code></span>
+<span class="codeline" id="line-682"><code>		throw("mspan.sweep: bad span state after sweep")</code></span>
+<span class="codeline" id="line-683"><code>	}</code></span>
+<span class="codeline" id="line-684"><code>	if s.sweepgen == sweepgen+1 || s.sweepgen == sweepgen+3 {</code></span>
+<span class="codeline" id="line-685"><code>		throw("swept cached span")</code></span>
+<span class="codeline" id="line-686"><code>	}</code></span>
+<span class="codeline" id="line-687"><code></code></span>
+<span class="codeline" id="line-688"><code>	// We need to set s.sweepgen = h.sweepgen only when all blocks are swept,</code></span>
+<span class="codeline" id="line-689"><code>	// because of the potential for a concurrent free/SetFinalizer.</code></span>
+<span class="codeline" id="line-690"><code>	//</code></span>
+<span class="codeline" id="line-691"><code>	// But we need to set it before we make the span available for allocation</code></span>
+<span class="codeline" id="line-692"><code>	// (return it to heap or mcentral), because allocation code assumes that a</code></span>
+<span class="codeline" id="line-693"><code>	// span is already swept if available for allocation.</code></span>
+<span class="codeline" id="line-694"><code>	//</code></span>
+<span class="codeline" id="line-695"><code>	// Serialization point.</code></span>
+<span class="codeline" id="line-696"><code>	// At this point the mark bits are cleared and allocation ready</code></span>
+<span class="codeline" id="line-697"><code>	// to go so release the span.</code></span>
+<span class="codeline" id="line-698"><code>	atomic.Store(&amp;s.sweepgen, sweepgen)</code></span>
+<span class="codeline" id="line-699"><code></code></span>
+<span class="codeline" id="line-700"><code>	if s.isUserArenaChunk {</code></span>
+<span class="codeline" id="line-701"><code>		if preserve {</code></span>
+<span class="codeline" id="line-702"><code>			// This is a case that should never be handled by a sweeper that</code></span>
+<span class="codeline" id="line-703"><code>			// preserves the span for reuse.</code></span>
+<span class="codeline" id="line-704"><code>			throw("sweep: tried to preserve a user arena span")</code></span>
+<span class="codeline" id="line-705"><code>		}</code></span>
+<span class="codeline" id="line-706"><code>		if nalloc &gt; 0 {</code></span>
+<span class="codeline" id="line-707"><code>			// There still exist pointers into the span or the span hasn't been</code></span>
+<span class="codeline" id="line-708"><code>			// freed yet. It's not ready to be reused. Put it back on the</code></span>
+<span class="codeline" id="line-709"><code>			// full swept list for the next cycle.</code></span>
+<span class="codeline" id="line-710"><code>			mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)</code></span>
+<span class="codeline" id="line-711"><code>			return false</code></span>
+<span class="codeline" id="line-712"><code>		}</code></span>
+<span class="codeline" id="line-713"><code></code></span>
+<span class="codeline" id="line-714"><code>		// It's only at this point that the sweeper doesn't actually need to look</code></span>
+<span class="codeline" id="line-715"><code>		// at this arena anymore, so subtract from pagesInUse now.</code></span>
+<span class="codeline" id="line-716"><code>		mheap_.pagesInUse.Add(-s.npages)</code></span>
+<span class="codeline" id="line-717"><code>		s.state.set(mSpanDead)</code></span>
+<span class="codeline" id="line-718"><code></code></span>
+<span class="codeline" id="line-719"><code>		// The arena is ready to be recycled. Remove it from the quarantine list</code></span>
+<span class="codeline" id="line-720"><code>		// and place it on the ready list. Don't add it back to any sweep lists.</code></span>
+<span class="codeline" id="line-721"><code>		systemstack(func() {</code></span>
+<span class="codeline" id="line-722"><code>			// It's the arena code's responsibility to get the chunk on the quarantine</code></span>
+<span class="codeline" id="line-723"><code>			// list by the time all references to the chunk are gone.</code></span>
+<span class="codeline" id="line-724"><code>			if s.list != &amp;mheap_.userArena.quarantineList {</code></span>
+<span class="codeline" id="line-725"><code>				throw("user arena span is on the wrong list")</code></span>
+<span class="codeline" id="line-726"><code>			}</code></span>
+<span class="codeline" id="line-727"><code>			lock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-728"><code>			mheap_.userArena.quarantineList.remove(s)</code></span>
+<span class="codeline" id="line-729"><code>			mheap_.userArena.readyList.insert(s)</code></span>
+<span class="codeline" id="line-730"><code>			unlock(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-731"><code>		})</code></span>
+<span class="codeline" id="line-732"><code>		return false</code></span>
+<span class="codeline" id="line-733"><code>	}</code></span>
+<span class="codeline" id="line-734"><code></code></span>
+<span class="codeline" id="line-735"><code>	if spc.sizeclass() != 0 {</code></span>
+<span class="codeline" id="line-736"><code>		// Handle spans for small objects.</code></span>
+<span class="codeline" id="line-737"><code>		if nfreed &gt; 0 {</code></span>
+<span class="codeline" id="line-738"><code>			// Only mark the span as needing zeroing if we've freed any</code></span>
+<span class="codeline" id="line-739"><code>			// objects, because a fresh span that had been allocated into,</code></span>
+<span class="codeline" id="line-740"><code>			// wasn't totally filled, but then swept, still has all of its</code></span>
+<span class="codeline" id="line-741"><code>			// free slots zeroed.</code></span>
+<span class="codeline" id="line-742"><code>			s.needzero = 1</code></span>
+<span class="codeline" id="line-743"><code>			stats := memstats.heapStats.acquire()</code></span>
+<span class="codeline" id="line-744"><code>			atomic.Xadd64(&amp;stats.smallFreeCount[spc.sizeclass()], int64(nfreed))</code></span>
+<span class="codeline" id="line-745"><code>			memstats.heapStats.release()</code></span>
+<span class="codeline" id="line-746"><code></code></span>
+<span class="codeline" id="line-747"><code>			// Count the frees in the inconsistent, internal stats.</code></span>
+<span class="codeline" id="line-748"><code>			gcController.totalFree.Add(int64(nfreed) * int64(s.elemsize))</code></span>
+<span class="codeline" id="line-749"><code>		}</code></span>
+<span class="codeline" id="line-750"><code>		if !preserve {</code></span>
+<span class="codeline" id="line-751"><code>			// The caller may not have removed this span from whatever</code></span>
+<span class="codeline" id="line-752"><code>			// unswept set its on but taken ownership of the span for</code></span>
+<span class="codeline" id="line-753"><code>			// sweeping by updating sweepgen. If this span still is in</code></span>
+<span class="codeline" id="line-754"><code>			// an unswept set, then the mcentral will pop it off the</code></span>
+<span class="codeline" id="line-755"><code>			// set, check its sweepgen, and ignore it.</code></span>
+<span class="codeline" id="line-756"><code>			if nalloc == 0 {</code></span>
+<span class="codeline" id="line-757"><code>				// Free totally free span directly back to the heap.</code></span>
+<span class="codeline" id="line-758"><code>				mheap_.freeSpan(s)</code></span>
+<span class="codeline" id="line-759"><code>				return true</code></span>
+<span class="codeline" id="line-760"><code>			}</code></span>
+<span class="codeline" id="line-761"><code>			// Return span back to the right mcentral list.</code></span>
+<span class="codeline" id="line-762"><code>			if nalloc == s.nelems {</code></span>
+<span class="codeline" id="line-763"><code>				mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)</code></span>
+<span class="codeline" id="line-764"><code>			} else {</code></span>
+<span class="codeline" id="line-765"><code>				mheap_.central[spc].mcentral.partialSwept(sweepgen).push(s)</code></span>
+<span class="codeline" id="line-766"><code>			}</code></span>
+<span class="codeline" id="line-767"><code>		}</code></span>
+<span class="codeline" id="line-768"><code>	} else if !preserve {</code></span>
+<span class="codeline" id="line-769"><code>		// Handle spans for large objects.</code></span>
+<span class="codeline" id="line-770"><code>		if nfreed != 0 {</code></span>
+<span class="codeline" id="line-771"><code>			// Free large object span to heap.</code></span>
+<span class="codeline" id="line-772"><code></code></span>
+<span class="codeline" id="line-773"><code>			// NOTE(rsc,dvyukov): The original implementation of efence</code></span>
+<span class="codeline" id="line-774"><code>			// in CL 22060046 used sysFree instead of sysFault, so that</code></span>
+<span class="codeline" id="line-775"><code>			// the operating system would eventually give the memory</code></span>
+<span class="codeline" id="line-776"><code>			// back to us again, so that an efence program could run</code></span>
+<span class="codeline" id="line-777"><code>			// longer without running out of memory. Unfortunately,</code></span>
+<span class="codeline" id="line-778"><code>			// calling sysFree here without any kind of adjustment of the</code></span>
+<span class="codeline" id="line-779"><code>			// heap data structures means that when the memory does</code></span>
+<span class="codeline" id="line-780"><code>			// come back to us, we have the wrong metadata for it, either in</code></span>
+<span class="codeline" id="line-781"><code>			// the mspan structures or in the garbage collection bitmap.</code></span>
+<span class="codeline" id="line-782"><code>			// Using sysFault here means that the program will run out of</code></span>
+<span class="codeline" id="line-783"><code>			// memory fairly quickly in efence mode, but at least it won't</code></span>
+<span class="codeline" id="line-784"><code>			// have mysterious crashes due to confused memory reuse.</code></span>
+<span class="codeline" id="line-785"><code>			// It should be possible to switch back to sysFree if we also</code></span>
+<span class="codeline" id="line-786"><code>			// implement and then call some kind of mheap.deleteSpan.</code></span>
+<span class="codeline" id="line-787"><code>			if debug.efence &gt; 0 {</code></span>
+<span class="codeline" id="line-788"><code>				s.limit = 0 // prevent mlookup from finding this span</code></span>
+<span class="codeline" id="line-789"><code>				sysFault(unsafe.Pointer(s.base()), size)</code></span>
+<span class="codeline" id="line-790"><code>			} else {</code></span>
+<span class="codeline" id="line-791"><code>				mheap_.freeSpan(s)</code></span>
+<span class="codeline" id="line-792"><code>			}</code></span>
+<span class="codeline" id="line-793"><code>			if goexperiment.AllocHeaders &amp;&amp; s.largeType != nil &amp;&amp; s.largeType.TFlag&amp;abi.TFlagUnrolledBitmap != 0 {</code></span>
+<span class="codeline" id="line-794"><code>				// In the allocheaders experiment, the unrolled GCProg bitmap is allocated separately.</code></span>
+<span class="codeline" id="line-795"><code>				// Free the space for the unrolled bitmap.</code></span>
+<span class="codeline" id="line-796"><code>				systemstack(func() {</code></span>
+<span class="codeline" id="line-797"><code>					s := spanOf(uintptr(unsafe.Pointer(s.largeType)))</code></span>
+<span class="codeline" id="line-798"><code>					mheap_.freeManual(s, spanAllocPtrScalarBits)</code></span>
+<span class="codeline" id="line-799"><code>				})</code></span>
+<span class="codeline" id="line-800"><code>				// Make sure to zero this pointer without putting the old</code></span>
+<span class="codeline" id="line-801"><code>				// value in a write buffer, as the old value might be an</code></span>
+<span class="codeline" id="line-802"><code>				// invalid pointer. See arena.go:(*mheap).allocUserArenaChunk.</code></span>
+<span class="codeline" id="line-803"><code>				*(*uintptr)(unsafe.Pointer(&amp;s.largeType)) = 0</code></span>
+<span class="codeline" id="line-804"><code>			}</code></span>
+<span class="codeline" id="line-805"><code></code></span>
+<span class="codeline" id="line-806"><code>			// Count the free in the consistent, external stats.</code></span>
+<span class="codeline" id="line-807"><code>			stats := memstats.heapStats.acquire()</code></span>
+<span class="codeline" id="line-808"><code>			atomic.Xadd64(&amp;stats.largeFreeCount, 1)</code></span>
+<span class="codeline" id="line-809"><code>			atomic.Xadd64(&amp;stats.largeFree, int64(size))</code></span>
+<span class="codeline" id="line-810"><code>			memstats.heapStats.release()</code></span>
+<span class="codeline" id="line-811"><code></code></span>
+<span class="codeline" id="line-812"><code>			// Count the free in the inconsistent, internal stats.</code></span>
+<span class="codeline" id="line-813"><code>			gcController.totalFree.Add(int64(size))</code></span>
+<span class="codeline" id="line-814"><code></code></span>
+<span class="codeline" id="line-815"><code>			return true</code></span>
+<span class="codeline" id="line-816"><code>		}</code></span>
+<span class="codeline" id="line-817"><code></code></span>
+<span class="codeline" id="line-818"><code>		// Add a large span directly onto the full+swept list.</code></span>
+<span class="codeline" id="line-819"><code>		mheap_.central[spc].mcentral.fullSwept(sweepgen).push(s)</code></span>
+<span class="codeline" id="line-820"><code>	}</code></span>
+<span class="codeline" id="line-821"><code>	return false</code></span>
+<span class="codeline" id="line-822"><code>}</code></span>
+<span class="codeline" id="line-823"><code></code></span>
+<span class="codeline" id="line-824"><code>// reportZombies reports any marked but free objects in s and throws.</code></span>
+<span class="codeline" id="line-825"><code>//</code></span>
+<span class="codeline" id="line-826"><code>// This generally means one of the following:</code></span>
+<span class="codeline" id="line-827"><code>//</code></span>
+<span class="codeline" id="line-828"><code>// 1. User code converted a pointer to a uintptr and then back</code></span>
+<span class="codeline" id="line-829"><code>// unsafely, and a GC ran while the uintptr was the only reference to</code></span>
+<span class="codeline" id="line-830"><code>// an object.</code></span>
+<span class="codeline" id="line-831"><code>//</code></span>
+<span class="codeline" id="line-832"><code>// 2. User code (or a compiler bug) constructed a bad pointer that</code></span>
+<span class="codeline" id="line-833"><code>// points to a free slot, often a past-the-end pointer.</code></span>
+<span class="codeline" id="line-834"><code>//</code></span>
+<span class="codeline" id="line-835"><code>// 3. The GC two cycles ago missed a pointer and freed a live object,</code></span>
+<span class="codeline" id="line-836"><code>// but it was still live in the last cycle, so this GC cycle found a</code></span>
+<span class="codeline" id="line-837"><code>// pointer to that object and marked it.</code></span>
+<span class="codeline" id="line-838"><code>func (s *mspan) reportZombies() {</code></span>
+<span class="codeline" id="line-839"><code>	printlock()</code></span>
+<span class="codeline" id="line-840"><code>	print("runtime: marked free object in span ", s, ", elemsize=", s.elemsize, " freeindex=", s.freeindex, " (bad use of unsafe.Pointer? try -d=checkptr)\n")</code></span>
+<span class="codeline" id="line-841"><code>	mbits := s.markBitsForBase()</code></span>
+<span class="codeline" id="line-842"><code>	abits := s.allocBitsForIndex(0)</code></span>
+<span class="codeline" id="line-843"><code>	for i := uintptr(0); i &lt; uintptr(s.nelems); i++ {</code></span>
+<span class="codeline" id="line-844"><code>		addr := s.base() + i*s.elemsize</code></span>
+<span class="codeline" id="line-845"><code>		print(hex(addr))</code></span>
+<span class="codeline" id="line-846"><code>		alloc := i &lt; uintptr(s.freeindex) || abits.isMarked()</code></span>
+<span class="codeline" id="line-847"><code>		if alloc {</code></span>
+<span class="codeline" id="line-848"><code>			print(" alloc")</code></span>
+<span class="codeline" id="line-849"><code>		} else {</code></span>
+<span class="codeline" id="line-850"><code>			print(" free ")</code></span>
+<span class="codeline" id="line-851"><code>		}</code></span>
+<span class="codeline" id="line-852"><code>		if mbits.isMarked() {</code></span>
+<span class="codeline" id="line-853"><code>			print(" marked  ")</code></span>
+<span class="codeline" id="line-854"><code>		} else {</code></span>
+<span class="codeline" id="line-855"><code>			print(" unmarked")</code></span>
+<span class="codeline" id="line-856"><code>		}</code></span>
+<span class="codeline" id="line-857"><code>		zombie := mbits.isMarked() &amp;&amp; !alloc</code></span>
+<span class="codeline" id="line-858"><code>		if zombie {</code></span>
+<span class="codeline" id="line-859"><code>			print(" zombie")</code></span>
+<span class="codeline" id="line-860"><code>		}</code></span>
+<span class="codeline" id="line-861"><code>		print("\n")</code></span>
+<span class="codeline" id="line-862"><code>		if zombie {</code></span>
+<span class="codeline" id="line-863"><code>			length := s.elemsize</code></span>
+<span class="codeline" id="line-864"><code>			if length &gt; 1024 {</code></span>
+<span class="codeline" id="line-865"><code>				length = 1024</code></span>
+<span class="codeline" id="line-866"><code>			}</code></span>
+<span class="codeline" id="line-867"><code>			hexdumpWords(addr, addr+length, nil)</code></span>
+<span class="codeline" id="line-868"><code>		}</code></span>
+<span class="codeline" id="line-869"><code>		mbits.advance()</code></span>
+<span class="codeline" id="line-870"><code>		abits.advance()</code></span>
+<span class="codeline" id="line-871"><code>	}</code></span>
+<span class="codeline" id="line-872"><code>	throw("found pointer to free object")</code></span>
+<span class="codeline" id="line-873"><code>}</code></span>
+<span class="codeline" id="line-874"><code></code></span>
+<span class="codeline" id="line-875"><code>// deductSweepCredit deducts sweep credit for allocating a span of</code></span>
+<span class="codeline" id="line-876"><code>// size spanBytes. This must be performed *before* the span is</code></span>
+<span class="codeline" id="line-877"><code>// allocated to ensure the system has enough credit. If necessary, it</code></span>
+<span class="codeline" id="line-878"><code>// performs sweeping to prevent going in to debt. If the caller will</code></span>
+<span class="codeline" id="line-879"><code>// also sweep pages (e.g., for a large allocation), it can pass a</code></span>
+<span class="codeline" id="line-880"><code>// non-zero callerSweepPages to leave that many pages unswept.</code></span>
+<span class="codeline" id="line-881"><code>//</code></span>
+<span class="codeline" id="line-882"><code>// deductSweepCredit makes a worst-case assumption that all spanBytes</code></span>
+<span class="codeline" id="line-883"><code>// bytes of the ultimately allocated span will be available for object</code></span>
+<span class="codeline" id="line-884"><code>// allocation.</code></span>
+<span class="codeline" id="line-885"><code>//</code></span>
+<span class="codeline" id="line-886"><code>// deductSweepCredit is the core of the "proportional sweep" system.</code></span>
+<span class="codeline" id="line-887"><code>// It uses statistics gathered by the garbage collector to perform</code></span>
+<span class="codeline" id="line-888"><code>// enough sweeping so that all pages are swept during the concurrent</code></span>
+<span class="codeline" id="line-889"><code>// sweep phase between GC cycles.</code></span>
+<span class="codeline" id="line-890"><code>//</code></span>
+<span class="codeline" id="line-891"><code>// mheap_ must NOT be locked.</code></span>
+<span class="codeline" id="line-892"><code>func deductSweepCredit(spanBytes uintptr, callerSweepPages uintptr) {</code></span>
+<span class="codeline" id="line-893"><code>	if mheap_.sweepPagesPerByte == 0 {</code></span>
+<span class="codeline" id="line-894"><code>		// Proportional sweep is done or disabled.</code></span>
+<span class="codeline" id="line-895"><code>		return</code></span>
+<span class="codeline" id="line-896"><code>	}</code></span>
+<span class="codeline" id="line-897"><code></code></span>
+<span class="codeline" id="line-898"><code>	trace := traceAcquire()</code></span>
+<span class="codeline" id="line-899"><code>	if trace.ok() {</code></span>
+<span class="codeline" id="line-900"><code>		trace.GCSweepStart()</code></span>
+<span class="codeline" id="line-901"><code>		traceRelease(trace)</code></span>
+<span class="codeline" id="line-902"><code>	}</code></span>
+<span class="codeline" id="line-903"><code></code></span>
+<span class="codeline" id="line-904"><code>	// Fix debt if necessary.</code></span>
+<span class="codeline" id="line-905"><code>retry:</code></span>
+<span class="codeline" id="line-906"><code>	sweptBasis := mheap_.pagesSweptBasis.Load()</code></span>
+<span class="codeline" id="line-907"><code>	live := gcController.heapLive.Load()</code></span>
+<span class="codeline" id="line-908"><code>	liveBasis := mheap_.sweepHeapLiveBasis</code></span>
+<span class="codeline" id="line-909"><code>	newHeapLive := spanBytes</code></span>
+<span class="codeline" id="line-910"><code>	if liveBasis &lt; live {</code></span>
+<span class="codeline" id="line-911"><code>		// Only do this subtraction when we don't overflow. Otherwise, pagesTarget</code></span>
+<span class="codeline" id="line-912"><code>		// might be computed as something really huge, causing us to get stuck</code></span>
+<span class="codeline" id="line-913"><code>		// sweeping here until the next mark phase.</code></span>
+<span class="codeline" id="line-914"><code>		//</code></span>
+<span class="codeline" id="line-915"><code>		// Overflow can happen here if gcPaceSweeper is called concurrently with</code></span>
+<span class="codeline" id="line-916"><code>		// sweeping (i.e. not during a STW, like it usually is) because this code</code></span>
+<span class="codeline" id="line-917"><code>		// is intentionally racy. A concurrent call to gcPaceSweeper can happen</code></span>
+<span class="codeline" id="line-918"><code>		// if a GC tuning parameter is modified and we read an older value of</code></span>
+<span class="codeline" id="line-919"><code>		// heapLive than what was used to set the basis.</code></span>
+<span class="codeline" id="line-920"><code>		//</code></span>
+<span class="codeline" id="line-921"><code>		// This state should be transient, so it's fine to just let newHeapLive</code></span>
+<span class="codeline" id="line-922"><code>		// be a relatively small number. We'll probably just skip this attempt to</code></span>
+<span class="codeline" id="line-923"><code>		// sweep.</code></span>
+<span class="codeline" id="line-924"><code>		//</code></span>
+<span class="codeline" id="line-925"><code>		// See issue #57523.</code></span>
+<span class="codeline" id="line-926"><code>		newHeapLive += uintptr(live - liveBasis)</code></span>
+<span class="codeline" id="line-927"><code>	}</code></span>
+<span class="codeline" id="line-928"><code>	pagesTarget := int64(mheap_.sweepPagesPerByte*float64(newHeapLive)) - int64(callerSweepPages)</code></span>
+<span class="codeline" id="line-929"><code>	for pagesTarget &gt; int64(mheap_.pagesSwept.Load()-sweptBasis) {</code></span>
+<span class="codeline" id="line-930"><code>		if sweepone() == ^uintptr(0) {</code></span>
+<span class="codeline" id="line-931"><code>			mheap_.sweepPagesPerByte = 0</code></span>
+<span class="codeline" id="line-932"><code>			break</code></span>
+<span class="codeline" id="line-933"><code>		}</code></span>
+<span class="codeline" id="line-934"><code>		if mheap_.pagesSweptBasis.Load() != sweptBasis {</code></span>
+<span class="codeline" id="line-935"><code>			// Sweep pacing changed. Recompute debt.</code></span>
+<span class="codeline" id="line-936"><code>			goto retry</code></span>
+<span class="codeline" id="line-937"><code>		}</code></span>
+<span class="codeline" id="line-938"><code>	}</code></span>
+<span class="codeline" id="line-939"><code></code></span>
+<span class="codeline" id="line-940"><code>	trace = traceAcquire()</code></span>
+<span class="codeline" id="line-941"><code>	if trace.ok() {</code></span>
+<span class="codeline" id="line-942"><code>		trace.GCSweepDone()</code></span>
+<span class="codeline" id="line-943"><code>		traceRelease(trace)</code></span>
+<span class="codeline" id="line-944"><code>	}</code></span>
+<span class="codeline" id="line-945"><code>}</code></span>
+<span class="codeline" id="line-946"><code></code></span>
+<span class="codeline" id="line-947"><code>// clobberfree sets the memory content at x to bad content, for debugging</code></span>
+<span class="codeline" id="line-948"><code>// purposes.</code></span>
+<span class="codeline" id="line-949"><code>func clobberfree(x unsafe.Pointer, size uintptr) {</code></span>
+<span class="codeline" id="line-950"><code>	// size (span.elemsize) is always a multiple of 4.</code></span>
+<span class="codeline" id="line-951"><code>	for i := uintptr(0); i &lt; size; i += 4 {</code></span>
+<span class="codeline" id="line-952"><code>		*(*uint32)(add(x, i)) = 0xdeadbeef</code></span>
+<span class="codeline" id="line-953"><code>	}</code></span>
+<span class="codeline" id="line-954"><code>}</code></span>
+<span class="codeline" id="line-955"><code></code></span>
+<span class="codeline" id="line-956"><code>// gcPaceSweeper updates the sweeper's pacing parameters.</code></span>
+<span class="codeline" id="line-957"><code>//</code></span>
+<span class="codeline" id="line-958"><code>// Must be called whenever the GC's pacing is updated.</code></span>
+<span class="codeline" id="line-959"><code>//</code></span>
+<span class="codeline" id="line-960"><code>// The world must be stopped, or mheap_.lock must be held.</code></span>
+<span class="codeline" id="line-961"><code>func gcPaceSweeper(trigger uint64) {</code></span>
+<span class="codeline" id="line-962"><code>	assertWorldStoppedOrLockHeld(&amp;mheap_.lock)</code></span>
+<span class="codeline" id="line-963"><code></code></span>
+<span class="codeline" id="line-964"><code>	// Update sweep pacing.</code></span>
+<span class="codeline" id="line-965"><code>	if isSweepDone() {</code></span>
+<span class="codeline" id="line-966"><code>		mheap_.sweepPagesPerByte = 0</code></span>
+<span class="codeline" id="line-967"><code>	} else {</code></span>
+<span class="codeline" id="line-968"><code>		// Concurrent sweep needs to sweep all of the in-use</code></span>
+<span class="codeline" id="line-969"><code>		// pages by the time the allocated heap reaches the GC</code></span>
+<span class="codeline" id="line-970"><code>		// trigger. Compute the ratio of in-use pages to sweep</code></span>
+<span class="codeline" id="line-971"><code>		// per byte allocated, accounting for the fact that</code></span>
+<span class="codeline" id="line-972"><code>		// some might already be swept.</code></span>
+<span class="codeline" id="line-973"><code>		heapLiveBasis := gcController.heapLive.Load()</code></span>
+<span class="codeline" id="line-974"><code>		heapDistance := int64(trigger) - int64(heapLiveBasis)</code></span>
+<span class="codeline" id="line-975"><code>		// Add a little margin so rounding errors and</code></span>
+<span class="codeline" id="line-976"><code>		// concurrent sweep are less likely to leave pages</code></span>
+<span class="codeline" id="line-977"><code>		// unswept when GC starts.</code></span>
+<span class="codeline" id="line-978"><code>		heapDistance -= 1024 * 1024</code></span>
+<span class="codeline" id="line-979"><code>		if heapDistance &lt; _PageSize {</code></span>
+<span class="codeline" id="line-980"><code>			// Avoid setting the sweep ratio extremely high</code></span>
+<span class="codeline" id="line-981"><code>			heapDistance = _PageSize</code></span>
+<span class="codeline" id="line-982"><code>		}</code></span>
+<span class="codeline" id="line-983"><code>		pagesSwept := mheap_.pagesSwept.Load()</code></span>
+<span class="codeline" id="line-984"><code>		pagesInUse := mheap_.pagesInUse.Load()</code></span>
+<span class="codeline" id="line-985"><code>		sweepDistancePages := int64(pagesInUse) - int64(pagesSwept)</code></span>
+<span class="codeline" id="line-986"><code>		if sweepDistancePages &lt;= 0 {</code></span>
+<span class="codeline" id="line-987"><code>			mheap_.sweepPagesPerByte = 0</code></span>
+<span class="codeline" id="line-988"><code>		} else {</code></span>
+<span class="codeline" id="line-989"><code>			mheap_.sweepPagesPerByte = float64(sweepDistancePages) / float64(heapDistance)</code></span>
+<span class="codeline" id="line-990"><code>			mheap_.sweepHeapLiveBasis = heapLiveBasis</code></span>
+<span class="codeline" id="line-991"><code>			// Write pagesSweptBasis last, since this</code></span>
+<span class="codeline" id="line-992"><code>			// signals concurrent sweeps to recompute</code></span>
+<span class="codeline" id="line-993"><code>			// their debt.</code></span>
+<span class="codeline" id="line-994"><code>			mheap_.pagesSweptBasis.Store(pagesSwept)</code></span>
+<span class="codeline" id="line-995"><code>		}</code></span>
+<span class="codeline" id="line-996"><code>	}</code></span>
+<span class="codeline" id="line-997"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

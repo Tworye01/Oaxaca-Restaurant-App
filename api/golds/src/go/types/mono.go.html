@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: mono.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	mono.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package types</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-9"><code>	"go/token"</code></span>
+<span class="codeline" id="line-10"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-11"><code>)</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>// This file implements a check to validate that a Go package doesn't</code></span>
+<span class="codeline" id="line-14"><code>// have unbounded recursive instantiation, which is not compatible</code></span>
+<span class="codeline" id="line-15"><code>// with compilers using static instantiation (such as</code></span>
+<span class="codeline" id="line-16"><code>// monomorphization).</code></span>
+<span class="codeline" id="line-17"><code>//</code></span>
+<span class="codeline" id="line-18"><code>// It implements a sort of "type flow" analysis by detecting which</code></span>
+<span class="codeline" id="line-19"><code>// type parameters are instantiated with other type parameters (or</code></span>
+<span class="codeline" id="line-20"><code>// types derived thereof). A package cannot be statically instantiated</code></span>
+<span class="codeline" id="line-21"><code>// if the graph has any cycles involving at least one derived type.</code></span>
+<span class="codeline" id="line-22"><code>//</code></span>
+<span class="codeline" id="line-23"><code>// Concretely, we construct a directed, weighted graph. Vertices are</code></span>
+<span class="codeline" id="line-24"><code>// used to represent type parameters as well as some defined</code></span>
+<span class="codeline" id="line-25"><code>// types. Edges are used to represent how types depend on each other:</code></span>
+<span class="codeline" id="line-26"><code>//</code></span>
+<span class="codeline" id="line-27"><code>// * Everywhere a type-parameterized function or type is instantiated,</code></span>
+<span class="codeline" id="line-28"><code>//   we add edges to each type parameter from the vertices (if any)</code></span>
+<span class="codeline" id="line-29"><code>//   representing each type parameter or defined type referenced by</code></span>
+<span class="codeline" id="line-30"><code>//   the type argument. If the type argument is just the referenced</code></span>
+<span class="codeline" id="line-31"><code>//   type itself, then the edge has weight 0, otherwise 1.</code></span>
+<span class="codeline" id="line-32"><code>//</code></span>
+<span class="codeline" id="line-33"><code>// * For every defined type declared within a type-parameterized</code></span>
+<span class="codeline" id="line-34"><code>//   function or method, we add an edge of weight 1 to the defined</code></span>
+<span class="codeline" id="line-35"><code>//   type from each ambient type parameter.</code></span>
+<span class="codeline" id="line-36"><code>//</code></span>
+<span class="codeline" id="line-37"><code>// For example, given:</code></span>
+<span class="codeline" id="line-38"><code>//</code></span>
+<span class="codeline" id="line-39"><code>//	func f[A, B any]() {</code></span>
+<span class="codeline" id="line-40"><code>//		type T int</code></span>
+<span class="codeline" id="line-41"><code>//		f[T, map[A]B]()</code></span>
+<span class="codeline" id="line-42"><code>//	}</code></span>
+<span class="codeline" id="line-43"><code>//</code></span>
+<span class="codeline" id="line-44"><code>// we construct vertices representing types A, B, and T. Because of</code></span>
+<span class="codeline" id="line-45"><code>// declaration "type T int", we construct edges T&lt;-A and T&lt;-B with</code></span>
+<span class="codeline" id="line-46"><code>// weight 1; and because of instantiation "f[T, map[A]B]" we construct</code></span>
+<span class="codeline" id="line-47"><code>// edges A&lt;-T with weight 0, and B&lt;-A and B&lt;-B with weight 1.</code></span>
+<span class="codeline" id="line-48"><code>//</code></span>
+<span class="codeline" id="line-49"><code>// Finally, we look for any positive-weight cycles. Zero-weight cycles</code></span>
+<span class="codeline" id="line-50"><code>// are allowed because static instantiation will reach a fixed point.</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>type monoGraph struct {</code></span>
+<span class="codeline" id="line-53"><code>	vertices []monoVertex</code></span>
+<span class="codeline" id="line-54"><code>	edges    []monoEdge</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>	// canon maps method receiver type parameters to their respective</code></span>
+<span class="codeline" id="line-57"><code>	// receiver type's type parameters.</code></span>
+<span class="codeline" id="line-58"><code>	canon map[*TypeParam]*TypeParam</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// nameIdx maps a defined type or (canonical) type parameter to its</code></span>
+<span class="codeline" id="line-61"><code>	// vertex index.</code></span>
+<span class="codeline" id="line-62"><code>	nameIdx map[*TypeName]int</code></span>
+<span class="codeline" id="line-63"><code>}</code></span>
+<span class="codeline" id="line-64"><code></code></span>
+<span class="codeline" id="line-65"><code>type monoVertex struct {</code></span>
+<span class="codeline" id="line-66"><code>	weight int // weight of heaviest known path to this vertex</code></span>
+<span class="codeline" id="line-67"><code>	pre    int // previous edge (if any) in the above path</code></span>
+<span class="codeline" id="line-68"><code>	len    int // length of the above path</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>	// obj is the defined type or type parameter represented by this</code></span>
+<span class="codeline" id="line-71"><code>	// vertex.</code></span>
+<span class="codeline" id="line-72"><code>	obj *TypeName</code></span>
+<span class="codeline" id="line-73"><code>}</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>type monoEdge struct {</code></span>
+<span class="codeline" id="line-76"><code>	dst, src int</code></span>
+<span class="codeline" id="line-77"><code>	weight   int</code></span>
+<span class="codeline" id="line-78"><code></code></span>
+<span class="codeline" id="line-79"><code>	pos token.Pos</code></span>
+<span class="codeline" id="line-80"><code>	typ Type</code></span>
+<span class="codeline" id="line-81"><code>}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>func (check *Checker) monomorph() {</code></span>
+<span class="codeline" id="line-84"><code>	// We detect unbounded instantiation cycles using a variant of</code></span>
+<span class="codeline" id="line-85"><code>	// Bellman-Ford's algorithm. Namely, instead of always running |V|</code></span>
+<span class="codeline" id="line-86"><code>	// iterations, we run until we either reach a fixed point or we've</code></span>
+<span class="codeline" id="line-87"><code>	// found a path of length |V|. This allows us to terminate earlier</code></span>
+<span class="codeline" id="line-88"><code>	// when there are no cycles, which should be the common case.</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	again := true</code></span>
+<span class="codeline" id="line-91"><code>	for again {</code></span>
+<span class="codeline" id="line-92"><code>		again = false</code></span>
+<span class="codeline" id="line-93"><code></code></span>
+<span class="codeline" id="line-94"><code>		for i, edge := range check.mono.edges {</code></span>
+<span class="codeline" id="line-95"><code>			src := &amp;check.mono.vertices[edge.src]</code></span>
+<span class="codeline" id="line-96"><code>			dst := &amp;check.mono.vertices[edge.dst]</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>			// N.B., we're looking for the greatest weight paths, unlike</code></span>
+<span class="codeline" id="line-99"><code>			// typical Bellman-Ford.</code></span>
+<span class="codeline" id="line-100"><code>			w := src.weight + edge.weight</code></span>
+<span class="codeline" id="line-101"><code>			if w &lt;= dst.weight {</code></span>
+<span class="codeline" id="line-102"><code>				continue</code></span>
+<span class="codeline" id="line-103"><code>			}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>			dst.pre = i</code></span>
+<span class="codeline" id="line-106"><code>			dst.len = src.len + 1</code></span>
+<span class="codeline" id="line-107"><code>			if dst.len == len(check.mono.vertices) {</code></span>
+<span class="codeline" id="line-108"><code>				check.reportInstanceLoop(edge.dst)</code></span>
+<span class="codeline" id="line-109"><code>				return</code></span>
+<span class="codeline" id="line-110"><code>			}</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>			dst.weight = w</code></span>
+<span class="codeline" id="line-113"><code>			again = true</code></span>
+<span class="codeline" id="line-114"><code>		}</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>}</code></span>
+<span class="codeline" id="line-117"><code></code></span>
+<span class="codeline" id="line-118"><code>func (check *Checker) reportInstanceLoop(v int) {</code></span>
+<span class="codeline" id="line-119"><code>	var stack []int</code></span>
+<span class="codeline" id="line-120"><code>	seen := make([]bool, len(check.mono.vertices))</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>	// We have a path that contains a cycle and ends at v, but v may</code></span>
+<span class="codeline" id="line-123"><code>	// only be reachable from the cycle, not on the cycle itself. We</code></span>
+<span class="codeline" id="line-124"><code>	// start by walking backwards along the path until we find a vertex</code></span>
+<span class="codeline" id="line-125"><code>	// that appears twice.</code></span>
+<span class="codeline" id="line-126"><code>	for !seen[v] {</code></span>
+<span class="codeline" id="line-127"><code>		stack = append(stack, v)</code></span>
+<span class="codeline" id="line-128"><code>		seen[v] = true</code></span>
+<span class="codeline" id="line-129"><code>		v = check.mono.edges[check.mono.vertices[v].pre].src</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	// Trim any vertices we visited before visiting v the first</code></span>
+<span class="codeline" id="line-133"><code>	// time. Since v is the first vertex we found within the cycle, any</code></span>
+<span class="codeline" id="line-134"><code>	// vertices we visited earlier cannot be part of the cycle.</code></span>
+<span class="codeline" id="line-135"><code>	for stack[0] != v {</code></span>
+<span class="codeline" id="line-136"><code>		stack = stack[1:]</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>	// TODO(mdempsky): Pivot stack so we report the cycle from the top?</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>	obj0 := check.mono.vertices[v].obj</code></span>
+<span class="codeline" id="line-142"><code>	check.error(obj0, InvalidInstanceCycle, "instantiation cycle:")</code></span>
+<span class="codeline" id="line-143"><code></code></span>
+<span class="codeline" id="line-144"><code>	qf := RelativeTo(check.pkg)</code></span>
+<span class="codeline" id="line-145"><code>	for _, v := range stack {</code></span>
+<span class="codeline" id="line-146"><code>		edge := check.mono.edges[check.mono.vertices[v].pre]</code></span>
+<span class="codeline" id="line-147"><code>		obj := check.mono.vertices[edge.dst].obj</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>		switch obj.Type().(type) {</code></span>
+<span class="codeline" id="line-150"><code>		default:</code></span>
+<span class="codeline" id="line-151"><code>			panic("unexpected type")</code></span>
+<span class="codeline" id="line-152"><code>		case *Named:</code></span>
+<span class="codeline" id="line-153"><code>			check.errorf(atPos(edge.pos), InvalidInstanceCycle, "\t%s implicitly parameterized by %s", obj.Name(), TypeString(edge.typ, qf)) // secondary error, \t indented</code></span>
+<span class="codeline" id="line-154"><code>		case *TypeParam:</code></span>
+<span class="codeline" id="line-155"><code>			check.errorf(atPos(edge.pos), InvalidInstanceCycle, "\t%s instantiated as %s", obj.Name(), TypeString(edge.typ, qf)) // secondary error, \t indented</code></span>
+<span class="codeline" id="line-156"><code>		}</code></span>
+<span class="codeline" id="line-157"><code>	}</code></span>
+<span class="codeline" id="line-158"><code>}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>// recordCanon records that tpar is the canonical type parameter</code></span>
+<span class="codeline" id="line-161"><code>// corresponding to method type parameter mpar.</code></span>
+<span class="codeline" id="line-162"><code>func (w *monoGraph) recordCanon(mpar, tpar *TypeParam) {</code></span>
+<span class="codeline" id="line-163"><code>	if w.canon == nil {</code></span>
+<span class="codeline" id="line-164"><code>		w.canon = make(map[*TypeParam]*TypeParam)</code></span>
+<span class="codeline" id="line-165"><code>	}</code></span>
+<span class="codeline" id="line-166"><code>	w.canon[mpar] = tpar</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>// recordInstance records that the given type parameters were</code></span>
+<span class="codeline" id="line-170"><code>// instantiated with the corresponding type arguments.</code></span>
+<span class="codeline" id="line-171"><code>func (w *monoGraph) recordInstance(pkg *Package, pos token.Pos, tparams []*TypeParam, targs []Type, xlist []ast.Expr) {</code></span>
+<span class="codeline" id="line-172"><code>	for i, tpar := range tparams {</code></span>
+<span class="codeline" id="line-173"><code>		pos := pos</code></span>
+<span class="codeline" id="line-174"><code>		if i &lt; len(xlist) {</code></span>
+<span class="codeline" id="line-175"><code>			pos = xlist[i].Pos()</code></span>
+<span class="codeline" id="line-176"><code>		}</code></span>
+<span class="codeline" id="line-177"><code>		w.assign(pkg, pos, tpar, targs[i])</code></span>
+<span class="codeline" id="line-178"><code>	}</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>// assign records that tpar was instantiated as targ at pos.</code></span>
+<span class="codeline" id="line-182"><code>func (w *monoGraph) assign(pkg *Package, pos token.Pos, tpar *TypeParam, targ Type) {</code></span>
+<span class="codeline" id="line-183"><code>	// Go generics do not have an analog to C++`s template-templates,</code></span>
+<span class="codeline" id="line-184"><code>	// where a template parameter can itself be an instantiable</code></span>
+<span class="codeline" id="line-185"><code>	// template. So any instantiation cycles must occur within a single</code></span>
+<span class="codeline" id="line-186"><code>	// package. Accordingly, we can ignore instantiations of imported</code></span>
+<span class="codeline" id="line-187"><code>	// type parameters.</code></span>
+<span class="codeline" id="line-188"><code>	//</code></span>
+<span class="codeline" id="line-189"><code>	// TODO(mdempsky): Push this check up into recordInstance? All type</code></span>
+<span class="codeline" id="line-190"><code>	// parameters in a list will appear in the same package.</code></span>
+<span class="codeline" id="line-191"><code>	if tpar.Obj().Pkg() != pkg {</code></span>
+<span class="codeline" id="line-192"><code>		return</code></span>
+<span class="codeline" id="line-193"><code>	}</code></span>
+<span class="codeline" id="line-194"><code></code></span>
+<span class="codeline" id="line-195"><code>	// flow adds an edge from vertex src representing that typ flows to tpar.</code></span>
+<span class="codeline" id="line-196"><code>	flow := func(src int, typ Type) {</code></span>
+<span class="codeline" id="line-197"><code>		weight := 1</code></span>
+<span class="codeline" id="line-198"><code>		if typ == targ {</code></span>
+<span class="codeline" id="line-199"><code>			weight = 0</code></span>
+<span class="codeline" id="line-200"><code>		}</code></span>
+<span class="codeline" id="line-201"><code></code></span>
+<span class="codeline" id="line-202"><code>		w.addEdge(w.typeParamVertex(tpar), src, weight, pos, targ)</code></span>
+<span class="codeline" id="line-203"><code>	}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>	// Recursively walk the type argument to find any defined types or</code></span>
+<span class="codeline" id="line-206"><code>	// type parameters.</code></span>
+<span class="codeline" id="line-207"><code>	var do func(typ Type)</code></span>
+<span class="codeline" id="line-208"><code>	do = func(typ Type) {</code></span>
+<span class="codeline" id="line-209"><code>		switch typ := Unalias(typ).(type) {</code></span>
+<span class="codeline" id="line-210"><code>		default:</code></span>
+<span class="codeline" id="line-211"><code>			panic("unexpected type")</code></span>
+<span class="codeline" id="line-212"><code></code></span>
+<span class="codeline" id="line-213"><code>		case *TypeParam:</code></span>
+<span class="codeline" id="line-214"><code>			assert(typ.Obj().Pkg() == pkg)</code></span>
+<span class="codeline" id="line-215"><code>			flow(w.typeParamVertex(typ), typ)</code></span>
+<span class="codeline" id="line-216"><code></code></span>
+<span class="codeline" id="line-217"><code>		case *Named:</code></span>
+<span class="codeline" id="line-218"><code>			if src := w.localNamedVertex(pkg, typ.Origin()); src &gt;= 0 {</code></span>
+<span class="codeline" id="line-219"><code>				flow(src, typ)</code></span>
+<span class="codeline" id="line-220"><code>			}</code></span>
+<span class="codeline" id="line-221"><code></code></span>
+<span class="codeline" id="line-222"><code>			targs := typ.TypeArgs()</code></span>
+<span class="codeline" id="line-223"><code>			for i := 0; i &lt; targs.Len(); i++ {</code></span>
+<span class="codeline" id="line-224"><code>				do(targs.At(i))</code></span>
+<span class="codeline" id="line-225"><code>			}</code></span>
+<span class="codeline" id="line-226"><code></code></span>
+<span class="codeline" id="line-227"><code>		case *Array:</code></span>
+<span class="codeline" id="line-228"><code>			do(typ.Elem())</code></span>
+<span class="codeline" id="line-229"><code>		case *Basic:</code></span>
+<span class="codeline" id="line-230"><code>			// ok</code></span>
+<span class="codeline" id="line-231"><code>		case *Chan:</code></span>
+<span class="codeline" id="line-232"><code>			do(typ.Elem())</code></span>
+<span class="codeline" id="line-233"><code>		case *Map:</code></span>
+<span class="codeline" id="line-234"><code>			do(typ.Key())</code></span>
+<span class="codeline" id="line-235"><code>			do(typ.Elem())</code></span>
+<span class="codeline" id="line-236"><code>		case *Pointer:</code></span>
+<span class="codeline" id="line-237"><code>			do(typ.Elem())</code></span>
+<span class="codeline" id="line-238"><code>		case *Slice:</code></span>
+<span class="codeline" id="line-239"><code>			do(typ.Elem())</code></span>
+<span class="codeline" id="line-240"><code></code></span>
+<span class="codeline" id="line-241"><code>		case *Interface:</code></span>
+<span class="codeline" id="line-242"><code>			for i := 0; i &lt; typ.NumMethods(); i++ {</code></span>
+<span class="codeline" id="line-243"><code>				do(typ.Method(i).Type())</code></span>
+<span class="codeline" id="line-244"><code>			}</code></span>
+<span class="codeline" id="line-245"><code>		case *Signature:</code></span>
+<span class="codeline" id="line-246"><code>			tuple := func(tup *Tuple) {</code></span>
+<span class="codeline" id="line-247"><code>				for i := 0; i &lt; tup.Len(); i++ {</code></span>
+<span class="codeline" id="line-248"><code>					do(tup.At(i).Type())</code></span>
+<span class="codeline" id="line-249"><code>				}</code></span>
+<span class="codeline" id="line-250"><code>			}</code></span>
+<span class="codeline" id="line-251"><code>			tuple(typ.Params())</code></span>
+<span class="codeline" id="line-252"><code>			tuple(typ.Results())</code></span>
+<span class="codeline" id="line-253"><code>		case *Struct:</code></span>
+<span class="codeline" id="line-254"><code>			for i := 0; i &lt; typ.NumFields(); i++ {</code></span>
+<span class="codeline" id="line-255"><code>				do(typ.Field(i).Type())</code></span>
+<span class="codeline" id="line-256"><code>			}</code></span>
+<span class="codeline" id="line-257"><code>		}</code></span>
+<span class="codeline" id="line-258"><code>	}</code></span>
+<span class="codeline" id="line-259"><code>	do(targ)</code></span>
+<span class="codeline" id="line-260"><code>}</code></span>
+<span class="codeline" id="line-261"><code></code></span>
+<span class="codeline" id="line-262"><code>// localNamedVertex returns the index of the vertex representing</code></span>
+<span class="codeline" id="line-263"><code>// named, or -1 if named doesn't need representation.</code></span>
+<span class="codeline" id="line-264"><code>func (w *monoGraph) localNamedVertex(pkg *Package, named *Named) int {</code></span>
+<span class="codeline" id="line-265"><code>	obj := named.Obj()</code></span>
+<span class="codeline" id="line-266"><code>	if obj.Pkg() != pkg {</code></span>
+<span class="codeline" id="line-267"><code>		return -1 // imported type</code></span>
+<span class="codeline" id="line-268"><code>	}</code></span>
+<span class="codeline" id="line-269"><code></code></span>
+<span class="codeline" id="line-270"><code>	root := pkg.Scope()</code></span>
+<span class="codeline" id="line-271"><code>	if obj.Parent() == root {</code></span>
+<span class="codeline" id="line-272"><code>		return -1 // package scope, no ambient type parameters</code></span>
+<span class="codeline" id="line-273"><code>	}</code></span>
+<span class="codeline" id="line-274"><code></code></span>
+<span class="codeline" id="line-275"><code>	if idx, ok := w.nameIdx[obj]; ok {</code></span>
+<span class="codeline" id="line-276"><code>		return idx</code></span>
+<span class="codeline" id="line-277"><code>	}</code></span>
+<span class="codeline" id="line-278"><code></code></span>
+<span class="codeline" id="line-279"><code>	idx := -1</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>	// Walk the type definition's scope to find any ambient type</code></span>
+<span class="codeline" id="line-282"><code>	// parameters that it's implicitly parameterized by.</code></span>
+<span class="codeline" id="line-283"><code>	for scope := obj.Parent(); scope != root; scope = scope.Parent() {</code></span>
+<span class="codeline" id="line-284"><code>		for _, elem := range scope.elems {</code></span>
+<span class="codeline" id="line-285"><code>			if elem, ok := elem.(*TypeName); ok &amp;&amp; !elem.IsAlias() &amp;&amp; cmpPos(elem.Pos(), obj.Pos()) &lt; 0 {</code></span>
+<span class="codeline" id="line-286"><code>				if tpar, ok := elem.Type().(*TypeParam); ok {</code></span>
+<span class="codeline" id="line-287"><code>					if idx &lt; 0 {</code></span>
+<span class="codeline" id="line-288"><code>						idx = len(w.vertices)</code></span>
+<span class="codeline" id="line-289"><code>						w.vertices = append(w.vertices, monoVertex{obj: obj})</code></span>
+<span class="codeline" id="line-290"><code>					}</code></span>
+<span class="codeline" id="line-291"><code></code></span>
+<span class="codeline" id="line-292"><code>					w.addEdge(idx, w.typeParamVertex(tpar), 1, obj.Pos(), tpar)</code></span>
+<span class="codeline" id="line-293"><code>				}</code></span>
+<span class="codeline" id="line-294"><code>			}</code></span>
+<span class="codeline" id="line-295"><code>		}</code></span>
+<span class="codeline" id="line-296"><code>	}</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>	if w.nameIdx == nil {</code></span>
+<span class="codeline" id="line-299"><code>		w.nameIdx = make(map[*TypeName]int)</code></span>
+<span class="codeline" id="line-300"><code>	}</code></span>
+<span class="codeline" id="line-301"><code>	w.nameIdx[obj] = idx</code></span>
+<span class="codeline" id="line-302"><code>	return idx</code></span>
+<span class="codeline" id="line-303"><code>}</code></span>
+<span class="codeline" id="line-304"><code></code></span>
+<span class="codeline" id="line-305"><code>// typeParamVertex returns the index of the vertex representing tpar.</code></span>
+<span class="codeline" id="line-306"><code>func (w *monoGraph) typeParamVertex(tpar *TypeParam) int {</code></span>
+<span class="codeline" id="line-307"><code>	if x, ok := w.canon[tpar]; ok {</code></span>
+<span class="codeline" id="line-308"><code>		tpar = x</code></span>
+<span class="codeline" id="line-309"><code>	}</code></span>
+<span class="codeline" id="line-310"><code></code></span>
+<span class="codeline" id="line-311"><code>	obj := tpar.Obj()</code></span>
+<span class="codeline" id="line-312"><code></code></span>
+<span class="codeline" id="line-313"><code>	if idx, ok := w.nameIdx[obj]; ok {</code></span>
+<span class="codeline" id="line-314"><code>		return idx</code></span>
+<span class="codeline" id="line-315"><code>	}</code></span>
+<span class="codeline" id="line-316"><code></code></span>
+<span class="codeline" id="line-317"><code>	if w.nameIdx == nil {</code></span>
+<span class="codeline" id="line-318"><code>		w.nameIdx = make(map[*TypeName]int)</code></span>
+<span class="codeline" id="line-319"><code>	}</code></span>
+<span class="codeline" id="line-320"><code></code></span>
+<span class="codeline" id="line-321"><code>	idx := len(w.vertices)</code></span>
+<span class="codeline" id="line-322"><code>	w.vertices = append(w.vertices, monoVertex{obj: obj})</code></span>
+<span class="codeline" id="line-323"><code>	w.nameIdx[obj] = idx</code></span>
+<span class="codeline" id="line-324"><code>	return idx</code></span>
+<span class="codeline" id="line-325"><code>}</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>func (w *monoGraph) addEdge(dst, src, weight int, pos token.Pos, typ Type) {</code></span>
+<span class="codeline" id="line-328"><code>	// TODO(mdempsky): Deduplicate redundant edges?</code></span>
+<span class="codeline" id="line-329"><code>	w.edges = append(w.edges, monoEdge{</code></span>
+<span class="codeline" id="line-330"><code>		dst:    dst,</code></span>
+<span class="codeline" id="line-331"><code>		src:    src,</code></span>
+<span class="codeline" id="line-332"><code>		weight: weight,</code></span>
+<span class="codeline" id="line-333"><code></code></span>
+<span class="codeline" id="line-334"><code>		pos: pos,</code></span>
+<span class="codeline" id="line-335"><code>		typ: typ,</code></span>
+<span class="codeline" id="line-336"><code>	})</code></span>
+<span class="codeline" id="line-337"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

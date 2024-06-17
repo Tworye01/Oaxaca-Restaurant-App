@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: struct_codec.go in package go.mongodb.org/mongo-driver/bson/bsoncodec</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	struct_codec.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/go.mongodb.org/mongo-driver/bson/bsoncodec.html">go.mongodb.org/mongo-driver/bson/bsoncodec</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright (C) MongoDB, Inc. 2017-present.</code></span>
+<span class="codeline" id="line-2"><code>//</code></span>
+<span class="codeline" id="line-3"><code>// Licensed under the Apache License, Version 2.0 (the "License"); you may</code></span>
+<span class="codeline" id="line-4"><code>// not use this file except in compliance with the License. You may obtain</code></span>
+<span class="codeline" id="line-5"><code>// a copy of the License at http://www.apache.org/licenses/LICENSE-2.0</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package bsoncodec</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"reflect"</code></span>
+<span class="codeline" id="line-13"><code>	"sort"</code></span>
+<span class="codeline" id="line-14"><code>	"strings"</code></span>
+<span class="codeline" id="line-15"><code>	"sync"</code></span>
+<span class="codeline" id="line-16"><code>	"time"</code></span>
+<span class="codeline" id="line-17"><code></code></span>
+<span class="codeline" id="line-18"><code>	"go.mongodb.org/mongo-driver/bson/bsonoptions"</code></span>
+<span class="codeline" id="line-19"><code>	"go.mongodb.org/mongo-driver/bson/bsonrw"</code></span>
+<span class="codeline" id="line-20"><code>	"go.mongodb.org/mongo-driver/bson/bsontype"</code></span>
+<span class="codeline" id="line-21"><code>)</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>// DecodeError represents an error that occurs when unmarshalling BSON bytes into a native Go type.</code></span>
+<span class="codeline" id="line-24"><code>type DecodeError struct {</code></span>
+<span class="codeline" id="line-25"><code>	keys    []string</code></span>
+<span class="codeline" id="line-26"><code>	wrapped error</code></span>
+<span class="codeline" id="line-27"><code>}</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>// Unwrap returns the underlying error</code></span>
+<span class="codeline" id="line-30"><code>func (de *DecodeError) Unwrap() error {</code></span>
+<span class="codeline" id="line-31"><code>	return de.wrapped</code></span>
+<span class="codeline" id="line-32"><code>}</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>// Error implements the error interface.</code></span>
+<span class="codeline" id="line-35"><code>func (de *DecodeError) Error() string {</code></span>
+<span class="codeline" id="line-36"><code>	// The keys are stored in reverse order because the de.keys slice is builtup while propagating the error up the</code></span>
+<span class="codeline" id="line-37"><code>	// stack of BSON keys, so we call de.Keys(), which reverses them.</code></span>
+<span class="codeline" id="line-38"><code>	keyPath := strings.Join(de.Keys(), ".")</code></span>
+<span class="codeline" id="line-39"><code>	return fmt.Sprintf("error decoding key %s: %v", keyPath, de.wrapped)</code></span>
+<span class="codeline" id="line-40"><code>}</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>// Keys returns the BSON key path that caused an error as a slice of strings. The keys in the slice are in top-down</code></span>
+<span class="codeline" id="line-43"><code>// order. For example, if the document being unmarshalled was {a: {b: {c: 1}}} and the value for c was supposed to be</code></span>
+<span class="codeline" id="line-44"><code>// a string, the keys slice will be ["a", "b", "c"].</code></span>
+<span class="codeline" id="line-45"><code>func (de *DecodeError) Keys() []string {</code></span>
+<span class="codeline" id="line-46"><code>	reversedKeys := make([]string, 0, len(de.keys))</code></span>
+<span class="codeline" id="line-47"><code>	for idx := len(de.keys) - 1; idx &gt;= 0; idx-- {</code></span>
+<span class="codeline" id="line-48"><code>		reversedKeys = append(reversedKeys, de.keys[idx])</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code></code></span>
+<span class="codeline" id="line-51"><code>	return reversedKeys</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>// Zeroer allows custom struct types to implement a report of zero</code></span>
+<span class="codeline" id="line-55"><code>// state. All struct types that don't implement Zeroer or where IsZero</code></span>
+<span class="codeline" id="line-56"><code>// returns false are considered to be not zero.</code></span>
+<span class="codeline" id="line-57"><code>type Zeroer interface {</code></span>
+<span class="codeline" id="line-58"><code>	IsZero() bool</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>// StructCodec is the Codec used for struct values.</code></span>
+<span class="codeline" id="line-62"><code>//</code></span>
+<span class="codeline" id="line-63"><code>// Deprecated: StructCodec will not be directly configurable in Go Driver 2.0.</code></span>
+<span class="codeline" id="line-64"><code>// To configure the struct encode and decode behavior, use the configuration</code></span>
+<span class="codeline" id="line-65"><code>// methods on a [go.mongodb.org/mongo-driver/bson.Encoder] or</code></span>
+<span class="codeline" id="line-66"><code>// [go.mongodb.org/mongo-driver/bson.Decoder]. To configure the struct encode</code></span>
+<span class="codeline" id="line-67"><code>// and decode behavior for a mongo.Client, use</code></span>
+<span class="codeline" id="line-68"><code>// [go.mongodb.org/mongo-driver/mongo/options.ClientOptions.SetBSONOptions].</code></span>
+<span class="codeline" id="line-69"><code>//</code></span>
+<span class="codeline" id="line-70"><code>// For example, to configure a mongo.Client to omit zero-value structs when</code></span>
+<span class="codeline" id="line-71"><code>// using the "omitempty" struct tag, use:</code></span>
+<span class="codeline" id="line-72"><code>//</code></span>
+<span class="codeline" id="line-73"><code>//	opt := options.Client().SetBSONOptions(&amp;options.BSONOptions{</code></span>
+<span class="codeline" id="line-74"><code>//	    OmitZeroStruct: true,</code></span>
+<span class="codeline" id="line-75"><code>//	})</code></span>
+<span class="codeline" id="line-76"><code>//</code></span>
+<span class="codeline" id="line-77"><code>// See the deprecation notice for each field in StructCodec for the corresponding</code></span>
+<span class="codeline" id="line-78"><code>// settings.</code></span>
+<span class="codeline" id="line-79"><code>type StructCodec struct {</code></span>
+<span class="codeline" id="line-80"><code>	cache  sync.Map // map[reflect.Type]*structDescription</code></span>
+<span class="codeline" id="line-81"><code>	parser StructTagParser</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	// DecodeZeroStruct causes DecodeValue to delete any existing values from Go structs in the</code></span>
+<span class="codeline" id="line-84"><code>	// destination value passed to Decode before unmarshaling BSON documents into them.</code></span>
+<span class="codeline" id="line-85"><code>	//</code></span>
+<span class="codeline" id="line-86"><code>	// Deprecated: Use bson.Decoder.ZeroStructs or options.BSONOptions.ZeroStructs instead.</code></span>
+<span class="codeline" id="line-87"><code>	DecodeZeroStruct bool</code></span>
+<span class="codeline" id="line-88"><code></code></span>
+<span class="codeline" id="line-89"><code>	// DecodeDeepZeroInline causes DecodeValue to delete any existing values from Go structs in the</code></span>
+<span class="codeline" id="line-90"><code>	// destination value passed to Decode before unmarshaling BSON documents into them.</code></span>
+<span class="codeline" id="line-91"><code>	//</code></span>
+<span class="codeline" id="line-92"><code>	// Deprecated: DecodeDeepZeroInline will not be supported in Go Driver 2.0.</code></span>
+<span class="codeline" id="line-93"><code>	DecodeDeepZeroInline bool</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>	// EncodeOmitDefaultStruct causes the Encoder to consider the zero value for a struct (e.g.</code></span>
+<span class="codeline" id="line-96"><code>	// MyStruct{}) as empty and omit it from the marshaled BSON when the "omitempty" struct tag</code></span>
+<span class="codeline" id="line-97"><code>	// option is set.</code></span>
+<span class="codeline" id="line-98"><code>	//</code></span>
+<span class="codeline" id="line-99"><code>	// Deprecated: Use bson.Encoder.OmitZeroStruct or options.BSONOptions.OmitZeroStruct instead.</code></span>
+<span class="codeline" id="line-100"><code>	EncodeOmitDefaultStruct bool</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>	// AllowUnexportedFields allows encoding and decoding values from un-exported struct fields.</code></span>
+<span class="codeline" id="line-103"><code>	//</code></span>
+<span class="codeline" id="line-104"><code>	// Deprecated: AllowUnexportedFields does not work on recent versions of Go and will not be</code></span>
+<span class="codeline" id="line-105"><code>	// supported in Go Driver 2.0.</code></span>
+<span class="codeline" id="line-106"><code>	AllowUnexportedFields bool</code></span>
+<span class="codeline" id="line-107"><code></code></span>
+<span class="codeline" id="line-108"><code>	// OverwriteDuplicatedInlinedFields, if false, causes EncodeValue to return an error if there is</code></span>
+<span class="codeline" id="line-109"><code>	// a duplicate field in the marshaled BSON when the "inline" struct tag option is set. The</code></span>
+<span class="codeline" id="line-110"><code>	// default value is true.</code></span>
+<span class="codeline" id="line-111"><code>	//</code></span>
+<span class="codeline" id="line-112"><code>	// Deprecated: Use bson.Encoder.ErrorOnInlineDuplicates or</code></span>
+<span class="codeline" id="line-113"><code>	// options.BSONOptions.ErrorOnInlineDuplicates instead.</code></span>
+<span class="codeline" id="line-114"><code>	OverwriteDuplicatedInlinedFields bool</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>var _ ValueEncoder = &amp;StructCodec{}</code></span>
+<span class="codeline" id="line-118"><code>var _ ValueDecoder = &amp;StructCodec{}</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>// NewStructCodec returns a StructCodec that uses p for struct tag parsing.</code></span>
+<span class="codeline" id="line-121"><code>//</code></span>
+<span class="codeline" id="line-122"><code>// Deprecated: NewStructCodec will not be available in Go Driver 2.0. See</code></span>
+<span class="codeline" id="line-123"><code>// [StructCodec] for more details.</code></span>
+<span class="codeline" id="line-124"><code>func NewStructCodec(p StructTagParser, opts ...*bsonoptions.StructCodecOptions) (*StructCodec, error) {</code></span>
+<span class="codeline" id="line-125"><code>	if p == nil {</code></span>
+<span class="codeline" id="line-126"><code>		return nil, errors.New("a StructTagParser must be provided to NewStructCodec")</code></span>
+<span class="codeline" id="line-127"><code>	}</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>	structOpt := bsonoptions.MergeStructCodecOptions(opts...)</code></span>
+<span class="codeline" id="line-130"><code></code></span>
+<span class="codeline" id="line-131"><code>	codec := &amp;StructCodec{</code></span>
+<span class="codeline" id="line-132"><code>		parser: p,</code></span>
+<span class="codeline" id="line-133"><code>	}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>	if structOpt.DecodeZeroStruct != nil {</code></span>
+<span class="codeline" id="line-136"><code>		codec.DecodeZeroStruct = *structOpt.DecodeZeroStruct</code></span>
+<span class="codeline" id="line-137"><code>	}</code></span>
+<span class="codeline" id="line-138"><code>	if structOpt.DecodeDeepZeroInline != nil {</code></span>
+<span class="codeline" id="line-139"><code>		codec.DecodeDeepZeroInline = *structOpt.DecodeDeepZeroInline</code></span>
+<span class="codeline" id="line-140"><code>	}</code></span>
+<span class="codeline" id="line-141"><code>	if structOpt.EncodeOmitDefaultStruct != nil {</code></span>
+<span class="codeline" id="line-142"><code>		codec.EncodeOmitDefaultStruct = *structOpt.EncodeOmitDefaultStruct</code></span>
+<span class="codeline" id="line-143"><code>	}</code></span>
+<span class="codeline" id="line-144"><code>	if structOpt.OverwriteDuplicatedInlinedFields != nil {</code></span>
+<span class="codeline" id="line-145"><code>		codec.OverwriteDuplicatedInlinedFields = *structOpt.OverwriteDuplicatedInlinedFields</code></span>
+<span class="codeline" id="line-146"><code>	}</code></span>
+<span class="codeline" id="line-147"><code>	if structOpt.AllowUnexportedFields != nil {</code></span>
+<span class="codeline" id="line-148"><code>		codec.AllowUnexportedFields = *structOpt.AllowUnexportedFields</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code></code></span>
+<span class="codeline" id="line-151"><code>	return codec, nil</code></span>
+<span class="codeline" id="line-152"><code>}</code></span>
+<span class="codeline" id="line-153"><code></code></span>
+<span class="codeline" id="line-154"><code>// EncodeValue handles encoding generic struct types.</code></span>
+<span class="codeline" id="line-155"><code>func (sc *StructCodec) EncodeValue(ec EncodeContext, vw bsonrw.ValueWriter, val reflect.Value) error {</code></span>
+<span class="codeline" id="line-156"><code>	if !val.IsValid() || val.Kind() != reflect.Struct {</code></span>
+<span class="codeline" id="line-157"><code>		return ValueEncoderError{Name: "StructCodec.EncodeValue", Kinds: []reflect.Kind{reflect.Struct}, Received: val}</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code></code></span>
+<span class="codeline" id="line-160"><code>	sd, err := sc.describeStruct(ec.Registry, val.Type(), ec.useJSONStructTags, ec.errorOnInlineDuplicates)</code></span>
+<span class="codeline" id="line-161"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-162"><code>		return err</code></span>
+<span class="codeline" id="line-163"><code>	}</code></span>
+<span class="codeline" id="line-164"><code></code></span>
+<span class="codeline" id="line-165"><code>	dw, err := vw.WriteDocument()</code></span>
+<span class="codeline" id="line-166"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-167"><code>		return err</code></span>
+<span class="codeline" id="line-168"><code>	}</code></span>
+<span class="codeline" id="line-169"><code>	var rv reflect.Value</code></span>
+<span class="codeline" id="line-170"><code>	for _, desc := range sd.fl {</code></span>
+<span class="codeline" id="line-171"><code>		if desc.inline == nil {</code></span>
+<span class="codeline" id="line-172"><code>			rv = val.Field(desc.idx)</code></span>
+<span class="codeline" id="line-173"><code>		} else {</code></span>
+<span class="codeline" id="line-174"><code>			rv, err = fieldByIndexErr(val, desc.inline)</code></span>
+<span class="codeline" id="line-175"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-176"><code>				continue</code></span>
+<span class="codeline" id="line-177"><code>			}</code></span>
+<span class="codeline" id="line-178"><code>		}</code></span>
+<span class="codeline" id="line-179"><code></code></span>
+<span class="codeline" id="line-180"><code>		desc.encoder, rv, err = defaultValueEncoders.lookupElementEncoder(ec, desc.encoder, rv)</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>		if err != nil &amp;&amp; !errors.Is(err, errInvalidValue) {</code></span>
+<span class="codeline" id="line-183"><code>			return err</code></span>
+<span class="codeline" id="line-184"><code>		}</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>		if errors.Is(err, errInvalidValue) {</code></span>
+<span class="codeline" id="line-187"><code>			if desc.omitEmpty {</code></span>
+<span class="codeline" id="line-188"><code>				continue</code></span>
+<span class="codeline" id="line-189"><code>			}</code></span>
+<span class="codeline" id="line-190"><code>			vw2, err := dw.WriteDocumentElement(desc.name)</code></span>
+<span class="codeline" id="line-191"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-192"><code>				return err</code></span>
+<span class="codeline" id="line-193"><code>			}</code></span>
+<span class="codeline" id="line-194"><code>			err = vw2.WriteNull()</code></span>
+<span class="codeline" id="line-195"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-196"><code>				return err</code></span>
+<span class="codeline" id="line-197"><code>			}</code></span>
+<span class="codeline" id="line-198"><code>			continue</code></span>
+<span class="codeline" id="line-199"><code>		}</code></span>
+<span class="codeline" id="line-200"><code></code></span>
+<span class="codeline" id="line-201"><code>		if desc.encoder == nil {</code></span>
+<span class="codeline" id="line-202"><code>			return ErrNoEncoder{Type: rv.Type()}</code></span>
+<span class="codeline" id="line-203"><code>		}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>		encoder := desc.encoder</code></span>
+<span class="codeline" id="line-206"><code></code></span>
+<span class="codeline" id="line-207"><code>		var empty bool</code></span>
+<span class="codeline" id="line-208"><code>		if cz, ok := encoder.(CodecZeroer); ok {</code></span>
+<span class="codeline" id="line-209"><code>			empty = cz.IsTypeZero(rv.Interface())</code></span>
+<span class="codeline" id="line-210"><code>		} else if rv.Kind() == reflect.Interface {</code></span>
+<span class="codeline" id="line-211"><code>			// isEmpty will not treat an interface rv as an interface, so we need to check for the</code></span>
+<span class="codeline" id="line-212"><code>			// nil interface separately.</code></span>
+<span class="codeline" id="line-213"><code>			empty = rv.IsNil()</code></span>
+<span class="codeline" id="line-214"><code>		} else {</code></span>
+<span class="codeline" id="line-215"><code>			empty = isEmpty(rv, sc.EncodeOmitDefaultStruct || ec.omitZeroStruct)</code></span>
+<span class="codeline" id="line-216"><code>		}</code></span>
+<span class="codeline" id="line-217"><code>		if desc.omitEmpty &amp;&amp; empty {</code></span>
+<span class="codeline" id="line-218"><code>			continue</code></span>
+<span class="codeline" id="line-219"><code>		}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>		vw2, err := dw.WriteDocumentElement(desc.name)</code></span>
+<span class="codeline" id="line-222"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-223"><code>			return err</code></span>
+<span class="codeline" id="line-224"><code>		}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>		ectx := EncodeContext{</code></span>
+<span class="codeline" id="line-227"><code>			Registry:                ec.Registry,</code></span>
+<span class="codeline" id="line-228"><code>			MinSize:                 desc.minSize || ec.MinSize,</code></span>
+<span class="codeline" id="line-229"><code>			errorOnInlineDuplicates: ec.errorOnInlineDuplicates,</code></span>
+<span class="codeline" id="line-230"><code>			stringifyMapKeysWithFmt: ec.stringifyMapKeysWithFmt,</code></span>
+<span class="codeline" id="line-231"><code>			nilMapAsEmpty:           ec.nilMapAsEmpty,</code></span>
+<span class="codeline" id="line-232"><code>			nilSliceAsEmpty:         ec.nilSliceAsEmpty,</code></span>
+<span class="codeline" id="line-233"><code>			nilByteSliceAsEmpty:     ec.nilByteSliceAsEmpty,</code></span>
+<span class="codeline" id="line-234"><code>			omitZeroStruct:          ec.omitZeroStruct,</code></span>
+<span class="codeline" id="line-235"><code>			useJSONStructTags:       ec.useJSONStructTags,</code></span>
+<span class="codeline" id="line-236"><code>		}</code></span>
+<span class="codeline" id="line-237"><code>		err = encoder.EncodeValue(ectx, vw2, rv)</code></span>
+<span class="codeline" id="line-238"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-239"><code>			return err</code></span>
+<span class="codeline" id="line-240"><code>		}</code></span>
+<span class="codeline" id="line-241"><code>	}</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>	if sd.inlineMap &gt;= 0 {</code></span>
+<span class="codeline" id="line-244"><code>		rv := val.Field(sd.inlineMap)</code></span>
+<span class="codeline" id="line-245"><code>		collisionFn := func(key string) bool {</code></span>
+<span class="codeline" id="line-246"><code>			_, exists := sd.fm[key]</code></span>
+<span class="codeline" id="line-247"><code>			return exists</code></span>
+<span class="codeline" id="line-248"><code>		}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>		return defaultMapCodec.mapEncodeValue(ec, dw, rv, collisionFn)</code></span>
+<span class="codeline" id="line-251"><code>	}</code></span>
+<span class="codeline" id="line-252"><code></code></span>
+<span class="codeline" id="line-253"><code>	return dw.WriteDocumentEnd()</code></span>
+<span class="codeline" id="line-254"><code>}</code></span>
+<span class="codeline" id="line-255"><code></code></span>
+<span class="codeline" id="line-256"><code>func newDecodeError(key string, original error) error {</code></span>
+<span class="codeline" id="line-257"><code>	var de *DecodeError</code></span>
+<span class="codeline" id="line-258"><code>	if !errors.As(original, &amp;de) {</code></span>
+<span class="codeline" id="line-259"><code>		return &amp;DecodeError{</code></span>
+<span class="codeline" id="line-260"><code>			keys:    []string{key},</code></span>
+<span class="codeline" id="line-261"><code>			wrapped: original,</code></span>
+<span class="codeline" id="line-262"><code>		}</code></span>
+<span class="codeline" id="line-263"><code>	}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>	de.keys = append(de.keys, key)</code></span>
+<span class="codeline" id="line-266"><code>	return de</code></span>
+<span class="codeline" id="line-267"><code>}</code></span>
+<span class="codeline" id="line-268"><code></code></span>
+<span class="codeline" id="line-269"><code>// DecodeValue implements the Codec interface.</code></span>
+<span class="codeline" id="line-270"><code>// By default, map types in val will not be cleared. If a map has existing key/value pairs, it will be extended with the new ones from vr.</code></span>
+<span class="codeline" id="line-271"><code>// For slices, the decoder will set the length of the slice to zero and append all elements. The underlying array will not be cleared.</code></span>
+<span class="codeline" id="line-272"><code>func (sc *StructCodec) DecodeValue(dc DecodeContext, vr bsonrw.ValueReader, val reflect.Value) error {</code></span>
+<span class="codeline" id="line-273"><code>	if !val.CanSet() || val.Kind() != reflect.Struct {</code></span>
+<span class="codeline" id="line-274"><code>		return ValueDecoderError{Name: "StructCodec.DecodeValue", Kinds: []reflect.Kind{reflect.Struct}, Received: val}</code></span>
+<span class="codeline" id="line-275"><code>	}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>	switch vrType := vr.Type(); vrType {</code></span>
+<span class="codeline" id="line-278"><code>	case bsontype.Type(0), bsontype.EmbeddedDocument:</code></span>
+<span class="codeline" id="line-279"><code>	case bsontype.Null:</code></span>
+<span class="codeline" id="line-280"><code>		if err := vr.ReadNull(); err != nil {</code></span>
+<span class="codeline" id="line-281"><code>			return err</code></span>
+<span class="codeline" id="line-282"><code>		}</code></span>
+<span class="codeline" id="line-283"><code></code></span>
+<span class="codeline" id="line-284"><code>		val.Set(reflect.Zero(val.Type()))</code></span>
+<span class="codeline" id="line-285"><code>		return nil</code></span>
+<span class="codeline" id="line-286"><code>	case bsontype.Undefined:</code></span>
+<span class="codeline" id="line-287"><code>		if err := vr.ReadUndefined(); err != nil {</code></span>
+<span class="codeline" id="line-288"><code>			return err</code></span>
+<span class="codeline" id="line-289"><code>		}</code></span>
+<span class="codeline" id="line-290"><code></code></span>
+<span class="codeline" id="line-291"><code>		val.Set(reflect.Zero(val.Type()))</code></span>
+<span class="codeline" id="line-292"><code>		return nil</code></span>
+<span class="codeline" id="line-293"><code>	default:</code></span>
+<span class="codeline" id="line-294"><code>		return fmt.Errorf("cannot decode %v into a %s", vrType, val.Type())</code></span>
+<span class="codeline" id="line-295"><code>	}</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>	sd, err := sc.describeStruct(dc.Registry, val.Type(), dc.useJSONStructTags, false)</code></span>
+<span class="codeline" id="line-298"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-299"><code>		return err</code></span>
+<span class="codeline" id="line-300"><code>	}</code></span>
+<span class="codeline" id="line-301"><code></code></span>
+<span class="codeline" id="line-302"><code>	if sc.DecodeZeroStruct || dc.zeroStructs {</code></span>
+<span class="codeline" id="line-303"><code>		val.Set(reflect.Zero(val.Type()))</code></span>
+<span class="codeline" id="line-304"><code>	}</code></span>
+<span class="codeline" id="line-305"><code>	if sc.DecodeDeepZeroInline &amp;&amp; sd.inline {</code></span>
+<span class="codeline" id="line-306"><code>		val.Set(deepZero(val.Type()))</code></span>
+<span class="codeline" id="line-307"><code>	}</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>	var decoder ValueDecoder</code></span>
+<span class="codeline" id="line-310"><code>	var inlineMap reflect.Value</code></span>
+<span class="codeline" id="line-311"><code>	if sd.inlineMap &gt;= 0 {</code></span>
+<span class="codeline" id="line-312"><code>		inlineMap = val.Field(sd.inlineMap)</code></span>
+<span class="codeline" id="line-313"><code>		decoder, err = dc.LookupDecoder(inlineMap.Type().Elem())</code></span>
+<span class="codeline" id="line-314"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-315"><code>			return err</code></span>
+<span class="codeline" id="line-316"><code>		}</code></span>
+<span class="codeline" id="line-317"><code>	}</code></span>
+<span class="codeline" id="line-318"><code></code></span>
+<span class="codeline" id="line-319"><code>	dr, err := vr.ReadDocument()</code></span>
+<span class="codeline" id="line-320"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-321"><code>		return err</code></span>
+<span class="codeline" id="line-322"><code>	}</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>	for {</code></span>
+<span class="codeline" id="line-325"><code>		name, vr, err := dr.ReadElement()</code></span>
+<span class="codeline" id="line-326"><code>		if errors.Is(err, bsonrw.ErrEOD) {</code></span>
+<span class="codeline" id="line-327"><code>			break</code></span>
+<span class="codeline" id="line-328"><code>		}</code></span>
+<span class="codeline" id="line-329"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-330"><code>			return err</code></span>
+<span class="codeline" id="line-331"><code>		}</code></span>
+<span class="codeline" id="line-332"><code></code></span>
+<span class="codeline" id="line-333"><code>		fd, exists := sd.fm[name]</code></span>
+<span class="codeline" id="line-334"><code>		if !exists {</code></span>
+<span class="codeline" id="line-335"><code>			// if the original name isn't found in the struct description, try again with the name in lowercase</code></span>
+<span class="codeline" id="line-336"><code>			// this could match if a BSON tag isn't specified because by default, describeStruct lowercases all field</code></span>
+<span class="codeline" id="line-337"><code>			// names</code></span>
+<span class="codeline" id="line-338"><code>			fd, exists = sd.fm[strings.ToLower(name)]</code></span>
+<span class="codeline" id="line-339"><code>		}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>		if !exists {</code></span>
+<span class="codeline" id="line-342"><code>			if sd.inlineMap &lt; 0 {</code></span>
+<span class="codeline" id="line-343"><code>				// The encoding/json package requires a flag to return on error for non-existent fields.</code></span>
+<span class="codeline" id="line-344"><code>				// This functionality seems appropriate for the struct codec.</code></span>
+<span class="codeline" id="line-345"><code>				err = vr.Skip()</code></span>
+<span class="codeline" id="line-346"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-347"><code>					return err</code></span>
+<span class="codeline" id="line-348"><code>				}</code></span>
+<span class="codeline" id="line-349"><code>				continue</code></span>
+<span class="codeline" id="line-350"><code>			}</code></span>
+<span class="codeline" id="line-351"><code></code></span>
+<span class="codeline" id="line-352"><code>			if inlineMap.IsNil() {</code></span>
+<span class="codeline" id="line-353"><code>				inlineMap.Set(reflect.MakeMap(inlineMap.Type()))</code></span>
+<span class="codeline" id="line-354"><code>			}</code></span>
+<span class="codeline" id="line-355"><code></code></span>
+<span class="codeline" id="line-356"><code>			elem := reflect.New(inlineMap.Type().Elem()).Elem()</code></span>
+<span class="codeline" id="line-357"><code>			dc.Ancestor = inlineMap.Type()</code></span>
+<span class="codeline" id="line-358"><code>			err = decoder.DecodeValue(dc, vr, elem)</code></span>
+<span class="codeline" id="line-359"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-360"><code>				return err</code></span>
+<span class="codeline" id="line-361"><code>			}</code></span>
+<span class="codeline" id="line-362"><code>			inlineMap.SetMapIndex(reflect.ValueOf(name), elem)</code></span>
+<span class="codeline" id="line-363"><code>			continue</code></span>
+<span class="codeline" id="line-364"><code>		}</code></span>
+<span class="codeline" id="line-365"><code></code></span>
+<span class="codeline" id="line-366"><code>		var field reflect.Value</code></span>
+<span class="codeline" id="line-367"><code>		if fd.inline == nil {</code></span>
+<span class="codeline" id="line-368"><code>			field = val.Field(fd.idx)</code></span>
+<span class="codeline" id="line-369"><code>		} else {</code></span>
+<span class="codeline" id="line-370"><code>			field, err = getInlineField(val, fd.inline)</code></span>
+<span class="codeline" id="line-371"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-372"><code>				return err</code></span>
+<span class="codeline" id="line-373"><code>			}</code></span>
+<span class="codeline" id="line-374"><code>		}</code></span>
+<span class="codeline" id="line-375"><code></code></span>
+<span class="codeline" id="line-376"><code>		if !field.CanSet() { // Being settable is a super set of being addressable.</code></span>
+<span class="codeline" id="line-377"><code>			innerErr := fmt.Errorf("field %v is not settable", field)</code></span>
+<span class="codeline" id="line-378"><code>			return newDecodeError(fd.name, innerErr)</code></span>
+<span class="codeline" id="line-379"><code>		}</code></span>
+<span class="codeline" id="line-380"><code>		if field.Kind() == reflect.Ptr &amp;&amp; field.IsNil() {</code></span>
+<span class="codeline" id="line-381"><code>			field.Set(reflect.New(field.Type().Elem()))</code></span>
+<span class="codeline" id="line-382"><code>		}</code></span>
+<span class="codeline" id="line-383"><code>		field = field.Addr()</code></span>
+<span class="codeline" id="line-384"><code></code></span>
+<span class="codeline" id="line-385"><code>		dctx := DecodeContext{</code></span>
+<span class="codeline" id="line-386"><code>			Registry:            dc.Registry,</code></span>
+<span class="codeline" id="line-387"><code>			Truncate:            fd.truncate || dc.Truncate,</code></span>
+<span class="codeline" id="line-388"><code>			defaultDocumentType: dc.defaultDocumentType,</code></span>
+<span class="codeline" id="line-389"><code>			binaryAsSlice:       dc.binaryAsSlice,</code></span>
+<span class="codeline" id="line-390"><code>			useJSONStructTags:   dc.useJSONStructTags,</code></span>
+<span class="codeline" id="line-391"><code>			useLocalTimeZone:    dc.useLocalTimeZone,</code></span>
+<span class="codeline" id="line-392"><code>			zeroMaps:            dc.zeroMaps,</code></span>
+<span class="codeline" id="line-393"><code>			zeroStructs:         dc.zeroStructs,</code></span>
+<span class="codeline" id="line-394"><code>		}</code></span>
+<span class="codeline" id="line-395"><code></code></span>
+<span class="codeline" id="line-396"><code>		if fd.decoder == nil {</code></span>
+<span class="codeline" id="line-397"><code>			return newDecodeError(fd.name, ErrNoDecoder{Type: field.Elem().Type()})</code></span>
+<span class="codeline" id="line-398"><code>		}</code></span>
+<span class="codeline" id="line-399"><code></code></span>
+<span class="codeline" id="line-400"><code>		err = fd.decoder.DecodeValue(dctx, vr, field.Elem())</code></span>
+<span class="codeline" id="line-401"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-402"><code>			return newDecodeError(fd.name, err)</code></span>
+<span class="codeline" id="line-403"><code>		}</code></span>
+<span class="codeline" id="line-404"><code>	}</code></span>
+<span class="codeline" id="line-405"><code></code></span>
+<span class="codeline" id="line-406"><code>	return nil</code></span>
+<span class="codeline" id="line-407"><code>}</code></span>
+<span class="codeline" id="line-408"><code></code></span>
+<span class="codeline" id="line-409"><code>func isEmpty(v reflect.Value, omitZeroStruct bool) bool {</code></span>
+<span class="codeline" id="line-410"><code>	kind := v.Kind()</code></span>
+<span class="codeline" id="line-411"><code>	if (kind != reflect.Ptr || !v.IsNil()) &amp;&amp; v.Type().Implements(tZeroer) {</code></span>
+<span class="codeline" id="line-412"><code>		return v.Interface().(Zeroer).IsZero()</code></span>
+<span class="codeline" id="line-413"><code>	}</code></span>
+<span class="codeline" id="line-414"><code>	switch kind {</code></span>
+<span class="codeline" id="line-415"><code>	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:</code></span>
+<span class="codeline" id="line-416"><code>		return v.Len() == 0</code></span>
+<span class="codeline" id="line-417"><code>	case reflect.Struct:</code></span>
+<span class="codeline" id="line-418"><code>		if !omitZeroStruct {</code></span>
+<span class="codeline" id="line-419"><code>			return false</code></span>
+<span class="codeline" id="line-420"><code>		}</code></span>
+<span class="codeline" id="line-421"><code>		vt := v.Type()</code></span>
+<span class="codeline" id="line-422"><code>		if vt == tTime {</code></span>
+<span class="codeline" id="line-423"><code>			return v.Interface().(time.Time).IsZero()</code></span>
+<span class="codeline" id="line-424"><code>		}</code></span>
+<span class="codeline" id="line-425"><code>		numField := vt.NumField()</code></span>
+<span class="codeline" id="line-426"><code>		for i := 0; i &lt; numField; i++ {</code></span>
+<span class="codeline" id="line-427"><code>			ff := vt.Field(i)</code></span>
+<span class="codeline" id="line-428"><code>			if ff.PkgPath != "" &amp;&amp; !ff.Anonymous {</code></span>
+<span class="codeline" id="line-429"><code>				continue // Private field</code></span>
+<span class="codeline" id="line-430"><code>			}</code></span>
+<span class="codeline" id="line-431"><code>			if !isEmpty(v.Field(i), omitZeroStruct) {</code></span>
+<span class="codeline" id="line-432"><code>				return false</code></span>
+<span class="codeline" id="line-433"><code>			}</code></span>
+<span class="codeline" id="line-434"><code>		}</code></span>
+<span class="codeline" id="line-435"><code>		return true</code></span>
+<span class="codeline" id="line-436"><code>	}</code></span>
+<span class="codeline" id="line-437"><code>	return !v.IsValid() || v.IsZero()</code></span>
+<span class="codeline" id="line-438"><code>}</code></span>
+<span class="codeline" id="line-439"><code></code></span>
+<span class="codeline" id="line-440"><code>type structDescription struct {</code></span>
+<span class="codeline" id="line-441"><code>	fm        map[string]fieldDescription</code></span>
+<span class="codeline" id="line-442"><code>	fl        []fieldDescription</code></span>
+<span class="codeline" id="line-443"><code>	inlineMap int</code></span>
+<span class="codeline" id="line-444"><code>	inline    bool</code></span>
+<span class="codeline" id="line-445"><code>}</code></span>
+<span class="codeline" id="line-446"><code></code></span>
+<span class="codeline" id="line-447"><code>type fieldDescription struct {</code></span>
+<span class="codeline" id="line-448"><code>	name      string // BSON key name</code></span>
+<span class="codeline" id="line-449"><code>	fieldName string // struct field name</code></span>
+<span class="codeline" id="line-450"><code>	idx       int</code></span>
+<span class="codeline" id="line-451"><code>	omitEmpty bool</code></span>
+<span class="codeline" id="line-452"><code>	minSize   bool</code></span>
+<span class="codeline" id="line-453"><code>	truncate  bool</code></span>
+<span class="codeline" id="line-454"><code>	inline    []int</code></span>
+<span class="codeline" id="line-455"><code>	encoder   ValueEncoder</code></span>
+<span class="codeline" id="line-456"><code>	decoder   ValueDecoder</code></span>
+<span class="codeline" id="line-457"><code>}</code></span>
+<span class="codeline" id="line-458"><code></code></span>
+<span class="codeline" id="line-459"><code>type byIndex []fieldDescription</code></span>
+<span class="codeline" id="line-460"><code></code></span>
+<span class="codeline" id="line-461"><code>func (bi byIndex) Len() int { return len(bi) }</code></span>
+<span class="codeline" id="line-462"><code></code></span>
+<span class="codeline" id="line-463"><code>func (bi byIndex) Swap(i, j int) { bi[i], bi[j] = bi[j], bi[i] }</code></span>
+<span class="codeline" id="line-464"><code></code></span>
+<span class="codeline" id="line-465"><code>func (bi byIndex) Less(i, j int) bool {</code></span>
+<span class="codeline" id="line-466"><code>	// If a field is inlined, its index in the top level struct is stored at inline[0]</code></span>
+<span class="codeline" id="line-467"><code>	iIdx, jIdx := bi[i].idx, bi[j].idx</code></span>
+<span class="codeline" id="line-468"><code>	if len(bi[i].inline) &gt; 0 {</code></span>
+<span class="codeline" id="line-469"><code>		iIdx = bi[i].inline[0]</code></span>
+<span class="codeline" id="line-470"><code>	}</code></span>
+<span class="codeline" id="line-471"><code>	if len(bi[j].inline) &gt; 0 {</code></span>
+<span class="codeline" id="line-472"><code>		jIdx = bi[j].inline[0]</code></span>
+<span class="codeline" id="line-473"><code>	}</code></span>
+<span class="codeline" id="line-474"><code>	if iIdx != jIdx {</code></span>
+<span class="codeline" id="line-475"><code>		return iIdx &lt; jIdx</code></span>
+<span class="codeline" id="line-476"><code>	}</code></span>
+<span class="codeline" id="line-477"><code>	for k, biik := range bi[i].inline {</code></span>
+<span class="codeline" id="line-478"><code>		if k &gt;= len(bi[j].inline) {</code></span>
+<span class="codeline" id="line-479"><code>			return false</code></span>
+<span class="codeline" id="line-480"><code>		}</code></span>
+<span class="codeline" id="line-481"><code>		if biik != bi[j].inline[k] {</code></span>
+<span class="codeline" id="line-482"><code>			return biik &lt; bi[j].inline[k]</code></span>
+<span class="codeline" id="line-483"><code>		}</code></span>
+<span class="codeline" id="line-484"><code>	}</code></span>
+<span class="codeline" id="line-485"><code>	return len(bi[i].inline) &lt; len(bi[j].inline)</code></span>
+<span class="codeline" id="line-486"><code>}</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>func (sc *StructCodec) describeStruct(</code></span>
+<span class="codeline" id="line-489"><code>	r *Registry,</code></span>
+<span class="codeline" id="line-490"><code>	t reflect.Type,</code></span>
+<span class="codeline" id="line-491"><code>	useJSONStructTags bool,</code></span>
+<span class="codeline" id="line-492"><code>	errorOnDuplicates bool,</code></span>
+<span class="codeline" id="line-493"><code>) (*structDescription, error) {</code></span>
+<span class="codeline" id="line-494"><code>	// We need to analyze the struct, including getting the tags, collecting</code></span>
+<span class="codeline" id="line-495"><code>	// information about inlining, and create a map of the field name to the field.</code></span>
+<span class="codeline" id="line-496"><code>	if v, ok := sc.cache.Load(t); ok {</code></span>
+<span class="codeline" id="line-497"><code>		return v.(*structDescription), nil</code></span>
+<span class="codeline" id="line-498"><code>	}</code></span>
+<span class="codeline" id="line-499"><code>	// TODO(charlie): Only describe the struct once when called</code></span>
+<span class="codeline" id="line-500"><code>	// concurrently with the same type.</code></span>
+<span class="codeline" id="line-501"><code>	ds, err := sc.describeStructSlow(r, t, useJSONStructTags, errorOnDuplicates)</code></span>
+<span class="codeline" id="line-502"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-503"><code>		return nil, err</code></span>
+<span class="codeline" id="line-504"><code>	}</code></span>
+<span class="codeline" id="line-505"><code>	if v, loaded := sc.cache.LoadOrStore(t, ds); loaded {</code></span>
+<span class="codeline" id="line-506"><code>		ds = v.(*structDescription)</code></span>
+<span class="codeline" id="line-507"><code>	}</code></span>
+<span class="codeline" id="line-508"><code>	return ds, nil</code></span>
+<span class="codeline" id="line-509"><code>}</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>func (sc *StructCodec) describeStructSlow(</code></span>
+<span class="codeline" id="line-512"><code>	r *Registry,</code></span>
+<span class="codeline" id="line-513"><code>	t reflect.Type,</code></span>
+<span class="codeline" id="line-514"><code>	useJSONStructTags bool,</code></span>
+<span class="codeline" id="line-515"><code>	errorOnDuplicates bool,</code></span>
+<span class="codeline" id="line-516"><code>) (*structDescription, error) {</code></span>
+<span class="codeline" id="line-517"><code>	numFields := t.NumField()</code></span>
+<span class="codeline" id="line-518"><code>	sd := &amp;structDescription{</code></span>
+<span class="codeline" id="line-519"><code>		fm:        make(map[string]fieldDescription, numFields),</code></span>
+<span class="codeline" id="line-520"><code>		fl:        make([]fieldDescription, 0, numFields),</code></span>
+<span class="codeline" id="line-521"><code>		inlineMap: -1,</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>	var fields []fieldDescription</code></span>
+<span class="codeline" id="line-525"><code>	for i := 0; i &lt; numFields; i++ {</code></span>
+<span class="codeline" id="line-526"><code>		sf := t.Field(i)</code></span>
+<span class="codeline" id="line-527"><code>		if sf.PkgPath != "" &amp;&amp; (!sc.AllowUnexportedFields || !sf.Anonymous) {</code></span>
+<span class="codeline" id="line-528"><code>			// field is private or unexported fields aren't allowed, ignore</code></span>
+<span class="codeline" id="line-529"><code>			continue</code></span>
+<span class="codeline" id="line-530"><code>		}</code></span>
+<span class="codeline" id="line-531"><code></code></span>
+<span class="codeline" id="line-532"><code>		sfType := sf.Type</code></span>
+<span class="codeline" id="line-533"><code>		encoder, err := r.LookupEncoder(sfType)</code></span>
+<span class="codeline" id="line-534"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-535"><code>			encoder = nil</code></span>
+<span class="codeline" id="line-536"><code>		}</code></span>
+<span class="codeline" id="line-537"><code>		decoder, err := r.LookupDecoder(sfType)</code></span>
+<span class="codeline" id="line-538"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-539"><code>			decoder = nil</code></span>
+<span class="codeline" id="line-540"><code>		}</code></span>
+<span class="codeline" id="line-541"><code></code></span>
+<span class="codeline" id="line-542"><code>		description := fieldDescription{</code></span>
+<span class="codeline" id="line-543"><code>			fieldName: sf.Name,</code></span>
+<span class="codeline" id="line-544"><code>			idx:       i,</code></span>
+<span class="codeline" id="line-545"><code>			encoder:   encoder,</code></span>
+<span class="codeline" id="line-546"><code>			decoder:   decoder,</code></span>
+<span class="codeline" id="line-547"><code>		}</code></span>
+<span class="codeline" id="line-548"><code></code></span>
+<span class="codeline" id="line-549"><code>		var stags StructTags</code></span>
+<span class="codeline" id="line-550"><code>		// If the caller requested that we use JSON struct tags, use the JSONFallbackStructTagParser</code></span>
+<span class="codeline" id="line-551"><code>		// instead of the parser defined on the codec.</code></span>
+<span class="codeline" id="line-552"><code>		if useJSONStructTags {</code></span>
+<span class="codeline" id="line-553"><code>			stags, err = JSONFallbackStructTagParser.ParseStructTags(sf)</code></span>
+<span class="codeline" id="line-554"><code>		} else {</code></span>
+<span class="codeline" id="line-555"><code>			stags, err = sc.parser.ParseStructTags(sf)</code></span>
+<span class="codeline" id="line-556"><code>		}</code></span>
+<span class="codeline" id="line-557"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-558"><code>			return nil, err</code></span>
+<span class="codeline" id="line-559"><code>		}</code></span>
+<span class="codeline" id="line-560"><code>		if stags.Skip {</code></span>
+<span class="codeline" id="line-561"><code>			continue</code></span>
+<span class="codeline" id="line-562"><code>		}</code></span>
+<span class="codeline" id="line-563"><code>		description.name = stags.Name</code></span>
+<span class="codeline" id="line-564"><code>		description.omitEmpty = stags.OmitEmpty</code></span>
+<span class="codeline" id="line-565"><code>		description.minSize = stags.MinSize</code></span>
+<span class="codeline" id="line-566"><code>		description.truncate = stags.Truncate</code></span>
+<span class="codeline" id="line-567"><code></code></span>
+<span class="codeline" id="line-568"><code>		if stags.Inline {</code></span>
+<span class="codeline" id="line-569"><code>			sd.inline = true</code></span>
+<span class="codeline" id="line-570"><code>			switch sfType.Kind() {</code></span>
+<span class="codeline" id="line-571"><code>			case reflect.Map:</code></span>
+<span class="codeline" id="line-572"><code>				if sd.inlineMap &gt;= 0 {</code></span>
+<span class="codeline" id="line-573"><code>					return nil, errors.New("(struct " + t.String() + ") multiple inline maps")</code></span>
+<span class="codeline" id="line-574"><code>				}</code></span>
+<span class="codeline" id="line-575"><code>				if sfType.Key() != tString {</code></span>
+<span class="codeline" id="line-576"><code>					return nil, errors.New("(struct " + t.String() + ") inline map must have a string keys")</code></span>
+<span class="codeline" id="line-577"><code>				}</code></span>
+<span class="codeline" id="line-578"><code>				sd.inlineMap = description.idx</code></span>
+<span class="codeline" id="line-579"><code>			case reflect.Ptr:</code></span>
+<span class="codeline" id="line-580"><code>				sfType = sfType.Elem()</code></span>
+<span class="codeline" id="line-581"><code>				if sfType.Kind() != reflect.Struct {</code></span>
+<span class="codeline" id="line-582"><code>					return nil, fmt.Errorf("(struct %s) inline fields must be a struct, a struct pointer, or a map", t.String())</code></span>
+<span class="codeline" id="line-583"><code>				}</code></span>
+<span class="codeline" id="line-584"><code>				fallthrough</code></span>
+<span class="codeline" id="line-585"><code>			case reflect.Struct:</code></span>
+<span class="codeline" id="line-586"><code>				inlinesf, err := sc.describeStruct(r, sfType, useJSONStructTags, errorOnDuplicates)</code></span>
+<span class="codeline" id="line-587"><code>				if err != nil {</code></span>
+<span class="codeline" id="line-588"><code>					return nil, err</code></span>
+<span class="codeline" id="line-589"><code>				}</code></span>
+<span class="codeline" id="line-590"><code>				for _, fd := range inlinesf.fl {</code></span>
+<span class="codeline" id="line-591"><code>					if fd.inline == nil {</code></span>
+<span class="codeline" id="line-592"><code>						fd.inline = []int{i, fd.idx}</code></span>
+<span class="codeline" id="line-593"><code>					} else {</code></span>
+<span class="codeline" id="line-594"><code>						fd.inline = append([]int{i}, fd.inline...)</code></span>
+<span class="codeline" id="line-595"><code>					}</code></span>
+<span class="codeline" id="line-596"><code>					fields = append(fields, fd)</code></span>
+<span class="codeline" id="line-597"><code></code></span>
+<span class="codeline" id="line-598"><code>				}</code></span>
+<span class="codeline" id="line-599"><code>			default:</code></span>
+<span class="codeline" id="line-600"><code>				return nil, fmt.Errorf("(struct %s) inline fields must be a struct, a struct pointer, or a map", t.String())</code></span>
+<span class="codeline" id="line-601"><code>			}</code></span>
+<span class="codeline" id="line-602"><code>			continue</code></span>
+<span class="codeline" id="line-603"><code>		}</code></span>
+<span class="codeline" id="line-604"><code>		fields = append(fields, description)</code></span>
+<span class="codeline" id="line-605"><code>	}</code></span>
+<span class="codeline" id="line-606"><code></code></span>
+<span class="codeline" id="line-607"><code>	// Sort fieldDescriptions by name and use dominance rules to determine which should be added for each name</code></span>
+<span class="codeline" id="line-608"><code>	sort.Slice(fields, func(i, j int) bool {</code></span>
+<span class="codeline" id="line-609"><code>		x := fields</code></span>
+<span class="codeline" id="line-610"><code>		// sort field by name, breaking ties with depth, then</code></span>
+<span class="codeline" id="line-611"><code>		// breaking ties with index sequence.</code></span>
+<span class="codeline" id="line-612"><code>		if x[i].name != x[j].name {</code></span>
+<span class="codeline" id="line-613"><code>			return x[i].name &lt; x[j].name</code></span>
+<span class="codeline" id="line-614"><code>		}</code></span>
+<span class="codeline" id="line-615"><code>		if len(x[i].inline) != len(x[j].inline) {</code></span>
+<span class="codeline" id="line-616"><code>			return len(x[i].inline) &lt; len(x[j].inline)</code></span>
+<span class="codeline" id="line-617"><code>		}</code></span>
+<span class="codeline" id="line-618"><code>		return byIndex(x).Less(i, j)</code></span>
+<span class="codeline" id="line-619"><code>	})</code></span>
+<span class="codeline" id="line-620"><code></code></span>
+<span class="codeline" id="line-621"><code>	for advance, i := 0, 0; i &lt; len(fields); i += advance {</code></span>
+<span class="codeline" id="line-622"><code>		// One iteration per name.</code></span>
+<span class="codeline" id="line-623"><code>		// Find the sequence of fields with the name of this first field.</code></span>
+<span class="codeline" id="line-624"><code>		fi := fields[i]</code></span>
+<span class="codeline" id="line-625"><code>		name := fi.name</code></span>
+<span class="codeline" id="line-626"><code>		for advance = 1; i+advance &lt; len(fields); advance++ {</code></span>
+<span class="codeline" id="line-627"><code>			fj := fields[i+advance]</code></span>
+<span class="codeline" id="line-628"><code>			if fj.name != name {</code></span>
+<span class="codeline" id="line-629"><code>				break</code></span>
+<span class="codeline" id="line-630"><code>			}</code></span>
+<span class="codeline" id="line-631"><code>		}</code></span>
+<span class="codeline" id="line-632"><code>		if advance == 1 { // Only one field with this name</code></span>
+<span class="codeline" id="line-633"><code>			sd.fl = append(sd.fl, fi)</code></span>
+<span class="codeline" id="line-634"><code>			sd.fm[name] = fi</code></span>
+<span class="codeline" id="line-635"><code>			continue</code></span>
+<span class="codeline" id="line-636"><code>		}</code></span>
+<span class="codeline" id="line-637"><code>		dominant, ok := dominantField(fields[i : i+advance])</code></span>
+<span class="codeline" id="line-638"><code>		if !ok || !sc.OverwriteDuplicatedInlinedFields || errorOnDuplicates {</code></span>
+<span class="codeline" id="line-639"><code>			return nil, fmt.Errorf("struct %s has duplicated key %s", t.String(), name)</code></span>
+<span class="codeline" id="line-640"><code>		}</code></span>
+<span class="codeline" id="line-641"><code>		sd.fl = append(sd.fl, dominant)</code></span>
+<span class="codeline" id="line-642"><code>		sd.fm[name] = dominant</code></span>
+<span class="codeline" id="line-643"><code>	}</code></span>
+<span class="codeline" id="line-644"><code></code></span>
+<span class="codeline" id="line-645"><code>	sort.Sort(byIndex(sd.fl))</code></span>
+<span class="codeline" id="line-646"><code></code></span>
+<span class="codeline" id="line-647"><code>	return sd, nil</code></span>
+<span class="codeline" id="line-648"><code>}</code></span>
+<span class="codeline" id="line-649"><code></code></span>
+<span class="codeline" id="line-650"><code>// dominantField looks through the fields, all of which are known to</code></span>
+<span class="codeline" id="line-651"><code>// have the same name, to find the single field that dominates the</code></span>
+<span class="codeline" id="line-652"><code>// others using Go's inlining rules. If there are multiple top-level</code></span>
+<span class="codeline" id="line-653"><code>// fields, the boolean will be false: This condition is an error in Go</code></span>
+<span class="codeline" id="line-654"><code>// and we skip all the fields.</code></span>
+<span class="codeline" id="line-655"><code>func dominantField(fields []fieldDescription) (fieldDescription, bool) {</code></span>
+<span class="codeline" id="line-656"><code>	// The fields are sorted in increasing index-length order, then by presence of tag.</code></span>
+<span class="codeline" id="line-657"><code>	// That means that the first field is the dominant one. We need only check</code></span>
+<span class="codeline" id="line-658"><code>	// for error cases: two fields at top level.</code></span>
+<span class="codeline" id="line-659"><code>	if len(fields) &gt; 1 &amp;&amp;</code></span>
+<span class="codeline" id="line-660"><code>		len(fields[0].inline) == len(fields[1].inline) {</code></span>
+<span class="codeline" id="line-661"><code>		return fieldDescription{}, false</code></span>
+<span class="codeline" id="line-662"><code>	}</code></span>
+<span class="codeline" id="line-663"><code>	return fields[0], true</code></span>
+<span class="codeline" id="line-664"><code>}</code></span>
+<span class="codeline" id="line-665"><code></code></span>
+<span class="codeline" id="line-666"><code>func fieldByIndexErr(v reflect.Value, index []int) (result reflect.Value, err error) {</code></span>
+<span class="codeline" id="line-667"><code>	defer func() {</code></span>
+<span class="codeline" id="line-668"><code>		if recovered := recover(); recovered != nil {</code></span>
+<span class="codeline" id="line-669"><code>			switch r := recovered.(type) {</code></span>
+<span class="codeline" id="line-670"><code>			case string:</code></span>
+<span class="codeline" id="line-671"><code>				err = fmt.Errorf("%s", r)</code></span>
+<span class="codeline" id="line-672"><code>			case error:</code></span>
+<span class="codeline" id="line-673"><code>				err = r</code></span>
+<span class="codeline" id="line-674"><code>			}</code></span>
+<span class="codeline" id="line-675"><code>		}</code></span>
+<span class="codeline" id="line-676"><code>	}()</code></span>
+<span class="codeline" id="line-677"><code></code></span>
+<span class="codeline" id="line-678"><code>	result = v.FieldByIndex(index)</code></span>
+<span class="codeline" id="line-679"><code>	return</code></span>
+<span class="codeline" id="line-680"><code>}</code></span>
+<span class="codeline" id="line-681"><code></code></span>
+<span class="codeline" id="line-682"><code>func getInlineField(val reflect.Value, index []int) (reflect.Value, error) {</code></span>
+<span class="codeline" id="line-683"><code>	field, err := fieldByIndexErr(val, index)</code></span>
+<span class="codeline" id="line-684"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-685"><code>		return field, nil</code></span>
+<span class="codeline" id="line-686"><code>	}</code></span>
+<span class="codeline" id="line-687"><code></code></span>
+<span class="codeline" id="line-688"><code>	// if parent of this element doesn't exist, fix its parent</code></span>
+<span class="codeline" id="line-689"><code>	inlineParent := index[:len(index)-1]</code></span>
+<span class="codeline" id="line-690"><code>	var fParent reflect.Value</code></span>
+<span class="codeline" id="line-691"><code>	if fParent, err = fieldByIndexErr(val, inlineParent); err != nil {</code></span>
+<span class="codeline" id="line-692"><code>		fParent, err = getInlineField(val, inlineParent)</code></span>
+<span class="codeline" id="line-693"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-694"><code>			return fParent, err</code></span>
+<span class="codeline" id="line-695"><code>		}</code></span>
+<span class="codeline" id="line-696"><code>	}</code></span>
+<span class="codeline" id="line-697"><code>	fParent.Set(reflect.New(fParent.Type().Elem()))</code></span>
+<span class="codeline" id="line-698"><code></code></span>
+<span class="codeline" id="line-699"><code>	return fieldByIndexErr(val, index)</code></span>
+<span class="codeline" id="line-700"><code>}</code></span>
+<span class="codeline" id="line-701"><code></code></span>
+<span class="codeline" id="line-702"><code>// DeepZero returns recursive zero object</code></span>
+<span class="codeline" id="line-703"><code>func deepZero(st reflect.Type) (result reflect.Value) {</code></span>
+<span class="codeline" id="line-704"><code>	if st.Kind() == reflect.Struct {</code></span>
+<span class="codeline" id="line-705"><code>		numField := st.NumField()</code></span>
+<span class="codeline" id="line-706"><code>		for i := 0; i &lt; numField; i++ {</code></span>
+<span class="codeline" id="line-707"><code>			if result == emptyValue {</code></span>
+<span class="codeline" id="line-708"><code>				result = reflect.Indirect(reflect.New(st))</code></span>
+<span class="codeline" id="line-709"><code>			}</code></span>
+<span class="codeline" id="line-710"><code>			f := result.Field(i)</code></span>
+<span class="codeline" id="line-711"><code>			if f.CanInterface() {</code></span>
+<span class="codeline" id="line-712"><code>				if f.Type().Kind() == reflect.Struct {</code></span>
+<span class="codeline" id="line-713"><code>					result.Field(i).Set(recursivePointerTo(deepZero(f.Type().Elem())))</code></span>
+<span class="codeline" id="line-714"><code>				}</code></span>
+<span class="codeline" id="line-715"><code>			}</code></span>
+<span class="codeline" id="line-716"><code>		}</code></span>
+<span class="codeline" id="line-717"><code>	}</code></span>
+<span class="codeline" id="line-718"><code>	return result</code></span>
+<span class="codeline" id="line-719"><code>}</code></span>
+<span class="codeline" id="line-720"><code></code></span>
+<span class="codeline" id="line-721"><code>// recursivePointerTo calls reflect.New(v.Type) but recursively for its fields inside</code></span>
+<span class="codeline" id="line-722"><code>func recursivePointerTo(v reflect.Value) reflect.Value {</code></span>
+<span class="codeline" id="line-723"><code>	v = reflect.Indirect(v)</code></span>
+<span class="codeline" id="line-724"><code>	result := reflect.New(v.Type())</code></span>
+<span class="codeline" id="line-725"><code>	if v.Kind() == reflect.Struct {</code></span>
+<span class="codeline" id="line-726"><code>		for i := 0; i &lt; v.NumField(); i++ {</code></span>
+<span class="codeline" id="line-727"><code>			if f := v.Field(i); f.Kind() == reflect.Ptr {</code></span>
+<span class="codeline" id="line-728"><code>				if f.Elem().Kind() == reflect.Struct {</code></span>
+<span class="codeline" id="line-729"><code>					result.Elem().Field(i).Set(recursivePointerTo(f))</code></span>
+<span class="codeline" id="line-730"><code>				}</code></span>
+<span class="codeline" id="line-731"><code>			}</code></span>
+<span class="codeline" id="line-732"><code>		}</code></span>
+<span class="codeline" id="line-733"><code>	}</code></span>
+<span class="codeline" id="line-734"><code></code></span>
+<span class="codeline" id="line-735"><code>	return result</code></span>
+<span class="codeline" id="line-736"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,1267 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: runtime2.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	runtime2.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"internal/abi"</code></span>
+<span class="codeline" id="line-9"><code>	"internal/chacha8rand"</code></span>
+<span class="codeline" id="line-10"><code>	"internal/goarch"</code></span>
+<span class="codeline" id="line-11"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-12"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-13"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-14"><code>)</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>// defined constants</code></span>
+<span class="codeline" id="line-17"><code>const (</code></span>
+<span class="codeline" id="line-18"><code>	// G status</code></span>
+<span class="codeline" id="line-19"><code>	//</code></span>
+<span class="codeline" id="line-20"><code>	// Beyond indicating the general state of a G, the G status</code></span>
+<span class="codeline" id="line-21"><code>	// acts like a lock on the goroutine's stack (and hence its</code></span>
+<span class="codeline" id="line-22"><code>	// ability to execute user code).</code></span>
+<span class="codeline" id="line-23"><code>	//</code></span>
+<span class="codeline" id="line-24"><code>	// If you add to this list, add to the list</code></span>
+<span class="codeline" id="line-25"><code>	// of "okay during garbage collection" status</code></span>
+<span class="codeline" id="line-26"><code>	// in mgcmark.go too.</code></span>
+<span class="codeline" id="line-27"><code>	//</code></span>
+<span class="codeline" id="line-28"><code>	// TODO(austin): The _Gscan bit could be much lighter-weight.</code></span>
+<span class="codeline" id="line-29"><code>	// For example, we could choose not to run _Gscanrunnable</code></span>
+<span class="codeline" id="line-30"><code>	// goroutines found in the run queue, rather than CAS-looping</code></span>
+<span class="codeline" id="line-31"><code>	// until they become _Grunnable. And transitions like</code></span>
+<span class="codeline" id="line-32"><code>	// _Gscanwaiting -&gt; _Gscanrunnable are actually okay because</code></span>
+<span class="codeline" id="line-33"><code>	// they don't affect stack ownership.</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>	// _Gidle means this goroutine was just allocated and has not</code></span>
+<span class="codeline" id="line-36"><code>	// yet been initialized.</code></span>
+<span class="codeline" id="line-37"><code>	_Gidle = iota // 0</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>	// _Grunnable means this goroutine is on a run queue. It is</code></span>
+<span class="codeline" id="line-40"><code>	// not currently executing user code. The stack is not owned.</code></span>
+<span class="codeline" id="line-41"><code>	_Grunnable // 1</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>	// _Grunning means this goroutine may execute user code. The</code></span>
+<span class="codeline" id="line-44"><code>	// stack is owned by this goroutine. It is not on a run queue.</code></span>
+<span class="codeline" id="line-45"><code>	// It is assigned an M and a P (g.m and g.m.p are valid).</code></span>
+<span class="codeline" id="line-46"><code>	_Grunning // 2</code></span>
+<span class="codeline" id="line-47"><code></code></span>
+<span class="codeline" id="line-48"><code>	// _Gsyscall means this goroutine is executing a system call.</code></span>
+<span class="codeline" id="line-49"><code>	// It is not executing user code. The stack is owned by this</code></span>
+<span class="codeline" id="line-50"><code>	// goroutine. It is not on a run queue. It is assigned an M.</code></span>
+<span class="codeline" id="line-51"><code>	_Gsyscall // 3</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>	// _Gwaiting means this goroutine is blocked in the runtime.</code></span>
+<span class="codeline" id="line-54"><code>	// It is not executing user code. It is not on a run queue,</code></span>
+<span class="codeline" id="line-55"><code>	// but should be recorded somewhere (e.g., a channel wait</code></span>
+<span class="codeline" id="line-56"><code>	// queue) so it can be ready()d when necessary. The stack is</code></span>
+<span class="codeline" id="line-57"><code>	// not owned *except* that a channel operation may read or</code></span>
+<span class="codeline" id="line-58"><code>	// write parts of the stack under the appropriate channel</code></span>
+<span class="codeline" id="line-59"><code>	// lock. Otherwise, it is not safe to access the stack after a</code></span>
+<span class="codeline" id="line-60"><code>	// goroutine enters _Gwaiting (e.g., it may get moved).</code></span>
+<span class="codeline" id="line-61"><code>	_Gwaiting // 4</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>	// _Gmoribund_unused is currently unused, but hardcoded in gdb</code></span>
+<span class="codeline" id="line-64"><code>	// scripts.</code></span>
+<span class="codeline" id="line-65"><code>	_Gmoribund_unused // 5</code></span>
+<span class="codeline" id="line-66"><code></code></span>
+<span class="codeline" id="line-67"><code>	// _Gdead means this goroutine is currently unused. It may be</code></span>
+<span class="codeline" id="line-68"><code>	// just exited, on a free list, or just being initialized. It</code></span>
+<span class="codeline" id="line-69"><code>	// is not executing user code. It may or may not have a stack</code></span>
+<span class="codeline" id="line-70"><code>	// allocated. The G and its stack (if any) are owned by the M</code></span>
+<span class="codeline" id="line-71"><code>	// that is exiting the G or that obtained the G from the free</code></span>
+<span class="codeline" id="line-72"><code>	// list.</code></span>
+<span class="codeline" id="line-73"><code>	_Gdead // 6</code></span>
+<span class="codeline" id="line-74"><code></code></span>
+<span class="codeline" id="line-75"><code>	// _Genqueue_unused is currently unused.</code></span>
+<span class="codeline" id="line-76"><code>	_Genqueue_unused // 7</code></span>
+<span class="codeline" id="line-77"><code></code></span>
+<span class="codeline" id="line-78"><code>	// _Gcopystack means this goroutine's stack is being moved. It</code></span>
+<span class="codeline" id="line-79"><code>	// is not executing user code and is not on a run queue. The</code></span>
+<span class="codeline" id="line-80"><code>	// stack is owned by the goroutine that put it in _Gcopystack.</code></span>
+<span class="codeline" id="line-81"><code>	_Gcopystack // 8</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	// _Gpreempted means this goroutine stopped itself for a</code></span>
+<span class="codeline" id="line-84"><code>	// suspendG preemption. It is like _Gwaiting, but nothing is</code></span>
+<span class="codeline" id="line-85"><code>	// yet responsible for ready()ing it. Some suspendG must CAS</code></span>
+<span class="codeline" id="line-86"><code>	// the status to _Gwaiting to take responsibility for</code></span>
+<span class="codeline" id="line-87"><code>	// ready()ing this G.</code></span>
+<span class="codeline" id="line-88"><code>	_Gpreempted // 9</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>	// _Gscan combined with one of the above states other than</code></span>
+<span class="codeline" id="line-91"><code>	// _Grunning indicates that GC is scanning the stack. The</code></span>
+<span class="codeline" id="line-92"><code>	// goroutine is not executing user code and the stack is owned</code></span>
+<span class="codeline" id="line-93"><code>	// by the goroutine that set the _Gscan bit.</code></span>
+<span class="codeline" id="line-94"><code>	//</code></span>
+<span class="codeline" id="line-95"><code>	// _Gscanrunning is different: it is used to briefly block</code></span>
+<span class="codeline" id="line-96"><code>	// state transitions while GC signals the G to scan its own</code></span>
+<span class="codeline" id="line-97"><code>	// stack. This is otherwise like _Grunning.</code></span>
+<span class="codeline" id="line-98"><code>	//</code></span>
+<span class="codeline" id="line-99"><code>	// atomicstatus&amp;~Gscan gives the state the goroutine will</code></span>
+<span class="codeline" id="line-100"><code>	// return to when the scan completes.</code></span>
+<span class="codeline" id="line-101"><code>	_Gscan          = 0x1000</code></span>
+<span class="codeline" id="line-102"><code>	_Gscanrunnable  = _Gscan + _Grunnable  // 0x1001</code></span>
+<span class="codeline" id="line-103"><code>	_Gscanrunning   = _Gscan + _Grunning   // 0x1002</code></span>
+<span class="codeline" id="line-104"><code>	_Gscansyscall   = _Gscan + _Gsyscall   // 0x1003</code></span>
+<span class="codeline" id="line-105"><code>	_Gscanwaiting   = _Gscan + _Gwaiting   // 0x1004</code></span>
+<span class="codeline" id="line-106"><code>	_Gscanpreempted = _Gscan + _Gpreempted // 0x1009</code></span>
+<span class="codeline" id="line-107"><code>)</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>const (</code></span>
+<span class="codeline" id="line-110"><code>	// P status</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	// _Pidle means a P is not being used to run user code or the</code></span>
+<span class="codeline" id="line-113"><code>	// scheduler. Typically, it's on the idle P list and available</code></span>
+<span class="codeline" id="line-114"><code>	// to the scheduler, but it may just be transitioning between</code></span>
+<span class="codeline" id="line-115"><code>	// other states.</code></span>
+<span class="codeline" id="line-116"><code>	//</code></span>
+<span class="codeline" id="line-117"><code>	// The P is owned by the idle list or by whatever is</code></span>
+<span class="codeline" id="line-118"><code>	// transitioning its state. Its run queue is empty.</code></span>
+<span class="codeline" id="line-119"><code>	_Pidle = iota</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>	// _Prunning means a P is owned by an M and is being used to</code></span>
+<span class="codeline" id="line-122"><code>	// run user code or the scheduler. Only the M that owns this P</code></span>
+<span class="codeline" id="line-123"><code>	// is allowed to change the P's status from _Prunning. The M</code></span>
+<span class="codeline" id="line-124"><code>	// may transition the P to _Pidle (if it has no more work to</code></span>
+<span class="codeline" id="line-125"><code>	// do), _Psyscall (when entering a syscall), or _Pgcstop (to</code></span>
+<span class="codeline" id="line-126"><code>	// halt for the GC). The M may also hand ownership of the P</code></span>
+<span class="codeline" id="line-127"><code>	// off directly to another M (e.g., to schedule a locked G).</code></span>
+<span class="codeline" id="line-128"><code>	_Prunning</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>	// _Psyscall means a P is not running user code. It has</code></span>
+<span class="codeline" id="line-131"><code>	// affinity to an M in a syscall but is not owned by it and</code></span>
+<span class="codeline" id="line-132"><code>	// may be stolen by another M. This is similar to _Pidle but</code></span>
+<span class="codeline" id="line-133"><code>	// uses lightweight transitions and maintains M affinity.</code></span>
+<span class="codeline" id="line-134"><code>	//</code></span>
+<span class="codeline" id="line-135"><code>	// Leaving _Psyscall must be done with a CAS, either to steal</code></span>
+<span class="codeline" id="line-136"><code>	// or retake the P. Note that there's an ABA hazard: even if</code></span>
+<span class="codeline" id="line-137"><code>	// an M successfully CASes its original P back to _Prunning</code></span>
+<span class="codeline" id="line-138"><code>	// after a syscall, it must understand the P may have been</code></span>
+<span class="codeline" id="line-139"><code>	// used by another M in the interim.</code></span>
+<span class="codeline" id="line-140"><code>	_Psyscall</code></span>
+<span class="codeline" id="line-141"><code></code></span>
+<span class="codeline" id="line-142"><code>	// _Pgcstop means a P is halted for STW and owned by the M</code></span>
+<span class="codeline" id="line-143"><code>	// that stopped the world. The M that stopped the world</code></span>
+<span class="codeline" id="line-144"><code>	// continues to use its P, even in _Pgcstop. Transitioning</code></span>
+<span class="codeline" id="line-145"><code>	// from _Prunning to _Pgcstop causes an M to release its P and</code></span>
+<span class="codeline" id="line-146"><code>	// park.</code></span>
+<span class="codeline" id="line-147"><code>	//</code></span>
+<span class="codeline" id="line-148"><code>	// The P retains its run queue and startTheWorld will restart</code></span>
+<span class="codeline" id="line-149"><code>	// the scheduler on Ps with non-empty run queues.</code></span>
+<span class="codeline" id="line-150"><code>	_Pgcstop</code></span>
+<span class="codeline" id="line-151"><code></code></span>
+<span class="codeline" id="line-152"><code>	// _Pdead means a P is no longer used (GOMAXPROCS shrank). We</code></span>
+<span class="codeline" id="line-153"><code>	// reuse Ps if GOMAXPROCS increases. A dead P is mostly</code></span>
+<span class="codeline" id="line-154"><code>	// stripped of its resources, though a few things remain</code></span>
+<span class="codeline" id="line-155"><code>	// (e.g., trace buffers).</code></span>
+<span class="codeline" id="line-156"><code>	_Pdead</code></span>
+<span class="codeline" id="line-157"><code>)</code></span>
+<span class="codeline" id="line-158"><code></code></span>
+<span class="codeline" id="line-159"><code>// Mutual exclusion locks.  In the uncontended case,</code></span>
+<span class="codeline" id="line-160"><code>// as fast as spin locks (just a few user-level instructions),</code></span>
+<span class="codeline" id="line-161"><code>// but on the contention path they sleep in the kernel.</code></span>
+<span class="codeline" id="line-162"><code>// A zeroed Mutex is unlocked (no need to initialize each lock).</code></span>
+<span class="codeline" id="line-163"><code>// Initialization is helpful for static lock ranking, but not required.</code></span>
+<span class="codeline" id="line-164"><code>type mutex struct {</code></span>
+<span class="codeline" id="line-165"><code>	// Empty struct if lock ranking is disabled, otherwise includes the lock rank</code></span>
+<span class="codeline" id="line-166"><code>	lockRankStruct</code></span>
+<span class="codeline" id="line-167"><code>	// Futex-based impl treats it as uint32 key,</code></span>
+<span class="codeline" id="line-168"><code>	// while sema-based impl as M* waitm.</code></span>
+<span class="codeline" id="line-169"><code>	// Used to be a union, but unions break precise GC.</code></span>
+<span class="codeline" id="line-170"><code>	key uintptr</code></span>
+<span class="codeline" id="line-171"><code>}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>// sleep and wakeup on one-time events.</code></span>
+<span class="codeline" id="line-174"><code>// before any calls to notesleep or notewakeup,</code></span>
+<span class="codeline" id="line-175"><code>// must call noteclear to initialize the Note.</code></span>
+<span class="codeline" id="line-176"><code>// then, exactly one thread can call notesleep</code></span>
+<span class="codeline" id="line-177"><code>// and exactly one thread can call notewakeup (once).</code></span>
+<span class="codeline" id="line-178"><code>// once notewakeup has been called, the notesleep</code></span>
+<span class="codeline" id="line-179"><code>// will return.  future notesleep will return immediately.</code></span>
+<span class="codeline" id="line-180"><code>// subsequent noteclear must be called only after</code></span>
+<span class="codeline" id="line-181"><code>// previous notesleep has returned, e.g. it's disallowed</code></span>
+<span class="codeline" id="line-182"><code>// to call noteclear straight after notewakeup.</code></span>
+<span class="codeline" id="line-183"><code>//</code></span>
+<span class="codeline" id="line-184"><code>// notetsleep is like notesleep but wakes up after</code></span>
+<span class="codeline" id="line-185"><code>// a given number of nanoseconds even if the event</code></span>
+<span class="codeline" id="line-186"><code>// has not yet happened.  if a goroutine uses notetsleep to</code></span>
+<span class="codeline" id="line-187"><code>// wake up early, it must wait to call noteclear until it</code></span>
+<span class="codeline" id="line-188"><code>// can be sure that no other goroutine is calling</code></span>
+<span class="codeline" id="line-189"><code>// notewakeup.</code></span>
+<span class="codeline" id="line-190"><code>//</code></span>
+<span class="codeline" id="line-191"><code>// notesleep/notetsleep are generally called on g0,</code></span>
+<span class="codeline" id="line-192"><code>// notetsleepg is similar to notetsleep but is called on user g.</code></span>
+<span class="codeline" id="line-193"><code>type note struct {</code></span>
+<span class="codeline" id="line-194"><code>	// Futex-based impl treats it as uint32 key,</code></span>
+<span class="codeline" id="line-195"><code>	// while sema-based impl as M* waitm.</code></span>
+<span class="codeline" id="line-196"><code>	// Used to be a union, but unions break precise GC.</code></span>
+<span class="codeline" id="line-197"><code>	key uintptr</code></span>
+<span class="codeline" id="line-198"><code>}</code></span>
+<span class="codeline" id="line-199"><code></code></span>
+<span class="codeline" id="line-200"><code>type funcval struct {</code></span>
+<span class="codeline" id="line-201"><code>	fn uintptr</code></span>
+<span class="codeline" id="line-202"><code>	// variable-size, fn-specific data here</code></span>
+<span class="codeline" id="line-203"><code>}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>type iface struct {</code></span>
+<span class="codeline" id="line-206"><code>	tab  *itab</code></span>
+<span class="codeline" id="line-207"><code>	data unsafe.Pointer</code></span>
+<span class="codeline" id="line-208"><code>}</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>type eface struct {</code></span>
+<span class="codeline" id="line-211"><code>	_type *_type</code></span>
+<span class="codeline" id="line-212"><code>	data  unsafe.Pointer</code></span>
+<span class="codeline" id="line-213"><code>}</code></span>
+<span class="codeline" id="line-214"><code></code></span>
+<span class="codeline" id="line-215"><code>func efaceOf(ep *any) *eface {</code></span>
+<span class="codeline" id="line-216"><code>	return (*eface)(unsafe.Pointer(ep))</code></span>
+<span class="codeline" id="line-217"><code>}</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>// The guintptr, muintptr, and puintptr are all used to bypass write barriers.</code></span>
+<span class="codeline" id="line-220"><code>// It is particularly important to avoid write barriers when the current P has</code></span>
+<span class="codeline" id="line-221"><code>// been released, because the GC thinks the world is stopped, and an</code></span>
+<span class="codeline" id="line-222"><code>// unexpected write barrier would not be synchronized with the GC,</code></span>
+<span class="codeline" id="line-223"><code>// which can lead to a half-executed write barrier that has marked the object</code></span>
+<span class="codeline" id="line-224"><code>// but not queued it. If the GC skips the object and completes before the</code></span>
+<span class="codeline" id="line-225"><code>// queuing can occur, it will incorrectly free the object.</code></span>
+<span class="codeline" id="line-226"><code>//</code></span>
+<span class="codeline" id="line-227"><code>// We tried using special assignment functions invoked only when not</code></span>
+<span class="codeline" id="line-228"><code>// holding a running P, but then some updates to a particular memory</code></span>
+<span class="codeline" id="line-229"><code>// word went through write barriers and some did not. This breaks the</code></span>
+<span class="codeline" id="line-230"><code>// write barrier shadow checking mode, and it is also scary: better to have</code></span>
+<span class="codeline" id="line-231"><code>// a word that is completely ignored by the GC than to have one for which</code></span>
+<span class="codeline" id="line-232"><code>// only a few updates are ignored.</code></span>
+<span class="codeline" id="line-233"><code>//</code></span>
+<span class="codeline" id="line-234"><code>// Gs and Ps are always reachable via true pointers in the</code></span>
+<span class="codeline" id="line-235"><code>// allgs and allp lists or (during allocation before they reach those lists)</code></span>
+<span class="codeline" id="line-236"><code>// from stack variables.</code></span>
+<span class="codeline" id="line-237"><code>//</code></span>
+<span class="codeline" id="line-238"><code>// Ms are always reachable via true pointers either from allm or</code></span>
+<span class="codeline" id="line-239"><code>// freem. Unlike Gs and Ps we do free Ms, so it's important that</code></span>
+<span class="codeline" id="line-240"><code>// nothing ever hold an muintptr across a safe point.</code></span>
+<span class="codeline" id="line-241"><code></code></span>
+<span class="codeline" id="line-242"><code>// A guintptr holds a goroutine pointer, but typed as a uintptr</code></span>
+<span class="codeline" id="line-243"><code>// to bypass write barriers. It is used in the Gobuf goroutine state</code></span>
+<span class="codeline" id="line-244"><code>// and in scheduling lists that are manipulated without a P.</code></span>
+<span class="codeline" id="line-245"><code>//</code></span>
+<span class="codeline" id="line-246"><code>// The Gobuf.g goroutine pointer is almost always updated by assembly code.</code></span>
+<span class="codeline" id="line-247"><code>// In one of the few places it is updated by Go code - func save - it must be</code></span>
+<span class="codeline" id="line-248"><code>// treated as a uintptr to avoid a write barrier being emitted at a bad time.</code></span>
+<span class="codeline" id="line-249"><code>// Instead of figuring out how to emit the write barriers missing in the</code></span>
+<span class="codeline" id="line-250"><code>// assembly manipulation, we change the type of the field to uintptr,</code></span>
+<span class="codeline" id="line-251"><code>// so that it does not require write barriers at all.</code></span>
+<span class="codeline" id="line-252"><code>//</code></span>
+<span class="codeline" id="line-253"><code>// Goroutine structs are published in the allg list and never freed.</code></span>
+<span class="codeline" id="line-254"><code>// That will keep the goroutine structs from being collected.</code></span>
+<span class="codeline" id="line-255"><code>// There is never a time that Gobuf.g's contain the only references</code></span>
+<span class="codeline" id="line-256"><code>// to a goroutine: the publishing of the goroutine in allg comes first.</code></span>
+<span class="codeline" id="line-257"><code>// Goroutine pointers are also kept in non-GC-visible places like TLS,</code></span>
+<span class="codeline" id="line-258"><code>// so I can't see them ever moving. If we did want to start moving data</code></span>
+<span class="codeline" id="line-259"><code>// in the GC, we'd need to allocate the goroutine structs from an</code></span>
+<span class="codeline" id="line-260"><code>// alternate arena. Using guintptr doesn't make that problem any worse.</code></span>
+<span class="codeline" id="line-261"><code>// Note that pollDesc.rg, pollDesc.wg also store g in uintptr form,</code></span>
+<span class="codeline" id="line-262"><code>// so they would need to be updated too if g's start moving.</code></span>
+<span class="codeline" id="line-263"><code>type guintptr uintptr</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-266"><code>func (gp guintptr) ptr() *g { return (*g)(unsafe.Pointer(gp)) }</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-269"><code>func (gp *guintptr) set(g *g) { *gp = guintptr(unsafe.Pointer(g)) }</code></span>
+<span class="codeline" id="line-270"><code></code></span>
+<span class="codeline" id="line-271"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-272"><code>func (gp *guintptr) cas(old, new guintptr) bool {</code></span>
+<span class="codeline" id="line-273"><code>	return atomic.Casuintptr((*uintptr)(unsafe.Pointer(gp)), uintptr(old), uintptr(new))</code></span>
+<span class="codeline" id="line-274"><code>}</code></span>
+<span class="codeline" id="line-275"><code></code></span>
+<span class="codeline" id="line-276"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-277"><code>func (gp *g) guintptr() guintptr {</code></span>
+<span class="codeline" id="line-278"><code>	return guintptr(unsafe.Pointer(gp))</code></span>
+<span class="codeline" id="line-279"><code>}</code></span>
+<span class="codeline" id="line-280"><code></code></span>
+<span class="codeline" id="line-281"><code>// setGNoWB performs *gp = new without a write barrier.</code></span>
+<span class="codeline" id="line-282"><code>// For times when it's impractical to use a guintptr.</code></span>
+<span class="codeline" id="line-283"><code>//</code></span>
+<span class="codeline" id="line-284"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-285"><code>//go:nowritebarrier</code></span>
+<span class="codeline" id="line-286"><code>func setGNoWB(gp **g, new *g) {</code></span>
+<span class="codeline" id="line-287"><code>	(*guintptr)(unsafe.Pointer(gp)).set(new)</code></span>
+<span class="codeline" id="line-288"><code>}</code></span>
+<span class="codeline" id="line-289"><code></code></span>
+<span class="codeline" id="line-290"><code>type puintptr uintptr</code></span>
+<span class="codeline" id="line-291"><code></code></span>
+<span class="codeline" id="line-292"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-293"><code>func (pp puintptr) ptr() *p { return (*p)(unsafe.Pointer(pp)) }</code></span>
+<span class="codeline" id="line-294"><code></code></span>
+<span class="codeline" id="line-295"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-296"><code>func (pp *puintptr) set(p *p) { *pp = puintptr(unsafe.Pointer(p)) }</code></span>
+<span class="codeline" id="line-297"><code></code></span>
+<span class="codeline" id="line-298"><code>// muintptr is a *m that is not tracked by the garbage collector.</code></span>
+<span class="codeline" id="line-299"><code>//</code></span>
+<span class="codeline" id="line-300"><code>// Because we do free Ms, there are some additional constrains on</code></span>
+<span class="codeline" id="line-301"><code>// muintptrs:</code></span>
+<span class="codeline" id="line-302"><code>//</code></span>
+<span class="codeline" id="line-303"><code>//  1. Never hold an muintptr locally across a safe point.</code></span>
+<span class="codeline" id="line-304"><code>//</code></span>
+<span class="codeline" id="line-305"><code>//  2. Any muintptr in the heap must be owned by the M itself so it can</code></span>
+<span class="codeline" id="line-306"><code>//     ensure it is not in use when the last true *m is released.</code></span>
+<span class="codeline" id="line-307"><code>type muintptr uintptr</code></span>
+<span class="codeline" id="line-308"><code></code></span>
+<span class="codeline" id="line-309"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-310"><code>func (mp muintptr) ptr() *m { return (*m)(unsafe.Pointer(mp)) }</code></span>
+<span class="codeline" id="line-311"><code></code></span>
+<span class="codeline" id="line-312"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-313"><code>func (mp *muintptr) set(m *m) { *mp = muintptr(unsafe.Pointer(m)) }</code></span>
+<span class="codeline" id="line-314"><code></code></span>
+<span class="codeline" id="line-315"><code>// setMNoWB performs *mp = new without a write barrier.</code></span>
+<span class="codeline" id="line-316"><code>// For times when it's impractical to use an muintptr.</code></span>
+<span class="codeline" id="line-317"><code>//</code></span>
+<span class="codeline" id="line-318"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-319"><code>//go:nowritebarrier</code></span>
+<span class="codeline" id="line-320"><code>func setMNoWB(mp **m, new *m) {</code></span>
+<span class="codeline" id="line-321"><code>	(*muintptr)(unsafe.Pointer(mp)).set(new)</code></span>
+<span class="codeline" id="line-322"><code>}</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>type gobuf struct {</code></span>
+<span class="codeline" id="line-325"><code>	// The offsets of sp, pc, and g are known to (hard-coded in) libmach.</code></span>
+<span class="codeline" id="line-326"><code>	//</code></span>
+<span class="codeline" id="line-327"><code>	// ctxt is unusual with respect to GC: it may be a</code></span>
+<span class="codeline" id="line-328"><code>	// heap-allocated funcval, so GC needs to track it, but it</code></span>
+<span class="codeline" id="line-329"><code>	// needs to be set and cleared from assembly, where it's</code></span>
+<span class="codeline" id="line-330"><code>	// difficult to have write barriers. However, ctxt is really a</code></span>
+<span class="codeline" id="line-331"><code>	// saved, live register, and we only ever exchange it between</code></span>
+<span class="codeline" id="line-332"><code>	// the real register and the gobuf. Hence, we treat it as a</code></span>
+<span class="codeline" id="line-333"><code>	// root during stack scanning, which means assembly that saves</code></span>
+<span class="codeline" id="line-334"><code>	// and restores it doesn't need write barriers. It's still</code></span>
+<span class="codeline" id="line-335"><code>	// typed as a pointer so that any other writes from Go get</code></span>
+<span class="codeline" id="line-336"><code>	// write barriers.</code></span>
+<span class="codeline" id="line-337"><code>	sp   uintptr</code></span>
+<span class="codeline" id="line-338"><code>	pc   uintptr</code></span>
+<span class="codeline" id="line-339"><code>	g    guintptr</code></span>
+<span class="codeline" id="line-340"><code>	ctxt unsafe.Pointer</code></span>
+<span class="codeline" id="line-341"><code>	ret  uintptr</code></span>
+<span class="codeline" id="line-342"><code>	lr   uintptr</code></span>
+<span class="codeline" id="line-343"><code>	bp   uintptr // for framepointer-enabled architectures</code></span>
+<span class="codeline" id="line-344"><code>}</code></span>
+<span class="codeline" id="line-345"><code></code></span>
+<span class="codeline" id="line-346"><code>// sudog (pseudo-g) represents a g in a wait list, such as for sending/receiving</code></span>
+<span class="codeline" id="line-347"><code>// on a channel.</code></span>
+<span class="codeline" id="line-348"><code>//</code></span>
+<span class="codeline" id="line-349"><code>// sudog is necessary because the g ↔ synchronization object relation</code></span>
+<span class="codeline" id="line-350"><code>// is many-to-many. A g can be on many wait lists, so there may be</code></span>
+<span class="codeline" id="line-351"><code>// many sudogs for one g; and many gs may be waiting on the same</code></span>
+<span class="codeline" id="line-352"><code>// synchronization object, so there may be many sudogs for one object.</code></span>
+<span class="codeline" id="line-353"><code>//</code></span>
+<span class="codeline" id="line-354"><code>// sudogs are allocated from a special pool. Use acquireSudog and</code></span>
+<span class="codeline" id="line-355"><code>// releaseSudog to allocate and free them.</code></span>
+<span class="codeline" id="line-356"><code>type sudog struct {</code></span>
+<span class="codeline" id="line-357"><code>	// The following fields are protected by the hchan.lock of the</code></span>
+<span class="codeline" id="line-358"><code>	// channel this sudog is blocking on. shrinkstack depends on</code></span>
+<span class="codeline" id="line-359"><code>	// this for sudogs involved in channel ops.</code></span>
+<span class="codeline" id="line-360"><code></code></span>
+<span class="codeline" id="line-361"><code>	g *g</code></span>
+<span class="codeline" id="line-362"><code></code></span>
+<span class="codeline" id="line-363"><code>	next *sudog</code></span>
+<span class="codeline" id="line-364"><code>	prev *sudog</code></span>
+<span class="codeline" id="line-365"><code>	elem unsafe.Pointer // data element (may point to stack)</code></span>
+<span class="codeline" id="line-366"><code></code></span>
+<span class="codeline" id="line-367"><code>	// The following fields are never accessed concurrently.</code></span>
+<span class="codeline" id="line-368"><code>	// For channels, waitlink is only accessed by g.</code></span>
+<span class="codeline" id="line-369"><code>	// For semaphores, all fields (including the ones above)</code></span>
+<span class="codeline" id="line-370"><code>	// are only accessed when holding a semaRoot lock.</code></span>
+<span class="codeline" id="line-371"><code></code></span>
+<span class="codeline" id="line-372"><code>	acquiretime int64</code></span>
+<span class="codeline" id="line-373"><code>	releasetime int64</code></span>
+<span class="codeline" id="line-374"><code>	ticket      uint32</code></span>
+<span class="codeline" id="line-375"><code></code></span>
+<span class="codeline" id="line-376"><code>	// isSelect indicates g is participating in a select, so</code></span>
+<span class="codeline" id="line-377"><code>	// g.selectDone must be CAS'd to win the wake-up race.</code></span>
+<span class="codeline" id="line-378"><code>	isSelect bool</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>	// success indicates whether communication over channel c</code></span>
+<span class="codeline" id="line-381"><code>	// succeeded. It is true if the goroutine was awoken because a</code></span>
+<span class="codeline" id="line-382"><code>	// value was delivered over channel c, and false if awoken</code></span>
+<span class="codeline" id="line-383"><code>	// because c was closed.</code></span>
+<span class="codeline" id="line-384"><code>	success bool</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>	// waiters is a count of semaRoot waiting list other than head of list,</code></span>
+<span class="codeline" id="line-387"><code>	// clamped to a uint16 to fit in unused space.</code></span>
+<span class="codeline" id="line-388"><code>	// Only meaningful at the head of the list.</code></span>
+<span class="codeline" id="line-389"><code>	// (If we wanted to be overly clever, we could store a high 16 bits</code></span>
+<span class="codeline" id="line-390"><code>	// in the second entry in the list.)</code></span>
+<span class="codeline" id="line-391"><code>	waiters uint16</code></span>
+<span class="codeline" id="line-392"><code></code></span>
+<span class="codeline" id="line-393"><code>	parent   *sudog // semaRoot binary tree</code></span>
+<span class="codeline" id="line-394"><code>	waitlink *sudog // g.waiting list or semaRoot</code></span>
+<span class="codeline" id="line-395"><code>	waittail *sudog // semaRoot</code></span>
+<span class="codeline" id="line-396"><code>	c        *hchan // channel</code></span>
+<span class="codeline" id="line-397"><code>}</code></span>
+<span class="codeline" id="line-398"><code></code></span>
+<span class="codeline" id="line-399"><code>type libcall struct {</code></span>
+<span class="codeline" id="line-400"><code>	fn   uintptr</code></span>
+<span class="codeline" id="line-401"><code>	n    uintptr // number of parameters</code></span>
+<span class="codeline" id="line-402"><code>	args uintptr // parameters</code></span>
+<span class="codeline" id="line-403"><code>	r1   uintptr // return values</code></span>
+<span class="codeline" id="line-404"><code>	r2   uintptr</code></span>
+<span class="codeline" id="line-405"><code>	err  uintptr // error number</code></span>
+<span class="codeline" id="line-406"><code>}</code></span>
+<span class="codeline" id="line-407"><code></code></span>
+<span class="codeline" id="line-408"><code>// Stack describes a Go execution stack.</code></span>
+<span class="codeline" id="line-409"><code>// The bounds of the stack are exactly [lo, hi),</code></span>
+<span class="codeline" id="line-410"><code>// with no implicit data structures on either side.</code></span>
+<span class="codeline" id="line-411"><code>type stack struct {</code></span>
+<span class="codeline" id="line-412"><code>	lo uintptr</code></span>
+<span class="codeline" id="line-413"><code>	hi uintptr</code></span>
+<span class="codeline" id="line-414"><code>}</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>// heldLockInfo gives info on a held lock and the rank of that lock</code></span>
+<span class="codeline" id="line-417"><code>type heldLockInfo struct {</code></span>
+<span class="codeline" id="line-418"><code>	lockAddr uintptr</code></span>
+<span class="codeline" id="line-419"><code>	rank     lockRank</code></span>
+<span class="codeline" id="line-420"><code>}</code></span>
+<span class="codeline" id="line-421"><code></code></span>
+<span class="codeline" id="line-422"><code>type g struct {</code></span>
+<span class="codeline" id="line-423"><code>	// Stack parameters.</code></span>
+<span class="codeline" id="line-424"><code>	// stack describes the actual stack memory: [stack.lo, stack.hi).</code></span>
+<span class="codeline" id="line-425"><code>	// stackguard0 is the stack pointer compared in the Go stack growth prologue.</code></span>
+<span class="codeline" id="line-426"><code>	// It is stack.lo+StackGuard normally, but can be StackPreempt to trigger a preemption.</code></span>
+<span class="codeline" id="line-427"><code>	// stackguard1 is the stack pointer compared in the //go:systemstack stack growth prologue.</code></span>
+<span class="codeline" id="line-428"><code>	// It is stack.lo+StackGuard on g0 and gsignal stacks.</code></span>
+<span class="codeline" id="line-429"><code>	// It is ~0 on other goroutine stacks, to trigger a call to morestackc (and crash).</code></span>
+<span class="codeline" id="line-430"><code>	stack       stack   // offset known to runtime/cgo</code></span>
+<span class="codeline" id="line-431"><code>	stackguard0 uintptr // offset known to liblink</code></span>
+<span class="codeline" id="line-432"><code>	stackguard1 uintptr // offset known to liblink</code></span>
+<span class="codeline" id="line-433"><code></code></span>
+<span class="codeline" id="line-434"><code>	_panic    *_panic // innermost panic - offset known to liblink</code></span>
+<span class="codeline" id="line-435"><code>	_defer    *_defer // innermost defer</code></span>
+<span class="codeline" id="line-436"><code>	m         *m      // current m; offset known to arm liblink</code></span>
+<span class="codeline" id="line-437"><code>	sched     gobuf</code></span>
+<span class="codeline" id="line-438"><code>	syscallsp uintptr // if status==Gsyscall, syscallsp = sched.sp to use during gc</code></span>
+<span class="codeline" id="line-439"><code>	syscallpc uintptr // if status==Gsyscall, syscallpc = sched.pc to use during gc</code></span>
+<span class="codeline" id="line-440"><code>	stktopsp  uintptr // expected sp at top of stack, to check in traceback</code></span>
+<span class="codeline" id="line-441"><code>	// param is a generic pointer parameter field used to pass</code></span>
+<span class="codeline" id="line-442"><code>	// values in particular contexts where other storage for the</code></span>
+<span class="codeline" id="line-443"><code>	// parameter would be difficult to find. It is currently used</code></span>
+<span class="codeline" id="line-444"><code>	// in four ways:</code></span>
+<span class="codeline" id="line-445"><code>	// 1. When a channel operation wakes up a blocked goroutine, it sets param to</code></span>
+<span class="codeline" id="line-446"><code>	//    point to the sudog of the completed blocking operation.</code></span>
+<span class="codeline" id="line-447"><code>	// 2. By gcAssistAlloc1 to signal back to its caller that the goroutine completed</code></span>
+<span class="codeline" id="line-448"><code>	//    the GC cycle. It is unsafe to do so in any other way, because the goroutine's</code></span>
+<span class="codeline" id="line-449"><code>	//    stack may have moved in the meantime.</code></span>
+<span class="codeline" id="line-450"><code>	// 3. By debugCallWrap to pass parameters to a new goroutine because allocating a</code></span>
+<span class="codeline" id="line-451"><code>	//    closure in the runtime is forbidden.</code></span>
+<span class="codeline" id="line-452"><code>	// 4. When a panic is recovered and control returns to the respective frame,</code></span>
+<span class="codeline" id="line-453"><code>	//    param may point to a savedOpenDeferState.</code></span>
+<span class="codeline" id="line-454"><code>	param        unsafe.Pointer</code></span>
+<span class="codeline" id="line-455"><code>	atomicstatus atomic.Uint32</code></span>
+<span class="codeline" id="line-456"><code>	stackLock    uint32 // sigprof/scang lock; TODO: fold in to atomicstatus</code></span>
+<span class="codeline" id="line-457"><code>	goid         uint64</code></span>
+<span class="codeline" id="line-458"><code>	schedlink    guintptr</code></span>
+<span class="codeline" id="line-459"><code>	waitsince    int64      // approx time when the g become blocked</code></span>
+<span class="codeline" id="line-460"><code>	waitreason   waitReason // if status==Gwaiting</code></span>
+<span class="codeline" id="line-461"><code></code></span>
+<span class="codeline" id="line-462"><code>	preempt       bool // preemption signal, duplicates stackguard0 = stackpreempt</code></span>
+<span class="codeline" id="line-463"><code>	preemptStop   bool // transition to _Gpreempted on preemption; otherwise, just deschedule</code></span>
+<span class="codeline" id="line-464"><code>	preemptShrink bool // shrink stack at synchronous safe point</code></span>
+<span class="codeline" id="line-465"><code></code></span>
+<span class="codeline" id="line-466"><code>	// asyncSafePoint is set if g is stopped at an asynchronous</code></span>
+<span class="codeline" id="line-467"><code>	// safe point. This means there are frames on the stack</code></span>
+<span class="codeline" id="line-468"><code>	// without precise pointer information.</code></span>
+<span class="codeline" id="line-469"><code>	asyncSafePoint bool</code></span>
+<span class="codeline" id="line-470"><code></code></span>
+<span class="codeline" id="line-471"><code>	paniconfault bool // panic (instead of crash) on unexpected fault address</code></span>
+<span class="codeline" id="line-472"><code>	gcscandone   bool // g has scanned stack; protected by _Gscan bit in status</code></span>
+<span class="codeline" id="line-473"><code>	throwsplit   bool // must not split stack</code></span>
+<span class="codeline" id="line-474"><code>	// activeStackChans indicates that there are unlocked channels</code></span>
+<span class="codeline" id="line-475"><code>	// pointing into this goroutine's stack. If true, stack</code></span>
+<span class="codeline" id="line-476"><code>	// copying needs to acquire channel locks to protect these</code></span>
+<span class="codeline" id="line-477"><code>	// areas of the stack.</code></span>
+<span class="codeline" id="line-478"><code>	activeStackChans bool</code></span>
+<span class="codeline" id="line-479"><code>	// parkingOnChan indicates that the goroutine is about to</code></span>
+<span class="codeline" id="line-480"><code>	// park on a chansend or chanrecv. Used to signal an unsafe point</code></span>
+<span class="codeline" id="line-481"><code>	// for stack shrinking.</code></span>
+<span class="codeline" id="line-482"><code>	parkingOnChan atomic.Bool</code></span>
+<span class="codeline" id="line-483"><code>	// inMarkAssist indicates whether the goroutine is in mark assist.</code></span>
+<span class="codeline" id="line-484"><code>	// Used by the execution tracer.</code></span>
+<span class="codeline" id="line-485"><code>	inMarkAssist bool</code></span>
+<span class="codeline" id="line-486"><code>	coroexit     bool // argument to coroswitch_m</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>	raceignore    int8  // ignore race detection events</code></span>
+<span class="codeline" id="line-489"><code>	nocgocallback bool  // whether disable callback from C</code></span>
+<span class="codeline" id="line-490"><code>	tracking      bool  // whether we're tracking this G for sched latency statistics</code></span>
+<span class="codeline" id="line-491"><code>	trackingSeq   uint8 // used to decide whether to track this G</code></span>
+<span class="codeline" id="line-492"><code>	trackingStamp int64 // timestamp of when the G last started being tracked</code></span>
+<span class="codeline" id="line-493"><code>	runnableTime  int64 // the amount of time spent runnable, cleared when running, only used when tracking</code></span>
+<span class="codeline" id="line-494"><code>	lockedm       muintptr</code></span>
+<span class="codeline" id="line-495"><code>	sig           uint32</code></span>
+<span class="codeline" id="line-496"><code>	writebuf      []byte</code></span>
+<span class="codeline" id="line-497"><code>	sigcode0      uintptr</code></span>
+<span class="codeline" id="line-498"><code>	sigcode1      uintptr</code></span>
+<span class="codeline" id="line-499"><code>	sigpc         uintptr</code></span>
+<span class="codeline" id="line-500"><code>	parentGoid    uint64          // goid of goroutine that created this goroutine</code></span>
+<span class="codeline" id="line-501"><code>	gopc          uintptr         // pc of go statement that created this goroutine</code></span>
+<span class="codeline" id="line-502"><code>	ancestors     *[]ancestorInfo // ancestor information goroutine(s) that created this goroutine (only used if debug.tracebackancestors)</code></span>
+<span class="codeline" id="line-503"><code>	startpc       uintptr         // pc of goroutine function</code></span>
+<span class="codeline" id="line-504"><code>	racectx       uintptr</code></span>
+<span class="codeline" id="line-505"><code>	waiting       *sudog         // sudog structures this g is waiting on (that have a valid elem ptr); in lock order</code></span>
+<span class="codeline" id="line-506"><code>	cgoCtxt       []uintptr      // cgo traceback context</code></span>
+<span class="codeline" id="line-507"><code>	labels        unsafe.Pointer // profiler labels</code></span>
+<span class="codeline" id="line-508"><code>	timer         *timer         // cached timer for time.Sleep</code></span>
+<span class="codeline" id="line-509"><code>	selectDone    atomic.Uint32  // are we participating in a select and did someone win the race?</code></span>
+<span class="codeline" id="line-510"><code></code></span>
+<span class="codeline" id="line-511"><code>	coroarg *coro // argument during coroutine transfers</code></span>
+<span class="codeline" id="line-512"><code></code></span>
+<span class="codeline" id="line-513"><code>	// goroutineProfiled indicates the status of this goroutine's stack for the</code></span>
+<span class="codeline" id="line-514"><code>	// current in-progress goroutine profile</code></span>
+<span class="codeline" id="line-515"><code>	goroutineProfiled goroutineProfileStateHolder</code></span>
+<span class="codeline" id="line-516"><code></code></span>
+<span class="codeline" id="line-517"><code>	// Per-G tracer state.</code></span>
+<span class="codeline" id="line-518"><code>	trace gTraceState</code></span>
+<span class="codeline" id="line-519"><code></code></span>
+<span class="codeline" id="line-520"><code>	// Per-G GC state</code></span>
+<span class="codeline" id="line-521"><code></code></span>
+<span class="codeline" id="line-522"><code>	// gcAssistBytes is this G's GC assist credit in terms of</code></span>
+<span class="codeline" id="line-523"><code>	// bytes allocated. If this is positive, then the G has credit</code></span>
+<span class="codeline" id="line-524"><code>	// to allocate gcAssistBytes bytes without assisting. If this</code></span>
+<span class="codeline" id="line-525"><code>	// is negative, then the G must correct this by performing</code></span>
+<span class="codeline" id="line-526"><code>	// scan work. We track this in bytes to make it fast to update</code></span>
+<span class="codeline" id="line-527"><code>	// and check for debt in the malloc hot path. The assist ratio</code></span>
+<span class="codeline" id="line-528"><code>	// determines how this corresponds to scan work debt.</code></span>
+<span class="codeline" id="line-529"><code>	gcAssistBytes int64</code></span>
+<span class="codeline" id="line-530"><code>}</code></span>
+<span class="codeline" id="line-531"><code></code></span>
+<span class="codeline" id="line-532"><code>// gTrackingPeriod is the number of transitions out of _Grunning between</code></span>
+<span class="codeline" id="line-533"><code>// latency tracking runs.</code></span>
+<span class="codeline" id="line-534"><code>const gTrackingPeriod = 8</code></span>
+<span class="codeline" id="line-535"><code></code></span>
+<span class="codeline" id="line-536"><code>const (</code></span>
+<span class="codeline" id="line-537"><code>	// tlsSlots is the number of pointer-sized slots reserved for TLS on some platforms,</code></span>
+<span class="codeline" id="line-538"><code>	// like Windows.</code></span>
+<span class="codeline" id="line-539"><code>	tlsSlots = 6</code></span>
+<span class="codeline" id="line-540"><code>	tlsSize  = tlsSlots * goarch.PtrSize</code></span>
+<span class="codeline" id="line-541"><code>)</code></span>
+<span class="codeline" id="line-542"><code></code></span>
+<span class="codeline" id="line-543"><code>// Values for m.freeWait.</code></span>
+<span class="codeline" id="line-544"><code>const (</code></span>
+<span class="codeline" id="line-545"><code>	freeMStack = 0 // M done, free stack and reference.</code></span>
+<span class="codeline" id="line-546"><code>	freeMRef   = 1 // M done, free reference.</code></span>
+<span class="codeline" id="line-547"><code>	freeMWait  = 2 // M still in use.</code></span>
+<span class="codeline" id="line-548"><code>)</code></span>
+<span class="codeline" id="line-549"><code></code></span>
+<span class="codeline" id="line-550"><code>type m struct {</code></span>
+<span class="codeline" id="line-551"><code>	g0      *g     // goroutine with scheduling stack</code></span>
+<span class="codeline" id="line-552"><code>	morebuf gobuf  // gobuf arg to morestack</code></span>
+<span class="codeline" id="line-553"><code>	divmod  uint32 // div/mod denominator for arm - known to liblink</code></span>
+<span class="codeline" id="line-554"><code>	_       uint32 // align next field to 8 bytes</code></span>
+<span class="codeline" id="line-555"><code></code></span>
+<span class="codeline" id="line-556"><code>	// Fields not known to debuggers.</code></span>
+<span class="codeline" id="line-557"><code>	procid        uint64            // for debuggers, but offset not hard-coded</code></span>
+<span class="codeline" id="line-558"><code>	gsignal       *g                // signal-handling g</code></span>
+<span class="codeline" id="line-559"><code>	goSigStack    gsignalStack      // Go-allocated signal handling stack</code></span>
+<span class="codeline" id="line-560"><code>	sigmask       sigset            // storage for saved signal mask</code></span>
+<span class="codeline" id="line-561"><code>	tls           [tlsSlots]uintptr // thread-local storage (for x86 extern register)</code></span>
+<span class="codeline" id="line-562"><code>	mstartfn      func()</code></span>
+<span class="codeline" id="line-563"><code>	curg          *g       // current running goroutine</code></span>
+<span class="codeline" id="line-564"><code>	caughtsig     guintptr // goroutine running during fatal signal</code></span>
+<span class="codeline" id="line-565"><code>	p             puintptr // attached p for executing go code (nil if not executing go code)</code></span>
+<span class="codeline" id="line-566"><code>	nextp         puintptr</code></span>
+<span class="codeline" id="line-567"><code>	oldp          puintptr // the p that was attached before executing a syscall</code></span>
+<span class="codeline" id="line-568"><code>	id            int64</code></span>
+<span class="codeline" id="line-569"><code>	mallocing     int32</code></span>
+<span class="codeline" id="line-570"><code>	throwing      throwType</code></span>
+<span class="codeline" id="line-571"><code>	preemptoff    string // if != "", keep curg running on this m</code></span>
+<span class="codeline" id="line-572"><code>	locks         int32</code></span>
+<span class="codeline" id="line-573"><code>	dying         int32</code></span>
+<span class="codeline" id="line-574"><code>	profilehz     int32</code></span>
+<span class="codeline" id="line-575"><code>	spinning      bool // m is out of work and is actively looking for work</code></span>
+<span class="codeline" id="line-576"><code>	blocked       bool // m is blocked on a note</code></span>
+<span class="codeline" id="line-577"><code>	newSigstack   bool // minit on C thread called sigaltstack</code></span>
+<span class="codeline" id="line-578"><code>	printlock     int8</code></span>
+<span class="codeline" id="line-579"><code>	incgo         bool          // m is executing a cgo call</code></span>
+<span class="codeline" id="line-580"><code>	isextra       bool          // m is an extra m</code></span>
+<span class="codeline" id="line-581"><code>	isExtraInC    bool          // m is an extra m that is not executing Go code</code></span>
+<span class="codeline" id="line-582"><code>	isExtraInSig  bool          // m is an extra m in a signal handler</code></span>
+<span class="codeline" id="line-583"><code>	freeWait      atomic.Uint32 // Whether it is safe to free g0 and delete m (one of freeMRef, freeMStack, freeMWait)</code></span>
+<span class="codeline" id="line-584"><code>	needextram    bool</code></span>
+<span class="codeline" id="line-585"><code>	traceback     uint8</code></span>
+<span class="codeline" id="line-586"><code>	ncgocall      uint64        // number of cgo calls in total</code></span>
+<span class="codeline" id="line-587"><code>	ncgo          int32         // number of cgo calls currently in progress</code></span>
+<span class="codeline" id="line-588"><code>	cgoCallersUse atomic.Uint32 // if non-zero, cgoCallers in use temporarily</code></span>
+<span class="codeline" id="line-589"><code>	cgoCallers    *cgoCallers   // cgo traceback if crashing in cgo call</code></span>
+<span class="codeline" id="line-590"><code>	park          note</code></span>
+<span class="codeline" id="line-591"><code>	alllink       *m // on allm</code></span>
+<span class="codeline" id="line-592"><code>	schedlink     muintptr</code></span>
+<span class="codeline" id="line-593"><code>	lockedg       guintptr</code></span>
+<span class="codeline" id="line-594"><code>	createstack   [32]uintptr // stack that created this thread, it's used for StackRecord.Stack0, so it must align with it.</code></span>
+<span class="codeline" id="line-595"><code>	lockedExt     uint32      // tracking for external LockOSThread</code></span>
+<span class="codeline" id="line-596"><code>	lockedInt     uint32      // tracking for internal lockOSThread</code></span>
+<span class="codeline" id="line-597"><code>	nextwaitm     muintptr    // next m waiting for lock</code></span>
+<span class="codeline" id="line-598"><code></code></span>
+<span class="codeline" id="line-599"><code>	mLockProfile mLockProfile // fields relating to runtime.lock contention</code></span>
+<span class="codeline" id="line-600"><code></code></span>
+<span class="codeline" id="line-601"><code>	// wait* are used to carry arguments from gopark into park_m, because</code></span>
+<span class="codeline" id="line-602"><code>	// there's no stack to put them on. That is their sole purpose.</code></span>
+<span class="codeline" id="line-603"><code>	waitunlockf          func(*g, unsafe.Pointer) bool</code></span>
+<span class="codeline" id="line-604"><code>	waitlock             unsafe.Pointer</code></span>
+<span class="codeline" id="line-605"><code>	waitTraceBlockReason traceBlockReason</code></span>
+<span class="codeline" id="line-606"><code>	waitTraceSkip        int</code></span>
+<span class="codeline" id="line-607"><code></code></span>
+<span class="codeline" id="line-608"><code>	syscalltick uint32</code></span>
+<span class="codeline" id="line-609"><code>	freelink    *m // on sched.freem</code></span>
+<span class="codeline" id="line-610"><code>	trace       mTraceState</code></span>
+<span class="codeline" id="line-611"><code></code></span>
+<span class="codeline" id="line-612"><code>	// these are here because they are too large to be on the stack</code></span>
+<span class="codeline" id="line-613"><code>	// of low-level NOSPLIT functions.</code></span>
+<span class="codeline" id="line-614"><code>	libcall   libcall</code></span>
+<span class="codeline" id="line-615"><code>	libcallpc uintptr // for cpu profiler</code></span>
+<span class="codeline" id="line-616"><code>	libcallsp uintptr</code></span>
+<span class="codeline" id="line-617"><code>	libcallg  guintptr</code></span>
+<span class="codeline" id="line-618"><code>	syscall   libcall // stores syscall parameters on windows</code></span>
+<span class="codeline" id="line-619"><code></code></span>
+<span class="codeline" id="line-620"><code>	vdsoSP uintptr // SP for traceback while in VDSO call (0 if not in call)</code></span>
+<span class="codeline" id="line-621"><code>	vdsoPC uintptr // PC for traceback while in VDSO call</code></span>
+<span class="codeline" id="line-622"><code></code></span>
+<span class="codeline" id="line-623"><code>	// preemptGen counts the number of completed preemption</code></span>
+<span class="codeline" id="line-624"><code>	// signals. This is used to detect when a preemption is</code></span>
+<span class="codeline" id="line-625"><code>	// requested, but fails.</code></span>
+<span class="codeline" id="line-626"><code>	preemptGen atomic.Uint32</code></span>
+<span class="codeline" id="line-627"><code></code></span>
+<span class="codeline" id="line-628"><code>	// Whether this is a pending preemption signal on this M.</code></span>
+<span class="codeline" id="line-629"><code>	signalPending atomic.Uint32</code></span>
+<span class="codeline" id="line-630"><code></code></span>
+<span class="codeline" id="line-631"><code>	// pcvalue lookup cache</code></span>
+<span class="codeline" id="line-632"><code>	pcvalueCache pcvalueCache</code></span>
+<span class="codeline" id="line-633"><code></code></span>
+<span class="codeline" id="line-634"><code>	dlogPerM</code></span>
+<span class="codeline" id="line-635"><code></code></span>
+<span class="codeline" id="line-636"><code>	mOS</code></span>
+<span class="codeline" id="line-637"><code></code></span>
+<span class="codeline" id="line-638"><code>	chacha8   chacha8rand.State</code></span>
+<span class="codeline" id="line-639"><code>	cheaprand uint64</code></span>
+<span class="codeline" id="line-640"><code></code></span>
+<span class="codeline" id="line-641"><code>	// Up to 10 locks held by this m, maintained by the lock ranking code.</code></span>
+<span class="codeline" id="line-642"><code>	locksHeldLen int</code></span>
+<span class="codeline" id="line-643"><code>	locksHeld    [10]heldLockInfo</code></span>
+<span class="codeline" id="line-644"><code>}</code></span>
+<span class="codeline" id="line-645"><code></code></span>
+<span class="codeline" id="line-646"><code>type p struct {</code></span>
+<span class="codeline" id="line-647"><code>	id          int32</code></span>
+<span class="codeline" id="line-648"><code>	status      uint32 // one of pidle/prunning/...</code></span>
+<span class="codeline" id="line-649"><code>	link        puintptr</code></span>
+<span class="codeline" id="line-650"><code>	schedtick   uint32     // incremented on every scheduler call</code></span>
+<span class="codeline" id="line-651"><code>	syscalltick uint32     // incremented on every system call</code></span>
+<span class="codeline" id="line-652"><code>	sysmontick  sysmontick // last tick observed by sysmon</code></span>
+<span class="codeline" id="line-653"><code>	m           muintptr   // back-link to associated m (nil if idle)</code></span>
+<span class="codeline" id="line-654"><code>	mcache      *mcache</code></span>
+<span class="codeline" id="line-655"><code>	pcache      pageCache</code></span>
+<span class="codeline" id="line-656"><code>	raceprocctx uintptr</code></span>
+<span class="codeline" id="line-657"><code></code></span>
+<span class="codeline" id="line-658"><code>	deferpool    []*_defer // pool of available defer structs (see panic.go)</code></span>
+<span class="codeline" id="line-659"><code>	deferpoolbuf [32]*_defer</code></span>
+<span class="codeline" id="line-660"><code></code></span>
+<span class="codeline" id="line-661"><code>	// Cache of goroutine ids, amortizes accesses to runtime·sched.goidgen.</code></span>
+<span class="codeline" id="line-662"><code>	goidcache    uint64</code></span>
+<span class="codeline" id="line-663"><code>	goidcacheend uint64</code></span>
+<span class="codeline" id="line-664"><code></code></span>
+<span class="codeline" id="line-665"><code>	// Queue of runnable goroutines. Accessed without lock.</code></span>
+<span class="codeline" id="line-666"><code>	runqhead uint32</code></span>
+<span class="codeline" id="line-667"><code>	runqtail uint32</code></span>
+<span class="codeline" id="line-668"><code>	runq     [256]guintptr</code></span>
+<span class="codeline" id="line-669"><code>	// runnext, if non-nil, is a runnable G that was ready'd by</code></span>
+<span class="codeline" id="line-670"><code>	// the current G and should be run next instead of what's in</code></span>
+<span class="codeline" id="line-671"><code>	// runq if there's time remaining in the running G's time</code></span>
+<span class="codeline" id="line-672"><code>	// slice. It will inherit the time left in the current time</code></span>
+<span class="codeline" id="line-673"><code>	// slice. If a set of goroutines is locked in a</code></span>
+<span class="codeline" id="line-674"><code>	// communicate-and-wait pattern, this schedules that set as a</code></span>
+<span class="codeline" id="line-675"><code>	// unit and eliminates the (potentially large) scheduling</code></span>
+<span class="codeline" id="line-676"><code>	// latency that otherwise arises from adding the ready'd</code></span>
+<span class="codeline" id="line-677"><code>	// goroutines to the end of the run queue.</code></span>
+<span class="codeline" id="line-678"><code>	//</code></span>
+<span class="codeline" id="line-679"><code>	// Note that while other P's may atomically CAS this to zero,</code></span>
+<span class="codeline" id="line-680"><code>	// only the owner P can CAS it to a valid G.</code></span>
+<span class="codeline" id="line-681"><code>	runnext guintptr</code></span>
+<span class="codeline" id="line-682"><code></code></span>
+<span class="codeline" id="line-683"><code>	// Available G's (status == Gdead)</code></span>
+<span class="codeline" id="line-684"><code>	gFree struct {</code></span>
+<span class="codeline" id="line-685"><code>		gList</code></span>
+<span class="codeline" id="line-686"><code>		n int32</code></span>
+<span class="codeline" id="line-687"><code>	}</code></span>
+<span class="codeline" id="line-688"><code></code></span>
+<span class="codeline" id="line-689"><code>	sudogcache []*sudog</code></span>
+<span class="codeline" id="line-690"><code>	sudogbuf   [128]*sudog</code></span>
+<span class="codeline" id="line-691"><code></code></span>
+<span class="codeline" id="line-692"><code>	// Cache of mspan objects from the heap.</code></span>
+<span class="codeline" id="line-693"><code>	mspancache struct {</code></span>
+<span class="codeline" id="line-694"><code>		// We need an explicit length here because this field is used</code></span>
+<span class="codeline" id="line-695"><code>		// in allocation codepaths where write barriers are not allowed,</code></span>
+<span class="codeline" id="line-696"><code>		// and eliminating the write barrier/keeping it eliminated from</code></span>
+<span class="codeline" id="line-697"><code>		// slice updates is tricky, more so than just managing the length</code></span>
+<span class="codeline" id="line-698"><code>		// ourselves.</code></span>
+<span class="codeline" id="line-699"><code>		len int</code></span>
+<span class="codeline" id="line-700"><code>		buf [128]*mspan</code></span>
+<span class="codeline" id="line-701"><code>	}</code></span>
+<span class="codeline" id="line-702"><code></code></span>
+<span class="codeline" id="line-703"><code>	// Cache of a single pinner object to reduce allocations from repeated</code></span>
+<span class="codeline" id="line-704"><code>	// pinner creation.</code></span>
+<span class="codeline" id="line-705"><code>	pinnerCache *pinner</code></span>
+<span class="codeline" id="line-706"><code></code></span>
+<span class="codeline" id="line-707"><code>	trace pTraceState</code></span>
+<span class="codeline" id="line-708"><code></code></span>
+<span class="codeline" id="line-709"><code>	palloc persistentAlloc // per-P to avoid mutex</code></span>
+<span class="codeline" id="line-710"><code></code></span>
+<span class="codeline" id="line-711"><code>	// The when field of the first entry on the timer heap.</code></span>
+<span class="codeline" id="line-712"><code>	// This is 0 if the timer heap is empty.</code></span>
+<span class="codeline" id="line-713"><code>	timer0When atomic.Int64</code></span>
+<span class="codeline" id="line-714"><code></code></span>
+<span class="codeline" id="line-715"><code>	// The earliest known nextwhen field of a timer with</code></span>
+<span class="codeline" id="line-716"><code>	// timerModifiedEarlier status. Because the timer may have been</code></span>
+<span class="codeline" id="line-717"><code>	// modified again, there need not be any timer with this value.</code></span>
+<span class="codeline" id="line-718"><code>	// This is 0 if there are no timerModifiedEarlier timers.</code></span>
+<span class="codeline" id="line-719"><code>	timerModifiedEarliest atomic.Int64</code></span>
+<span class="codeline" id="line-720"><code></code></span>
+<span class="codeline" id="line-721"><code>	// Per-P GC state</code></span>
+<span class="codeline" id="line-722"><code>	gcAssistTime         int64 // Nanoseconds in assistAlloc</code></span>
+<span class="codeline" id="line-723"><code>	gcFractionalMarkTime int64 // Nanoseconds in fractional mark worker (atomic)</code></span>
+<span class="codeline" id="line-724"><code></code></span>
+<span class="codeline" id="line-725"><code>	// limiterEvent tracks events for the GC CPU limiter.</code></span>
+<span class="codeline" id="line-726"><code>	limiterEvent limiterEvent</code></span>
+<span class="codeline" id="line-727"><code></code></span>
+<span class="codeline" id="line-728"><code>	// gcMarkWorkerMode is the mode for the next mark worker to run in.</code></span>
+<span class="codeline" id="line-729"><code>	// That is, this is used to communicate with the worker goroutine</code></span>
+<span class="codeline" id="line-730"><code>	// selected for immediate execution by</code></span>
+<span class="codeline" id="line-731"><code>	// gcController.findRunnableGCWorker. When scheduling other goroutines,</code></span>
+<span class="codeline" id="line-732"><code>	// this field must be set to gcMarkWorkerNotWorker.</code></span>
+<span class="codeline" id="line-733"><code>	gcMarkWorkerMode gcMarkWorkerMode</code></span>
+<span class="codeline" id="line-734"><code>	// gcMarkWorkerStartTime is the nanotime() at which the most recent</code></span>
+<span class="codeline" id="line-735"><code>	// mark worker started.</code></span>
+<span class="codeline" id="line-736"><code>	gcMarkWorkerStartTime int64</code></span>
+<span class="codeline" id="line-737"><code></code></span>
+<span class="codeline" id="line-738"><code>	// gcw is this P's GC work buffer cache. The work buffer is</code></span>
+<span class="codeline" id="line-739"><code>	// filled by write barriers, drained by mutator assists, and</code></span>
+<span class="codeline" id="line-740"><code>	// disposed on certain GC state transitions.</code></span>
+<span class="codeline" id="line-741"><code>	gcw gcWork</code></span>
+<span class="codeline" id="line-742"><code></code></span>
+<span class="codeline" id="line-743"><code>	// wbBuf is this P's GC write barrier buffer.</code></span>
+<span class="codeline" id="line-744"><code>	//</code></span>
+<span class="codeline" id="line-745"><code>	// TODO: Consider caching this in the running G.</code></span>
+<span class="codeline" id="line-746"><code>	wbBuf wbBuf</code></span>
+<span class="codeline" id="line-747"><code></code></span>
+<span class="codeline" id="line-748"><code>	runSafePointFn uint32 // if 1, run sched.safePointFn at next safe point</code></span>
+<span class="codeline" id="line-749"><code></code></span>
+<span class="codeline" id="line-750"><code>	// statsSeq is a counter indicating whether this P is currently</code></span>
+<span class="codeline" id="line-751"><code>	// writing any stats. Its value is even when not, odd when it is.</code></span>
+<span class="codeline" id="line-752"><code>	statsSeq atomic.Uint32</code></span>
+<span class="codeline" id="line-753"><code></code></span>
+<span class="codeline" id="line-754"><code>	// Lock for timers. We normally access the timers while running</code></span>
+<span class="codeline" id="line-755"><code>	// on this P, but the scheduler can also do it from a different P.</code></span>
+<span class="codeline" id="line-756"><code>	timersLock mutex</code></span>
+<span class="codeline" id="line-757"><code></code></span>
+<span class="codeline" id="line-758"><code>	// Actions to take at some time. This is used to implement the</code></span>
+<span class="codeline" id="line-759"><code>	// standard library's time package.</code></span>
+<span class="codeline" id="line-760"><code>	// Must hold timersLock to access.</code></span>
+<span class="codeline" id="line-761"><code>	timers []*timer</code></span>
+<span class="codeline" id="line-762"><code></code></span>
+<span class="codeline" id="line-763"><code>	// Number of timers in P's heap.</code></span>
+<span class="codeline" id="line-764"><code>	numTimers atomic.Uint32</code></span>
+<span class="codeline" id="line-765"><code></code></span>
+<span class="codeline" id="line-766"><code>	// Number of timerDeleted timers in P's heap.</code></span>
+<span class="codeline" id="line-767"><code>	deletedTimers atomic.Uint32</code></span>
+<span class="codeline" id="line-768"><code></code></span>
+<span class="codeline" id="line-769"><code>	// Race context used while executing timer functions.</code></span>
+<span class="codeline" id="line-770"><code>	timerRaceCtx uintptr</code></span>
+<span class="codeline" id="line-771"><code></code></span>
+<span class="codeline" id="line-772"><code>	// maxStackScanDelta accumulates the amount of stack space held by</code></span>
+<span class="codeline" id="line-773"><code>	// live goroutines (i.e. those eligible for stack scanning).</code></span>
+<span class="codeline" id="line-774"><code>	// Flushed to gcController.maxStackScan once maxStackScanSlack</code></span>
+<span class="codeline" id="line-775"><code>	// or -maxStackScanSlack is reached.</code></span>
+<span class="codeline" id="line-776"><code>	maxStackScanDelta int64</code></span>
+<span class="codeline" id="line-777"><code></code></span>
+<span class="codeline" id="line-778"><code>	// gc-time statistics about current goroutines</code></span>
+<span class="codeline" id="line-779"><code>	// Note that this differs from maxStackScan in that this</code></span>
+<span class="codeline" id="line-780"><code>	// accumulates the actual stack observed to be used at GC time (hi - sp),</code></span>
+<span class="codeline" id="line-781"><code>	// not an instantaneous measure of the total stack size that might need</code></span>
+<span class="codeline" id="line-782"><code>	// to be scanned (hi - lo).</code></span>
+<span class="codeline" id="line-783"><code>	scannedStackSize uint64 // stack size of goroutines scanned by this P</code></span>
+<span class="codeline" id="line-784"><code>	scannedStacks    uint64 // number of goroutines scanned by this P</code></span>
+<span class="codeline" id="line-785"><code></code></span>
+<span class="codeline" id="line-786"><code>	// preempt is set to indicate that this P should be enter the</code></span>
+<span class="codeline" id="line-787"><code>	// scheduler ASAP (regardless of what G is running on it).</code></span>
+<span class="codeline" id="line-788"><code>	preempt bool</code></span>
+<span class="codeline" id="line-789"><code></code></span>
+<span class="codeline" id="line-790"><code>	// pageTraceBuf is a buffer for writing out page allocation/free/scavenge traces.</code></span>
+<span class="codeline" id="line-791"><code>	//</code></span>
+<span class="codeline" id="line-792"><code>	// Used only if GOEXPERIMENT=pagetrace.</code></span>
+<span class="codeline" id="line-793"><code>	pageTraceBuf pageTraceBuf</code></span>
+<span class="codeline" id="line-794"><code></code></span>
+<span class="codeline" id="line-795"><code>	// Padding is no longer needed. False sharing is now not a worry because p is large enough</code></span>
+<span class="codeline" id="line-796"><code>	// that its size class is an integer multiple of the cache line size (for any of our architectures).</code></span>
+<span class="codeline" id="line-797"><code>}</code></span>
+<span class="codeline" id="line-798"><code></code></span>
+<span class="codeline" id="line-799"><code>type schedt struct {</code></span>
+<span class="codeline" id="line-800"><code>	goidgen   atomic.Uint64</code></span>
+<span class="codeline" id="line-801"><code>	lastpoll  atomic.Int64 // time of last network poll, 0 if currently polling</code></span>
+<span class="codeline" id="line-802"><code>	pollUntil atomic.Int64 // time to which current poll is sleeping</code></span>
+<span class="codeline" id="line-803"><code></code></span>
+<span class="codeline" id="line-804"><code>	lock mutex</code></span>
+<span class="codeline" id="line-805"><code></code></span>
+<span class="codeline" id="line-806"><code>	// When increasing nmidle, nmidlelocked, nmsys, or nmfreed, be</code></span>
+<span class="codeline" id="line-807"><code>	// sure to call checkdead().</code></span>
+<span class="codeline" id="line-808"><code></code></span>
+<span class="codeline" id="line-809"><code>	midle        muintptr // idle m's waiting for work</code></span>
+<span class="codeline" id="line-810"><code>	nmidle       int32    // number of idle m's waiting for work</code></span>
+<span class="codeline" id="line-811"><code>	nmidlelocked int32    // number of locked m's waiting for work</code></span>
+<span class="codeline" id="line-812"><code>	mnext        int64    // number of m's that have been created and next M ID</code></span>
+<span class="codeline" id="line-813"><code>	maxmcount    int32    // maximum number of m's allowed (or die)</code></span>
+<span class="codeline" id="line-814"><code>	nmsys        int32    // number of system m's not counted for deadlock</code></span>
+<span class="codeline" id="line-815"><code>	nmfreed      int64    // cumulative number of freed m's</code></span>
+<span class="codeline" id="line-816"><code></code></span>
+<span class="codeline" id="line-817"><code>	ngsys atomic.Int32 // number of system goroutines</code></span>
+<span class="codeline" id="line-818"><code></code></span>
+<span class="codeline" id="line-819"><code>	pidle        puintptr // idle p's</code></span>
+<span class="codeline" id="line-820"><code>	npidle       atomic.Int32</code></span>
+<span class="codeline" id="line-821"><code>	nmspinning   atomic.Int32  // See "Worker thread parking/unparking" comment in proc.go.</code></span>
+<span class="codeline" id="line-822"><code>	needspinning atomic.Uint32 // See "Delicate dance" comment in proc.go. Boolean. Must hold sched.lock to set to 1.</code></span>
+<span class="codeline" id="line-823"><code></code></span>
+<span class="codeline" id="line-824"><code>	// Global runnable queue.</code></span>
+<span class="codeline" id="line-825"><code>	runq     gQueue</code></span>
+<span class="codeline" id="line-826"><code>	runqsize int32</code></span>
+<span class="codeline" id="line-827"><code></code></span>
+<span class="codeline" id="line-828"><code>	// disable controls selective disabling of the scheduler.</code></span>
+<span class="codeline" id="line-829"><code>	//</code></span>
+<span class="codeline" id="line-830"><code>	// Use schedEnableUser to control this.</code></span>
+<span class="codeline" id="line-831"><code>	//</code></span>
+<span class="codeline" id="line-832"><code>	// disable is protected by sched.lock.</code></span>
+<span class="codeline" id="line-833"><code>	disable struct {</code></span>
+<span class="codeline" id="line-834"><code>		// user disables scheduling of user goroutines.</code></span>
+<span class="codeline" id="line-835"><code>		user     bool</code></span>
+<span class="codeline" id="line-836"><code>		runnable gQueue // pending runnable Gs</code></span>
+<span class="codeline" id="line-837"><code>		n        int32  // length of runnable</code></span>
+<span class="codeline" id="line-838"><code>	}</code></span>
+<span class="codeline" id="line-839"><code></code></span>
+<span class="codeline" id="line-840"><code>	// Global cache of dead G's.</code></span>
+<span class="codeline" id="line-841"><code>	gFree struct {</code></span>
+<span class="codeline" id="line-842"><code>		lock    mutex</code></span>
+<span class="codeline" id="line-843"><code>		stack   gList // Gs with stacks</code></span>
+<span class="codeline" id="line-844"><code>		noStack gList // Gs without stacks</code></span>
+<span class="codeline" id="line-845"><code>		n       int32</code></span>
+<span class="codeline" id="line-846"><code>	}</code></span>
+<span class="codeline" id="line-847"><code></code></span>
+<span class="codeline" id="line-848"><code>	// Central cache of sudog structs.</code></span>
+<span class="codeline" id="line-849"><code>	sudoglock  mutex</code></span>
+<span class="codeline" id="line-850"><code>	sudogcache *sudog</code></span>
+<span class="codeline" id="line-851"><code></code></span>
+<span class="codeline" id="line-852"><code>	// Central pool of available defer structs.</code></span>
+<span class="codeline" id="line-853"><code>	deferlock mutex</code></span>
+<span class="codeline" id="line-854"><code>	deferpool *_defer</code></span>
+<span class="codeline" id="line-855"><code></code></span>
+<span class="codeline" id="line-856"><code>	// freem is the list of m's waiting to be freed when their</code></span>
+<span class="codeline" id="line-857"><code>	// m.exited is set. Linked through m.freelink.</code></span>
+<span class="codeline" id="line-858"><code>	freem *m</code></span>
+<span class="codeline" id="line-859"><code></code></span>
+<span class="codeline" id="line-860"><code>	gcwaiting  atomic.Bool // gc is waiting to run</code></span>
+<span class="codeline" id="line-861"><code>	stopwait   int32</code></span>
+<span class="codeline" id="line-862"><code>	stopnote   note</code></span>
+<span class="codeline" id="line-863"><code>	sysmonwait atomic.Bool</code></span>
+<span class="codeline" id="line-864"><code>	sysmonnote note</code></span>
+<span class="codeline" id="line-865"><code></code></span>
+<span class="codeline" id="line-866"><code>	// safePointFn should be called on each P at the next GC</code></span>
+<span class="codeline" id="line-867"><code>	// safepoint if p.runSafePointFn is set.</code></span>
+<span class="codeline" id="line-868"><code>	safePointFn   func(*p)</code></span>
+<span class="codeline" id="line-869"><code>	safePointWait int32</code></span>
+<span class="codeline" id="line-870"><code>	safePointNote note</code></span>
+<span class="codeline" id="line-871"><code></code></span>
+<span class="codeline" id="line-872"><code>	profilehz int32 // cpu profiling rate</code></span>
+<span class="codeline" id="line-873"><code></code></span>
+<span class="codeline" id="line-874"><code>	procresizetime int64 // nanotime() of last change to gomaxprocs</code></span>
+<span class="codeline" id="line-875"><code>	totaltime      int64 // ∫gomaxprocs dt up to procresizetime</code></span>
+<span class="codeline" id="line-876"><code></code></span>
+<span class="codeline" id="line-877"><code>	// sysmonlock protects sysmon's actions on the runtime.</code></span>
+<span class="codeline" id="line-878"><code>	//</code></span>
+<span class="codeline" id="line-879"><code>	// Acquire and hold this mutex to block sysmon from interacting</code></span>
+<span class="codeline" id="line-880"><code>	// with the rest of the runtime.</code></span>
+<span class="codeline" id="line-881"><code>	sysmonlock mutex</code></span>
+<span class="codeline" id="line-882"><code></code></span>
+<span class="codeline" id="line-883"><code>	// timeToRun is a distribution of scheduling latencies, defined</code></span>
+<span class="codeline" id="line-884"><code>	// as the sum of time a G spends in the _Grunnable state before</code></span>
+<span class="codeline" id="line-885"><code>	// it transitions to _Grunning.</code></span>
+<span class="codeline" id="line-886"><code>	timeToRun timeHistogram</code></span>
+<span class="codeline" id="line-887"><code></code></span>
+<span class="codeline" id="line-888"><code>	// idleTime is the total CPU time Ps have "spent" idle.</code></span>
+<span class="codeline" id="line-889"><code>	//</code></span>
+<span class="codeline" id="line-890"><code>	// Reset on each GC cycle.</code></span>
+<span class="codeline" id="line-891"><code>	idleTime atomic.Int64</code></span>
+<span class="codeline" id="line-892"><code></code></span>
+<span class="codeline" id="line-893"><code>	// totalMutexWaitTime is the sum of time goroutines have spent in _Gwaiting</code></span>
+<span class="codeline" id="line-894"><code>	// with a waitreason of the form waitReasonSync{RW,}Mutex{R,}Lock.</code></span>
+<span class="codeline" id="line-895"><code>	totalMutexWaitTime atomic.Int64</code></span>
+<span class="codeline" id="line-896"><code></code></span>
+<span class="codeline" id="line-897"><code>	// stwStoppingTimeGC/Other are distributions of stop-the-world stopping</code></span>
+<span class="codeline" id="line-898"><code>	// latencies, defined as the time taken by stopTheWorldWithSema to get</code></span>
+<span class="codeline" id="line-899"><code>	// all Ps to stop. stwStoppingTimeGC covers all GC-related STWs,</code></span>
+<span class="codeline" id="line-900"><code>	// stwStoppingTimeOther covers the others.</code></span>
+<span class="codeline" id="line-901"><code>	stwStoppingTimeGC    timeHistogram</code></span>
+<span class="codeline" id="line-902"><code>	stwStoppingTimeOther timeHistogram</code></span>
+<span class="codeline" id="line-903"><code></code></span>
+<span class="codeline" id="line-904"><code>	// stwTotalTimeGC/Other are distributions of stop-the-world total</code></span>
+<span class="codeline" id="line-905"><code>	// latencies, defined as the total time from stopTheWorldWithSema to</code></span>
+<span class="codeline" id="line-906"><code>	// startTheWorldWithSema. This is a superset of</code></span>
+<span class="codeline" id="line-907"><code>	// stwStoppingTimeGC/Other. stwTotalTimeGC covers all GC-related STWs,</code></span>
+<span class="codeline" id="line-908"><code>	// stwTotalTimeOther covers the others.</code></span>
+<span class="codeline" id="line-909"><code>	stwTotalTimeGC    timeHistogram</code></span>
+<span class="codeline" id="line-910"><code>	stwTotalTimeOther timeHistogram</code></span>
+<span class="codeline" id="line-911"><code></code></span>
+<span class="codeline" id="line-912"><code>	// totalRuntimeLockWaitTime (plus the value of lockWaitTime on each M in</code></span>
+<span class="codeline" id="line-913"><code>	// allm) is the sum of time goroutines have spent in _Grunnable and with an</code></span>
+<span class="codeline" id="line-914"><code>	// M, but waiting for locks within the runtime. This field stores the value</code></span>
+<span class="codeline" id="line-915"><code>	// for Ms that have exited.</code></span>
+<span class="codeline" id="line-916"><code>	totalRuntimeLockWaitTime atomic.Int64</code></span>
+<span class="codeline" id="line-917"><code>}</code></span>
+<span class="codeline" id="line-918"><code></code></span>
+<span class="codeline" id="line-919"><code>// Values for the flags field of a sigTabT.</code></span>
+<span class="codeline" id="line-920"><code>const (</code></span>
+<span class="codeline" id="line-921"><code>	_SigNotify   = 1 &lt;&lt; iota // let signal.Notify have signal, even if from kernel</code></span>
+<span class="codeline" id="line-922"><code>	_SigKill                 // if signal.Notify doesn't take it, exit quietly</code></span>
+<span class="codeline" id="line-923"><code>	_SigThrow                // if signal.Notify doesn't take it, exit loudly</code></span>
+<span class="codeline" id="line-924"><code>	_SigPanic                // if the signal is from the kernel, panic</code></span>
+<span class="codeline" id="line-925"><code>	_SigDefault              // if the signal isn't explicitly requested, don't monitor it</code></span>
+<span class="codeline" id="line-926"><code>	_SigGoExit               // cause all runtime procs to exit (only used on Plan 9).</code></span>
+<span class="codeline" id="line-927"><code>	_SigSetStack             // Don't explicitly install handler, but add SA_ONSTACK to existing libc handler</code></span>
+<span class="codeline" id="line-928"><code>	_SigUnblock              // always unblock; see blockableSig</code></span>
+<span class="codeline" id="line-929"><code>	_SigIgn                  // _SIG_DFL action is to ignore the signal</code></span>
+<span class="codeline" id="line-930"><code>)</code></span>
+<span class="codeline" id="line-931"><code></code></span>
+<span class="codeline" id="line-932"><code>// Layout of in-memory per-function information prepared by linker</code></span>
+<span class="codeline" id="line-933"><code>// See https://golang.org/s/go12symtab.</code></span>
+<span class="codeline" id="line-934"><code>// Keep in sync with linker (../cmd/link/internal/ld/pcln.go:/pclntab)</code></span>
+<span class="codeline" id="line-935"><code>// and with package debug/gosym and with symtab.go in package runtime.</code></span>
+<span class="codeline" id="line-936"><code>type _func struct {</code></span>
+<span class="codeline" id="line-937"><code>	sys.NotInHeap // Only in static data</code></span>
+<span class="codeline" id="line-938"><code></code></span>
+<span class="codeline" id="line-939"><code>	entryOff uint32 // start pc, as offset from moduledata.text/pcHeader.textStart</code></span>
+<span class="codeline" id="line-940"><code>	nameOff  int32  // function name, as index into moduledata.funcnametab.</code></span>
+<span class="codeline" id="line-941"><code></code></span>
+<span class="codeline" id="line-942"><code>	args        int32  // in/out args size</code></span>
+<span class="codeline" id="line-943"><code>	deferreturn uint32 // offset of start of a deferreturn call instruction from entry, if any.</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>	pcsp      uint32</code></span>
+<span class="codeline" id="line-946"><code>	pcfile    uint32</code></span>
+<span class="codeline" id="line-947"><code>	pcln      uint32</code></span>
+<span class="codeline" id="line-948"><code>	npcdata   uint32</code></span>
+<span class="codeline" id="line-949"><code>	cuOffset  uint32     // runtime.cutab offset of this function's CU</code></span>
+<span class="codeline" id="line-950"><code>	startLine int32      // line number of start of function (func keyword/TEXT directive)</code></span>
+<span class="codeline" id="line-951"><code>	funcID    abi.FuncID // set for certain special runtime functions</code></span>
+<span class="codeline" id="line-952"><code>	flag      abi.FuncFlag</code></span>
+<span class="codeline" id="line-953"><code>	_         [1]byte // pad</code></span>
+<span class="codeline" id="line-954"><code>	nfuncdata uint8   // must be last, must end on a uint32-aligned boundary</code></span>
+<span class="codeline" id="line-955"><code></code></span>
+<span class="codeline" id="line-956"><code>	// The end of the struct is followed immediately by two variable-length</code></span>
+<span class="codeline" id="line-957"><code>	// arrays that reference the pcdata and funcdata locations for this</code></span>
+<span class="codeline" id="line-958"><code>	// function.</code></span>
+<span class="codeline" id="line-959"><code></code></span>
+<span class="codeline" id="line-960"><code>	// pcdata contains the offset into moduledata.pctab for the start of</code></span>
+<span class="codeline" id="line-961"><code>	// that index's table. e.g.,</code></span>
+<span class="codeline" id="line-962"><code>	// &amp;moduledata.pctab[_func.pcdata[_PCDATA_UnsafePoint]] is the start of</code></span>
+<span class="codeline" id="line-963"><code>	// the unsafe point table.</code></span>
+<span class="codeline" id="line-964"><code>	//</code></span>
+<span class="codeline" id="line-965"><code>	// An offset of 0 indicates that there is no table.</code></span>
+<span class="codeline" id="line-966"><code>	//</code></span>
+<span class="codeline" id="line-967"><code>	// pcdata [npcdata]uint32</code></span>
+<span class="codeline" id="line-968"><code></code></span>
+<span class="codeline" id="line-969"><code>	// funcdata contains the offset past moduledata.gofunc which contains a</code></span>
+<span class="codeline" id="line-970"><code>	// pointer to that index's funcdata. e.g.,</code></span>
+<span class="codeline" id="line-971"><code>	// *(moduledata.gofunc +  _func.funcdata[_FUNCDATA_ArgsPointerMaps]) is</code></span>
+<span class="codeline" id="line-972"><code>	// the argument pointer map.</code></span>
+<span class="codeline" id="line-973"><code>	//</code></span>
+<span class="codeline" id="line-974"><code>	// An offset of ^uint32(0) indicates that there is no entry.</code></span>
+<span class="codeline" id="line-975"><code>	//</code></span>
+<span class="codeline" id="line-976"><code>	// funcdata [nfuncdata]uint32</code></span>
+<span class="codeline" id="line-977"><code>}</code></span>
+<span class="codeline" id="line-978"><code></code></span>
+<span class="codeline" id="line-979"><code>// Pseudo-Func that is returned for PCs that occur in inlined code.</code></span>
+<span class="codeline" id="line-980"><code>// A *Func can be either a *_func or a *funcinl, and they are distinguished</code></span>
+<span class="codeline" id="line-981"><code>// by the first uintptr.</code></span>
+<span class="codeline" id="line-982"><code>//</code></span>
+<span class="codeline" id="line-983"><code>// TODO(austin): Can we merge this with inlinedCall?</code></span>
+<span class="codeline" id="line-984"><code>type funcinl struct {</code></span>
+<span class="codeline" id="line-985"><code>	ones      uint32  // set to ^0 to distinguish from _func</code></span>
+<span class="codeline" id="line-986"><code>	entry     uintptr // entry of the real (the "outermost") frame</code></span>
+<span class="codeline" id="line-987"><code>	name      string</code></span>
+<span class="codeline" id="line-988"><code>	file      string</code></span>
+<span class="codeline" id="line-989"><code>	line      int32</code></span>
+<span class="codeline" id="line-990"><code>	startLine int32</code></span>
+<span class="codeline" id="line-991"><code>}</code></span>
+<span class="codeline" id="line-992"><code></code></span>
+<span class="codeline" id="line-993"><code>// layout of Itab known to compilers</code></span>
+<span class="codeline" id="line-994"><code>// allocated in non-garbage-collected memory</code></span>
+<span class="codeline" id="line-995"><code>// Needs to be in sync with</code></span>
+<span class="codeline" id="line-996"><code>// ../cmd/compile/internal/reflectdata/reflect.go:/^func.WritePluginTable.</code></span>
+<span class="codeline" id="line-997"><code>type itab struct {</code></span>
+<span class="codeline" id="line-998"><code>	inter *interfacetype</code></span>
+<span class="codeline" id="line-999"><code>	_type *_type</code></span>
+<span class="codeline" id="line-1000"><code>	hash  uint32 // copy of _type.hash. Used for type switches.</code></span>
+<span class="codeline" id="line-1001"><code>	_     [4]byte</code></span>
+<span class="codeline" id="line-1002"><code>	fun   [1]uintptr // variable sized. fun[0]==0 means _type does not implement inter.</code></span>
+<span class="codeline" id="line-1003"><code>}</code></span>
+<span class="codeline" id="line-1004"><code></code></span>
+<span class="codeline" id="line-1005"><code>// Lock-free stack node.</code></span>
+<span class="codeline" id="line-1006"><code>// Also known to export_test.go.</code></span>
+<span class="codeline" id="line-1007"><code>type lfnode struct {</code></span>
+<span class="codeline" id="line-1008"><code>	next    uint64</code></span>
+<span class="codeline" id="line-1009"><code>	pushcnt uintptr</code></span>
+<span class="codeline" id="line-1010"><code>}</code></span>
+<span class="codeline" id="line-1011"><code></code></span>
+<span class="codeline" id="line-1012"><code>type forcegcstate struct {</code></span>
+<span class="codeline" id="line-1013"><code>	lock mutex</code></span>
+<span class="codeline" id="line-1014"><code>	g    *g</code></span>
+<span class="codeline" id="line-1015"><code>	idle atomic.Bool</code></span>
+<span class="codeline" id="line-1016"><code>}</code></span>
+<span class="codeline" id="line-1017"><code></code></span>
+<span class="codeline" id="line-1018"><code>// A _defer holds an entry on the list of deferred calls.</code></span>
+<span class="codeline" id="line-1019"><code>// If you add a field here, add code to clear it in deferProcStack.</code></span>
+<span class="codeline" id="line-1020"><code>// This struct must match the code in cmd/compile/internal/ssagen/ssa.go:deferstruct</code></span>
+<span class="codeline" id="line-1021"><code>// and cmd/compile/internal/ssagen/ssa.go:(*state).call.</code></span>
+<span class="codeline" id="line-1022"><code>// Some defers will be allocated on the stack and some on the heap.</code></span>
+<span class="codeline" id="line-1023"><code>// All defers are logically part of the stack, so write barriers to</code></span>
+<span class="codeline" id="line-1024"><code>// initialize them are not required. All defers must be manually scanned,</code></span>
+<span class="codeline" id="line-1025"><code>// and for heap defers, marked.</code></span>
+<span class="codeline" id="line-1026"><code>type _defer struct {</code></span>
+<span class="codeline" id="line-1027"><code>	heap      bool</code></span>
+<span class="codeline" id="line-1028"><code>	rangefunc bool    // true for rangefunc list</code></span>
+<span class="codeline" id="line-1029"><code>	sp        uintptr // sp at time of defer</code></span>
+<span class="codeline" id="line-1030"><code>	pc        uintptr // pc at time of defer</code></span>
+<span class="codeline" id="line-1031"><code>	fn        func()  // can be nil for open-coded defers</code></span>
+<span class="codeline" id="line-1032"><code>	link      *_defer // next defer on G; can point to either heap or stack!</code></span>
+<span class="codeline" id="line-1033"><code></code></span>
+<span class="codeline" id="line-1034"><code>	// If rangefunc is true, *head is the head of the atomic linked list</code></span>
+<span class="codeline" id="line-1035"><code>	// during a range-over-func execution.</code></span>
+<span class="codeline" id="line-1036"><code>	head *atomic.Pointer[_defer]</code></span>
+<span class="codeline" id="line-1037"><code>}</code></span>
+<span class="codeline" id="line-1038"><code></code></span>
+<span class="codeline" id="line-1039"><code>// A _panic holds information about an active panic.</code></span>
+<span class="codeline" id="line-1040"><code>//</code></span>
+<span class="codeline" id="line-1041"><code>// A _panic value must only ever live on the stack.</code></span>
+<span class="codeline" id="line-1042"><code>//</code></span>
+<span class="codeline" id="line-1043"><code>// The argp and link fields are stack pointers, but don't need special</code></span>
+<span class="codeline" id="line-1044"><code>// handling during stack growth: because they are pointer-typed and</code></span>
+<span class="codeline" id="line-1045"><code>// _panic values only live on the stack, regular stack pointer</code></span>
+<span class="codeline" id="line-1046"><code>// adjustment takes care of them.</code></span>
+<span class="codeline" id="line-1047"><code>type _panic struct {</code></span>
+<span class="codeline" id="line-1048"><code>	argp unsafe.Pointer // pointer to arguments of deferred call run during panic; cannot move - known to liblink</code></span>
+<span class="codeline" id="line-1049"><code>	arg  any            // argument to panic</code></span>
+<span class="codeline" id="line-1050"><code>	link *_panic        // link to earlier panic</code></span>
+<span class="codeline" id="line-1051"><code></code></span>
+<span class="codeline" id="line-1052"><code>	// startPC and startSP track where _panic.start was called.</code></span>
+<span class="codeline" id="line-1053"><code>	startPC uintptr</code></span>
+<span class="codeline" id="line-1054"><code>	startSP unsafe.Pointer</code></span>
+<span class="codeline" id="line-1055"><code></code></span>
+<span class="codeline" id="line-1056"><code>	// The current stack frame that we're running deferred calls for.</code></span>
+<span class="codeline" id="line-1057"><code>	sp unsafe.Pointer</code></span>
+<span class="codeline" id="line-1058"><code>	lr uintptr</code></span>
+<span class="codeline" id="line-1059"><code>	fp unsafe.Pointer</code></span>
+<span class="codeline" id="line-1060"><code></code></span>
+<span class="codeline" id="line-1061"><code>	// retpc stores the PC where the panic should jump back to, if the</code></span>
+<span class="codeline" id="line-1062"><code>	// function last returned by _panic.next() recovers the panic.</code></span>
+<span class="codeline" id="line-1063"><code>	retpc uintptr</code></span>
+<span class="codeline" id="line-1064"><code></code></span>
+<span class="codeline" id="line-1065"><code>	// Extra state for handling open-coded defers.</code></span>
+<span class="codeline" id="line-1066"><code>	deferBitsPtr *uint8</code></span>
+<span class="codeline" id="line-1067"><code>	slotsPtr     unsafe.Pointer</code></span>
+<span class="codeline" id="line-1068"><code></code></span>
+<span class="codeline" id="line-1069"><code>	recovered   bool // whether this panic has been recovered</code></span>
+<span class="codeline" id="line-1070"><code>	goexit      bool</code></span>
+<span class="codeline" id="line-1071"><code>	deferreturn bool</code></span>
+<span class="codeline" id="line-1072"><code>}</code></span>
+<span class="codeline" id="line-1073"><code></code></span>
+<span class="codeline" id="line-1074"><code>// savedOpenDeferState tracks the extra state from _panic that's</code></span>
+<span class="codeline" id="line-1075"><code>// necessary for deferreturn to pick up where gopanic left off,</code></span>
+<span class="codeline" id="line-1076"><code>// without needing to unwind the stack.</code></span>
+<span class="codeline" id="line-1077"><code>type savedOpenDeferState struct {</code></span>
+<span class="codeline" id="line-1078"><code>	retpc           uintptr</code></span>
+<span class="codeline" id="line-1079"><code>	deferBitsOffset uintptr</code></span>
+<span class="codeline" id="line-1080"><code>	slotsOffset     uintptr</code></span>
+<span class="codeline" id="line-1081"><code>}</code></span>
+<span class="codeline" id="line-1082"><code></code></span>
+<span class="codeline" id="line-1083"><code>// ancestorInfo records details of where a goroutine was started.</code></span>
+<span class="codeline" id="line-1084"><code>type ancestorInfo struct {</code></span>
+<span class="codeline" id="line-1085"><code>	pcs  []uintptr // pcs from the stack of this goroutine</code></span>
+<span class="codeline" id="line-1086"><code>	goid uint64    // goroutine id of this goroutine; original goroutine possibly dead</code></span>
+<span class="codeline" id="line-1087"><code>	gopc uintptr   // pc of go statement that created this goroutine</code></span>
+<span class="codeline" id="line-1088"><code>}</code></span>
+<span class="codeline" id="line-1089"><code></code></span>
+<span class="codeline" id="line-1090"><code>// A waitReason explains why a goroutine has been stopped.</code></span>
+<span class="codeline" id="line-1091"><code>// See gopark. Do not re-use waitReasons, add new ones.</code></span>
+<span class="codeline" id="line-1092"><code>type waitReason uint8</code></span>
+<span class="codeline" id="line-1093"><code></code></span>
+<span class="codeline" id="line-1094"><code>const (</code></span>
+<span class="codeline" id="line-1095"><code>	waitReasonZero                  waitReason = iota // ""</code></span>
+<span class="codeline" id="line-1096"><code>	waitReasonGCAssistMarking                         // "GC assist marking"</code></span>
+<span class="codeline" id="line-1097"><code>	waitReasonIOWait                                  // "IO wait"</code></span>
+<span class="codeline" id="line-1098"><code>	waitReasonChanReceiveNilChan                      // "chan receive (nil chan)"</code></span>
+<span class="codeline" id="line-1099"><code>	waitReasonChanSendNilChan                         // "chan send (nil chan)"</code></span>
+<span class="codeline" id="line-1100"><code>	waitReasonDumpingHeap                             // "dumping heap"</code></span>
+<span class="codeline" id="line-1101"><code>	waitReasonGarbageCollection                       // "garbage collection"</code></span>
+<span class="codeline" id="line-1102"><code>	waitReasonGarbageCollectionScan                   // "garbage collection scan"</code></span>
+<span class="codeline" id="line-1103"><code>	waitReasonPanicWait                               // "panicwait"</code></span>
+<span class="codeline" id="line-1104"><code>	waitReasonSelect                                  // "select"</code></span>
+<span class="codeline" id="line-1105"><code>	waitReasonSelectNoCases                           // "select (no cases)"</code></span>
+<span class="codeline" id="line-1106"><code>	waitReasonGCAssistWait                            // "GC assist wait"</code></span>
+<span class="codeline" id="line-1107"><code>	waitReasonGCSweepWait                             // "GC sweep wait"</code></span>
+<span class="codeline" id="line-1108"><code>	waitReasonGCScavengeWait                          // "GC scavenge wait"</code></span>
+<span class="codeline" id="line-1109"><code>	waitReasonChanReceive                             // "chan receive"</code></span>
+<span class="codeline" id="line-1110"><code>	waitReasonChanSend                                // "chan send"</code></span>
+<span class="codeline" id="line-1111"><code>	waitReasonFinalizerWait                           // "finalizer wait"</code></span>
+<span class="codeline" id="line-1112"><code>	waitReasonForceGCIdle                             // "force gc (idle)"</code></span>
+<span class="codeline" id="line-1113"><code>	waitReasonSemacquire                              // "semacquire"</code></span>
+<span class="codeline" id="line-1114"><code>	waitReasonSleep                                   // "sleep"</code></span>
+<span class="codeline" id="line-1115"><code>	waitReasonSyncCondWait                            // "sync.Cond.Wait"</code></span>
+<span class="codeline" id="line-1116"><code>	waitReasonSyncMutexLock                           // "sync.Mutex.Lock"</code></span>
+<span class="codeline" id="line-1117"><code>	waitReasonSyncRWMutexRLock                        // "sync.RWMutex.RLock"</code></span>
+<span class="codeline" id="line-1118"><code>	waitReasonSyncRWMutexLock                         // "sync.RWMutex.Lock"</code></span>
+<span class="codeline" id="line-1119"><code>	waitReasonTraceReaderBlocked                      // "trace reader (blocked)"</code></span>
+<span class="codeline" id="line-1120"><code>	waitReasonWaitForGCCycle                          // "wait for GC cycle"</code></span>
+<span class="codeline" id="line-1121"><code>	waitReasonGCWorkerIdle                            // "GC worker (idle)"</code></span>
+<span class="codeline" id="line-1122"><code>	waitReasonGCWorkerActive                          // "GC worker (active)"</code></span>
+<span class="codeline" id="line-1123"><code>	waitReasonPreempted                               // "preempted"</code></span>
+<span class="codeline" id="line-1124"><code>	waitReasonDebugCall                               // "debug call"</code></span>
+<span class="codeline" id="line-1125"><code>	waitReasonGCMarkTermination                       // "GC mark termination"</code></span>
+<span class="codeline" id="line-1126"><code>	waitReasonStoppingTheWorld                        // "stopping the world"</code></span>
+<span class="codeline" id="line-1127"><code>	waitReasonFlushProcCaches                         // "flushing proc caches"</code></span>
+<span class="codeline" id="line-1128"><code>	waitReasonTraceGoroutineStatus                    // "trace goroutine status"</code></span>
+<span class="codeline" id="line-1129"><code>	waitReasonTraceProcStatus                         // "trace proc status"</code></span>
+<span class="codeline" id="line-1130"><code>	waitReasonPageTraceFlush                          // "page trace flush"</code></span>
+<span class="codeline" id="line-1131"><code>	waitReasonCoroutine                               // "coroutine"</code></span>
+<span class="codeline" id="line-1132"><code>)</code></span>
+<span class="codeline" id="line-1133"><code></code></span>
+<span class="codeline" id="line-1134"><code>var waitReasonStrings = [...]string{</code></span>
+<span class="codeline" id="line-1135"><code>	waitReasonZero:                  "",</code></span>
+<span class="codeline" id="line-1136"><code>	waitReasonGCAssistMarking:       "GC assist marking",</code></span>
+<span class="codeline" id="line-1137"><code>	waitReasonIOWait:                "IO wait",</code></span>
+<span class="codeline" id="line-1138"><code>	waitReasonChanReceiveNilChan:    "chan receive (nil chan)",</code></span>
+<span class="codeline" id="line-1139"><code>	waitReasonChanSendNilChan:       "chan send (nil chan)",</code></span>
+<span class="codeline" id="line-1140"><code>	waitReasonDumpingHeap:           "dumping heap",</code></span>
+<span class="codeline" id="line-1141"><code>	waitReasonGarbageCollection:     "garbage collection",</code></span>
+<span class="codeline" id="line-1142"><code>	waitReasonGarbageCollectionScan: "garbage collection scan",</code></span>
+<span class="codeline" id="line-1143"><code>	waitReasonPanicWait:             "panicwait",</code></span>
+<span class="codeline" id="line-1144"><code>	waitReasonSelect:                "select",</code></span>
+<span class="codeline" id="line-1145"><code>	waitReasonSelectNoCases:         "select (no cases)",</code></span>
+<span class="codeline" id="line-1146"><code>	waitReasonGCAssistWait:          "GC assist wait",</code></span>
+<span class="codeline" id="line-1147"><code>	waitReasonGCSweepWait:           "GC sweep wait",</code></span>
+<span class="codeline" id="line-1148"><code>	waitReasonGCScavengeWait:        "GC scavenge wait",</code></span>
+<span class="codeline" id="line-1149"><code>	waitReasonChanReceive:           "chan receive",</code></span>
+<span class="codeline" id="line-1150"><code>	waitReasonChanSend:              "chan send",</code></span>
+<span class="codeline" id="line-1151"><code>	waitReasonFinalizerWait:         "finalizer wait",</code></span>
+<span class="codeline" id="line-1152"><code>	waitReasonForceGCIdle:           "force gc (idle)",</code></span>
+<span class="codeline" id="line-1153"><code>	waitReasonSemacquire:            "semacquire",</code></span>
+<span class="codeline" id="line-1154"><code>	waitReasonSleep:                 "sleep",</code></span>
+<span class="codeline" id="line-1155"><code>	waitReasonSyncCondWait:          "sync.Cond.Wait",</code></span>
+<span class="codeline" id="line-1156"><code>	waitReasonSyncMutexLock:         "sync.Mutex.Lock",</code></span>
+<span class="codeline" id="line-1157"><code>	waitReasonSyncRWMutexRLock:      "sync.RWMutex.RLock",</code></span>
+<span class="codeline" id="line-1158"><code>	waitReasonSyncRWMutexLock:       "sync.RWMutex.Lock",</code></span>
+<span class="codeline" id="line-1159"><code>	waitReasonTraceReaderBlocked:    "trace reader (blocked)",</code></span>
+<span class="codeline" id="line-1160"><code>	waitReasonWaitForGCCycle:        "wait for GC cycle",</code></span>
+<span class="codeline" id="line-1161"><code>	waitReasonGCWorkerIdle:          "GC worker (idle)",</code></span>
+<span class="codeline" id="line-1162"><code>	waitReasonGCWorkerActive:        "GC worker (active)",</code></span>
+<span class="codeline" id="line-1163"><code>	waitReasonPreempted:             "preempted",</code></span>
+<span class="codeline" id="line-1164"><code>	waitReasonDebugCall:             "debug call",</code></span>
+<span class="codeline" id="line-1165"><code>	waitReasonGCMarkTermination:     "GC mark termination",</code></span>
+<span class="codeline" id="line-1166"><code>	waitReasonStoppingTheWorld:      "stopping the world",</code></span>
+<span class="codeline" id="line-1167"><code>	waitReasonFlushProcCaches:       "flushing proc caches",</code></span>
+<span class="codeline" id="line-1168"><code>	waitReasonTraceGoroutineStatus:  "trace goroutine status",</code></span>
+<span class="codeline" id="line-1169"><code>	waitReasonTraceProcStatus:       "trace proc status",</code></span>
+<span class="codeline" id="line-1170"><code>	waitReasonPageTraceFlush:        "page trace flush",</code></span>
+<span class="codeline" id="line-1171"><code>	waitReasonCoroutine:             "coroutine",</code></span>
+<span class="codeline" id="line-1172"><code>}</code></span>
+<span class="codeline" id="line-1173"><code></code></span>
+<span class="codeline" id="line-1174"><code>func (w waitReason) String() string {</code></span>
+<span class="codeline" id="line-1175"><code>	if w &lt; 0 || w &gt;= waitReason(len(waitReasonStrings)) {</code></span>
+<span class="codeline" id="line-1176"><code>		return "unknown wait reason"</code></span>
+<span class="codeline" id="line-1177"><code>	}</code></span>
+<span class="codeline" id="line-1178"><code>	return waitReasonStrings[w]</code></span>
+<span class="codeline" id="line-1179"><code>}</code></span>
+<span class="codeline" id="line-1180"><code></code></span>
+<span class="codeline" id="line-1181"><code>func (w waitReason) isMutexWait() bool {</code></span>
+<span class="codeline" id="line-1182"><code>	return w == waitReasonSyncMutexLock ||</code></span>
+<span class="codeline" id="line-1183"><code>		w == waitReasonSyncRWMutexRLock ||</code></span>
+<span class="codeline" id="line-1184"><code>		w == waitReasonSyncRWMutexLock</code></span>
+<span class="codeline" id="line-1185"><code>}</code></span>
+<span class="codeline" id="line-1186"><code></code></span>
+<span class="codeline" id="line-1187"><code>var (</code></span>
+<span class="codeline" id="line-1188"><code>	allm       *m</code></span>
+<span class="codeline" id="line-1189"><code>	gomaxprocs int32</code></span>
+<span class="codeline" id="line-1190"><code>	ncpu       int32</code></span>
+<span class="codeline" id="line-1191"><code>	forcegc    forcegcstate</code></span>
+<span class="codeline" id="line-1192"><code>	sched      schedt</code></span>
+<span class="codeline" id="line-1193"><code>	newprocs   int32</code></span>
+<span class="codeline" id="line-1194"><code></code></span>
+<span class="codeline" id="line-1195"><code>	// allpLock protects P-less reads and size changes of allp, idlepMask,</code></span>
+<span class="codeline" id="line-1196"><code>	// and timerpMask, and all writes to allp.</code></span>
+<span class="codeline" id="line-1197"><code>	allpLock mutex</code></span>
+<span class="codeline" id="line-1198"><code>	// len(allp) == gomaxprocs; may change at safe points, otherwise</code></span>
+<span class="codeline" id="line-1199"><code>	// immutable.</code></span>
+<span class="codeline" id="line-1200"><code>	allp []*p</code></span>
+<span class="codeline" id="line-1201"><code>	// Bitmask of Ps in _Pidle list, one bit per P. Reads and writes must</code></span>
+<span class="codeline" id="line-1202"><code>	// be atomic. Length may change at safe points.</code></span>
+<span class="codeline" id="line-1203"><code>	//</code></span>
+<span class="codeline" id="line-1204"><code>	// Each P must update only its own bit. In order to maintain</code></span>
+<span class="codeline" id="line-1205"><code>	// consistency, a P going idle must the idle mask simultaneously with</code></span>
+<span class="codeline" id="line-1206"><code>	// updates to the idle P list under the sched.lock, otherwise a racing</code></span>
+<span class="codeline" id="line-1207"><code>	// pidleget may clear the mask before pidleput sets the mask,</code></span>
+<span class="codeline" id="line-1208"><code>	// corrupting the bitmap.</code></span>
+<span class="codeline" id="line-1209"><code>	//</code></span>
+<span class="codeline" id="line-1210"><code>	// N.B., procresize takes ownership of all Ps in stopTheWorldWithSema.</code></span>
+<span class="codeline" id="line-1211"><code>	idlepMask pMask</code></span>
+<span class="codeline" id="line-1212"><code>	// Bitmask of Ps that may have a timer, one bit per P. Reads and writes</code></span>
+<span class="codeline" id="line-1213"><code>	// must be atomic. Length may change at safe points.</code></span>
+<span class="codeline" id="line-1214"><code>	timerpMask pMask</code></span>
+<span class="codeline" id="line-1215"><code></code></span>
+<span class="codeline" id="line-1216"><code>	// Pool of GC parked background workers. Entries are type</code></span>
+<span class="codeline" id="line-1217"><code>	// *gcBgMarkWorkerNode.</code></span>
+<span class="codeline" id="line-1218"><code>	gcBgMarkWorkerPool lfstack</code></span>
+<span class="codeline" id="line-1219"><code></code></span>
+<span class="codeline" id="line-1220"><code>	// Total number of gcBgMarkWorker goroutines. Protected by worldsema.</code></span>
+<span class="codeline" id="line-1221"><code>	gcBgMarkWorkerCount int32</code></span>
+<span class="codeline" id="line-1222"><code></code></span>
+<span class="codeline" id="line-1223"><code>	// Information about what cpu features are available.</code></span>
+<span class="codeline" id="line-1224"><code>	// Packages outside the runtime should not use these</code></span>
+<span class="codeline" id="line-1225"><code>	// as they are not an external api.</code></span>
+<span class="codeline" id="line-1226"><code>	// Set on startup in asm_{386,amd64}.s</code></span>
+<span class="codeline" id="line-1227"><code>	processorVersionInfo uint32</code></span>
+<span class="codeline" id="line-1228"><code>	isIntel              bool</code></span>
+<span class="codeline" id="line-1229"><code></code></span>
+<span class="codeline" id="line-1230"><code>	// set by cmd/link on arm systems</code></span>
+<span class="codeline" id="line-1231"><code>	goarm       uint8</code></span>
+<span class="codeline" id="line-1232"><code>	goarmsoftfp uint8</code></span>
+<span class="codeline" id="line-1233"><code>)</code></span>
+<span class="codeline" id="line-1234"><code></code></span>
+<span class="codeline" id="line-1235"><code>// Set by the linker so the runtime can determine the buildmode.</code></span>
+<span class="codeline" id="line-1236"><code>var (</code></span>
+<span class="codeline" id="line-1237"><code>	islibrary bool // -buildmode=c-shared</code></span>
+<span class="codeline" id="line-1238"><code>	isarchive bool // -buildmode=c-archive</code></span>
+<span class="codeline" id="line-1239"><code>)</code></span>
+<span class="codeline" id="line-1240"><code></code></span>
+<span class="codeline" id="line-1241"><code>// Must agree with internal/buildcfg.FramePointerEnabled.</code></span>
+<span class="codeline" id="line-1242"><code>const framepointer_enabled = GOARCH == "amd64" || GOARCH == "arm64"</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

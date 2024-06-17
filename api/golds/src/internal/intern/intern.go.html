@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: intern.go in package internal/intern</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	intern.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/internal/intern.html">internal/intern</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2020 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<div class="anchor" id="doc"><span class="codeline" id="line-5"><code>// Package intern lets you make smaller comparable values by boxing</code></span>
+<span class="codeline" id="line-6"><code>// a larger comparable value (such as a 16 byte string header) down</code></span>
+<span class="codeline" id="line-7"><code>// into a globally unique 8 byte pointer.</code></span>
+<span class="codeline" id="line-8"><code>//</code></span>
+<span class="codeline" id="line-9"><code>// The globally unique pointers are garbage collected with weak</code></span>
+<span class="codeline" id="line-10"><code>// references and finalizers. This package hides that.</code></span></div><span class="codeline" id="line-11"><code>package intern</code></span>
+<span class="codeline" id="line-12"><code></code></span>
+<span class="codeline" id="line-13"><code>import (</code></span>
+<span class="codeline" id="line-14"><code>	"internal/godebug"</code></span>
+<span class="codeline" id="line-15"><code>	"runtime"</code></span>
+<span class="codeline" id="line-16"><code>	"sync"</code></span>
+<span class="codeline" id="line-17"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-18"><code>)</code></span>
+<span class="codeline" id="line-19"><code></code></span>
+<span class="codeline" id="line-20"><code>// A Value pointer is the handle to an underlying comparable value.</code></span>
+<span class="codeline" id="line-21"><code>// See func Get for how Value pointers may be used.</code></span>
+<span class="codeline" id="line-22"><code>type Value struct {</code></span>
+<span class="codeline" id="line-23"><code>	_      [0]func() // prevent people from accidentally using value type as comparable</code></span>
+<span class="codeline" id="line-24"><code>	cmpVal any</code></span>
+<span class="codeline" id="line-25"><code>	// resurrected is guarded by mu (for all instances of Value).</code></span>
+<span class="codeline" id="line-26"><code>	// It is set true whenever v is synthesized from a uintptr.</code></span>
+<span class="codeline" id="line-27"><code>	resurrected bool</code></span>
+<span class="codeline" id="line-28"><code>}</code></span>
+<span class="codeline" id="line-29"><code></code></span>
+<span class="codeline" id="line-30"><code>// Get returns the comparable value passed to the Get func</code></span>
+<span class="codeline" id="line-31"><code>// that returned v.</code></span>
+<span class="codeline" id="line-32"><code>func (v *Value) Get() any { return v.cmpVal }</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>// key is a key in our global value map.</code></span>
+<span class="codeline" id="line-35"><code>// It contains type-specialized fields to avoid allocations</code></span>
+<span class="codeline" id="line-36"><code>// when converting common types to empty interfaces.</code></span>
+<span class="codeline" id="line-37"><code>type key struct {</code></span>
+<span class="codeline" id="line-38"><code>	s      string</code></span>
+<span class="codeline" id="line-39"><code>	cmpVal any</code></span>
+<span class="codeline" id="line-40"><code>	// isString reports whether key contains a string.</code></span>
+<span class="codeline" id="line-41"><code>	// Without it, the zero value of key is ambiguous.</code></span>
+<span class="codeline" id="line-42"><code>	isString bool</code></span>
+<span class="codeline" id="line-43"><code>}</code></span>
+<span class="codeline" id="line-44"><code></code></span>
+<span class="codeline" id="line-45"><code>// keyFor returns a key to use with cmpVal.</code></span>
+<span class="codeline" id="line-46"><code>func keyFor(cmpVal any) key {</code></span>
+<span class="codeline" id="line-47"><code>	if s, ok := cmpVal.(string); ok {</code></span>
+<span class="codeline" id="line-48"><code>		return key{s: s, isString: true}</code></span>
+<span class="codeline" id="line-49"><code>	}</code></span>
+<span class="codeline" id="line-50"><code>	return key{cmpVal: cmpVal}</code></span>
+<span class="codeline" id="line-51"><code>}</code></span>
+<span class="codeline" id="line-52"><code></code></span>
+<span class="codeline" id="line-53"><code>// Value returns a *Value built from k.</code></span>
+<span class="codeline" id="line-54"><code>func (k key) Value() *Value {</code></span>
+<span class="codeline" id="line-55"><code>	if k.isString {</code></span>
+<span class="codeline" id="line-56"><code>		return &amp;Value{cmpVal: k.s}</code></span>
+<span class="codeline" id="line-57"><code>	}</code></span>
+<span class="codeline" id="line-58"><code>	return &amp;Value{cmpVal: k.cmpVal}</code></span>
+<span class="codeline" id="line-59"><code>}</code></span>
+<span class="codeline" id="line-60"><code></code></span>
+<span class="codeline" id="line-61"><code>var (</code></span>
+<span class="codeline" id="line-62"><code>	// mu guards valMap, a weakref map of *Value by underlying value.</code></span>
+<span class="codeline" id="line-63"><code>	// It also guards the resurrected field of all *Values.</code></span>
+<span class="codeline" id="line-64"><code>	mu      sync.Mutex</code></span>
+<span class="codeline" id="line-65"><code>	valMap  = map[key]uintptr{} // to uintptr(*Value)</code></span>
+<span class="codeline" id="line-66"><code>	valSafe = safeMap()         // non-nil in safe+leaky mode</code></span>
+<span class="codeline" id="line-67"><code>)</code></span>
+<span class="codeline" id="line-68"><code></code></span>
+<span class="codeline" id="line-69"><code>var intern = godebug.New("#intern")</code></span>
+<span class="codeline" id="line-70"><code></code></span>
+<span class="codeline" id="line-71"><code>// safeMap returns a non-nil map if we're in safe-but-leaky mode,</code></span>
+<span class="codeline" id="line-72"><code>// as controlled by GODEBUG=intern=leaky</code></span>
+<span class="codeline" id="line-73"><code>func safeMap() map[key]*Value {</code></span>
+<span class="codeline" id="line-74"><code>	if intern.Value() == "leaky" {</code></span>
+<span class="codeline" id="line-75"><code>		return map[key]*Value{}</code></span>
+<span class="codeline" id="line-76"><code>	}</code></span>
+<span class="codeline" id="line-77"><code>	return nil</code></span>
+<span class="codeline" id="line-78"><code>}</code></span>
+<span class="codeline" id="line-79"><code></code></span>
+<span class="codeline" id="line-80"><code>// Get returns a pointer representing the comparable value cmpVal.</code></span>
+<span class="codeline" id="line-81"><code>//</code></span>
+<span class="codeline" id="line-82"><code>// The returned pointer will be the same for Get(v) and Get(v2)</code></span>
+<span class="codeline" id="line-83"><code>// if and only if v == v2, and can be used as a map key.</code></span>
+<span class="codeline" id="line-84"><code>func Get(cmpVal any) *Value {</code></span>
+<span class="codeline" id="line-85"><code>	return get(keyFor(cmpVal))</code></span>
+<span class="codeline" id="line-86"><code>}</code></span>
+<span class="codeline" id="line-87"><code></code></span>
+<span class="codeline" id="line-88"><code>// GetByString is identical to Get, except that it is specialized for strings.</code></span>
+<span class="codeline" id="line-89"><code>// This avoids an allocation from putting a string into an interface{}</code></span>
+<span class="codeline" id="line-90"><code>// to pass as an argument to Get.</code></span>
+<span class="codeline" id="line-91"><code>func GetByString(s string) *Value {</code></span>
+<span class="codeline" id="line-92"><code>	return get(key{s: s, isString: true})</code></span>
+<span class="codeline" id="line-93"><code>}</code></span>
+<span class="codeline" id="line-94"><code></code></span>
+<span class="codeline" id="line-95"><code>// We play unsafe games that violate Go's rules (and assume a non-moving</code></span>
+<span class="codeline" id="line-96"><code>// collector). So we quiet Go here.</code></span>
+<span class="codeline" id="line-97"><code>// See the comment below Get for more implementation details.</code></span>
+<span class="codeline" id="line-98"><code>//</code></span>
+<span class="codeline" id="line-99"><code>//go:nocheckptr</code></span>
+<span class="codeline" id="line-100"><code>func get(k key) *Value {</code></span>
+<span class="codeline" id="line-101"><code>	mu.Lock()</code></span>
+<span class="codeline" id="line-102"><code>	defer mu.Unlock()</code></span>
+<span class="codeline" id="line-103"><code></code></span>
+<span class="codeline" id="line-104"><code>	var v *Value</code></span>
+<span class="codeline" id="line-105"><code>	if valSafe != nil {</code></span>
+<span class="codeline" id="line-106"><code>		v = valSafe[k]</code></span>
+<span class="codeline" id="line-107"><code>	} else if addr, ok := valMap[k]; ok {</code></span>
+<span class="codeline" id="line-108"><code>		v = (*Value)(unsafe.Pointer(addr))</code></span>
+<span class="codeline" id="line-109"><code>		v.resurrected = true</code></span>
+<span class="codeline" id="line-110"><code>	}</code></span>
+<span class="codeline" id="line-111"><code>	if v != nil {</code></span>
+<span class="codeline" id="line-112"><code>		return v</code></span>
+<span class="codeline" id="line-113"><code>	}</code></span>
+<span class="codeline" id="line-114"><code>	v = k.Value()</code></span>
+<span class="codeline" id="line-115"><code>	if valSafe != nil {</code></span>
+<span class="codeline" id="line-116"><code>		valSafe[k] = v</code></span>
+<span class="codeline" id="line-117"><code>	} else {</code></span>
+<span class="codeline" id="line-118"><code>		// SetFinalizer before uintptr conversion (theoretical concern;</code></span>
+<span class="codeline" id="line-119"><code>		// see https://github.com/go4org/intern/issues/13)</code></span>
+<span class="codeline" id="line-120"><code>		runtime.SetFinalizer(v, finalize)</code></span>
+<span class="codeline" id="line-121"><code>		valMap[k] = uintptr(unsafe.Pointer(v))</code></span>
+<span class="codeline" id="line-122"><code>	}</code></span>
+<span class="codeline" id="line-123"><code>	return v</code></span>
+<span class="codeline" id="line-124"><code>}</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>func finalize(v *Value) {</code></span>
+<span class="codeline" id="line-127"><code>	mu.Lock()</code></span>
+<span class="codeline" id="line-128"><code>	defer mu.Unlock()</code></span>
+<span class="codeline" id="line-129"><code>	if v.resurrected {</code></span>
+<span class="codeline" id="line-130"><code>		// We lost the race. Somebody resurrected it while we</code></span>
+<span class="codeline" id="line-131"><code>		// were about to finalize it. Try again next round.</code></span>
+<span class="codeline" id="line-132"><code>		v.resurrected = false</code></span>
+<span class="codeline" id="line-133"><code>		runtime.SetFinalizer(v, finalize)</code></span>
+<span class="codeline" id="line-134"><code>		return</code></span>
+<span class="codeline" id="line-135"><code>	}</code></span>
+<span class="codeline" id="line-136"><code>	delete(valMap, keyFor(v.cmpVal))</code></span>
+<span class="codeline" id="line-137"><code>}</code></span>
+<span class="codeline" id="line-138"><code></code></span>
+<span class="codeline" id="line-139"><code>// Interning is simple if you don't require that unused values be</code></span>
+<span class="codeline" id="line-140"><code>// garbage collectable. But we do require that; we don't want to be</code></span>
+<span class="codeline" id="line-141"><code>// DOS vector. We do this by using a uintptr to hide the pointer from</code></span>
+<span class="codeline" id="line-142"><code>// the garbage collector, and using a finalizer to eliminate the</code></span>
+<span class="codeline" id="line-143"><code>// pointer when no other code is using it.</code></span>
+<span class="codeline" id="line-144"><code>//</code></span>
+<span class="codeline" id="line-145"><code>// The obvious implementation of this is to use a</code></span>
+<span class="codeline" id="line-146"><code>// map[interface{}]uintptr-of-*interface{}, and set up a finalizer to</code></span>
+<span class="codeline" id="line-147"><code>// delete from the map. Unfortunately, this is racy. Because pointers</code></span>
+<span class="codeline" id="line-148"><code>// are being created in violation of Go's unsafety rules, it's</code></span>
+<span class="codeline" id="line-149"><code>// possible to create a pointer to a value concurrently with the GC</code></span>
+<span class="codeline" id="line-150"><code>// concluding that the value can be collected. There are other races</code></span>
+<span class="codeline" id="line-151"><code>// that break the equality invariant as well, but the use-after-free</code></span>
+<span class="codeline" id="line-152"><code>// will cause a runtime crash.</code></span>
+<span class="codeline" id="line-153"><code>//</code></span>
+<span class="codeline" id="line-154"><code>// To make this work, the finalizer needs to know that no references</code></span>
+<span class="codeline" id="line-155"><code>// have been unsafely created since the finalizer was set up. To do</code></span>
+<span class="codeline" id="line-156"><code>// this, values carry a "resurrected" sentinel, which gets set</code></span>
+<span class="codeline" id="line-157"><code>// whenever a pointer is unsafely created. If the finalizer encounters</code></span>
+<span class="codeline" id="line-158"><code>// the sentinel, it clears the sentinel and delays collection for one</code></span>
+<span class="codeline" id="line-159"><code>// additional GC cycle, by re-installing itself as finalizer. This</code></span>
+<span class="codeline" id="line-160"><code>// ensures that the unsafely created pointer is visible to the GC, and</code></span>
+<span class="codeline" id="line-161"><code>// will correctly prevent collection.</code></span>
+<span class="codeline" id="line-162"><code>//</code></span>
+<span class="codeline" id="line-163"><code>// This technique does mean that interned values that get reused take</code></span>
+<span class="codeline" id="line-164"><code>// at least 3 GC cycles to fully collect (1 to clear the sentinel, 1</code></span>
+<span class="codeline" id="line-165"><code>// to clean up the unsafe map, 1 to be actually deleted).</code></span>
+<span class="codeline" id="line-166"><code>//</code></span>
+<span class="codeline" id="line-167"><code>// @ianlancetaylor commented in</code></span>
+<span class="codeline" id="line-168"><code>// https://github.com/golang/go/issues/41303#issuecomment-717401656</code></span>
+<span class="codeline" id="line-169"><code>// that it is possible to implement weak references in terms of</code></span>
+<span class="codeline" id="line-170"><code>// finalizers without unsafe. Unfortunately, the approach he outlined</code></span>
+<span class="codeline" id="line-171"><code>// does not work here, for two reasons. First, there is no way to</code></span>
+<span class="codeline" id="line-172"><code>// construct a strong pointer out of a weak pointer; our map stores</code></span>
+<span class="codeline" id="line-173"><code>// weak pointers, but we must return strong pointers to callers.</code></span>
+<span class="codeline" id="line-174"><code>// Second, and more fundamentally, we must return not just _a_ strong</code></span>
+<span class="codeline" id="line-175"><code>// pointer to callers, but _the same_ strong pointer to callers. In</code></span>
+<span class="codeline" id="line-176"><code>// order to return _the same_ strong pointer to callers, we must track</code></span>
+<span class="codeline" id="line-177"><code>// it, which is exactly what we cannot do with strong pointers.</code></span>
+<span class="codeline" id="line-178"><code>//</code></span>
+<span class="codeline" id="line-179"><code>// See https://github.com/inetaf/netaddr/issues/53 for more</code></span>
+<span class="codeline" id="line-180"><code>// discussion, and https://github.com/go4org/intern/issues/2 for an</code></span>
+<span class="codeline" id="line-181"><code>// illustration of the subtleties at play.</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

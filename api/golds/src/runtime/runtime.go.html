@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: runtime.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	runtime.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package runtime</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"runtime/internal/atomic"</code></span>
+<span class="codeline" id="line-9"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-10"><code>)</code></span>
+<span class="codeline" id="line-11"><code></code></span>
+<span class="codeline" id="line-12"><code>//go:generate go run wincallback.go</code></span>
+<span class="codeline" id="line-13"><code>//go:generate go run mkduff.go</code></span>
+<span class="codeline" id="line-14"><code>//go:generate go run mkfastlog2table.go</code></span>
+<span class="codeline" id="line-15"><code>//go:generate go run mklockrank.go -o lockrank.go</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>var ticks ticksType</code></span>
+<span class="codeline" id="line-18"><code></code></span>
+<span class="codeline" id="line-19"><code>type ticksType struct {</code></span>
+<span class="codeline" id="line-20"><code>	// lock protects access to start* and val.</code></span>
+<span class="codeline" id="line-21"><code>	lock       mutex</code></span>
+<span class="codeline" id="line-22"><code>	startTicks int64</code></span>
+<span class="codeline" id="line-23"><code>	startTime  int64</code></span>
+<span class="codeline" id="line-24"><code>	val        atomic.Int64</code></span>
+<span class="codeline" id="line-25"><code>}</code></span>
+<span class="codeline" id="line-26"><code></code></span>
+<span class="codeline" id="line-27"><code>// init initializes ticks to maximize the chance that we have a good ticksPerSecond reference.</code></span>
+<span class="codeline" id="line-28"><code>//</code></span>
+<span class="codeline" id="line-29"><code>// Must not run concurrently with ticksPerSecond.</code></span>
+<span class="codeline" id="line-30"><code>func (t *ticksType) init() {</code></span>
+<span class="codeline" id="line-31"><code>	lock(&amp;ticks.lock)</code></span>
+<span class="codeline" id="line-32"><code>	t.startTime = nanotime()</code></span>
+<span class="codeline" id="line-33"><code>	t.startTicks = cputicks()</code></span>
+<span class="codeline" id="line-34"><code>	unlock(&amp;ticks.lock)</code></span>
+<span class="codeline" id="line-35"><code>}</code></span>
+<span class="codeline" id="line-36"><code></code></span>
+<span class="codeline" id="line-37"><code>// minTimeForTicksPerSecond is the minimum elapsed time we require to consider our ticksPerSecond</code></span>
+<span class="codeline" id="line-38"><code>// measurement to be of decent enough quality for profiling.</code></span>
+<span class="codeline" id="line-39"><code>//</code></span>
+<span class="codeline" id="line-40"><code>// There's a linear relationship here between minimum time and error from the true value.</code></span>
+<span class="codeline" id="line-41"><code>// The error from the true ticks-per-second in a linux/amd64 VM seems to be:</code></span>
+<span class="codeline" id="line-42"><code>// -   1 ms -&gt; ~0.02% error</code></span>
+<span class="codeline" id="line-43"><code>// -   5 ms -&gt; ~0.004% error</code></span>
+<span class="codeline" id="line-44"><code>// -  10 ms -&gt; ~0.002% error</code></span>
+<span class="codeline" id="line-45"><code>// -  50 ms -&gt; ~0.0003% error</code></span>
+<span class="codeline" id="line-46"><code>// - 100 ms -&gt; ~0.0001% error</code></span>
+<span class="codeline" id="line-47"><code>//</code></span>
+<span class="codeline" id="line-48"><code>// We're willing to take 0.004% error here, because ticksPerSecond is intended to be used for</code></span>
+<span class="codeline" id="line-49"><code>// converting durations, not timestamps. Durations are usually going to be much larger, and so</code></span>
+<span class="codeline" id="line-50"><code>// the tiny error doesn't matter. The error is definitely going to be a problem when trying to</code></span>
+<span class="codeline" id="line-51"><code>// use this for timestamps, as it'll make those timestamps much less likely to line up.</code></span>
+<span class="codeline" id="line-52"><code>const minTimeForTicksPerSecond = 5_000_000*(1-osHasLowResClockInt) + 100_000_000*osHasLowResClockInt</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>// ticksPerSecond returns a conversion rate between the cputicks clock and the nanotime clock.</code></span>
+<span class="codeline" id="line-55"><code>//</code></span>
+<span class="codeline" id="line-56"><code>// Note: Clocks are hard. Using this as an actual conversion rate for timestamps is ill-advised</code></span>
+<span class="codeline" id="line-57"><code>// and should be avoided when possible. Use only for durations, where a tiny error term isn't going</code></span>
+<span class="codeline" id="line-58"><code>// to make a meaningful difference in even a 1ms duration. If an accurate timestamp is needed,</code></span>
+<span class="codeline" id="line-59"><code>// use nanotime instead. (The entire Windows platform is a broad exception to this rule, where nanotime</code></span>
+<span class="codeline" id="line-60"><code>// produces timestamps on such a coarse granularity that the error from this conversion is actually</code></span>
+<span class="codeline" id="line-61"><code>// preferable.)</code></span>
+<span class="codeline" id="line-62"><code>//</code></span>
+<span class="codeline" id="line-63"><code>// The strategy for computing the conversion rate is to write down nanotime and cputicks as</code></span>
+<span class="codeline" id="line-64"><code>// early in process startup as possible. From then, we just need to wait until we get values</code></span>
+<span class="codeline" id="line-65"><code>// from nanotime that we can use (some platforms have a really coarse system time granularity).</code></span>
+<span class="codeline" id="line-66"><code>// We require some amount of time to pass to ensure that the conversion rate is fairly accurate</code></span>
+<span class="codeline" id="line-67"><code>// in aggregate. But because we compute this rate lazily, there's a pretty good chance a decent</code></span>
+<span class="codeline" id="line-68"><code>// amount of time has passed by the time we get here.</code></span>
+<span class="codeline" id="line-69"><code>//</code></span>
+<span class="codeline" id="line-70"><code>// Must be called from a normal goroutine context (running regular goroutine with a P).</code></span>
+<span class="codeline" id="line-71"><code>//</code></span>
+<span class="codeline" id="line-72"><code>// Called by runtime/pprof in addition to runtime code.</code></span>
+<span class="codeline" id="line-73"><code>//</code></span>
+<span class="codeline" id="line-74"><code>// TODO(mknyszek): This doesn't account for things like CPU frequency scaling. Consider</code></span>
+<span class="codeline" id="line-75"><code>// a more sophisticated and general approach in the future.</code></span>
+<span class="codeline" id="line-76"><code>func ticksPerSecond() int64 {</code></span>
+<span class="codeline" id="line-77"><code>	// Get the conversion rate if we've already computed it.</code></span>
+<span class="codeline" id="line-78"><code>	r := ticks.val.Load()</code></span>
+<span class="codeline" id="line-79"><code>	if r != 0 {</code></span>
+<span class="codeline" id="line-80"><code>		return r</code></span>
+<span class="codeline" id="line-81"><code>	}</code></span>
+<span class="codeline" id="line-82"><code></code></span>
+<span class="codeline" id="line-83"><code>	// Compute the conversion rate.</code></span>
+<span class="codeline" id="line-84"><code>	for {</code></span>
+<span class="codeline" id="line-85"><code>		lock(&amp;ticks.lock)</code></span>
+<span class="codeline" id="line-86"><code>		r = ticks.val.Load()</code></span>
+<span class="codeline" id="line-87"><code>		if r != 0 {</code></span>
+<span class="codeline" id="line-88"><code>			unlock(&amp;ticks.lock)</code></span>
+<span class="codeline" id="line-89"><code>			return r</code></span>
+<span class="codeline" id="line-90"><code>		}</code></span>
+<span class="codeline" id="line-91"><code></code></span>
+<span class="codeline" id="line-92"><code>		// Grab the current time in both clocks.</code></span>
+<span class="codeline" id="line-93"><code>		nowTime := nanotime()</code></span>
+<span class="codeline" id="line-94"><code>		nowTicks := cputicks()</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>		// See if we can use these times.</code></span>
+<span class="codeline" id="line-97"><code>		if nowTicks &gt; ticks.startTicks &amp;&amp; nowTime-ticks.startTime &gt; minTimeForTicksPerSecond {</code></span>
+<span class="codeline" id="line-98"><code>			// Perform the calculation with floats. We don't want to risk overflow.</code></span>
+<span class="codeline" id="line-99"><code>			r = int64(float64(nowTicks-ticks.startTicks) * 1e9 / float64(nowTime-ticks.startTime))</code></span>
+<span class="codeline" id="line-100"><code>			if r == 0 {</code></span>
+<span class="codeline" id="line-101"><code>				// Zero is both a sentinel value and it would be bad if callers used this as</code></span>
+<span class="codeline" id="line-102"><code>				// a divisor. We tried out best, so just make it 1.</code></span>
+<span class="codeline" id="line-103"><code>				r++</code></span>
+<span class="codeline" id="line-104"><code>			}</code></span>
+<span class="codeline" id="line-105"><code>			ticks.val.Store(r)</code></span>
+<span class="codeline" id="line-106"><code>			unlock(&amp;ticks.lock)</code></span>
+<span class="codeline" id="line-107"><code>			break</code></span>
+<span class="codeline" id="line-108"><code>		}</code></span>
+<span class="codeline" id="line-109"><code>		unlock(&amp;ticks.lock)</code></span>
+<span class="codeline" id="line-110"><code></code></span>
+<span class="codeline" id="line-111"><code>		// Sleep in one millisecond increments until we have a reliable time.</code></span>
+<span class="codeline" id="line-112"><code>		timeSleep(1_000_000)</code></span>
+<span class="codeline" id="line-113"><code>	}</code></span>
+<span class="codeline" id="line-114"><code>	return r</code></span>
+<span class="codeline" id="line-115"><code>}</code></span>
+<span class="codeline" id="line-116"><code></code></span>
+<span class="codeline" id="line-117"><code>var envs []string</code></span>
+<span class="codeline" id="line-118"><code>var argslice []string</code></span>
+<span class="codeline" id="line-119"><code></code></span>
+<span class="codeline" id="line-120"><code>//go:linkname syscall_runtime_envs syscall.runtime_envs</code></span>
+<span class="codeline" id="line-121"><code>func syscall_runtime_envs() []string { return append([]string{}, envs...) }</code></span>
+<span class="codeline" id="line-122"><code></code></span>
+<span class="codeline" id="line-123"><code>//go:linkname syscall_Getpagesize syscall.Getpagesize</code></span>
+<span class="codeline" id="line-124"><code>func syscall_Getpagesize() int { return int(physPageSize) }</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>//go:linkname os_runtime_args os.runtime_args</code></span>
+<span class="codeline" id="line-127"><code>func os_runtime_args() []string { return append([]string{}, argslice...) }</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>//go:linkname syscall_Exit syscall.Exit</code></span>
+<span class="codeline" id="line-130"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-131"><code>func syscall_Exit(code int) {</code></span>
+<span class="codeline" id="line-132"><code>	exit(int32(code))</code></span>
+<span class="codeline" id="line-133"><code>}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>var godebugDefault string</code></span>
+<span class="codeline" id="line-136"><code>var godebugUpdate atomic.Pointer[func(string, string)]</code></span>
+<span class="codeline" id="line-137"><code>var godebugEnv atomic.Pointer[string] // set by parsedebugvars</code></span>
+<span class="codeline" id="line-138"><code>var godebugNewIncNonDefault atomic.Pointer[func(string) func()]</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>//go:linkname godebug_setUpdate internal/godebug.setUpdate</code></span>
+<span class="codeline" id="line-141"><code>func godebug_setUpdate(update func(string, string)) {</code></span>
+<span class="codeline" id="line-142"><code>	p := new(func(string, string))</code></span>
+<span class="codeline" id="line-143"><code>	*p = update</code></span>
+<span class="codeline" id="line-144"><code>	godebugUpdate.Store(p)</code></span>
+<span class="codeline" id="line-145"><code>	godebugNotify(false)</code></span>
+<span class="codeline" id="line-146"><code>}</code></span>
+<span class="codeline" id="line-147"><code></code></span>
+<span class="codeline" id="line-148"><code>//go:linkname godebug_setNewIncNonDefault internal/godebug.setNewIncNonDefault</code></span>
+<span class="codeline" id="line-149"><code>func godebug_setNewIncNonDefault(newIncNonDefault func(string) func()) {</code></span>
+<span class="codeline" id="line-150"><code>	p := new(func(string) func())</code></span>
+<span class="codeline" id="line-151"><code>	*p = newIncNonDefault</code></span>
+<span class="codeline" id="line-152"><code>	godebugNewIncNonDefault.Store(p)</code></span>
+<span class="codeline" id="line-153"><code>}</code></span>
+<span class="codeline" id="line-154"><code></code></span>
+<span class="codeline" id="line-155"><code>// A godebugInc provides access to internal/godebug's IncNonDefault function</code></span>
+<span class="codeline" id="line-156"><code>// for a given GODEBUG setting.</code></span>
+<span class="codeline" id="line-157"><code>// Calls before internal/godebug registers itself are dropped on the floor.</code></span>
+<span class="codeline" id="line-158"><code>type godebugInc struct {</code></span>
+<span class="codeline" id="line-159"><code>	name string</code></span>
+<span class="codeline" id="line-160"><code>	inc  atomic.Pointer[func()]</code></span>
+<span class="codeline" id="line-161"><code>}</code></span>
+<span class="codeline" id="line-162"><code></code></span>
+<span class="codeline" id="line-163"><code>func (g *godebugInc) IncNonDefault() {</code></span>
+<span class="codeline" id="line-164"><code>	inc := g.inc.Load()</code></span>
+<span class="codeline" id="line-165"><code>	if inc == nil {</code></span>
+<span class="codeline" id="line-166"><code>		newInc := godebugNewIncNonDefault.Load()</code></span>
+<span class="codeline" id="line-167"><code>		if newInc == nil {</code></span>
+<span class="codeline" id="line-168"><code>			return</code></span>
+<span class="codeline" id="line-169"><code>		}</code></span>
+<span class="codeline" id="line-170"><code>		inc = new(func())</code></span>
+<span class="codeline" id="line-171"><code>		*inc = (*newInc)(g.name)</code></span>
+<span class="codeline" id="line-172"><code>		if raceenabled {</code></span>
+<span class="codeline" id="line-173"><code>			racereleasemerge(unsafe.Pointer(&amp;g.inc))</code></span>
+<span class="codeline" id="line-174"><code>		}</code></span>
+<span class="codeline" id="line-175"><code>		if !g.inc.CompareAndSwap(nil, inc) {</code></span>
+<span class="codeline" id="line-176"><code>			inc = g.inc.Load()</code></span>
+<span class="codeline" id="line-177"><code>		}</code></span>
+<span class="codeline" id="line-178"><code>	}</code></span>
+<span class="codeline" id="line-179"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-180"><code>		raceacquire(unsafe.Pointer(&amp;g.inc))</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code>	(*inc)()</code></span>
+<span class="codeline" id="line-183"><code>}</code></span>
+<span class="codeline" id="line-184"><code></code></span>
+<span class="codeline" id="line-185"><code>func godebugNotify(envChanged bool) {</code></span>
+<span class="codeline" id="line-186"><code>	update := godebugUpdate.Load()</code></span>
+<span class="codeline" id="line-187"><code>	var env string</code></span>
+<span class="codeline" id="line-188"><code>	if p := godebugEnv.Load(); p != nil {</code></span>
+<span class="codeline" id="line-189"><code>		env = *p</code></span>
+<span class="codeline" id="line-190"><code>	}</code></span>
+<span class="codeline" id="line-191"><code>	if envChanged {</code></span>
+<span class="codeline" id="line-192"><code>		reparsedebugvars(env)</code></span>
+<span class="codeline" id="line-193"><code>	}</code></span>
+<span class="codeline" id="line-194"><code>	if update != nil {</code></span>
+<span class="codeline" id="line-195"><code>		(*update)(godebugDefault, env)</code></span>
+<span class="codeline" id="line-196"><code>	}</code></span>
+<span class="codeline" id="line-197"><code>}</code></span>
+<span class="codeline" id="line-198"><code></code></span>
+<span class="codeline" id="line-199"><code>//go:linkname syscall_runtimeSetenv syscall.runtimeSetenv</code></span>
+<span class="codeline" id="line-200"><code>func syscall_runtimeSetenv(key, value string) {</code></span>
+<span class="codeline" id="line-201"><code>	setenv_c(key, value)</code></span>
+<span class="codeline" id="line-202"><code>	if key == "GODEBUG" {</code></span>
+<span class="codeline" id="line-203"><code>		p := new(string)</code></span>
+<span class="codeline" id="line-204"><code>		*p = value</code></span>
+<span class="codeline" id="line-205"><code>		godebugEnv.Store(p)</code></span>
+<span class="codeline" id="line-206"><code>		godebugNotify(true)</code></span>
+<span class="codeline" id="line-207"><code>	}</code></span>
+<span class="codeline" id="line-208"><code>}</code></span>
+<span class="codeline" id="line-209"><code></code></span>
+<span class="codeline" id="line-210"><code>//go:linkname syscall_runtimeUnsetenv syscall.runtimeUnsetenv</code></span>
+<span class="codeline" id="line-211"><code>func syscall_runtimeUnsetenv(key string) {</code></span>
+<span class="codeline" id="line-212"><code>	unsetenv_c(key)</code></span>
+<span class="codeline" id="line-213"><code>	if key == "GODEBUG" {</code></span>
+<span class="codeline" id="line-214"><code>		godebugEnv.Store(nil)</code></span>
+<span class="codeline" id="line-215"><code>		godebugNotify(true)</code></span>
+<span class="codeline" id="line-216"><code>	}</code></span>
+<span class="codeline" id="line-217"><code>}</code></span>
+<span class="codeline" id="line-218"><code></code></span>
+<span class="codeline" id="line-219"><code>// writeErrStr writes a string to descriptor 2.</code></span>
+<span class="codeline" id="line-220"><code>//</code></span>
+<span class="codeline" id="line-221"><code>//go:nosplit</code></span>
+<span class="codeline" id="line-222"><code>func writeErrStr(s string) {</code></span>
+<span class="codeline" id="line-223"><code>	write(2, unsafe.Pointer(unsafe.StringData(s)), int32(len(s)))</code></span>
+<span class="codeline" id="line-224"><code>}</code></span>
+<span class="codeline" id="line-225"><code></code></span>
+<span class="codeline" id="line-226"><code>// auxv is populated on relevant platforms but defined here for all platforms</code></span>
+<span class="codeline" id="line-227"><code>// so x/sys/cpu can assume the getAuxv symbol exists without keeping its list</code></span>
+<span class="codeline" id="line-228"><code>// of auxv-using GOOS build tags in sync.</code></span>
+<span class="codeline" id="line-229"><code>//</code></span>
+<span class="codeline" id="line-230"><code>// It contains an even number of elements, (tag, value) pairs.</code></span>
+<span class="codeline" id="line-231"><code>var auxv []uintptr</code></span>
+<span class="codeline" id="line-232"><code></code></span>
+<span class="codeline" id="line-233"><code>func getAuxv() []uintptr { return auxv } // accessed from x/sys/cpu; see issue 57336</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

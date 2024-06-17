@@ -1,0 +1,1042 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: deflate.go in package github.com/klauspost/compress/flate</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	deflate.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/github.com/klauspost/compress/flate.html">github.com/klauspost/compress/flate</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Copyright (c) 2015 Klaus Post</code></span>
+<span class="codeline" id="line-3"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-4"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-5"><code></code></span>
+<span class="codeline" id="line-6"><code>package flate</code></span>
+<span class="codeline" id="line-7"><code></code></span>
+<span class="codeline" id="line-8"><code>import (</code></span>
+<span class="codeline" id="line-9"><code>	"encoding/binary"</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"io"</code></span>
+<span class="codeline" id="line-13"><code>	"math"</code></span>
+<span class="codeline" id="line-14"><code>)</code></span>
+<span class="codeline" id="line-15"><code></code></span>
+<span class="codeline" id="line-16"><code>const (</code></span>
+<span class="codeline" id="line-17"><code>	NoCompression      = 0</code></span>
+<span class="codeline" id="line-18"><code>	BestSpeed          = 1</code></span>
+<span class="codeline" id="line-19"><code>	BestCompression    = 9</code></span>
+<span class="codeline" id="line-20"><code>	DefaultCompression = -1</code></span>
+<span class="codeline" id="line-21"><code></code></span>
+<span class="codeline" id="line-22"><code>	// HuffmanOnly disables Lempel-Ziv match searching and only performs Huffman</code></span>
+<span class="codeline" id="line-23"><code>	// entropy encoding. This mode is useful in compressing data that has</code></span>
+<span class="codeline" id="line-24"><code>	// already been compressed with an LZ style algorithm (e.g. Snappy or LZ4)</code></span>
+<span class="codeline" id="line-25"><code>	// that lacks an entropy encoder. Compression gains are achieved when</code></span>
+<span class="codeline" id="line-26"><code>	// certain bytes in the input stream occur more frequently than others.</code></span>
+<span class="codeline" id="line-27"><code>	//</code></span>
+<span class="codeline" id="line-28"><code>	// Note that HuffmanOnly produces a compressed output that is</code></span>
+<span class="codeline" id="line-29"><code>	// RFC 1951 compliant. That is, any valid DEFLATE decompressor will</code></span>
+<span class="codeline" id="line-30"><code>	// continue to be able to decompress this output.</code></span>
+<span class="codeline" id="line-31"><code>	HuffmanOnly         = -2</code></span>
+<span class="codeline" id="line-32"><code>	ConstantCompression = HuffmanOnly // compatibility alias.</code></span>
+<span class="codeline" id="line-33"><code></code></span>
+<span class="codeline" id="line-34"><code>	logWindowSize    = 15</code></span>
+<span class="codeline" id="line-35"><code>	windowSize       = 1 &lt;&lt; logWindowSize</code></span>
+<span class="codeline" id="line-36"><code>	windowMask       = windowSize - 1</code></span>
+<span class="codeline" id="line-37"><code>	logMaxOffsetSize = 15  // Standard DEFLATE</code></span>
+<span class="codeline" id="line-38"><code>	minMatchLength   = 4   // The smallest match that the compressor looks for</code></span>
+<span class="codeline" id="line-39"><code>	maxMatchLength   = 258 // The longest match for the compressor</code></span>
+<span class="codeline" id="line-40"><code>	minOffsetSize    = 1   // The shortest offset that makes any sense</code></span>
+<span class="codeline" id="line-41"><code></code></span>
+<span class="codeline" id="line-42"><code>	// The maximum number of tokens we will encode at the time.</code></span>
+<span class="codeline" id="line-43"><code>	// Smaller sizes usually creates less optimal blocks.</code></span>
+<span class="codeline" id="line-44"><code>	// Bigger can make context switching slow.</code></span>
+<span class="codeline" id="line-45"><code>	// We use this for levels 7-9, so we make it big.</code></span>
+<span class="codeline" id="line-46"><code>	maxFlateBlockTokens = 1 &lt;&lt; 15</code></span>
+<span class="codeline" id="line-47"><code>	maxStoreBlockSize   = 65535</code></span>
+<span class="codeline" id="line-48"><code>	hashBits            = 17 // After 17 performance degrades</code></span>
+<span class="codeline" id="line-49"><code>	hashSize            = 1 &lt;&lt; hashBits</code></span>
+<span class="codeline" id="line-50"><code>	hashMask            = (1 &lt;&lt; hashBits) - 1</code></span>
+<span class="codeline" id="line-51"><code>	hashShift           = (hashBits + minMatchLength - 1) / minMatchLength</code></span>
+<span class="codeline" id="line-52"><code>	maxHashOffset       = 1 &lt;&lt; 28</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>	skipNever = math.MaxInt32</code></span>
+<span class="codeline" id="line-55"><code></code></span>
+<span class="codeline" id="line-56"><code>	debugDeflate = false</code></span>
+<span class="codeline" id="line-57"><code>)</code></span>
+<span class="codeline" id="line-58"><code></code></span>
+<span class="codeline" id="line-59"><code>type compressionLevel struct {</code></span>
+<span class="codeline" id="line-60"><code>	good, lazy, nice, chain, fastSkipHashing, level int</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// Compression levels have been rebalanced from zlib deflate defaults</code></span>
+<span class="codeline" id="line-64"><code>// to give a bigger spread in speed and compression.</code></span>
+<span class="codeline" id="line-65"><code>// See https://blog.klauspost.com/rebalancing-deflate-compression-levels/</code></span>
+<span class="codeline" id="line-66"><code>var levels = []compressionLevel{</code></span>
+<span class="codeline" id="line-67"><code>	{}, // 0</code></span>
+<span class="codeline" id="line-68"><code>	// Level 1-6 uses specialized algorithm - values not used</code></span>
+<span class="codeline" id="line-69"><code>	{0, 0, 0, 0, 0, 1},</code></span>
+<span class="codeline" id="line-70"><code>	{0, 0, 0, 0, 0, 2},</code></span>
+<span class="codeline" id="line-71"><code>	{0, 0, 0, 0, 0, 3},</code></span>
+<span class="codeline" id="line-72"><code>	{0, 0, 0, 0, 0, 4},</code></span>
+<span class="codeline" id="line-73"><code>	{0, 0, 0, 0, 0, 5},</code></span>
+<span class="codeline" id="line-74"><code>	{0, 0, 0, 0, 0, 6},</code></span>
+<span class="codeline" id="line-75"><code>	// Levels 7-9 use increasingly more lazy matching</code></span>
+<span class="codeline" id="line-76"><code>	// and increasingly stringent conditions for "good enough".</code></span>
+<span class="codeline" id="line-77"><code>	{8, 12, 16, 24, skipNever, 7},</code></span>
+<span class="codeline" id="line-78"><code>	{16, 30, 40, 64, skipNever, 8},</code></span>
+<span class="codeline" id="line-79"><code>	{32, 258, 258, 1024, skipNever, 9},</code></span>
+<span class="codeline" id="line-80"><code>}</code></span>
+<span class="codeline" id="line-81"><code></code></span>
+<span class="codeline" id="line-82"><code>// advancedState contains state for the advanced levels, with bigger hash tables, etc.</code></span>
+<span class="codeline" id="line-83"><code>type advancedState struct {</code></span>
+<span class="codeline" id="line-84"><code>	// deflate state</code></span>
+<span class="codeline" id="line-85"><code>	length         int</code></span>
+<span class="codeline" id="line-86"><code>	offset         int</code></span>
+<span class="codeline" id="line-87"><code>	maxInsertIndex int</code></span>
+<span class="codeline" id="line-88"><code>	chainHead      int</code></span>
+<span class="codeline" id="line-89"><code>	hashOffset     int</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>	ii uint16 // position of last match, intended to overflow to reset.</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>	// input window: unprocessed data is window[index:windowEnd]</code></span>
+<span class="codeline" id="line-94"><code>	index     int</code></span>
+<span class="codeline" id="line-95"><code>	hashMatch [maxMatchLength + minMatchLength]uint32</code></span>
+<span class="codeline" id="line-96"><code></code></span>
+<span class="codeline" id="line-97"><code>	// Input hash chains</code></span>
+<span class="codeline" id="line-98"><code>	// hashHead[hashValue] contains the largest inputIndex with the specified hash value</code></span>
+<span class="codeline" id="line-99"><code>	// If hashHead[hashValue] is within the current window, then</code></span>
+<span class="codeline" id="line-100"><code>	// hashPrev[hashHead[hashValue] &amp; windowMask] contains the previous index</code></span>
+<span class="codeline" id="line-101"><code>	// with the same hash value.</code></span>
+<span class="codeline" id="line-102"><code>	hashHead [hashSize]uint32</code></span>
+<span class="codeline" id="line-103"><code>	hashPrev [windowSize]uint32</code></span>
+<span class="codeline" id="line-104"><code>}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>type compressor struct {</code></span>
+<span class="codeline" id="line-107"><code>	compressionLevel</code></span>
+<span class="codeline" id="line-108"><code></code></span>
+<span class="codeline" id="line-109"><code>	h *huffmanEncoder</code></span>
+<span class="codeline" id="line-110"><code>	w *huffmanBitWriter</code></span>
+<span class="codeline" id="line-111"><code></code></span>
+<span class="codeline" id="line-112"><code>	// compression algorithm</code></span>
+<span class="codeline" id="line-113"><code>	fill func(*compressor, []byte) int // copy data to window</code></span>
+<span class="codeline" id="line-114"><code>	step func(*compressor)             // process window</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	window     []byte</code></span>
+<span class="codeline" id="line-117"><code>	windowEnd  int</code></span>
+<span class="codeline" id="line-118"><code>	blockStart int // window index where current tokens start</code></span>
+<span class="codeline" id="line-119"><code>	err        error</code></span>
+<span class="codeline" id="line-120"><code></code></span>
+<span class="codeline" id="line-121"><code>	// queued output tokens</code></span>
+<span class="codeline" id="line-122"><code>	tokens tokens</code></span>
+<span class="codeline" id="line-123"><code>	fast   fastEnc</code></span>
+<span class="codeline" id="line-124"><code>	state  *advancedState</code></span>
+<span class="codeline" id="line-125"><code></code></span>
+<span class="codeline" id="line-126"><code>	sync          bool // requesting flush</code></span>
+<span class="codeline" id="line-127"><code>	byteAvailable bool // if true, still need to process window[index-1].</code></span>
+<span class="codeline" id="line-128"><code>}</code></span>
+<span class="codeline" id="line-129"><code></code></span>
+<span class="codeline" id="line-130"><code>func (d *compressor) fillDeflate(b []byte) int {</code></span>
+<span class="codeline" id="line-131"><code>	s := d.state</code></span>
+<span class="codeline" id="line-132"><code>	if s.index &gt;= 2*windowSize-(minMatchLength+maxMatchLength) {</code></span>
+<span class="codeline" id="line-133"><code>		// shift the window by windowSize</code></span>
+<span class="codeline" id="line-134"><code>		//copy(d.window[:], d.window[windowSize:2*windowSize])</code></span>
+<span class="codeline" id="line-135"><code>		*(*[windowSize]byte)(d.window) = *(*[windowSize]byte)(d.window[windowSize:])</code></span>
+<span class="codeline" id="line-136"><code>		s.index -= windowSize</code></span>
+<span class="codeline" id="line-137"><code>		d.windowEnd -= windowSize</code></span>
+<span class="codeline" id="line-138"><code>		if d.blockStart &gt;= windowSize {</code></span>
+<span class="codeline" id="line-139"><code>			d.blockStart -= windowSize</code></span>
+<span class="codeline" id="line-140"><code>		} else {</code></span>
+<span class="codeline" id="line-141"><code>			d.blockStart = math.MaxInt32</code></span>
+<span class="codeline" id="line-142"><code>		}</code></span>
+<span class="codeline" id="line-143"><code>		s.hashOffset += windowSize</code></span>
+<span class="codeline" id="line-144"><code>		if s.hashOffset &gt; maxHashOffset {</code></span>
+<span class="codeline" id="line-145"><code>			delta := s.hashOffset - 1</code></span>
+<span class="codeline" id="line-146"><code>			s.hashOffset -= delta</code></span>
+<span class="codeline" id="line-147"><code>			s.chainHead -= delta</code></span>
+<span class="codeline" id="line-148"><code>			// Iterate over slices instead of arrays to avoid copying</code></span>
+<span class="codeline" id="line-149"><code>			// the entire table onto the stack (Issue #18625).</code></span>
+<span class="codeline" id="line-150"><code>			for i, v := range s.hashPrev[:] {</code></span>
+<span class="codeline" id="line-151"><code>				if int(v) &gt; delta {</code></span>
+<span class="codeline" id="line-152"><code>					s.hashPrev[i] = uint32(int(v) - delta)</code></span>
+<span class="codeline" id="line-153"><code>				} else {</code></span>
+<span class="codeline" id="line-154"><code>					s.hashPrev[i] = 0</code></span>
+<span class="codeline" id="line-155"><code>				}</code></span>
+<span class="codeline" id="line-156"><code>			}</code></span>
+<span class="codeline" id="line-157"><code>			for i, v := range s.hashHead[:] {</code></span>
+<span class="codeline" id="line-158"><code>				if int(v) &gt; delta {</code></span>
+<span class="codeline" id="line-159"><code>					s.hashHead[i] = uint32(int(v) - delta)</code></span>
+<span class="codeline" id="line-160"><code>				} else {</code></span>
+<span class="codeline" id="line-161"><code>					s.hashHead[i] = 0</code></span>
+<span class="codeline" id="line-162"><code>				}</code></span>
+<span class="codeline" id="line-163"><code>			}</code></span>
+<span class="codeline" id="line-164"><code>		}</code></span>
+<span class="codeline" id="line-165"><code>	}</code></span>
+<span class="codeline" id="line-166"><code>	n := copy(d.window[d.windowEnd:], b)</code></span>
+<span class="codeline" id="line-167"><code>	d.windowEnd += n</code></span>
+<span class="codeline" id="line-168"><code>	return n</code></span>
+<span class="codeline" id="line-169"><code>}</code></span>
+<span class="codeline" id="line-170"><code></code></span>
+<span class="codeline" id="line-171"><code>func (d *compressor) writeBlock(tok *tokens, index int, eof bool) error {</code></span>
+<span class="codeline" id="line-172"><code>	if index &gt; 0 || eof {</code></span>
+<span class="codeline" id="line-173"><code>		var window []byte</code></span>
+<span class="codeline" id="line-174"><code>		if d.blockStart &lt;= index {</code></span>
+<span class="codeline" id="line-175"><code>			window = d.window[d.blockStart:index]</code></span>
+<span class="codeline" id="line-176"><code>		}</code></span>
+<span class="codeline" id="line-177"><code>		d.blockStart = index</code></span>
+<span class="codeline" id="line-178"><code>		//d.w.writeBlock(tok, eof, window)</code></span>
+<span class="codeline" id="line-179"><code>		d.w.writeBlockDynamic(tok, eof, window, d.sync)</code></span>
+<span class="codeline" id="line-180"><code>		return d.w.err</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code>	return nil</code></span>
+<span class="codeline" id="line-183"><code>}</code></span>
+<span class="codeline" id="line-184"><code></code></span>
+<span class="codeline" id="line-185"><code>// writeBlockSkip writes the current block and uses the number of tokens</code></span>
+<span class="codeline" id="line-186"><code>// to determine if the block should be stored on no matches, or</code></span>
+<span class="codeline" id="line-187"><code>// only huffman encoded.</code></span>
+<span class="codeline" id="line-188"><code>func (d *compressor) writeBlockSkip(tok *tokens, index int, eof bool) error {</code></span>
+<span class="codeline" id="line-189"><code>	if index &gt; 0 || eof {</code></span>
+<span class="codeline" id="line-190"><code>		if d.blockStart &lt;= index {</code></span>
+<span class="codeline" id="line-191"><code>			window := d.window[d.blockStart:index]</code></span>
+<span class="codeline" id="line-192"><code>			// If we removed less than a 64th of all literals</code></span>
+<span class="codeline" id="line-193"><code>			// we huffman compress the block.</code></span>
+<span class="codeline" id="line-194"><code>			if int(tok.n) &gt; len(window)-int(tok.n&gt;&gt;6) {</code></span>
+<span class="codeline" id="line-195"><code>				d.w.writeBlockHuff(eof, window, d.sync)</code></span>
+<span class="codeline" id="line-196"><code>			} else {</code></span>
+<span class="codeline" id="line-197"><code>				// Write a dynamic huffman block.</code></span>
+<span class="codeline" id="line-198"><code>				d.w.writeBlockDynamic(tok, eof, window, d.sync)</code></span>
+<span class="codeline" id="line-199"><code>			}</code></span>
+<span class="codeline" id="line-200"><code>		} else {</code></span>
+<span class="codeline" id="line-201"><code>			d.w.writeBlock(tok, eof, nil)</code></span>
+<span class="codeline" id="line-202"><code>		}</code></span>
+<span class="codeline" id="line-203"><code>		d.blockStart = index</code></span>
+<span class="codeline" id="line-204"><code>		return d.w.err</code></span>
+<span class="codeline" id="line-205"><code>	}</code></span>
+<span class="codeline" id="line-206"><code>	return nil</code></span>
+<span class="codeline" id="line-207"><code>}</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>// fillWindow will fill the current window with the supplied</code></span>
+<span class="codeline" id="line-210"><code>// dictionary and calculate all hashes.</code></span>
+<span class="codeline" id="line-211"><code>// This is much faster than doing a full encode.</code></span>
+<span class="codeline" id="line-212"><code>// Should only be used after a start/reset.</code></span>
+<span class="codeline" id="line-213"><code>func (d *compressor) fillWindow(b []byte) {</code></span>
+<span class="codeline" id="line-214"><code>	// Do not fill window if we are in store-only or huffman mode.</code></span>
+<span class="codeline" id="line-215"><code>	if d.level &lt;= 0 &amp;&amp; d.level &gt; -MinCustomWindowSize {</code></span>
+<span class="codeline" id="line-216"><code>		return</code></span>
+<span class="codeline" id="line-217"><code>	}</code></span>
+<span class="codeline" id="line-218"><code>	if d.fast != nil {</code></span>
+<span class="codeline" id="line-219"><code>		// encode the last data, but discard the result</code></span>
+<span class="codeline" id="line-220"><code>		if len(b) &gt; maxMatchOffset {</code></span>
+<span class="codeline" id="line-221"><code>			b = b[len(b)-maxMatchOffset:]</code></span>
+<span class="codeline" id="line-222"><code>		}</code></span>
+<span class="codeline" id="line-223"><code>		d.fast.Encode(&amp;d.tokens, b)</code></span>
+<span class="codeline" id="line-224"><code>		d.tokens.Reset()</code></span>
+<span class="codeline" id="line-225"><code>		return</code></span>
+<span class="codeline" id="line-226"><code>	}</code></span>
+<span class="codeline" id="line-227"><code>	s := d.state</code></span>
+<span class="codeline" id="line-228"><code>	// If we are given too much, cut it.</code></span>
+<span class="codeline" id="line-229"><code>	if len(b) &gt; windowSize {</code></span>
+<span class="codeline" id="line-230"><code>		b = b[len(b)-windowSize:]</code></span>
+<span class="codeline" id="line-231"><code>	}</code></span>
+<span class="codeline" id="line-232"><code>	// Add all to window.</code></span>
+<span class="codeline" id="line-233"><code>	n := copy(d.window[d.windowEnd:], b)</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>	// Calculate 256 hashes at the time (more L1 cache hits)</code></span>
+<span class="codeline" id="line-236"><code>	loops := (n + 256 - minMatchLength) / 256</code></span>
+<span class="codeline" id="line-237"><code>	for j := 0; j &lt; loops; j++ {</code></span>
+<span class="codeline" id="line-238"><code>		startindex := j * 256</code></span>
+<span class="codeline" id="line-239"><code>		end := startindex + 256 + minMatchLength - 1</code></span>
+<span class="codeline" id="line-240"><code>		if end &gt; n {</code></span>
+<span class="codeline" id="line-241"><code>			end = n</code></span>
+<span class="codeline" id="line-242"><code>		}</code></span>
+<span class="codeline" id="line-243"><code>		tocheck := d.window[startindex:end]</code></span>
+<span class="codeline" id="line-244"><code>		dstSize := len(tocheck) - minMatchLength + 1</code></span>
+<span class="codeline" id="line-245"><code></code></span>
+<span class="codeline" id="line-246"><code>		if dstSize &lt;= 0 {</code></span>
+<span class="codeline" id="line-247"><code>			continue</code></span>
+<span class="codeline" id="line-248"><code>		}</code></span>
+<span class="codeline" id="line-249"><code></code></span>
+<span class="codeline" id="line-250"><code>		dst := s.hashMatch[:dstSize]</code></span>
+<span class="codeline" id="line-251"><code>		bulkHash4(tocheck, dst)</code></span>
+<span class="codeline" id="line-252"><code>		var newH uint32</code></span>
+<span class="codeline" id="line-253"><code>		for i, val := range dst {</code></span>
+<span class="codeline" id="line-254"><code>			di := i + startindex</code></span>
+<span class="codeline" id="line-255"><code>			newH = val &amp; hashMask</code></span>
+<span class="codeline" id="line-256"><code>			// Get previous value with the same hash.</code></span>
+<span class="codeline" id="line-257"><code>			// Our chain should point to the previous value.</code></span>
+<span class="codeline" id="line-258"><code>			s.hashPrev[di&amp;windowMask] = s.hashHead[newH]</code></span>
+<span class="codeline" id="line-259"><code>			// Set the head of the hash chain to us.</code></span>
+<span class="codeline" id="line-260"><code>			s.hashHead[newH] = uint32(di + s.hashOffset)</code></span>
+<span class="codeline" id="line-261"><code>		}</code></span>
+<span class="codeline" id="line-262"><code>	}</code></span>
+<span class="codeline" id="line-263"><code>	// Update window information.</code></span>
+<span class="codeline" id="line-264"><code>	d.windowEnd += n</code></span>
+<span class="codeline" id="line-265"><code>	s.index = n</code></span>
+<span class="codeline" id="line-266"><code>}</code></span>
+<span class="codeline" id="line-267"><code></code></span>
+<span class="codeline" id="line-268"><code>// Try to find a match starting at index whose length is greater than prevSize.</code></span>
+<span class="codeline" id="line-269"><code>// We only look at chainCount possibilities before giving up.</code></span>
+<span class="codeline" id="line-270"><code>// pos = s.index, prevHead = s.chainHead-s.hashOffset, prevLength=minMatchLength-1, lookahead</code></span>
+<span class="codeline" id="line-271"><code>func (d *compressor) findMatch(pos int, prevHead int, lookahead int) (length, offset int, ok bool) {</code></span>
+<span class="codeline" id="line-272"><code>	minMatchLook := maxMatchLength</code></span>
+<span class="codeline" id="line-273"><code>	if lookahead &lt; minMatchLook {</code></span>
+<span class="codeline" id="line-274"><code>		minMatchLook = lookahead</code></span>
+<span class="codeline" id="line-275"><code>	}</code></span>
+<span class="codeline" id="line-276"><code></code></span>
+<span class="codeline" id="line-277"><code>	win := d.window[0 : pos+minMatchLook]</code></span>
+<span class="codeline" id="line-278"><code></code></span>
+<span class="codeline" id="line-279"><code>	// We quit when we get a match that's at least nice long</code></span>
+<span class="codeline" id="line-280"><code>	nice := len(win) - pos</code></span>
+<span class="codeline" id="line-281"><code>	if d.nice &lt; nice {</code></span>
+<span class="codeline" id="line-282"><code>		nice = d.nice</code></span>
+<span class="codeline" id="line-283"><code>	}</code></span>
+<span class="codeline" id="line-284"><code></code></span>
+<span class="codeline" id="line-285"><code>	// If we've got a match that's good enough, only look in 1/4 the chain.</code></span>
+<span class="codeline" id="line-286"><code>	tries := d.chain</code></span>
+<span class="codeline" id="line-287"><code>	length = minMatchLength - 1</code></span>
+<span class="codeline" id="line-288"><code></code></span>
+<span class="codeline" id="line-289"><code>	wEnd := win[pos+length]</code></span>
+<span class="codeline" id="line-290"><code>	wPos := win[pos:]</code></span>
+<span class="codeline" id="line-291"><code>	minIndex := pos - windowSize</code></span>
+<span class="codeline" id="line-292"><code>	if minIndex &lt; 0 {</code></span>
+<span class="codeline" id="line-293"><code>		minIndex = 0</code></span>
+<span class="codeline" id="line-294"><code>	}</code></span>
+<span class="codeline" id="line-295"><code>	offset = 0</code></span>
+<span class="codeline" id="line-296"><code></code></span>
+<span class="codeline" id="line-297"><code>	if d.chain &lt; 100 {</code></span>
+<span class="codeline" id="line-298"><code>		for i := prevHead; tries &gt; 0; tries-- {</code></span>
+<span class="codeline" id="line-299"><code>			if wEnd == win[i+length] {</code></span>
+<span class="codeline" id="line-300"><code>				n := matchLen(win[i:i+minMatchLook], wPos)</code></span>
+<span class="codeline" id="line-301"><code>				if n &gt; length {</code></span>
+<span class="codeline" id="line-302"><code>					length = n</code></span>
+<span class="codeline" id="line-303"><code>					offset = pos - i</code></span>
+<span class="codeline" id="line-304"><code>					ok = true</code></span>
+<span class="codeline" id="line-305"><code>					if n &gt;= nice {</code></span>
+<span class="codeline" id="line-306"><code>						// The match is good enough that we don't try to find a better one.</code></span>
+<span class="codeline" id="line-307"><code>						break</code></span>
+<span class="codeline" id="line-308"><code>					}</code></span>
+<span class="codeline" id="line-309"><code>					wEnd = win[pos+n]</code></span>
+<span class="codeline" id="line-310"><code>				}</code></span>
+<span class="codeline" id="line-311"><code>			}</code></span>
+<span class="codeline" id="line-312"><code>			if i &lt;= minIndex {</code></span>
+<span class="codeline" id="line-313"><code>				// hashPrev[i &amp; windowMask] has already been overwritten, so stop now.</code></span>
+<span class="codeline" id="line-314"><code>				break</code></span>
+<span class="codeline" id="line-315"><code>			}</code></span>
+<span class="codeline" id="line-316"><code>			i = int(d.state.hashPrev[i&amp;windowMask]) - d.state.hashOffset</code></span>
+<span class="codeline" id="line-317"><code>			if i &lt; minIndex {</code></span>
+<span class="codeline" id="line-318"><code>				break</code></span>
+<span class="codeline" id="line-319"><code>			}</code></span>
+<span class="codeline" id="line-320"><code>		}</code></span>
+<span class="codeline" id="line-321"><code>		return</code></span>
+<span class="codeline" id="line-322"><code>	}</code></span>
+<span class="codeline" id="line-323"><code></code></span>
+<span class="codeline" id="line-324"><code>	// Minimum gain to accept a match.</code></span>
+<span class="codeline" id="line-325"><code>	cGain := 4</code></span>
+<span class="codeline" id="line-326"><code></code></span>
+<span class="codeline" id="line-327"><code>	// Some like it higher (CSV), some like it lower (JSON)</code></span>
+<span class="codeline" id="line-328"><code>	const baseCost = 3</code></span>
+<span class="codeline" id="line-329"><code>	// Base is 4 bytes at with an additional cost.</code></span>
+<span class="codeline" id="line-330"><code>	// Matches must be better than this.</code></span>
+<span class="codeline" id="line-331"><code></code></span>
+<span class="codeline" id="line-332"><code>	for i := prevHead; tries &gt; 0; tries-- {</code></span>
+<span class="codeline" id="line-333"><code>		if wEnd == win[i+length] {</code></span>
+<span class="codeline" id="line-334"><code>			n := matchLen(win[i:i+minMatchLook], wPos)</code></span>
+<span class="codeline" id="line-335"><code>			if n &gt; length {</code></span>
+<span class="codeline" id="line-336"><code>				// Calculate gain. Estimate</code></span>
+<span class="codeline" id="line-337"><code>				newGain := d.h.bitLengthRaw(wPos[:n]) - int(offsetExtraBits[offsetCode(uint32(pos-i))]) - baseCost - int(lengthExtraBits[lengthCodes[(n-3)&amp;255]])</code></span>
+<span class="codeline" id="line-338"><code></code></span>
+<span class="codeline" id="line-339"><code>				//fmt.Println("gain:", newGain, "prev:", cGain, "raw:", d.h.bitLengthRaw(wPos[:n]), "this-len:", n, "prev-len:", length)</code></span>
+<span class="codeline" id="line-340"><code>				if newGain &gt; cGain {</code></span>
+<span class="codeline" id="line-341"><code>					length = n</code></span>
+<span class="codeline" id="line-342"><code>					offset = pos - i</code></span>
+<span class="codeline" id="line-343"><code>					cGain = newGain</code></span>
+<span class="codeline" id="line-344"><code>					ok = true</code></span>
+<span class="codeline" id="line-345"><code>					if n &gt;= nice {</code></span>
+<span class="codeline" id="line-346"><code>						// The match is good enough that we don't try to find a better one.</code></span>
+<span class="codeline" id="line-347"><code>						break</code></span>
+<span class="codeline" id="line-348"><code>					}</code></span>
+<span class="codeline" id="line-349"><code>					wEnd = win[pos+n]</code></span>
+<span class="codeline" id="line-350"><code>				}</code></span>
+<span class="codeline" id="line-351"><code>			}</code></span>
+<span class="codeline" id="line-352"><code>		}</code></span>
+<span class="codeline" id="line-353"><code>		if i &lt;= minIndex {</code></span>
+<span class="codeline" id="line-354"><code>			// hashPrev[i &amp; windowMask] has already been overwritten, so stop now.</code></span>
+<span class="codeline" id="line-355"><code>			break</code></span>
+<span class="codeline" id="line-356"><code>		}</code></span>
+<span class="codeline" id="line-357"><code>		i = int(d.state.hashPrev[i&amp;windowMask]) - d.state.hashOffset</code></span>
+<span class="codeline" id="line-358"><code>		if i &lt; minIndex {</code></span>
+<span class="codeline" id="line-359"><code>			break</code></span>
+<span class="codeline" id="line-360"><code>		}</code></span>
+<span class="codeline" id="line-361"><code>	}</code></span>
+<span class="codeline" id="line-362"><code>	return</code></span>
+<span class="codeline" id="line-363"><code>}</code></span>
+<span class="codeline" id="line-364"><code></code></span>
+<span class="codeline" id="line-365"><code>func (d *compressor) writeStoredBlock(buf []byte) error {</code></span>
+<span class="codeline" id="line-366"><code>	if d.w.writeStoredHeader(len(buf), false); d.w.err != nil {</code></span>
+<span class="codeline" id="line-367"><code>		return d.w.err</code></span>
+<span class="codeline" id="line-368"><code>	}</code></span>
+<span class="codeline" id="line-369"><code>	d.w.writeBytes(buf)</code></span>
+<span class="codeline" id="line-370"><code>	return d.w.err</code></span>
+<span class="codeline" id="line-371"><code>}</code></span>
+<span class="codeline" id="line-372"><code></code></span>
+<span class="codeline" id="line-373"><code>// hash4 returns a hash representation of the first 4 bytes</code></span>
+<span class="codeline" id="line-374"><code>// of the supplied slice.</code></span>
+<span class="codeline" id="line-375"><code>// The caller must ensure that len(b) &gt;= 4.</code></span>
+<span class="codeline" id="line-376"><code>func hash4(b []byte) uint32 {</code></span>
+<span class="codeline" id="line-377"><code>	return hash4u(binary.LittleEndian.Uint32(b), hashBits)</code></span>
+<span class="codeline" id="line-378"><code>}</code></span>
+<span class="codeline" id="line-379"><code></code></span>
+<span class="codeline" id="line-380"><code>// hash4 returns the hash of u to fit in a hash table with h bits.</code></span>
+<span class="codeline" id="line-381"><code>// Preferably h should be a constant and should always be &lt;32.</code></span>
+<span class="codeline" id="line-382"><code>func hash4u(u uint32, h uint8) uint32 {</code></span>
+<span class="codeline" id="line-383"><code>	return (u * prime4bytes) &gt;&gt; (32 - h)</code></span>
+<span class="codeline" id="line-384"><code>}</code></span>
+<span class="codeline" id="line-385"><code></code></span>
+<span class="codeline" id="line-386"><code>// bulkHash4 will compute hashes using the same</code></span>
+<span class="codeline" id="line-387"><code>// algorithm as hash4</code></span>
+<span class="codeline" id="line-388"><code>func bulkHash4(b []byte, dst []uint32) {</code></span>
+<span class="codeline" id="line-389"><code>	if len(b) &lt; 4 {</code></span>
+<span class="codeline" id="line-390"><code>		return</code></span>
+<span class="codeline" id="line-391"><code>	}</code></span>
+<span class="codeline" id="line-392"><code>	hb := binary.LittleEndian.Uint32(b)</code></span>
+<span class="codeline" id="line-393"><code></code></span>
+<span class="codeline" id="line-394"><code>	dst[0] = hash4u(hb, hashBits)</code></span>
+<span class="codeline" id="line-395"><code>	end := len(b) - 4 + 1</code></span>
+<span class="codeline" id="line-396"><code>	for i := 1; i &lt; end; i++ {</code></span>
+<span class="codeline" id="line-397"><code>		hb = (hb &gt;&gt; 8) | uint32(b[i+3])&lt;&lt;24</code></span>
+<span class="codeline" id="line-398"><code>		dst[i] = hash4u(hb, hashBits)</code></span>
+<span class="codeline" id="line-399"><code>	}</code></span>
+<span class="codeline" id="line-400"><code>}</code></span>
+<span class="codeline" id="line-401"><code></code></span>
+<span class="codeline" id="line-402"><code>func (d *compressor) initDeflate() {</code></span>
+<span class="codeline" id="line-403"><code>	d.window = make([]byte, 2*windowSize)</code></span>
+<span class="codeline" id="line-404"><code>	d.byteAvailable = false</code></span>
+<span class="codeline" id="line-405"><code>	d.err = nil</code></span>
+<span class="codeline" id="line-406"><code>	if d.state == nil {</code></span>
+<span class="codeline" id="line-407"><code>		return</code></span>
+<span class="codeline" id="line-408"><code>	}</code></span>
+<span class="codeline" id="line-409"><code>	s := d.state</code></span>
+<span class="codeline" id="line-410"><code>	s.index = 0</code></span>
+<span class="codeline" id="line-411"><code>	s.hashOffset = 1</code></span>
+<span class="codeline" id="line-412"><code>	s.length = minMatchLength - 1</code></span>
+<span class="codeline" id="line-413"><code>	s.offset = 0</code></span>
+<span class="codeline" id="line-414"><code>	s.chainHead = -1</code></span>
+<span class="codeline" id="line-415"><code>}</code></span>
+<span class="codeline" id="line-416"><code></code></span>
+<span class="codeline" id="line-417"><code>// deflateLazy is the same as deflate, but with d.fastSkipHashing == skipNever,</code></span>
+<span class="codeline" id="line-418"><code>// meaning it always has lazy matching on.</code></span>
+<span class="codeline" id="line-419"><code>func (d *compressor) deflateLazy() {</code></span>
+<span class="codeline" id="line-420"><code>	s := d.state</code></span>
+<span class="codeline" id="line-421"><code>	// Sanity enables additional runtime tests.</code></span>
+<span class="codeline" id="line-422"><code>	// It's intended to be used during development</code></span>
+<span class="codeline" id="line-423"><code>	// to supplement the currently ad-hoc unit tests.</code></span>
+<span class="codeline" id="line-424"><code>	const sanity = debugDeflate</code></span>
+<span class="codeline" id="line-425"><code></code></span>
+<span class="codeline" id="line-426"><code>	if d.windowEnd-s.index &lt; minMatchLength+maxMatchLength &amp;&amp; !d.sync {</code></span>
+<span class="codeline" id="line-427"><code>		return</code></span>
+<span class="codeline" id="line-428"><code>	}</code></span>
+<span class="codeline" id="line-429"><code>	if d.windowEnd != s.index &amp;&amp; d.chain &gt; 100 {</code></span>
+<span class="codeline" id="line-430"><code>		// Get literal huffman coder.</code></span>
+<span class="codeline" id="line-431"><code>		if d.h == nil {</code></span>
+<span class="codeline" id="line-432"><code>			d.h = newHuffmanEncoder(maxFlateBlockTokens)</code></span>
+<span class="codeline" id="line-433"><code>		}</code></span>
+<span class="codeline" id="line-434"><code>		var tmp [256]uint16</code></span>
+<span class="codeline" id="line-435"><code>		for _, v := range d.window[s.index:d.windowEnd] {</code></span>
+<span class="codeline" id="line-436"><code>			tmp[v]++</code></span>
+<span class="codeline" id="line-437"><code>		}</code></span>
+<span class="codeline" id="line-438"><code>		d.h.generate(tmp[:], 15)</code></span>
+<span class="codeline" id="line-439"><code>	}</code></span>
+<span class="codeline" id="line-440"><code></code></span>
+<span class="codeline" id="line-441"><code>	s.maxInsertIndex = d.windowEnd - (minMatchLength - 1)</code></span>
+<span class="codeline" id="line-442"><code></code></span>
+<span class="codeline" id="line-443"><code>	for {</code></span>
+<span class="codeline" id="line-444"><code>		if sanity &amp;&amp; s.index &gt; d.windowEnd {</code></span>
+<span class="codeline" id="line-445"><code>			panic("index &gt; windowEnd")</code></span>
+<span class="codeline" id="line-446"><code>		}</code></span>
+<span class="codeline" id="line-447"><code>		lookahead := d.windowEnd - s.index</code></span>
+<span class="codeline" id="line-448"><code>		if lookahead &lt; minMatchLength+maxMatchLength {</code></span>
+<span class="codeline" id="line-449"><code>			if !d.sync {</code></span>
+<span class="codeline" id="line-450"><code>				return</code></span>
+<span class="codeline" id="line-451"><code>			}</code></span>
+<span class="codeline" id="line-452"><code>			if sanity &amp;&amp; s.index &gt; d.windowEnd {</code></span>
+<span class="codeline" id="line-453"><code>				panic("index &gt; windowEnd")</code></span>
+<span class="codeline" id="line-454"><code>			}</code></span>
+<span class="codeline" id="line-455"><code>			if lookahead == 0 {</code></span>
+<span class="codeline" id="line-456"><code>				// Flush current output block if any.</code></span>
+<span class="codeline" id="line-457"><code>				if d.byteAvailable {</code></span>
+<span class="codeline" id="line-458"><code>					// There is still one pending token that needs to be flushed</code></span>
+<span class="codeline" id="line-459"><code>					d.tokens.AddLiteral(d.window[s.index-1])</code></span>
+<span class="codeline" id="line-460"><code>					d.byteAvailable = false</code></span>
+<span class="codeline" id="line-461"><code>				}</code></span>
+<span class="codeline" id="line-462"><code>				if d.tokens.n &gt; 0 {</code></span>
+<span class="codeline" id="line-463"><code>					if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-464"><code>						return</code></span>
+<span class="codeline" id="line-465"><code>					}</code></span>
+<span class="codeline" id="line-466"><code>					d.tokens.Reset()</code></span>
+<span class="codeline" id="line-467"><code>				}</code></span>
+<span class="codeline" id="line-468"><code>				return</code></span>
+<span class="codeline" id="line-469"><code>			}</code></span>
+<span class="codeline" id="line-470"><code>		}</code></span>
+<span class="codeline" id="line-471"><code>		if s.index &lt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-472"><code>			// Update the hash</code></span>
+<span class="codeline" id="line-473"><code>			hash := hash4(d.window[s.index:])</code></span>
+<span class="codeline" id="line-474"><code>			ch := s.hashHead[hash]</code></span>
+<span class="codeline" id="line-475"><code>			s.chainHead = int(ch)</code></span>
+<span class="codeline" id="line-476"><code>			s.hashPrev[s.index&amp;windowMask] = ch</code></span>
+<span class="codeline" id="line-477"><code>			s.hashHead[hash] = uint32(s.index + s.hashOffset)</code></span>
+<span class="codeline" id="line-478"><code>		}</code></span>
+<span class="codeline" id="line-479"><code>		prevLength := s.length</code></span>
+<span class="codeline" id="line-480"><code>		prevOffset := s.offset</code></span>
+<span class="codeline" id="line-481"><code>		s.length = minMatchLength - 1</code></span>
+<span class="codeline" id="line-482"><code>		s.offset = 0</code></span>
+<span class="codeline" id="line-483"><code>		minIndex := s.index - windowSize</code></span>
+<span class="codeline" id="line-484"><code>		if minIndex &lt; 0 {</code></span>
+<span class="codeline" id="line-485"><code>			minIndex = 0</code></span>
+<span class="codeline" id="line-486"><code>		}</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>		if s.chainHead-s.hashOffset &gt;= minIndex &amp;&amp; lookahead &gt; prevLength &amp;&amp; prevLength &lt; d.lazy {</code></span>
+<span class="codeline" id="line-489"><code>			if newLength, newOffset, ok := d.findMatch(s.index, s.chainHead-s.hashOffset, lookahead); ok {</code></span>
+<span class="codeline" id="line-490"><code>				s.length = newLength</code></span>
+<span class="codeline" id="line-491"><code>				s.offset = newOffset</code></span>
+<span class="codeline" id="line-492"><code>			}</code></span>
+<span class="codeline" id="line-493"><code>		}</code></span>
+<span class="codeline" id="line-494"><code></code></span>
+<span class="codeline" id="line-495"><code>		if prevLength &gt;= minMatchLength &amp;&amp; s.length &lt;= prevLength {</code></span>
+<span class="codeline" id="line-496"><code>			// No better match, but check for better match at end...</code></span>
+<span class="codeline" id="line-497"><code>			//</code></span>
+<span class="codeline" id="line-498"><code>			// Skip forward a number of bytes.</code></span>
+<span class="codeline" id="line-499"><code>			// Offset of 2 seems to yield best results. 3 is sometimes better.</code></span>
+<span class="codeline" id="line-500"><code>			const checkOff = 2</code></span>
+<span class="codeline" id="line-501"><code></code></span>
+<span class="codeline" id="line-502"><code>			// Check all, except full length</code></span>
+<span class="codeline" id="line-503"><code>			if prevLength &lt; maxMatchLength-checkOff {</code></span>
+<span class="codeline" id="line-504"><code>				prevIndex := s.index - 1</code></span>
+<span class="codeline" id="line-505"><code>				if prevIndex+prevLength &lt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-506"><code>					end := lookahead</code></span>
+<span class="codeline" id="line-507"><code>					if lookahead &gt; maxMatchLength+checkOff {</code></span>
+<span class="codeline" id="line-508"><code>						end = maxMatchLength + checkOff</code></span>
+<span class="codeline" id="line-509"><code>					}</code></span>
+<span class="codeline" id="line-510"><code>					end += prevIndex</code></span>
+<span class="codeline" id="line-511"><code></code></span>
+<span class="codeline" id="line-512"><code>					// Hash at match end.</code></span>
+<span class="codeline" id="line-513"><code>					h := hash4(d.window[prevIndex+prevLength:])</code></span>
+<span class="codeline" id="line-514"><code>					ch2 := int(s.hashHead[h]) - s.hashOffset - prevLength</code></span>
+<span class="codeline" id="line-515"><code>					if prevIndex-ch2 != prevOffset &amp;&amp; ch2 &gt; minIndex+checkOff {</code></span>
+<span class="codeline" id="line-516"><code>						length := matchLen(d.window[prevIndex+checkOff:end], d.window[ch2+checkOff:])</code></span>
+<span class="codeline" id="line-517"><code>						// It seems like a pure length metric is best.</code></span>
+<span class="codeline" id="line-518"><code>						if length &gt; prevLength {</code></span>
+<span class="codeline" id="line-519"><code>							prevLength = length</code></span>
+<span class="codeline" id="line-520"><code>							prevOffset = prevIndex - ch2</code></span>
+<span class="codeline" id="line-521"><code></code></span>
+<span class="codeline" id="line-522"><code>							// Extend back...</code></span>
+<span class="codeline" id="line-523"><code>							for i := checkOff - 1; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-524"><code>								if prevLength &gt;= maxMatchLength || d.window[prevIndex+i] != d.window[ch2+i] {</code></span>
+<span class="codeline" id="line-525"><code>									// Emit tokens we "owe"</code></span>
+<span class="codeline" id="line-526"><code>									for j := 0; j &lt;= i; j++ {</code></span>
+<span class="codeline" id="line-527"><code>										d.tokens.AddLiteral(d.window[prevIndex+j])</code></span>
+<span class="codeline" id="line-528"><code>										if d.tokens.n == maxFlateBlockTokens {</code></span>
+<span class="codeline" id="line-529"><code>											// The block includes the current character</code></span>
+<span class="codeline" id="line-530"><code>											if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-531"><code>												return</code></span>
+<span class="codeline" id="line-532"><code>											}</code></span>
+<span class="codeline" id="line-533"><code>											d.tokens.Reset()</code></span>
+<span class="codeline" id="line-534"><code>										}</code></span>
+<span class="codeline" id="line-535"><code>										s.index++</code></span>
+<span class="codeline" id="line-536"><code>										if s.index &lt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-537"><code>											h := hash4(d.window[s.index:])</code></span>
+<span class="codeline" id="line-538"><code>											ch := s.hashHead[h]</code></span>
+<span class="codeline" id="line-539"><code>											s.chainHead = int(ch)</code></span>
+<span class="codeline" id="line-540"><code>											s.hashPrev[s.index&amp;windowMask] = ch</code></span>
+<span class="codeline" id="line-541"><code>											s.hashHead[h] = uint32(s.index + s.hashOffset)</code></span>
+<span class="codeline" id="line-542"><code>										}</code></span>
+<span class="codeline" id="line-543"><code>									}</code></span>
+<span class="codeline" id="line-544"><code>									break</code></span>
+<span class="codeline" id="line-545"><code>								} else {</code></span>
+<span class="codeline" id="line-546"><code>									prevLength++</code></span>
+<span class="codeline" id="line-547"><code>								}</code></span>
+<span class="codeline" id="line-548"><code>							}</code></span>
+<span class="codeline" id="line-549"><code>						} else if false {</code></span>
+<span class="codeline" id="line-550"><code>							// Check one further ahead.</code></span>
+<span class="codeline" id="line-551"><code>							// Only rarely better, disabled for now.</code></span>
+<span class="codeline" id="line-552"><code>							prevIndex++</code></span>
+<span class="codeline" id="line-553"><code>							h := hash4(d.window[prevIndex+prevLength:])</code></span>
+<span class="codeline" id="line-554"><code>							ch2 := int(s.hashHead[h]) - s.hashOffset - prevLength</code></span>
+<span class="codeline" id="line-555"><code>							if prevIndex-ch2 != prevOffset &amp;&amp; ch2 &gt; minIndex+checkOff {</code></span>
+<span class="codeline" id="line-556"><code>								length := matchLen(d.window[prevIndex+checkOff:end], d.window[ch2+checkOff:])</code></span>
+<span class="codeline" id="line-557"><code>								// It seems like a pure length metric is best.</code></span>
+<span class="codeline" id="line-558"><code>								if length &gt; prevLength+checkOff {</code></span>
+<span class="codeline" id="line-559"><code>									prevLength = length</code></span>
+<span class="codeline" id="line-560"><code>									prevOffset = prevIndex - ch2</code></span>
+<span class="codeline" id="line-561"><code>									prevIndex--</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>									// Extend back...</code></span>
+<span class="codeline" id="line-564"><code>									for i := checkOff; i &gt;= 0; i-- {</code></span>
+<span class="codeline" id="line-565"><code>										if prevLength &gt;= maxMatchLength || d.window[prevIndex+i] != d.window[ch2+i-1] {</code></span>
+<span class="codeline" id="line-566"><code>											// Emit tokens we "owe"</code></span>
+<span class="codeline" id="line-567"><code>											for j := 0; j &lt;= i; j++ {</code></span>
+<span class="codeline" id="line-568"><code>												d.tokens.AddLiteral(d.window[prevIndex+j])</code></span>
+<span class="codeline" id="line-569"><code>												if d.tokens.n == maxFlateBlockTokens {</code></span>
+<span class="codeline" id="line-570"><code>													// The block includes the current character</code></span>
+<span class="codeline" id="line-571"><code>													if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-572"><code>														return</code></span>
+<span class="codeline" id="line-573"><code>													}</code></span>
+<span class="codeline" id="line-574"><code>													d.tokens.Reset()</code></span>
+<span class="codeline" id="line-575"><code>												}</code></span>
+<span class="codeline" id="line-576"><code>												s.index++</code></span>
+<span class="codeline" id="line-577"><code>												if s.index &lt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-578"><code>													h := hash4(d.window[s.index:])</code></span>
+<span class="codeline" id="line-579"><code>													ch := s.hashHead[h]</code></span>
+<span class="codeline" id="line-580"><code>													s.chainHead = int(ch)</code></span>
+<span class="codeline" id="line-581"><code>													s.hashPrev[s.index&amp;windowMask] = ch</code></span>
+<span class="codeline" id="line-582"><code>													s.hashHead[h] = uint32(s.index + s.hashOffset)</code></span>
+<span class="codeline" id="line-583"><code>												}</code></span>
+<span class="codeline" id="line-584"><code>											}</code></span>
+<span class="codeline" id="line-585"><code>											break</code></span>
+<span class="codeline" id="line-586"><code>										} else {</code></span>
+<span class="codeline" id="line-587"><code>											prevLength++</code></span>
+<span class="codeline" id="line-588"><code>										}</code></span>
+<span class="codeline" id="line-589"><code>									}</code></span>
+<span class="codeline" id="line-590"><code>								}</code></span>
+<span class="codeline" id="line-591"><code>							}</code></span>
+<span class="codeline" id="line-592"><code>						}</code></span>
+<span class="codeline" id="line-593"><code>					}</code></span>
+<span class="codeline" id="line-594"><code>				}</code></span>
+<span class="codeline" id="line-595"><code>			}</code></span>
+<span class="codeline" id="line-596"><code>			// There was a match at the previous step, and the current match is</code></span>
+<span class="codeline" id="line-597"><code>			// not better. Output the previous match.</code></span>
+<span class="codeline" id="line-598"><code>			d.tokens.AddMatch(uint32(prevLength-3), uint32(prevOffset-minOffsetSize))</code></span>
+<span class="codeline" id="line-599"><code></code></span>
+<span class="codeline" id="line-600"><code>			// Insert in the hash table all strings up to the end of the match.</code></span>
+<span class="codeline" id="line-601"><code>			// index and index-1 are already inserted. If there is not enough</code></span>
+<span class="codeline" id="line-602"><code>			// lookahead, the last two strings are not inserted into the hash</code></span>
+<span class="codeline" id="line-603"><code>			// table.</code></span>
+<span class="codeline" id="line-604"><code>			newIndex := s.index + prevLength - 1</code></span>
+<span class="codeline" id="line-605"><code>			// Calculate missing hashes</code></span>
+<span class="codeline" id="line-606"><code>			end := newIndex</code></span>
+<span class="codeline" id="line-607"><code>			if end &gt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-608"><code>				end = s.maxInsertIndex</code></span>
+<span class="codeline" id="line-609"><code>			}</code></span>
+<span class="codeline" id="line-610"><code>			end += minMatchLength - 1</code></span>
+<span class="codeline" id="line-611"><code>			startindex := s.index + 1</code></span>
+<span class="codeline" id="line-612"><code>			if startindex &gt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-613"><code>				startindex = s.maxInsertIndex</code></span>
+<span class="codeline" id="line-614"><code>			}</code></span>
+<span class="codeline" id="line-615"><code>			tocheck := d.window[startindex:end]</code></span>
+<span class="codeline" id="line-616"><code>			dstSize := len(tocheck) - minMatchLength + 1</code></span>
+<span class="codeline" id="line-617"><code>			if dstSize &gt; 0 {</code></span>
+<span class="codeline" id="line-618"><code>				dst := s.hashMatch[:dstSize]</code></span>
+<span class="codeline" id="line-619"><code>				bulkHash4(tocheck, dst)</code></span>
+<span class="codeline" id="line-620"><code>				var newH uint32</code></span>
+<span class="codeline" id="line-621"><code>				for i, val := range dst {</code></span>
+<span class="codeline" id="line-622"><code>					di := i + startindex</code></span>
+<span class="codeline" id="line-623"><code>					newH = val &amp; hashMask</code></span>
+<span class="codeline" id="line-624"><code>					// Get previous value with the same hash.</code></span>
+<span class="codeline" id="line-625"><code>					// Our chain should point to the previous value.</code></span>
+<span class="codeline" id="line-626"><code>					s.hashPrev[di&amp;windowMask] = s.hashHead[newH]</code></span>
+<span class="codeline" id="line-627"><code>					// Set the head of the hash chain to us.</code></span>
+<span class="codeline" id="line-628"><code>					s.hashHead[newH] = uint32(di + s.hashOffset)</code></span>
+<span class="codeline" id="line-629"><code>				}</code></span>
+<span class="codeline" id="line-630"><code>			}</code></span>
+<span class="codeline" id="line-631"><code></code></span>
+<span class="codeline" id="line-632"><code>			s.index = newIndex</code></span>
+<span class="codeline" id="line-633"><code>			d.byteAvailable = false</code></span>
+<span class="codeline" id="line-634"><code>			s.length = minMatchLength - 1</code></span>
+<span class="codeline" id="line-635"><code>			if d.tokens.n == maxFlateBlockTokens {</code></span>
+<span class="codeline" id="line-636"><code>				// The block includes the current character</code></span>
+<span class="codeline" id="line-637"><code>				if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-638"><code>					return</code></span>
+<span class="codeline" id="line-639"><code>				}</code></span>
+<span class="codeline" id="line-640"><code>				d.tokens.Reset()</code></span>
+<span class="codeline" id="line-641"><code>			}</code></span>
+<span class="codeline" id="line-642"><code>			s.ii = 0</code></span>
+<span class="codeline" id="line-643"><code>		} else {</code></span>
+<span class="codeline" id="line-644"><code>			// Reset, if we got a match this run.</code></span>
+<span class="codeline" id="line-645"><code>			if s.length &gt;= minMatchLength {</code></span>
+<span class="codeline" id="line-646"><code>				s.ii = 0</code></span>
+<span class="codeline" id="line-647"><code>			}</code></span>
+<span class="codeline" id="line-648"><code>			// We have a byte waiting. Emit it.</code></span>
+<span class="codeline" id="line-649"><code>			if d.byteAvailable {</code></span>
+<span class="codeline" id="line-650"><code>				s.ii++</code></span>
+<span class="codeline" id="line-651"><code>				d.tokens.AddLiteral(d.window[s.index-1])</code></span>
+<span class="codeline" id="line-652"><code>				if d.tokens.n == maxFlateBlockTokens {</code></span>
+<span class="codeline" id="line-653"><code>					if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-654"><code>						return</code></span>
+<span class="codeline" id="line-655"><code>					}</code></span>
+<span class="codeline" id="line-656"><code>					d.tokens.Reset()</code></span>
+<span class="codeline" id="line-657"><code>				}</code></span>
+<span class="codeline" id="line-658"><code>				s.index++</code></span>
+<span class="codeline" id="line-659"><code></code></span>
+<span class="codeline" id="line-660"><code>				// If we have a long run of no matches, skip additional bytes</code></span>
+<span class="codeline" id="line-661"><code>				// Resets when s.ii overflows after 64KB.</code></span>
+<span class="codeline" id="line-662"><code>				if n := int(s.ii) - d.chain; n &gt; 0 {</code></span>
+<span class="codeline" id="line-663"><code>					n = 1 + int(n&gt;&gt;6)</code></span>
+<span class="codeline" id="line-664"><code>					for j := 0; j &lt; n; j++ {</code></span>
+<span class="codeline" id="line-665"><code>						if s.index &gt;= d.windowEnd-1 {</code></span>
+<span class="codeline" id="line-666"><code>							break</code></span>
+<span class="codeline" id="line-667"><code>						}</code></span>
+<span class="codeline" id="line-668"><code>						d.tokens.AddLiteral(d.window[s.index-1])</code></span>
+<span class="codeline" id="line-669"><code>						if d.tokens.n == maxFlateBlockTokens {</code></span>
+<span class="codeline" id="line-670"><code>							if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-671"><code>								return</code></span>
+<span class="codeline" id="line-672"><code>							}</code></span>
+<span class="codeline" id="line-673"><code>							d.tokens.Reset()</code></span>
+<span class="codeline" id="line-674"><code>						}</code></span>
+<span class="codeline" id="line-675"><code>						// Index...</code></span>
+<span class="codeline" id="line-676"><code>						if s.index &lt; s.maxInsertIndex {</code></span>
+<span class="codeline" id="line-677"><code>							h := hash4(d.window[s.index:])</code></span>
+<span class="codeline" id="line-678"><code>							ch := s.hashHead[h]</code></span>
+<span class="codeline" id="line-679"><code>							s.chainHead = int(ch)</code></span>
+<span class="codeline" id="line-680"><code>							s.hashPrev[s.index&amp;windowMask] = ch</code></span>
+<span class="codeline" id="line-681"><code>							s.hashHead[h] = uint32(s.index + s.hashOffset)</code></span>
+<span class="codeline" id="line-682"><code>						}</code></span>
+<span class="codeline" id="line-683"><code>						s.index++</code></span>
+<span class="codeline" id="line-684"><code>					}</code></span>
+<span class="codeline" id="line-685"><code>					// Flush last byte</code></span>
+<span class="codeline" id="line-686"><code>					d.tokens.AddLiteral(d.window[s.index-1])</code></span>
+<span class="codeline" id="line-687"><code>					d.byteAvailable = false</code></span>
+<span class="codeline" id="line-688"><code>					// s.length = minMatchLength - 1 // not needed, since s.ii is reset above, so it should never be &gt; minMatchLength</code></span>
+<span class="codeline" id="line-689"><code>					if d.tokens.n == maxFlateBlockTokens {</code></span>
+<span class="codeline" id="line-690"><code>						if d.err = d.writeBlock(&amp;d.tokens, s.index, false); d.err != nil {</code></span>
+<span class="codeline" id="line-691"><code>							return</code></span>
+<span class="codeline" id="line-692"><code>						}</code></span>
+<span class="codeline" id="line-693"><code>						d.tokens.Reset()</code></span>
+<span class="codeline" id="line-694"><code>					}</code></span>
+<span class="codeline" id="line-695"><code>				}</code></span>
+<span class="codeline" id="line-696"><code>			} else {</code></span>
+<span class="codeline" id="line-697"><code>				s.index++</code></span>
+<span class="codeline" id="line-698"><code>				d.byteAvailable = true</code></span>
+<span class="codeline" id="line-699"><code>			}</code></span>
+<span class="codeline" id="line-700"><code>		}</code></span>
+<span class="codeline" id="line-701"><code>	}</code></span>
+<span class="codeline" id="line-702"><code>}</code></span>
+<span class="codeline" id="line-703"><code></code></span>
+<span class="codeline" id="line-704"><code>func (d *compressor) store() {</code></span>
+<span class="codeline" id="line-705"><code>	if d.windowEnd &gt; 0 &amp;&amp; (d.windowEnd == maxStoreBlockSize || d.sync) {</code></span>
+<span class="codeline" id="line-706"><code>		d.err = d.writeStoredBlock(d.window[:d.windowEnd])</code></span>
+<span class="codeline" id="line-707"><code>		d.windowEnd = 0</code></span>
+<span class="codeline" id="line-708"><code>	}</code></span>
+<span class="codeline" id="line-709"><code>}</code></span>
+<span class="codeline" id="line-710"><code></code></span>
+<span class="codeline" id="line-711"><code>// fillWindow will fill the buffer with data for huffman-only compression.</code></span>
+<span class="codeline" id="line-712"><code>// The number of bytes copied is returned.</code></span>
+<span class="codeline" id="line-713"><code>func (d *compressor) fillBlock(b []byte) int {</code></span>
+<span class="codeline" id="line-714"><code>	n := copy(d.window[d.windowEnd:], b)</code></span>
+<span class="codeline" id="line-715"><code>	d.windowEnd += n</code></span>
+<span class="codeline" id="line-716"><code>	return n</code></span>
+<span class="codeline" id="line-717"><code>}</code></span>
+<span class="codeline" id="line-718"><code></code></span>
+<span class="codeline" id="line-719"><code>// storeHuff will compress and store the currently added data,</code></span>
+<span class="codeline" id="line-720"><code>// if enough has been accumulated or we at the end of the stream.</code></span>
+<span class="codeline" id="line-721"><code>// Any error that occurred will be in d.err</code></span>
+<span class="codeline" id="line-722"><code>func (d *compressor) storeHuff() {</code></span>
+<span class="codeline" id="line-723"><code>	if d.windowEnd &lt; len(d.window) &amp;&amp; !d.sync || d.windowEnd == 0 {</code></span>
+<span class="codeline" id="line-724"><code>		return</code></span>
+<span class="codeline" id="line-725"><code>	}</code></span>
+<span class="codeline" id="line-726"><code>	d.w.writeBlockHuff(false, d.window[:d.windowEnd], d.sync)</code></span>
+<span class="codeline" id="line-727"><code>	d.err = d.w.err</code></span>
+<span class="codeline" id="line-728"><code>	d.windowEnd = 0</code></span>
+<span class="codeline" id="line-729"><code>}</code></span>
+<span class="codeline" id="line-730"><code></code></span>
+<span class="codeline" id="line-731"><code>// storeFast will compress and store the currently added data,</code></span>
+<span class="codeline" id="line-732"><code>// if enough has been accumulated or we at the end of the stream.</code></span>
+<span class="codeline" id="line-733"><code>// Any error that occurred will be in d.err</code></span>
+<span class="codeline" id="line-734"><code>func (d *compressor) storeFast() {</code></span>
+<span class="codeline" id="line-735"><code>	// We only compress if we have maxStoreBlockSize.</code></span>
+<span class="codeline" id="line-736"><code>	if d.windowEnd &lt; len(d.window) {</code></span>
+<span class="codeline" id="line-737"><code>		if !d.sync {</code></span>
+<span class="codeline" id="line-738"><code>			return</code></span>
+<span class="codeline" id="line-739"><code>		}</code></span>
+<span class="codeline" id="line-740"><code>		// Handle extremely small sizes.</code></span>
+<span class="codeline" id="line-741"><code>		if d.windowEnd &lt; 128 {</code></span>
+<span class="codeline" id="line-742"><code>			if d.windowEnd == 0 {</code></span>
+<span class="codeline" id="line-743"><code>				return</code></span>
+<span class="codeline" id="line-744"><code>			}</code></span>
+<span class="codeline" id="line-745"><code>			if d.windowEnd &lt;= 32 {</code></span>
+<span class="codeline" id="line-746"><code>				d.err = d.writeStoredBlock(d.window[:d.windowEnd])</code></span>
+<span class="codeline" id="line-747"><code>			} else {</code></span>
+<span class="codeline" id="line-748"><code>				d.w.writeBlockHuff(false, d.window[:d.windowEnd], true)</code></span>
+<span class="codeline" id="line-749"><code>				d.err = d.w.err</code></span>
+<span class="codeline" id="line-750"><code>			}</code></span>
+<span class="codeline" id="line-751"><code>			d.tokens.Reset()</code></span>
+<span class="codeline" id="line-752"><code>			d.windowEnd = 0</code></span>
+<span class="codeline" id="line-753"><code>			d.fast.Reset()</code></span>
+<span class="codeline" id="line-754"><code>			return</code></span>
+<span class="codeline" id="line-755"><code>		}</code></span>
+<span class="codeline" id="line-756"><code>	}</code></span>
+<span class="codeline" id="line-757"><code></code></span>
+<span class="codeline" id="line-758"><code>	d.fast.Encode(&amp;d.tokens, d.window[:d.windowEnd])</code></span>
+<span class="codeline" id="line-759"><code>	// If we made zero matches, store the block as is.</code></span>
+<span class="codeline" id="line-760"><code>	if d.tokens.n == 0 {</code></span>
+<span class="codeline" id="line-761"><code>		d.err = d.writeStoredBlock(d.window[:d.windowEnd])</code></span>
+<span class="codeline" id="line-762"><code>		// If we removed less than 1/16th, huffman compress the block.</code></span>
+<span class="codeline" id="line-763"><code>	} else if int(d.tokens.n) &gt; d.windowEnd-(d.windowEnd&gt;&gt;4) {</code></span>
+<span class="codeline" id="line-764"><code>		d.w.writeBlockHuff(false, d.window[:d.windowEnd], d.sync)</code></span>
+<span class="codeline" id="line-765"><code>		d.err = d.w.err</code></span>
+<span class="codeline" id="line-766"><code>	} else {</code></span>
+<span class="codeline" id="line-767"><code>		d.w.writeBlockDynamic(&amp;d.tokens, false, d.window[:d.windowEnd], d.sync)</code></span>
+<span class="codeline" id="line-768"><code>		d.err = d.w.err</code></span>
+<span class="codeline" id="line-769"><code>	}</code></span>
+<span class="codeline" id="line-770"><code>	d.tokens.Reset()</code></span>
+<span class="codeline" id="line-771"><code>	d.windowEnd = 0</code></span>
+<span class="codeline" id="line-772"><code>}</code></span>
+<span class="codeline" id="line-773"><code></code></span>
+<span class="codeline" id="line-774"><code>// write will add input byte to the stream.</code></span>
+<span class="codeline" id="line-775"><code>// Unless an error occurs all bytes will be consumed.</code></span>
+<span class="codeline" id="line-776"><code>func (d *compressor) write(b []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-777"><code>	if d.err != nil {</code></span>
+<span class="codeline" id="line-778"><code>		return 0, d.err</code></span>
+<span class="codeline" id="line-779"><code>	}</code></span>
+<span class="codeline" id="line-780"><code>	n = len(b)</code></span>
+<span class="codeline" id="line-781"><code>	for len(b) &gt; 0 {</code></span>
+<span class="codeline" id="line-782"><code>		if d.windowEnd == len(d.window) || d.sync {</code></span>
+<span class="codeline" id="line-783"><code>			d.step(d)</code></span>
+<span class="codeline" id="line-784"><code>		}</code></span>
+<span class="codeline" id="line-785"><code>		b = b[d.fill(d, b):]</code></span>
+<span class="codeline" id="line-786"><code>		if d.err != nil {</code></span>
+<span class="codeline" id="line-787"><code>			return 0, d.err</code></span>
+<span class="codeline" id="line-788"><code>		}</code></span>
+<span class="codeline" id="line-789"><code>	}</code></span>
+<span class="codeline" id="line-790"><code>	return n, d.err</code></span>
+<span class="codeline" id="line-791"><code>}</code></span>
+<span class="codeline" id="line-792"><code></code></span>
+<span class="codeline" id="line-793"><code>func (d *compressor) syncFlush() error {</code></span>
+<span class="codeline" id="line-794"><code>	d.sync = true</code></span>
+<span class="codeline" id="line-795"><code>	if d.err != nil {</code></span>
+<span class="codeline" id="line-796"><code>		return d.err</code></span>
+<span class="codeline" id="line-797"><code>	}</code></span>
+<span class="codeline" id="line-798"><code>	d.step(d)</code></span>
+<span class="codeline" id="line-799"><code>	if d.err == nil {</code></span>
+<span class="codeline" id="line-800"><code>		d.w.writeStoredHeader(0, false)</code></span>
+<span class="codeline" id="line-801"><code>		d.w.flush()</code></span>
+<span class="codeline" id="line-802"><code>		d.err = d.w.err</code></span>
+<span class="codeline" id="line-803"><code>	}</code></span>
+<span class="codeline" id="line-804"><code>	d.sync = false</code></span>
+<span class="codeline" id="line-805"><code>	return d.err</code></span>
+<span class="codeline" id="line-806"><code>}</code></span>
+<span class="codeline" id="line-807"><code></code></span>
+<span class="codeline" id="line-808"><code>func (d *compressor) init(w io.Writer, level int) (err error) {</code></span>
+<span class="codeline" id="line-809"><code>	d.w = newHuffmanBitWriter(w)</code></span>
+<span class="codeline" id="line-810"><code></code></span>
+<span class="codeline" id="line-811"><code>	switch {</code></span>
+<span class="codeline" id="line-812"><code>	case level == NoCompression:</code></span>
+<span class="codeline" id="line-813"><code>		d.window = make([]byte, maxStoreBlockSize)</code></span>
+<span class="codeline" id="line-814"><code>		d.fill = (*compressor).fillBlock</code></span>
+<span class="codeline" id="line-815"><code>		d.step = (*compressor).store</code></span>
+<span class="codeline" id="line-816"><code>	case level == ConstantCompression:</code></span>
+<span class="codeline" id="line-817"><code>		d.w.logNewTablePenalty = 10</code></span>
+<span class="codeline" id="line-818"><code>		d.window = make([]byte, 32&lt;&lt;10)</code></span>
+<span class="codeline" id="line-819"><code>		d.fill = (*compressor).fillBlock</code></span>
+<span class="codeline" id="line-820"><code>		d.step = (*compressor).storeHuff</code></span>
+<span class="codeline" id="line-821"><code>	case level == DefaultCompression:</code></span>
+<span class="codeline" id="line-822"><code>		level = 5</code></span>
+<span class="codeline" id="line-823"><code>		fallthrough</code></span>
+<span class="codeline" id="line-824"><code>	case level &gt;= 1 &amp;&amp; level &lt;= 6:</code></span>
+<span class="codeline" id="line-825"><code>		d.w.logNewTablePenalty = 7</code></span>
+<span class="codeline" id="line-826"><code>		d.fast = newFastEnc(level)</code></span>
+<span class="codeline" id="line-827"><code>		d.window = make([]byte, maxStoreBlockSize)</code></span>
+<span class="codeline" id="line-828"><code>		d.fill = (*compressor).fillBlock</code></span>
+<span class="codeline" id="line-829"><code>		d.step = (*compressor).storeFast</code></span>
+<span class="codeline" id="line-830"><code>	case 7 &lt;= level &amp;&amp; level &lt;= 9:</code></span>
+<span class="codeline" id="line-831"><code>		d.w.logNewTablePenalty = 8</code></span>
+<span class="codeline" id="line-832"><code>		d.state = &amp;advancedState{}</code></span>
+<span class="codeline" id="line-833"><code>		d.compressionLevel = levels[level]</code></span>
+<span class="codeline" id="line-834"><code>		d.initDeflate()</code></span>
+<span class="codeline" id="line-835"><code>		d.fill = (*compressor).fillDeflate</code></span>
+<span class="codeline" id="line-836"><code>		d.step = (*compressor).deflateLazy</code></span>
+<span class="codeline" id="line-837"><code>	case -level &gt;= MinCustomWindowSize &amp;&amp; -level &lt;= MaxCustomWindowSize:</code></span>
+<span class="codeline" id="line-838"><code>		d.w.logNewTablePenalty = 7</code></span>
+<span class="codeline" id="line-839"><code>		d.fast = &amp;fastEncL5Window{maxOffset: int32(-level), cur: maxStoreBlockSize}</code></span>
+<span class="codeline" id="line-840"><code>		d.window = make([]byte, maxStoreBlockSize)</code></span>
+<span class="codeline" id="line-841"><code>		d.fill = (*compressor).fillBlock</code></span>
+<span class="codeline" id="line-842"><code>		d.step = (*compressor).storeFast</code></span>
+<span class="codeline" id="line-843"><code>	default:</code></span>
+<span class="codeline" id="line-844"><code>		return fmt.Errorf("flate: invalid compression level %d: want value in range [-2, 9]", level)</code></span>
+<span class="codeline" id="line-845"><code>	}</code></span>
+<span class="codeline" id="line-846"><code>	d.level = level</code></span>
+<span class="codeline" id="line-847"><code>	return nil</code></span>
+<span class="codeline" id="line-848"><code>}</code></span>
+<span class="codeline" id="line-849"><code></code></span>
+<span class="codeline" id="line-850"><code>// reset the state of the compressor.</code></span>
+<span class="codeline" id="line-851"><code>func (d *compressor) reset(w io.Writer) {</code></span>
+<span class="codeline" id="line-852"><code>	d.w.reset(w)</code></span>
+<span class="codeline" id="line-853"><code>	d.sync = false</code></span>
+<span class="codeline" id="line-854"><code>	d.err = nil</code></span>
+<span class="codeline" id="line-855"><code>	// We only need to reset a few things for Snappy.</code></span>
+<span class="codeline" id="line-856"><code>	if d.fast != nil {</code></span>
+<span class="codeline" id="line-857"><code>		d.fast.Reset()</code></span>
+<span class="codeline" id="line-858"><code>		d.windowEnd = 0</code></span>
+<span class="codeline" id="line-859"><code>		d.tokens.Reset()</code></span>
+<span class="codeline" id="line-860"><code>		return</code></span>
+<span class="codeline" id="line-861"><code>	}</code></span>
+<span class="codeline" id="line-862"><code>	switch d.compressionLevel.chain {</code></span>
+<span class="codeline" id="line-863"><code>	case 0:</code></span>
+<span class="codeline" id="line-864"><code>		// level was NoCompression or ConstantCompresssion.</code></span>
+<span class="codeline" id="line-865"><code>		d.windowEnd = 0</code></span>
+<span class="codeline" id="line-866"><code>	default:</code></span>
+<span class="codeline" id="line-867"><code>		s := d.state</code></span>
+<span class="codeline" id="line-868"><code>		s.chainHead = -1</code></span>
+<span class="codeline" id="line-869"><code>		for i := range s.hashHead {</code></span>
+<span class="codeline" id="line-870"><code>			s.hashHead[i] = 0</code></span>
+<span class="codeline" id="line-871"><code>		}</code></span>
+<span class="codeline" id="line-872"><code>		for i := range s.hashPrev {</code></span>
+<span class="codeline" id="line-873"><code>			s.hashPrev[i] = 0</code></span>
+<span class="codeline" id="line-874"><code>		}</code></span>
+<span class="codeline" id="line-875"><code>		s.hashOffset = 1</code></span>
+<span class="codeline" id="line-876"><code>		s.index, d.windowEnd = 0, 0</code></span>
+<span class="codeline" id="line-877"><code>		d.blockStart, d.byteAvailable = 0, false</code></span>
+<span class="codeline" id="line-878"><code>		d.tokens.Reset()</code></span>
+<span class="codeline" id="line-879"><code>		s.length = minMatchLength - 1</code></span>
+<span class="codeline" id="line-880"><code>		s.offset = 0</code></span>
+<span class="codeline" id="line-881"><code>		s.ii = 0</code></span>
+<span class="codeline" id="line-882"><code>		s.maxInsertIndex = 0</code></span>
+<span class="codeline" id="line-883"><code>	}</code></span>
+<span class="codeline" id="line-884"><code>}</code></span>
+<span class="codeline" id="line-885"><code></code></span>
+<span class="codeline" id="line-886"><code>func (d *compressor) close() error {</code></span>
+<span class="codeline" id="line-887"><code>	if d.err != nil {</code></span>
+<span class="codeline" id="line-888"><code>		return d.err</code></span>
+<span class="codeline" id="line-889"><code>	}</code></span>
+<span class="codeline" id="line-890"><code>	d.sync = true</code></span>
+<span class="codeline" id="line-891"><code>	d.step(d)</code></span>
+<span class="codeline" id="line-892"><code>	if d.err != nil {</code></span>
+<span class="codeline" id="line-893"><code>		return d.err</code></span>
+<span class="codeline" id="line-894"><code>	}</code></span>
+<span class="codeline" id="line-895"><code>	if d.w.writeStoredHeader(0, true); d.w.err != nil {</code></span>
+<span class="codeline" id="line-896"><code>		return d.w.err</code></span>
+<span class="codeline" id="line-897"><code>	}</code></span>
+<span class="codeline" id="line-898"><code>	d.w.flush()</code></span>
+<span class="codeline" id="line-899"><code>	d.w.reset(nil)</code></span>
+<span class="codeline" id="line-900"><code>	return d.w.err</code></span>
+<span class="codeline" id="line-901"><code>}</code></span>
+<span class="codeline" id="line-902"><code></code></span>
+<span class="codeline" id="line-903"><code>// NewWriter returns a new Writer compressing data at the given level.</code></span>
+<span class="codeline" id="line-904"><code>// Following zlib, levels range from 1 (BestSpeed) to 9 (BestCompression);</code></span>
+<span class="codeline" id="line-905"><code>// higher levels typically run slower but compress more.</code></span>
+<span class="codeline" id="line-906"><code>// Level 0 (NoCompression) does not attempt any compression; it only adds the</code></span>
+<span class="codeline" id="line-907"><code>// necessary DEFLATE framing.</code></span>
+<span class="codeline" id="line-908"><code>// Level -1 (DefaultCompression) uses the default compression level.</code></span>
+<span class="codeline" id="line-909"><code>// Level -2 (ConstantCompression) will use Huffman compression only, giving</code></span>
+<span class="codeline" id="line-910"><code>// a very fast compression for all types of input, but sacrificing considerable</code></span>
+<span class="codeline" id="line-911"><code>// compression efficiency.</code></span>
+<span class="codeline" id="line-912"><code>//</code></span>
+<span class="codeline" id="line-913"><code>// If level is in the range [-2, 9] then the error returned will be nil.</code></span>
+<span class="codeline" id="line-914"><code>// Otherwise the error returned will be non-nil.</code></span>
+<span class="codeline" id="line-915"><code>func NewWriter(w io.Writer, level int) (*Writer, error) {</code></span>
+<span class="codeline" id="line-916"><code>	var dw Writer</code></span>
+<span class="codeline" id="line-917"><code>	if err := dw.d.init(w, level); err != nil {</code></span>
+<span class="codeline" id="line-918"><code>		return nil, err</code></span>
+<span class="codeline" id="line-919"><code>	}</code></span>
+<span class="codeline" id="line-920"><code>	return &amp;dw, nil</code></span>
+<span class="codeline" id="line-921"><code>}</code></span>
+<span class="codeline" id="line-922"><code></code></span>
+<span class="codeline" id="line-923"><code>// NewWriterDict is like NewWriter but initializes the new</code></span>
+<span class="codeline" id="line-924"><code>// Writer with a preset dictionary.  The returned Writer behaves</code></span>
+<span class="codeline" id="line-925"><code>// as if the dictionary had been written to it without producing</code></span>
+<span class="codeline" id="line-926"><code>// any compressed output.  The compressed data written to w</code></span>
+<span class="codeline" id="line-927"><code>// can only be decompressed by a Reader initialized with the</code></span>
+<span class="codeline" id="line-928"><code>// same dictionary.</code></span>
+<span class="codeline" id="line-929"><code>func NewWriterDict(w io.Writer, level int, dict []byte) (*Writer, error) {</code></span>
+<span class="codeline" id="line-930"><code>	zw, err := NewWriter(w, level)</code></span>
+<span class="codeline" id="line-931"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-932"><code>		return nil, err</code></span>
+<span class="codeline" id="line-933"><code>	}</code></span>
+<span class="codeline" id="line-934"><code>	zw.d.fillWindow(dict)</code></span>
+<span class="codeline" id="line-935"><code>	zw.dict = append(zw.dict, dict...) // duplicate dictionary for Reset method.</code></span>
+<span class="codeline" id="line-936"><code>	return zw, err</code></span>
+<span class="codeline" id="line-937"><code>}</code></span>
+<span class="codeline" id="line-938"><code></code></span>
+<span class="codeline" id="line-939"><code>// MinCustomWindowSize is the minimum window size that can be sent to NewWriterWindow.</code></span>
+<span class="codeline" id="line-940"><code>const MinCustomWindowSize = 32</code></span>
+<span class="codeline" id="line-941"><code></code></span>
+<span class="codeline" id="line-942"><code>// MaxCustomWindowSize is the maximum custom window that can be sent to NewWriterWindow.</code></span>
+<span class="codeline" id="line-943"><code>const MaxCustomWindowSize = windowSize</code></span>
+<span class="codeline" id="line-944"><code></code></span>
+<span class="codeline" id="line-945"><code>// NewWriterWindow returns a new Writer compressing data with a custom window size.</code></span>
+<span class="codeline" id="line-946"><code>// windowSize must be from MinCustomWindowSize to MaxCustomWindowSize.</code></span>
+<span class="codeline" id="line-947"><code>func NewWriterWindow(w io.Writer, windowSize int) (*Writer, error) {</code></span>
+<span class="codeline" id="line-948"><code>	if windowSize &lt; MinCustomWindowSize {</code></span>
+<span class="codeline" id="line-949"><code>		return nil, errors.New("flate: requested window size less than MinWindowSize")</code></span>
+<span class="codeline" id="line-950"><code>	}</code></span>
+<span class="codeline" id="line-951"><code>	if windowSize &gt; MaxCustomWindowSize {</code></span>
+<span class="codeline" id="line-952"><code>		return nil, errors.New("flate: requested window size bigger than MaxCustomWindowSize")</code></span>
+<span class="codeline" id="line-953"><code>	}</code></span>
+<span class="codeline" id="line-954"><code>	var dw Writer</code></span>
+<span class="codeline" id="line-955"><code>	if err := dw.d.init(w, -windowSize); err != nil {</code></span>
+<span class="codeline" id="line-956"><code>		return nil, err</code></span>
+<span class="codeline" id="line-957"><code>	}</code></span>
+<span class="codeline" id="line-958"><code>	return &amp;dw, nil</code></span>
+<span class="codeline" id="line-959"><code>}</code></span>
+<span class="codeline" id="line-960"><code></code></span>
+<span class="codeline" id="line-961"><code>// A Writer takes data written to it and writes the compressed</code></span>
+<span class="codeline" id="line-962"><code>// form of that data to an underlying writer (see NewWriter).</code></span>
+<span class="codeline" id="line-963"><code>type Writer struct {</code></span>
+<span class="codeline" id="line-964"><code>	d    compressor</code></span>
+<span class="codeline" id="line-965"><code>	dict []byte</code></span>
+<span class="codeline" id="line-966"><code>}</code></span>
+<span class="codeline" id="line-967"><code></code></span>
+<span class="codeline" id="line-968"><code>// Write writes data to w, which will eventually write the</code></span>
+<span class="codeline" id="line-969"><code>// compressed form of data to its underlying writer.</code></span>
+<span class="codeline" id="line-970"><code>func (w *Writer) Write(data []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-971"><code>	return w.d.write(data)</code></span>
+<span class="codeline" id="line-972"><code>}</code></span>
+<span class="codeline" id="line-973"><code></code></span>
+<span class="codeline" id="line-974"><code>// Flush flushes any pending data to the underlying writer.</code></span>
+<span class="codeline" id="line-975"><code>// It is useful mainly in compressed network protocols, to ensure that</code></span>
+<span class="codeline" id="line-976"><code>// a remote reader has enough data to reconstruct a packet.</code></span>
+<span class="codeline" id="line-977"><code>// Flush does not return until the data has been written.</code></span>
+<span class="codeline" id="line-978"><code>// Calling Flush when there is no pending data still causes the Writer</code></span>
+<span class="codeline" id="line-979"><code>// to emit a sync marker of at least 4 bytes.</code></span>
+<span class="codeline" id="line-980"><code>// If the underlying writer returns an error, Flush returns that error.</code></span>
+<span class="codeline" id="line-981"><code>//</code></span>
+<span class="codeline" id="line-982"><code>// In the terminology of the zlib library, Flush is equivalent to Z_SYNC_FLUSH.</code></span>
+<span class="codeline" id="line-983"><code>func (w *Writer) Flush() error {</code></span>
+<span class="codeline" id="line-984"><code>	// For more about flushing:</code></span>
+<span class="codeline" id="line-985"><code>	// http://www.bolet.org/~pornin/deflate-flush.html</code></span>
+<span class="codeline" id="line-986"><code>	return w.d.syncFlush()</code></span>
+<span class="codeline" id="line-987"><code>}</code></span>
+<span class="codeline" id="line-988"><code></code></span>
+<span class="codeline" id="line-989"><code>// Close flushes and closes the writer.</code></span>
+<span class="codeline" id="line-990"><code>func (w *Writer) Close() error {</code></span>
+<span class="codeline" id="line-991"><code>	return w.d.close()</code></span>
+<span class="codeline" id="line-992"><code>}</code></span>
+<span class="codeline" id="line-993"><code></code></span>
+<span class="codeline" id="line-994"><code>// Reset discards the writer's state and makes it equivalent to</code></span>
+<span class="codeline" id="line-995"><code>// the result of NewWriter or NewWriterDict called with dst</code></span>
+<span class="codeline" id="line-996"><code>// and w's level and dictionary.</code></span>
+<span class="codeline" id="line-997"><code>func (w *Writer) Reset(dst io.Writer) {</code></span>
+<span class="codeline" id="line-998"><code>	if len(w.dict) &gt; 0 {</code></span>
+<span class="codeline" id="line-999"><code>		// w was created with NewWriterDict</code></span>
+<span class="codeline" id="line-1000"><code>		w.d.reset(dst)</code></span>
+<span class="codeline" id="line-1001"><code>		if dst != nil {</code></span>
+<span class="codeline" id="line-1002"><code>			w.d.fillWindow(w.dict)</code></span>
+<span class="codeline" id="line-1003"><code>		}</code></span>
+<span class="codeline" id="line-1004"><code>	} else {</code></span>
+<span class="codeline" id="line-1005"><code>		// w was created with NewWriter</code></span>
+<span class="codeline" id="line-1006"><code>		w.d.reset(dst)</code></span>
+<span class="codeline" id="line-1007"><code>	}</code></span>
+<span class="codeline" id="line-1008"><code>}</code></span>
+<span class="codeline" id="line-1009"><code></code></span>
+<span class="codeline" id="line-1010"><code>// ResetDict discards the writer's state and makes it equivalent to</code></span>
+<span class="codeline" id="line-1011"><code>// the result of NewWriter or NewWriterDict called with dst</code></span>
+<span class="codeline" id="line-1012"><code>// and w's level, but sets a specific dictionary.</code></span>
+<span class="codeline" id="line-1013"><code>func (w *Writer) ResetDict(dst io.Writer, dict []byte) {</code></span>
+<span class="codeline" id="line-1014"><code>	w.dict = dict</code></span>
+<span class="codeline" id="line-1015"><code>	w.d.reset(dst)</code></span>
+<span class="codeline" id="line-1016"><code>	w.d.fillWindow(w.dict)</code></span>
+<span class="codeline" id="line-1017"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: trace2event.go in package runtime</title>
+<link href="../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	trace2event.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../pkg/runtime.html">runtime</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2023 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build goexperiment.exectracer2</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>// Trace event writing API for trace2runtime.go.</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>package runtime</code></span>
+<span class="codeline" id="line-10"><code></code></span>
+<span class="codeline" id="line-11"><code>import (</code></span>
+<span class="codeline" id="line-12"><code>	"runtime/internal/sys"</code></span>
+<span class="codeline" id="line-13"><code>)</code></span>
+<span class="codeline" id="line-14"><code></code></span>
+<span class="codeline" id="line-15"><code>// Event types in the trace, args are given in square brackets.</code></span>
+<span class="codeline" id="line-16"><code>//</code></span>
+<span class="codeline" id="line-17"><code>// Naming scheme:</code></span>
+<span class="codeline" id="line-18"><code>//   - Time range event pairs have suffixes "Begin" and "End".</code></span>
+<span class="codeline" id="line-19"><code>//   - "Start", "Stop", "Create", "Destroy", "Block", "Unblock"</code></span>
+<span class="codeline" id="line-20"><code>//     are suffixes reserved for scheduling resources.</code></span>
+<span class="codeline" id="line-21"><code>//</code></span>
+<span class="codeline" id="line-22"><code>// NOTE: If you add an event type, make sure you also update all</code></span>
+<span class="codeline" id="line-23"><code>// tables in this file!</code></span>
+<span class="codeline" id="line-24"><code>type traceEv uint8</code></span>
+<span class="codeline" id="line-25"><code></code></span>
+<span class="codeline" id="line-26"><code>const (</code></span>
+<span class="codeline" id="line-27"><code>	traceEvNone traceEv = iota // unused</code></span>
+<span class="codeline" id="line-28"><code></code></span>
+<span class="codeline" id="line-29"><code>	// Structural events.</code></span>
+<span class="codeline" id="line-30"><code>	traceEvEventBatch // start of per-M batch of events [generation, M ID, timestamp, batch length]</code></span>
+<span class="codeline" id="line-31"><code>	traceEvStacks     // start of a section of the stack table [...traceEvStack]</code></span>
+<span class="codeline" id="line-32"><code>	traceEvStack      // stack table entry [ID, ...{PC, func string ID, file string ID, line #}]</code></span>
+<span class="codeline" id="line-33"><code>	traceEvStrings    // start of a section of the string dictionary [...traceEvString]</code></span>
+<span class="codeline" id="line-34"><code>	traceEvString     // string dictionary entry [ID, length, string]</code></span>
+<span class="codeline" id="line-35"><code>	traceEvCPUSamples // start of a section of CPU samples [...traceEvCPUSample]</code></span>
+<span class="codeline" id="line-36"><code>	traceEvCPUSample  // CPU profiling sample [timestamp, M ID, P ID, goroutine ID, stack ID]</code></span>
+<span class="codeline" id="line-37"><code>	traceEvFrequency  // timestamp units per sec [freq]</code></span>
+<span class="codeline" id="line-38"><code></code></span>
+<span class="codeline" id="line-39"><code>	// Procs.</code></span>
+<span class="codeline" id="line-40"><code>	traceEvProcsChange // current value of GOMAXPROCS [timestamp, GOMAXPROCS, stack ID]</code></span>
+<span class="codeline" id="line-41"><code>	traceEvProcStart   // start of P [timestamp, P ID, P seq]</code></span>
+<span class="codeline" id="line-42"><code>	traceEvProcStop    // stop of P [timestamp]</code></span>
+<span class="codeline" id="line-43"><code>	traceEvProcSteal   // P was stolen [timestamp, P ID, P seq, M ID]</code></span>
+<span class="codeline" id="line-44"><code>	traceEvProcStatus  // P status at the start of a generation [timestamp, P ID, status]</code></span>
+<span class="codeline" id="line-45"><code></code></span>
+<span class="codeline" id="line-46"><code>	// Goroutines.</code></span>
+<span class="codeline" id="line-47"><code>	traceEvGoCreate            // goroutine creation [timestamp, new goroutine ID, new stack ID, stack ID]</code></span>
+<span class="codeline" id="line-48"><code>	traceEvGoCreateSyscall     // goroutine appears in syscall (cgo callback) [timestamp, new goroutine ID]</code></span>
+<span class="codeline" id="line-49"><code>	traceEvGoStart             // goroutine starts running [timestamp, goroutine ID, goroutine seq]</code></span>
+<span class="codeline" id="line-50"><code>	traceEvGoDestroy           // goroutine ends [timestamp]</code></span>
+<span class="codeline" id="line-51"><code>	traceEvGoDestroySyscall    // goroutine ends in syscall (cgo callback) [timestamp]</code></span>
+<span class="codeline" id="line-52"><code>	traceEvGoStop              // goroutine yields its time, but is runnable [timestamp, reason, stack ID]</code></span>
+<span class="codeline" id="line-53"><code>	traceEvGoBlock             // goroutine blocks [timestamp, reason, stack ID]</code></span>
+<span class="codeline" id="line-54"><code>	traceEvGoUnblock           // goroutine is unblocked [timestamp, goroutine ID, goroutine seq, stack ID]</code></span>
+<span class="codeline" id="line-55"><code>	traceEvGoSyscallBegin      // syscall enter [timestamp, P seq, stack ID]</code></span>
+<span class="codeline" id="line-56"><code>	traceEvGoSyscallEnd        // syscall exit [timestamp]</code></span>
+<span class="codeline" id="line-57"><code>	traceEvGoSyscallEndBlocked // syscall exit and it blocked at some point [timestamp]</code></span>
+<span class="codeline" id="line-58"><code>	traceEvGoStatus            // goroutine status at the start of a generation [timestamp, goroutine ID, M ID, status]</code></span>
+<span class="codeline" id="line-59"><code></code></span>
+<span class="codeline" id="line-60"><code>	// STW.</code></span>
+<span class="codeline" id="line-61"><code>	traceEvSTWBegin // STW start [timestamp, kind]</code></span>
+<span class="codeline" id="line-62"><code>	traceEvSTWEnd   // STW done [timestamp]</code></span>
+<span class="codeline" id="line-63"><code></code></span>
+<span class="codeline" id="line-64"><code>	// GC events.</code></span>
+<span class="codeline" id="line-65"><code>	traceEvGCActive           // GC active [timestamp, seq]</code></span>
+<span class="codeline" id="line-66"><code>	traceEvGCBegin            // GC start [timestamp, seq, stack ID]</code></span>
+<span class="codeline" id="line-67"><code>	traceEvGCEnd              // GC done [timestamp, seq]</code></span>
+<span class="codeline" id="line-68"><code>	traceEvGCSweepActive      // GC sweep active [timestamp, P ID]</code></span>
+<span class="codeline" id="line-69"><code>	traceEvGCSweepBegin       // GC sweep start [timestamp, stack ID]</code></span>
+<span class="codeline" id="line-70"><code>	traceEvGCSweepEnd         // GC sweep done [timestamp, swept bytes, reclaimed bytes]</code></span>
+<span class="codeline" id="line-71"><code>	traceEvGCMarkAssistActive // GC mark assist active [timestamp, goroutine ID]</code></span>
+<span class="codeline" id="line-72"><code>	traceEvGCMarkAssistBegin  // GC mark assist start [timestamp, stack ID]</code></span>
+<span class="codeline" id="line-73"><code>	traceEvGCMarkAssistEnd    // GC mark assist done [timestamp]</code></span>
+<span class="codeline" id="line-74"><code>	traceEvHeapAlloc          // gcController.heapLive change [timestamp, heap alloc in bytes]</code></span>
+<span class="codeline" id="line-75"><code>	traceEvHeapGoal           // gcController.heapGoal() change [timestamp, heap goal in bytes]</code></span>
+<span class="codeline" id="line-76"><code></code></span>
+<span class="codeline" id="line-77"><code>	// Annotations.</code></span>
+<span class="codeline" id="line-78"><code>	traceEvGoLabel         // apply string label to current running goroutine [timestamp, label string ID]</code></span>
+<span class="codeline" id="line-79"><code>	traceEvUserTaskBegin   // trace.NewTask [timestamp, internal task ID, internal parent task ID, name string ID, stack ID]</code></span>
+<span class="codeline" id="line-80"><code>	traceEvUserTaskEnd     // end of a task [timestamp, internal task ID, stack ID]</code></span>
+<span class="codeline" id="line-81"><code>	traceEvUserRegionBegin // trace.{Start,With}Region [timestamp, internal task ID, name string ID, stack ID]</code></span>
+<span class="codeline" id="line-82"><code>	traceEvUserRegionEnd   // trace.{End,With}Region [timestamp, internal task ID, name string ID, stack ID]</code></span>
+<span class="codeline" id="line-83"><code>	traceEvUserLog         // trace.Log [timestamp, internal task ID, key string ID, stack, value string ID]</code></span>
+<span class="codeline" id="line-84"><code>)</code></span>
+<span class="codeline" id="line-85"><code></code></span>
+<span class="codeline" id="line-86"><code>// traceArg is a simple wrapper type to help ensure that arguments passed</code></span>
+<span class="codeline" id="line-87"><code>// to traces are well-formed.</code></span>
+<span class="codeline" id="line-88"><code>type traceArg uint64</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>// traceEventWriter is the high-level API for writing trace events.</code></span>
+<span class="codeline" id="line-91"><code>//</code></span>
+<span class="codeline" id="line-92"><code>// See the comment on traceWriter about style for more details as to why</code></span>
+<span class="codeline" id="line-93"><code>// this type and its methods are structured the way they are.</code></span>
+<span class="codeline" id="line-94"><code>type traceEventWriter struct {</code></span>
+<span class="codeline" id="line-95"><code>	w traceWriter</code></span>
+<span class="codeline" id="line-96"><code>}</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>// eventWriter creates a new traceEventWriter. It is the main entrypoint for writing trace events.</code></span>
+<span class="codeline" id="line-99"><code>//</code></span>
+<span class="codeline" id="line-100"><code>// Before creating the event writer, this method will emit a status for the current goroutine</code></span>
+<span class="codeline" id="line-101"><code>// or proc if it exists, and if it hasn't had its status emitted yet. goStatus and procStatus indicate</code></span>
+<span class="codeline" id="line-102"><code>// what the status of goroutine or P should be immediately *before* the events that are about to</code></span>
+<span class="codeline" id="line-103"><code>// be written using the eventWriter (if they exist). No status will be written if there's no active</code></span>
+<span class="codeline" id="line-104"><code>// goroutine or P.</code></span>
+<span class="codeline" id="line-105"><code>//</code></span>
+<span class="codeline" id="line-106"><code>// Callers can elect to pass a constant value here if the status is clear (e.g. a goroutine must have</code></span>
+<span class="codeline" id="line-107"><code>// been Runnable before a GoStart). Otherwise, callers can query the status of either the goroutine</code></span>
+<span class="codeline" id="line-108"><code>// or P and pass the appropriate status.</code></span>
+<span class="codeline" id="line-109"><code>//</code></span>
+<span class="codeline" id="line-110"><code>// In this case, the default status should be traceGoBad or traceProcBad to help identify bugs sooner.</code></span>
+<span class="codeline" id="line-111"><code>func (tl traceLocker) eventWriter(goStatus traceGoStatus, procStatus traceProcStatus) traceEventWriter {</code></span>
+<span class="codeline" id="line-112"><code>	w := tl.writer()</code></span>
+<span class="codeline" id="line-113"><code>	if pp := tl.mp.p.ptr(); pp != nil &amp;&amp; !pp.trace.statusWasTraced(tl.gen) &amp;&amp; pp.trace.acquireStatus(tl.gen) {</code></span>
+<span class="codeline" id="line-114"><code>		w = w.writeProcStatus(uint64(pp.id), procStatus, pp.trace.inSweep)</code></span>
+<span class="codeline" id="line-115"><code>	}</code></span>
+<span class="codeline" id="line-116"><code>	if gp := tl.mp.curg; gp != nil &amp;&amp; !gp.trace.statusWasTraced(tl.gen) &amp;&amp; gp.trace.acquireStatus(tl.gen) {</code></span>
+<span class="codeline" id="line-117"><code>		w = w.writeGoStatus(uint64(gp.goid), int64(tl.mp.procid), goStatus, gp.inMarkAssist)</code></span>
+<span class="codeline" id="line-118"><code>	}</code></span>
+<span class="codeline" id="line-119"><code>	return traceEventWriter{w}</code></span>
+<span class="codeline" id="line-120"><code>}</code></span>
+<span class="codeline" id="line-121"><code></code></span>
+<span class="codeline" id="line-122"><code>// commit writes out a trace event and calls end. It's a helper to make the</code></span>
+<span class="codeline" id="line-123"><code>// common case of writing out a single event less error-prone.</code></span>
+<span class="codeline" id="line-124"><code>func (e traceEventWriter) commit(ev traceEv, args ...traceArg) {</code></span>
+<span class="codeline" id="line-125"><code>	e = e.write(ev, args...)</code></span>
+<span class="codeline" id="line-126"><code>	e.end()</code></span>
+<span class="codeline" id="line-127"><code>}</code></span>
+<span class="codeline" id="line-128"><code></code></span>
+<span class="codeline" id="line-129"><code>// write writes an event into the trace.</code></span>
+<span class="codeline" id="line-130"><code>func (e traceEventWriter) write(ev traceEv, args ...traceArg) traceEventWriter {</code></span>
+<span class="codeline" id="line-131"><code>	e.w = e.w.event(ev, args...)</code></span>
+<span class="codeline" id="line-132"><code>	return e</code></span>
+<span class="codeline" id="line-133"><code>}</code></span>
+<span class="codeline" id="line-134"><code></code></span>
+<span class="codeline" id="line-135"><code>// end finishes writing to the trace. The traceEventWriter must not be used after this call.</code></span>
+<span class="codeline" id="line-136"><code>func (e traceEventWriter) end() {</code></span>
+<span class="codeline" id="line-137"><code>	e.w.end()</code></span>
+<span class="codeline" id="line-138"><code>}</code></span>
+<span class="codeline" id="line-139"><code></code></span>
+<span class="codeline" id="line-140"><code>// traceEventWrite is the part of traceEvent that actually writes the event.</code></span>
+<span class="codeline" id="line-141"><code>func (w traceWriter) event(ev traceEv, args ...traceArg) traceWriter {</code></span>
+<span class="codeline" id="line-142"><code>	// Make sure we have room.</code></span>
+<span class="codeline" id="line-143"><code>	w, _ = w.ensure(1 + (len(args)+1)*traceBytesPerNumber)</code></span>
+<span class="codeline" id="line-144"><code></code></span>
+<span class="codeline" id="line-145"><code>	// Compute the timestamp diff that we'll put in the trace.</code></span>
+<span class="codeline" id="line-146"><code>	ts := traceClockNow()</code></span>
+<span class="codeline" id="line-147"><code>	if ts &lt;= w.traceBuf.lastTime {</code></span>
+<span class="codeline" id="line-148"><code>		ts = w.traceBuf.lastTime + 1</code></span>
+<span class="codeline" id="line-149"><code>	}</code></span>
+<span class="codeline" id="line-150"><code>	tsDiff := uint64(ts - w.traceBuf.lastTime)</code></span>
+<span class="codeline" id="line-151"><code>	w.traceBuf.lastTime = ts</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>	// Write out event.</code></span>
+<span class="codeline" id="line-154"><code>	w.byte(byte(ev))</code></span>
+<span class="codeline" id="line-155"><code>	w.varint(tsDiff)</code></span>
+<span class="codeline" id="line-156"><code>	for _, arg := range args {</code></span>
+<span class="codeline" id="line-157"><code>		w.varint(uint64(arg))</code></span>
+<span class="codeline" id="line-158"><code>	}</code></span>
+<span class="codeline" id="line-159"><code>	return w</code></span>
+<span class="codeline" id="line-160"><code>}</code></span>
+<span class="codeline" id="line-161"><code></code></span>
+<span class="codeline" id="line-162"><code>// stack takes a stack trace skipping the provided number of frames.</code></span>
+<span class="codeline" id="line-163"><code>// It then returns a traceArg representing that stack which may be</code></span>
+<span class="codeline" id="line-164"><code>// passed to write.</code></span>
+<span class="codeline" id="line-165"><code>func (tl traceLocker) stack(skip int) traceArg {</code></span>
+<span class="codeline" id="line-166"><code>	return traceArg(traceStack(skip, tl.mp, tl.gen))</code></span>
+<span class="codeline" id="line-167"><code>}</code></span>
+<span class="codeline" id="line-168"><code></code></span>
+<span class="codeline" id="line-169"><code>// startPC takes a start PC for a goroutine and produces a unique</code></span>
+<span class="codeline" id="line-170"><code>// stack ID for it.</code></span>
+<span class="codeline" id="line-171"><code>//</code></span>
+<span class="codeline" id="line-172"><code>// It then returns a traceArg representing that stack which may be</code></span>
+<span class="codeline" id="line-173"><code>// passed to write.</code></span>
+<span class="codeline" id="line-174"><code>func (tl traceLocker) startPC(pc uintptr) traceArg {</code></span>
+<span class="codeline" id="line-175"><code>	// +PCQuantum because makeTraceFrame expects return PCs and subtracts PCQuantum.</code></span>
+<span class="codeline" id="line-176"><code>	return traceArg(trace.stackTab[tl.gen%2].put([]uintptr{</code></span>
+<span class="codeline" id="line-177"><code>		logicalStackSentinel,</code></span>
+<span class="codeline" id="line-178"><code>		startPCForTrace(pc) + sys.PCQuantum,</code></span>
+<span class="codeline" id="line-179"><code>	}))</code></span>
+<span class="codeline" id="line-180"><code>}</code></span>
+<span class="codeline" id="line-181"><code></code></span>
+<span class="codeline" id="line-182"><code>// string returns a traceArg representing s which may be passed to write.</code></span>
+<span class="codeline" id="line-183"><code>// The string is assumed to be relatively short and popular, so it may be</code></span>
+<span class="codeline" id="line-184"><code>// stored for a while in the string dictionary.</code></span>
+<span class="codeline" id="line-185"><code>func (tl traceLocker) string(s string) traceArg {</code></span>
+<span class="codeline" id="line-186"><code>	return traceArg(trace.stringTab[tl.gen%2].put(tl.gen, s))</code></span>
+<span class="codeline" id="line-187"><code>}</code></span>
+<span class="codeline" id="line-188"><code></code></span>
+<span class="codeline" id="line-189"><code>// uniqueString returns a traceArg representing s which may be passed to write.</code></span>
+<span class="codeline" id="line-190"><code>// The string is assumed to be unique or long, so it will be written out to</code></span>
+<span class="codeline" id="line-191"><code>// the trace eagerly.</code></span>
+<span class="codeline" id="line-192"><code>func (tl traceLocker) uniqueString(s string) traceArg {</code></span>
+<span class="codeline" id="line-193"><code>	return traceArg(trace.stringTab[tl.gen%2].emit(tl.gen, s))</code></span>
+<span class="codeline" id="line-194"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

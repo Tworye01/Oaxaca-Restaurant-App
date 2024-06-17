@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: signature.go in package go/types</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	signature.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/types.html">go/types</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2021 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package types</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"fmt"</code></span>
+<span class="codeline" id="line-9"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-10"><code>	"go/token"</code></span>
+<span class="codeline" id="line-11"><code>	. "internal/types/errors"</code></span>
+<span class="codeline" id="line-12"><code>)</code></span>
+<span class="codeline" id="line-13"><code></code></span>
+<span class="codeline" id="line-14"><code>// ----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-15"><code>// API</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>// A Signature represents a (non-builtin) function or method type.</code></span>
+<span class="codeline" id="line-18"><code>// The receiver is ignored when comparing signatures for identity.</code></span>
+<span class="codeline" id="line-19"><code>type Signature struct {</code></span>
+<span class="codeline" id="line-20"><code>	// We need to keep the scope in Signature (rather than passing it around</code></span>
+<span class="codeline" id="line-21"><code>	// and store it in the Func Object) because when type-checking a function</code></span>
+<span class="codeline" id="line-22"><code>	// literal we call the general type checker which returns a general Type.</code></span>
+<span class="codeline" id="line-23"><code>	// We then unpack the *Signature and use the scope for the literal body.</code></span>
+<span class="codeline" id="line-24"><code>	rparams  *TypeParamList // receiver type parameters from left to right, or nil</code></span>
+<span class="codeline" id="line-25"><code>	tparams  *TypeParamList // type parameters from left to right, or nil</code></span>
+<span class="codeline" id="line-26"><code>	scope    *Scope         // function scope for package-local and non-instantiated signatures; nil otherwise</code></span>
+<span class="codeline" id="line-27"><code>	recv     *Var           // nil if not a method</code></span>
+<span class="codeline" id="line-28"><code>	params   *Tuple         // (incoming) parameters from left to right; or nil</code></span>
+<span class="codeline" id="line-29"><code>	results  *Tuple         // (outgoing) results from left to right; or nil</code></span>
+<span class="codeline" id="line-30"><code>	variadic bool           // true if the last parameter's type is of the form ...T (or string, for append built-in only)</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>// NewSignature returns a new function type for the given receiver, parameters,</code></span>
+<span class="codeline" id="line-34"><code>// and results, either of which may be nil. If variadic is set, the function</code></span>
+<span class="codeline" id="line-35"><code>// is variadic, it must have at least one parameter, and the last parameter</code></span>
+<span class="codeline" id="line-36"><code>// must be of unnamed slice type.</code></span>
+<span class="codeline" id="line-37"><code>//</code></span>
+<span class="codeline" id="line-38"><code>// Deprecated: Use [NewSignatureType] instead which allows for type parameters.</code></span>
+<span class="codeline" id="line-39"><code>func NewSignature(recv *Var, params, results *Tuple, variadic bool) *Signature {</code></span>
+<span class="codeline" id="line-40"><code>	return NewSignatureType(recv, nil, nil, params, results, variadic)</code></span>
+<span class="codeline" id="line-41"><code>}</code></span>
+<span class="codeline" id="line-42"><code></code></span>
+<span class="codeline" id="line-43"><code>// NewSignatureType creates a new function type for the given receiver,</code></span>
+<span class="codeline" id="line-44"><code>// receiver type parameters, type parameters, parameters, and results. If</code></span>
+<span class="codeline" id="line-45"><code>// variadic is set, params must hold at least one parameter and the last</code></span>
+<span class="codeline" id="line-46"><code>// parameter's core type must be of unnamed slice or bytestring type.</code></span>
+<span class="codeline" id="line-47"><code>// If recv is non-nil, typeParams must be empty. If recvTypeParams is</code></span>
+<span class="codeline" id="line-48"><code>// non-empty, recv must be non-nil.</code></span>
+<span class="codeline" id="line-49"><code>func NewSignatureType(recv *Var, recvTypeParams, typeParams []*TypeParam, params, results *Tuple, variadic bool) *Signature {</code></span>
+<span class="codeline" id="line-50"><code>	if variadic {</code></span>
+<span class="codeline" id="line-51"><code>		n := params.Len()</code></span>
+<span class="codeline" id="line-52"><code>		if n == 0 {</code></span>
+<span class="codeline" id="line-53"><code>			panic("variadic function must have at least one parameter")</code></span>
+<span class="codeline" id="line-54"><code>		}</code></span>
+<span class="codeline" id="line-55"><code>		core := coreString(params.At(n - 1).typ)</code></span>
+<span class="codeline" id="line-56"><code>		if _, ok := core.(*Slice); !ok &amp;&amp; !isString(core) {</code></span>
+<span class="codeline" id="line-57"><code>			panic(fmt.Sprintf("got %s, want variadic parameter with unnamed slice type or string as core type", core.String()))</code></span>
+<span class="codeline" id="line-58"><code>		}</code></span>
+<span class="codeline" id="line-59"><code>	}</code></span>
+<span class="codeline" id="line-60"><code>	sig := &amp;Signature{recv: recv, params: params, results: results, variadic: variadic}</code></span>
+<span class="codeline" id="line-61"><code>	if len(recvTypeParams) != 0 {</code></span>
+<span class="codeline" id="line-62"><code>		if recv == nil {</code></span>
+<span class="codeline" id="line-63"><code>			panic("function with receiver type parameters must have a receiver")</code></span>
+<span class="codeline" id="line-64"><code>		}</code></span>
+<span class="codeline" id="line-65"><code>		sig.rparams = bindTParams(recvTypeParams)</code></span>
+<span class="codeline" id="line-66"><code>	}</code></span>
+<span class="codeline" id="line-67"><code>	if len(typeParams) != 0 {</code></span>
+<span class="codeline" id="line-68"><code>		if recv != nil {</code></span>
+<span class="codeline" id="line-69"><code>			panic("function with type parameters cannot have a receiver")</code></span>
+<span class="codeline" id="line-70"><code>		}</code></span>
+<span class="codeline" id="line-71"><code>		sig.tparams = bindTParams(typeParams)</code></span>
+<span class="codeline" id="line-72"><code>	}</code></span>
+<span class="codeline" id="line-73"><code>	return sig</code></span>
+<span class="codeline" id="line-74"><code>}</code></span>
+<span class="codeline" id="line-75"><code></code></span>
+<span class="codeline" id="line-76"><code>// Recv returns the receiver of signature s (if a method), or nil if a</code></span>
+<span class="codeline" id="line-77"><code>// function. It is ignored when comparing signatures for identity.</code></span>
+<span class="codeline" id="line-78"><code>//</code></span>
+<span class="codeline" id="line-79"><code>// For an abstract method, Recv returns the enclosing interface either</code></span>
+<span class="codeline" id="line-80"><code>// as a *[Named] or an *[Interface]. Due to embedding, an interface may</code></span>
+<span class="codeline" id="line-81"><code>// contain methods whose receiver type is a different interface.</code></span>
+<span class="codeline" id="line-82"><code>func (s *Signature) Recv() *Var { return s.recv }</code></span>
+<span class="codeline" id="line-83"><code></code></span>
+<span class="codeline" id="line-84"><code>// TypeParams returns the type parameters of signature s, or nil.</code></span>
+<span class="codeline" id="line-85"><code>func (s *Signature) TypeParams() *TypeParamList { return s.tparams }</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>// RecvTypeParams returns the receiver type parameters of signature s, or nil.</code></span>
+<span class="codeline" id="line-88"><code>func (s *Signature) RecvTypeParams() *TypeParamList { return s.rparams }</code></span>
+<span class="codeline" id="line-89"><code></code></span>
+<span class="codeline" id="line-90"><code>// Params returns the parameters of signature s, or nil.</code></span>
+<span class="codeline" id="line-91"><code>func (s *Signature) Params() *Tuple { return s.params }</code></span>
+<span class="codeline" id="line-92"><code></code></span>
+<span class="codeline" id="line-93"><code>// Results returns the results of signature s, or nil.</code></span>
+<span class="codeline" id="line-94"><code>func (s *Signature) Results() *Tuple { return s.results }</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// Variadic reports whether the signature s is variadic.</code></span>
+<span class="codeline" id="line-97"><code>func (s *Signature) Variadic() bool { return s.variadic }</code></span>
+<span class="codeline" id="line-98"><code></code></span>
+<span class="codeline" id="line-99"><code>func (t *Signature) Underlying() Type { return t }</code></span>
+<span class="codeline" id="line-100"><code>func (t *Signature) String() string   { return TypeString(t, nil) }</code></span>
+<span class="codeline" id="line-101"><code></code></span>
+<span class="codeline" id="line-102"><code>// ----------------------------------------------------------------------------</code></span>
+<span class="codeline" id="line-103"><code>// Implementation</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>// funcType type-checks a function or method type.</code></span>
+<span class="codeline" id="line-106"><code>func (check *Checker) funcType(sig *Signature, recvPar *ast.FieldList, ftyp *ast.FuncType) {</code></span>
+<span class="codeline" id="line-107"><code>	check.openScope(ftyp, "function")</code></span>
+<span class="codeline" id="line-108"><code>	check.scope.isFunc = true</code></span>
+<span class="codeline" id="line-109"><code>	check.recordScope(ftyp, check.scope)</code></span>
+<span class="codeline" id="line-110"><code>	sig.scope = check.scope</code></span>
+<span class="codeline" id="line-111"><code>	defer check.closeScope()</code></span>
+<span class="codeline" id="line-112"><code></code></span>
+<span class="codeline" id="line-113"><code>	if recvPar != nil &amp;&amp; len(recvPar.List) &gt; 0 {</code></span>
+<span class="codeline" id="line-114"><code>		// collect generic receiver type parameters, if any</code></span>
+<span class="codeline" id="line-115"><code>		// - a receiver type parameter is like any other type parameter, except that it is declared implicitly</code></span>
+<span class="codeline" id="line-116"><code>		// - the receiver specification acts as local declaration for its type parameters, which may be blank</code></span>
+<span class="codeline" id="line-117"><code>		_, rname, rparams := check.unpackRecv(recvPar.List[0].Type, true)</code></span>
+<span class="codeline" id="line-118"><code>		if len(rparams) &gt; 0 {</code></span>
+<span class="codeline" id="line-119"><code>			// The scope of the type parameter T in "func (r T[T]) f()"</code></span>
+<span class="codeline" id="line-120"><code>			// starts after f, not at "r"; see #52038.</code></span>
+<span class="codeline" id="line-121"><code>			scopePos := ftyp.Params.Pos()</code></span>
+<span class="codeline" id="line-122"><code>			tparams := check.declareTypeParams(nil, rparams, scopePos)</code></span>
+<span class="codeline" id="line-123"><code>			sig.rparams = bindTParams(tparams)</code></span>
+<span class="codeline" id="line-124"><code>			// Blank identifiers don't get declared, so naive type-checking of the</code></span>
+<span class="codeline" id="line-125"><code>			// receiver type expression would fail in Checker.collectParams below,</code></span>
+<span class="codeline" id="line-126"><code>			// when Checker.ident cannot resolve the _ to a type.</code></span>
+<span class="codeline" id="line-127"><code>			//</code></span>
+<span class="codeline" id="line-128"><code>			// Checker.recvTParamMap maps these blank identifiers to their type parameter</code></span>
+<span class="codeline" id="line-129"><code>			// types, so that they may be resolved in Checker.ident when they fail</code></span>
+<span class="codeline" id="line-130"><code>			// lookup in the scope.</code></span>
+<span class="codeline" id="line-131"><code>			for i, p := range rparams {</code></span>
+<span class="codeline" id="line-132"><code>				if p.Name == "_" {</code></span>
+<span class="codeline" id="line-133"><code>					if check.recvTParamMap == nil {</code></span>
+<span class="codeline" id="line-134"><code>						check.recvTParamMap = make(map[*ast.Ident]*TypeParam)</code></span>
+<span class="codeline" id="line-135"><code>					}</code></span>
+<span class="codeline" id="line-136"><code>					check.recvTParamMap[p] = tparams[i]</code></span>
+<span class="codeline" id="line-137"><code>				}</code></span>
+<span class="codeline" id="line-138"><code>			}</code></span>
+<span class="codeline" id="line-139"><code>			// determine receiver type to get its type parameters</code></span>
+<span class="codeline" id="line-140"><code>			// and the respective type parameter bounds</code></span>
+<span class="codeline" id="line-141"><code>			var recvTParams []*TypeParam</code></span>
+<span class="codeline" id="line-142"><code>			if rname != nil {</code></span>
+<span class="codeline" id="line-143"><code>				// recv should be a Named type (otherwise an error is reported elsewhere)</code></span>
+<span class="codeline" id="line-144"><code>				// Also: Don't report an error via genericType since it will be reported</code></span>
+<span class="codeline" id="line-145"><code>				//       again when we type-check the signature.</code></span>
+<span class="codeline" id="line-146"><code>				// TODO(gri) maybe the receiver should be marked as invalid instead?</code></span>
+<span class="codeline" id="line-147"><code>				if recv := asNamed(check.genericType(rname, nil)); recv != nil {</code></span>
+<span class="codeline" id="line-148"><code>					recvTParams = recv.TypeParams().list()</code></span>
+<span class="codeline" id="line-149"><code>				}</code></span>
+<span class="codeline" id="line-150"><code>			}</code></span>
+<span class="codeline" id="line-151"><code>			// provide type parameter bounds</code></span>
+<span class="codeline" id="line-152"><code>			if len(tparams) == len(recvTParams) {</code></span>
+<span class="codeline" id="line-153"><code>				smap := makeRenameMap(recvTParams, tparams)</code></span>
+<span class="codeline" id="line-154"><code>				for i, tpar := range tparams {</code></span>
+<span class="codeline" id="line-155"><code>					recvTPar := recvTParams[i]</code></span>
+<span class="codeline" id="line-156"><code>					check.mono.recordCanon(tpar, recvTPar)</code></span>
+<span class="codeline" id="line-157"><code>					// recvTPar.bound is (possibly) parameterized in the context of the</code></span>
+<span class="codeline" id="line-158"><code>					// receiver type declaration. Substitute parameters for the current</code></span>
+<span class="codeline" id="line-159"><code>					// context.</code></span>
+<span class="codeline" id="line-160"><code>					tpar.bound = check.subst(tpar.obj.pos, recvTPar.bound, smap, nil, check.context())</code></span>
+<span class="codeline" id="line-161"><code>				}</code></span>
+<span class="codeline" id="line-162"><code>			} else if len(tparams) &lt; len(recvTParams) {</code></span>
+<span class="codeline" id="line-163"><code>				// Reporting an error here is a stop-gap measure to avoid crashes in the</code></span>
+<span class="codeline" id="line-164"><code>				// compiler when a type parameter/argument cannot be inferred later. It</code></span>
+<span class="codeline" id="line-165"><code>				// may lead to follow-on errors (see issues go.dev/issue/51339, go.dev/issue/51343).</code></span>
+<span class="codeline" id="line-166"><code>				// TODO(gri) find a better solution</code></span>
+<span class="codeline" id="line-167"><code>				got := measure(len(tparams), "type parameter")</code></span>
+<span class="codeline" id="line-168"><code>				check.errorf(recvPar, BadRecv, "got %s, but receiver base type declares %d", got, len(recvTParams))</code></span>
+<span class="codeline" id="line-169"><code>			}</code></span>
+<span class="codeline" id="line-170"><code>		}</code></span>
+<span class="codeline" id="line-171"><code>	}</code></span>
+<span class="codeline" id="line-172"><code></code></span>
+<span class="codeline" id="line-173"><code>	if ftyp.TypeParams != nil {</code></span>
+<span class="codeline" id="line-174"><code>		check.collectTypeParams(&amp;sig.tparams, ftyp.TypeParams)</code></span>
+<span class="codeline" id="line-175"><code>		// Always type-check method type parameters but complain that they are not allowed.</code></span>
+<span class="codeline" id="line-176"><code>		// (A separate check is needed when type-checking interface method signatures because</code></span>
+<span class="codeline" id="line-177"><code>		// they don't have a receiver specification.)</code></span>
+<span class="codeline" id="line-178"><code>		if recvPar != nil {</code></span>
+<span class="codeline" id="line-179"><code>			check.error(ftyp.TypeParams, InvalidMethodTypeParams, "methods cannot have type parameters")</code></span>
+<span class="codeline" id="line-180"><code>		}</code></span>
+<span class="codeline" id="line-181"><code>	}</code></span>
+<span class="codeline" id="line-182"><code></code></span>
+<span class="codeline" id="line-183"><code>	// Use a temporary scope for all parameter declarations and then</code></span>
+<span class="codeline" id="line-184"><code>	// squash that scope into the parent scope (and report any</code></span>
+<span class="codeline" id="line-185"><code>	// redeclarations at that time).</code></span>
+<span class="codeline" id="line-186"><code>	//</code></span>
+<span class="codeline" id="line-187"><code>	// TODO(adonovan): now that each declaration has the correct</code></span>
+<span class="codeline" id="line-188"><code>	// scopePos, there should be no need for scope squashing.</code></span>
+<span class="codeline" id="line-189"><code>	// Audit to ensure all lookups honor scopePos and simplify.</code></span>
+<span class="codeline" id="line-190"><code>	scope := NewScope(check.scope, nopos, nopos, "function body (temp. scope)")</code></span>
+<span class="codeline" id="line-191"><code>	scopePos := ftyp.End() // all parameters' scopes start after the signature</code></span>
+<span class="codeline" id="line-192"><code>	recvList, _ := check.collectParams(scope, recvPar, false, scopePos)</code></span>
+<span class="codeline" id="line-193"><code>	params, variadic := check.collectParams(scope, ftyp.Params, true, scopePos)</code></span>
+<span class="codeline" id="line-194"><code>	results, _ := check.collectParams(scope, ftyp.Results, false, scopePos)</code></span>
+<span class="codeline" id="line-195"><code>	scope.squash(func(obj, alt Object) {</code></span>
+<span class="codeline" id="line-196"><code>		check.errorf(obj, DuplicateDecl, "%s redeclared in this block", obj.Name())</code></span>
+<span class="codeline" id="line-197"><code>		check.reportAltDecl(alt)</code></span>
+<span class="codeline" id="line-198"><code>	})</code></span>
+<span class="codeline" id="line-199"><code></code></span>
+<span class="codeline" id="line-200"><code>	if recvPar != nil {</code></span>
+<span class="codeline" id="line-201"><code>		// recv parameter list present (may be empty)</code></span>
+<span class="codeline" id="line-202"><code>		// spec: "The receiver is specified via an extra parameter section preceding the</code></span>
+<span class="codeline" id="line-203"><code>		// method name. That parameter section must declare a single parameter, the receiver."</code></span>
+<span class="codeline" id="line-204"><code>		var recv *Var</code></span>
+<span class="codeline" id="line-205"><code>		switch len(recvList) {</code></span>
+<span class="codeline" id="line-206"><code>		case 0:</code></span>
+<span class="codeline" id="line-207"><code>			// error reported by resolver</code></span>
+<span class="codeline" id="line-208"><code>			recv = NewParam(nopos, nil, "", Typ[Invalid]) // ignore recv below</code></span>
+<span class="codeline" id="line-209"><code>		default:</code></span>
+<span class="codeline" id="line-210"><code>			// more than one receiver</code></span>
+<span class="codeline" id="line-211"><code>			check.error(recvList[len(recvList)-1], InvalidRecv, "method has multiple receivers")</code></span>
+<span class="codeline" id="line-212"><code>			fallthrough // continue with first receiver</code></span>
+<span class="codeline" id="line-213"><code>		case 1:</code></span>
+<span class="codeline" id="line-214"><code>			recv = recvList[0]</code></span>
+<span class="codeline" id="line-215"><code>		}</code></span>
+<span class="codeline" id="line-216"><code>		sig.recv = recv</code></span>
+<span class="codeline" id="line-217"><code></code></span>
+<span class="codeline" id="line-218"><code>		// Delay validation of receiver type as it may cause premature expansion</code></span>
+<span class="codeline" id="line-219"><code>		// of types the receiver type is dependent on (see issues go.dev/issue/51232, go.dev/issue/51233).</code></span>
+<span class="codeline" id="line-220"><code>		check.later(func() {</code></span>
+<span class="codeline" id="line-221"><code>			// spec: "The receiver type must be of the form T or *T where T is a type name."</code></span>
+<span class="codeline" id="line-222"><code>			rtyp, _ := deref(recv.typ)</code></span>
+<span class="codeline" id="line-223"><code>			atyp := Unalias(rtyp)</code></span>
+<span class="codeline" id="line-224"><code>			if !isValid(atyp) {</code></span>
+<span class="codeline" id="line-225"><code>				return // error was reported before</code></span>
+<span class="codeline" id="line-226"><code>			}</code></span>
+<span class="codeline" id="line-227"><code>			// spec: "The type denoted by T is called the receiver base type; it must not</code></span>
+<span class="codeline" id="line-228"><code>			// be a pointer or interface type and it must be declared in the same package</code></span>
+<span class="codeline" id="line-229"><code>			// as the method."</code></span>
+<span class="codeline" id="line-230"><code>			switch T := atyp.(type) {</code></span>
+<span class="codeline" id="line-231"><code>			case *Named:</code></span>
+<span class="codeline" id="line-232"><code>				// The receiver type may be an instantiated type referred to</code></span>
+<span class="codeline" id="line-233"><code>				// by an alias (which cannot have receiver parameters for now).</code></span>
+<span class="codeline" id="line-234"><code>				if T.TypeArgs() != nil &amp;&amp; sig.RecvTypeParams() == nil {</code></span>
+<span class="codeline" id="line-235"><code>					check.errorf(recv, InvalidRecv, "cannot define new methods on instantiated type %s", rtyp)</code></span>
+<span class="codeline" id="line-236"><code>					break</code></span>
+<span class="codeline" id="line-237"><code>				}</code></span>
+<span class="codeline" id="line-238"><code>				if T.obj.pkg != check.pkg {</code></span>
+<span class="codeline" id="line-239"><code>					check.errorf(recv, InvalidRecv, "cannot define new methods on non-local type %s", rtyp)</code></span>
+<span class="codeline" id="line-240"><code>					break</code></span>
+<span class="codeline" id="line-241"><code>				}</code></span>
+<span class="codeline" id="line-242"><code>				var cause string</code></span>
+<span class="codeline" id="line-243"><code>				switch u := T.under().(type) {</code></span>
+<span class="codeline" id="line-244"><code>				case *Basic:</code></span>
+<span class="codeline" id="line-245"><code>					// unsafe.Pointer is treated like a regular pointer</code></span>
+<span class="codeline" id="line-246"><code>					if u.kind == UnsafePointer {</code></span>
+<span class="codeline" id="line-247"><code>						cause = "unsafe.Pointer"</code></span>
+<span class="codeline" id="line-248"><code>					}</code></span>
+<span class="codeline" id="line-249"><code>				case *Pointer, *Interface:</code></span>
+<span class="codeline" id="line-250"><code>					cause = "pointer or interface type"</code></span>
+<span class="codeline" id="line-251"><code>				case *TypeParam:</code></span>
+<span class="codeline" id="line-252"><code>					// The underlying type of a receiver base type cannot be a</code></span>
+<span class="codeline" id="line-253"><code>					// type parameter: "type T[P any] P" is not a valid declaration.</code></span>
+<span class="codeline" id="line-254"><code>					unreachable()</code></span>
+<span class="codeline" id="line-255"><code>				}</code></span>
+<span class="codeline" id="line-256"><code>				if cause != "" {</code></span>
+<span class="codeline" id="line-257"><code>					check.errorf(recv, InvalidRecv, "invalid receiver type %s (%s)", rtyp, cause)</code></span>
+<span class="codeline" id="line-258"><code>				}</code></span>
+<span class="codeline" id="line-259"><code>			case *Basic:</code></span>
+<span class="codeline" id="line-260"><code>				check.errorf(recv, InvalidRecv, "cannot define new methods on non-local type %s", rtyp)</code></span>
+<span class="codeline" id="line-261"><code>			default:</code></span>
+<span class="codeline" id="line-262"><code>				check.errorf(recv, InvalidRecv, "invalid receiver type %s", recv.typ)</code></span>
+<span class="codeline" id="line-263"><code>			}</code></span>
+<span class="codeline" id="line-264"><code>		}).describef(recv, "validate receiver %s", recv)</code></span>
+<span class="codeline" id="line-265"><code>	}</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>	sig.params = NewTuple(params...)</code></span>
+<span class="codeline" id="line-268"><code>	sig.results = NewTuple(results...)</code></span>
+<span class="codeline" id="line-269"><code>	sig.variadic = variadic</code></span>
+<span class="codeline" id="line-270"><code>}</code></span>
+<span class="codeline" id="line-271"><code></code></span>
+<span class="codeline" id="line-272"><code>// collectParams declares the parameters of list in scope and returns the corresponding</code></span>
+<span class="codeline" id="line-273"><code>// variable list.</code></span>
+<span class="codeline" id="line-274"><code>func (check *Checker) collectParams(scope *Scope, list *ast.FieldList, variadicOk bool, scopePos token.Pos) (params []*Var, variadic bool) {</code></span>
+<span class="codeline" id="line-275"><code>	if list == nil {</code></span>
+<span class="codeline" id="line-276"><code>		return</code></span>
+<span class="codeline" id="line-277"><code>	}</code></span>
+<span class="codeline" id="line-278"><code></code></span>
+<span class="codeline" id="line-279"><code>	var named, anonymous bool</code></span>
+<span class="codeline" id="line-280"><code>	for i, field := range list.List {</code></span>
+<span class="codeline" id="line-281"><code>		ftype := field.Type</code></span>
+<span class="codeline" id="line-282"><code>		if t, _ := ftype.(*ast.Ellipsis); t != nil {</code></span>
+<span class="codeline" id="line-283"><code>			ftype = t.Elt</code></span>
+<span class="codeline" id="line-284"><code>			if variadicOk &amp;&amp; i == len(list.List)-1 &amp;&amp; len(field.Names) &lt;= 1 {</code></span>
+<span class="codeline" id="line-285"><code>				variadic = true</code></span>
+<span class="codeline" id="line-286"><code>			} else {</code></span>
+<span class="codeline" id="line-287"><code>				check.softErrorf(t, MisplacedDotDotDot, "can only use ... with final parameter in list")</code></span>
+<span class="codeline" id="line-288"><code>				// ignore ... and continue</code></span>
+<span class="codeline" id="line-289"><code>			}</code></span>
+<span class="codeline" id="line-290"><code>		}</code></span>
+<span class="codeline" id="line-291"><code>		typ := check.varType(ftype)</code></span>
+<span class="codeline" id="line-292"><code>		// The parser ensures that f.Tag is nil and we don't</code></span>
+<span class="codeline" id="line-293"><code>		// care if a constructed AST contains a non-nil tag.</code></span>
+<span class="codeline" id="line-294"><code>		if len(field.Names) &gt; 0 {</code></span>
+<span class="codeline" id="line-295"><code>			// named parameter</code></span>
+<span class="codeline" id="line-296"><code>			for _, name := range field.Names {</code></span>
+<span class="codeline" id="line-297"><code>				if name.Name == "" {</code></span>
+<span class="codeline" id="line-298"><code>					check.error(name, InvalidSyntaxTree, "anonymous parameter")</code></span>
+<span class="codeline" id="line-299"><code>					// ok to continue</code></span>
+<span class="codeline" id="line-300"><code>				}</code></span>
+<span class="codeline" id="line-301"><code>				par := NewParam(name.Pos(), check.pkg, name.Name, typ)</code></span>
+<span class="codeline" id="line-302"><code>				check.declare(scope, name, par, scopePos)</code></span>
+<span class="codeline" id="line-303"><code>				params = append(params, par)</code></span>
+<span class="codeline" id="line-304"><code>			}</code></span>
+<span class="codeline" id="line-305"><code>			named = true</code></span>
+<span class="codeline" id="line-306"><code>		} else {</code></span>
+<span class="codeline" id="line-307"><code>			// anonymous parameter</code></span>
+<span class="codeline" id="line-308"><code>			par := NewParam(ftype.Pos(), check.pkg, "", typ)</code></span>
+<span class="codeline" id="line-309"><code>			check.recordImplicit(field, par)</code></span>
+<span class="codeline" id="line-310"><code>			params = append(params, par)</code></span>
+<span class="codeline" id="line-311"><code>			anonymous = true</code></span>
+<span class="codeline" id="line-312"><code>		}</code></span>
+<span class="codeline" id="line-313"><code>	}</code></span>
+<span class="codeline" id="line-314"><code></code></span>
+<span class="codeline" id="line-315"><code>	if named &amp;&amp; anonymous {</code></span>
+<span class="codeline" id="line-316"><code>		check.error(list, InvalidSyntaxTree, "list contains both named and anonymous parameters")</code></span>
+<span class="codeline" id="line-317"><code>		// ok to continue</code></span>
+<span class="codeline" id="line-318"><code>	}</code></span>
+<span class="codeline" id="line-319"><code></code></span>
+<span class="codeline" id="line-320"><code>	// For a variadic function, change the last parameter's type from T to []T.</code></span>
+<span class="codeline" id="line-321"><code>	// Since we type-checked T rather than ...T, we also need to retro-actively</code></span>
+<span class="codeline" id="line-322"><code>	// record the type for ...T.</code></span>
+<span class="codeline" id="line-323"><code>	if variadic {</code></span>
+<span class="codeline" id="line-324"><code>		last := params[len(params)-1]</code></span>
+<span class="codeline" id="line-325"><code>		last.typ = &amp;Slice{elem: last.typ}</code></span>
+<span class="codeline" id="line-326"><code>		check.recordTypeAndValue(list.List[len(list.List)-1].Type, typexpr, last.typ, nil)</code></span>
+<span class="codeline" id="line-327"><code>	}</code></span>
+<span class="codeline" id="line-328"><code></code></span>
+<span class="codeline" id="line-329"><code>	return</code></span>
+<span class="codeline" id="line-330"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>

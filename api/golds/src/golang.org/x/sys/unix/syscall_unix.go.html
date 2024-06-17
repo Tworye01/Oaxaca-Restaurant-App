@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: syscall_unix.go in package golang.org/x/sys/unix</title>
+<link href="../../../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	syscall_unix.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../../../pkg/golang.org/x/sys/unix.html">golang.org/x/sys/unix</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2009 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>package unix</code></span>
+<span class="codeline" id="line-8"><code></code></span>
+<span class="codeline" id="line-9"><code>import (</code></span>
+<span class="codeline" id="line-10"><code>	"bytes"</code></span>
+<span class="codeline" id="line-11"><code>	"sort"</code></span>
+<span class="codeline" id="line-12"><code>	"sync"</code></span>
+<span class="codeline" id="line-13"><code>	"syscall"</code></span>
+<span class="codeline" id="line-14"><code>	"unsafe"</code></span>
+<span class="codeline" id="line-15"><code>)</code></span>
+<span class="codeline" id="line-16"><code></code></span>
+<span class="codeline" id="line-17"><code>var (</code></span>
+<span class="codeline" id="line-18"><code>	Stdin  = 0</code></span>
+<span class="codeline" id="line-19"><code>	Stdout = 1</code></span>
+<span class="codeline" id="line-20"><code>	Stderr = 2</code></span>
+<span class="codeline" id="line-21"><code>)</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>// Do the interface allocations only once for common</code></span>
+<span class="codeline" id="line-24"><code>// Errno values.</code></span>
+<span class="codeline" id="line-25"><code>var (</code></span>
+<span class="codeline" id="line-26"><code>	errEAGAIN error = syscall.EAGAIN</code></span>
+<span class="codeline" id="line-27"><code>	errEINVAL error = syscall.EINVAL</code></span>
+<span class="codeline" id="line-28"><code>	errENOENT error = syscall.ENOENT</code></span>
+<span class="codeline" id="line-29"><code>)</code></span>
+<span class="codeline" id="line-30"><code></code></span>
+<span class="codeline" id="line-31"><code>var (</code></span>
+<span class="codeline" id="line-32"><code>	signalNameMapOnce sync.Once</code></span>
+<span class="codeline" id="line-33"><code>	signalNameMap     map[string]syscall.Signal</code></span>
+<span class="codeline" id="line-34"><code>)</code></span>
+<span class="codeline" id="line-35"><code></code></span>
+<span class="codeline" id="line-36"><code>// errnoErr returns common boxed Errno values, to prevent</code></span>
+<span class="codeline" id="line-37"><code>// allocations at runtime.</code></span>
+<span class="codeline" id="line-38"><code>func errnoErr(e syscall.Errno) error {</code></span>
+<span class="codeline" id="line-39"><code>	switch e {</code></span>
+<span class="codeline" id="line-40"><code>	case 0:</code></span>
+<span class="codeline" id="line-41"><code>		return nil</code></span>
+<span class="codeline" id="line-42"><code>	case EAGAIN:</code></span>
+<span class="codeline" id="line-43"><code>		return errEAGAIN</code></span>
+<span class="codeline" id="line-44"><code>	case EINVAL:</code></span>
+<span class="codeline" id="line-45"><code>		return errEINVAL</code></span>
+<span class="codeline" id="line-46"><code>	case ENOENT:</code></span>
+<span class="codeline" id="line-47"><code>		return errENOENT</code></span>
+<span class="codeline" id="line-48"><code>	}</code></span>
+<span class="codeline" id="line-49"><code>	return e</code></span>
+<span class="codeline" id="line-50"><code>}</code></span>
+<span class="codeline" id="line-51"><code></code></span>
+<span class="codeline" id="line-52"><code>// ErrnoName returns the error name for error number e.</code></span>
+<span class="codeline" id="line-53"><code>func ErrnoName(e syscall.Errno) string {</code></span>
+<span class="codeline" id="line-54"><code>	i := sort.Search(len(errorList), func(i int) bool {</code></span>
+<span class="codeline" id="line-55"><code>		return errorList[i].num &gt;= e</code></span>
+<span class="codeline" id="line-56"><code>	})</code></span>
+<span class="codeline" id="line-57"><code>	if i &lt; len(errorList) &amp;&amp; errorList[i].num == e {</code></span>
+<span class="codeline" id="line-58"><code>		return errorList[i].name</code></span>
+<span class="codeline" id="line-59"><code>	}</code></span>
+<span class="codeline" id="line-60"><code>	return ""</code></span>
+<span class="codeline" id="line-61"><code>}</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// SignalName returns the signal name for signal number s.</code></span>
+<span class="codeline" id="line-64"><code>func SignalName(s syscall.Signal) string {</code></span>
+<span class="codeline" id="line-65"><code>	i := sort.Search(len(signalList), func(i int) bool {</code></span>
+<span class="codeline" id="line-66"><code>		return signalList[i].num &gt;= s</code></span>
+<span class="codeline" id="line-67"><code>	})</code></span>
+<span class="codeline" id="line-68"><code>	if i &lt; len(signalList) &amp;&amp; signalList[i].num == s {</code></span>
+<span class="codeline" id="line-69"><code>		return signalList[i].name</code></span>
+<span class="codeline" id="line-70"><code>	}</code></span>
+<span class="codeline" id="line-71"><code>	return ""</code></span>
+<span class="codeline" id="line-72"><code>}</code></span>
+<span class="codeline" id="line-73"><code></code></span>
+<span class="codeline" id="line-74"><code>// SignalNum returns the syscall.Signal for signal named s,</code></span>
+<span class="codeline" id="line-75"><code>// or 0 if a signal with such name is not found.</code></span>
+<span class="codeline" id="line-76"><code>// The signal name should start with "SIG".</code></span>
+<span class="codeline" id="line-77"><code>func SignalNum(s string) syscall.Signal {</code></span>
+<span class="codeline" id="line-78"><code>	signalNameMapOnce.Do(func() {</code></span>
+<span class="codeline" id="line-79"><code>		signalNameMap = make(map[string]syscall.Signal, len(signalList))</code></span>
+<span class="codeline" id="line-80"><code>		for _, signal := range signalList {</code></span>
+<span class="codeline" id="line-81"><code>			signalNameMap[signal.name] = signal.num</code></span>
+<span class="codeline" id="line-82"><code>		}</code></span>
+<span class="codeline" id="line-83"><code>	})</code></span>
+<span class="codeline" id="line-84"><code>	return signalNameMap[s]</code></span>
+<span class="codeline" id="line-85"><code>}</code></span>
+<span class="codeline" id="line-86"><code></code></span>
+<span class="codeline" id="line-87"><code>// clen returns the index of the first NULL byte in n or len(n) if n contains no NULL byte.</code></span>
+<span class="codeline" id="line-88"><code>func clen(n []byte) int {</code></span>
+<span class="codeline" id="line-89"><code>	i := bytes.IndexByte(n, 0)</code></span>
+<span class="codeline" id="line-90"><code>	if i == -1 {</code></span>
+<span class="codeline" id="line-91"><code>		i = len(n)</code></span>
+<span class="codeline" id="line-92"><code>	}</code></span>
+<span class="codeline" id="line-93"><code>	return i</code></span>
+<span class="codeline" id="line-94"><code>}</code></span>
+<span class="codeline" id="line-95"><code></code></span>
+<span class="codeline" id="line-96"><code>// Mmap manager, for use by operating system-specific implementations.</code></span>
+<span class="codeline" id="line-97"><code></code></span>
+<span class="codeline" id="line-98"><code>type mmapper struct {</code></span>
+<span class="codeline" id="line-99"><code>	sync.Mutex</code></span>
+<span class="codeline" id="line-100"><code>	active map[*byte][]byte // active mappings; key is last byte in mapping</code></span>
+<span class="codeline" id="line-101"><code>	mmap   func(addr, length uintptr, prot, flags, fd int, offset int64) (uintptr, error)</code></span>
+<span class="codeline" id="line-102"><code>	munmap func(addr uintptr, length uintptr) error</code></span>
+<span class="codeline" id="line-103"><code>}</code></span>
+<span class="codeline" id="line-104"><code></code></span>
+<span class="codeline" id="line-105"><code>func (m *mmapper) Mmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err error) {</code></span>
+<span class="codeline" id="line-106"><code>	if length &lt;= 0 {</code></span>
+<span class="codeline" id="line-107"><code>		return nil, EINVAL</code></span>
+<span class="codeline" id="line-108"><code>	}</code></span>
+<span class="codeline" id="line-109"><code></code></span>
+<span class="codeline" id="line-110"><code>	// Map the requested memory.</code></span>
+<span class="codeline" id="line-111"><code>	addr, errno := m.mmap(0, uintptr(length), prot, flags, fd, offset)</code></span>
+<span class="codeline" id="line-112"><code>	if errno != nil {</code></span>
+<span class="codeline" id="line-113"><code>		return nil, errno</code></span>
+<span class="codeline" id="line-114"><code>	}</code></span>
+<span class="codeline" id="line-115"><code></code></span>
+<span class="codeline" id="line-116"><code>	// Use unsafe to convert addr into a []byte.</code></span>
+<span class="codeline" id="line-117"><code>	b := unsafe.Slice((*byte)(unsafe.Pointer(addr)), length)</code></span>
+<span class="codeline" id="line-118"><code></code></span>
+<span class="codeline" id="line-119"><code>	// Register mapping in m and return it.</code></span>
+<span class="codeline" id="line-120"><code>	p := &amp;b[cap(b)-1]</code></span>
+<span class="codeline" id="line-121"><code>	m.Lock()</code></span>
+<span class="codeline" id="line-122"><code>	defer m.Unlock()</code></span>
+<span class="codeline" id="line-123"><code>	m.active[p] = b</code></span>
+<span class="codeline" id="line-124"><code>	return b, nil</code></span>
+<span class="codeline" id="line-125"><code>}</code></span>
+<span class="codeline" id="line-126"><code></code></span>
+<span class="codeline" id="line-127"><code>func (m *mmapper) Munmap(data []byte) (err error) {</code></span>
+<span class="codeline" id="line-128"><code>	if len(data) == 0 || len(data) != cap(data) {</code></span>
+<span class="codeline" id="line-129"><code>		return EINVAL</code></span>
+<span class="codeline" id="line-130"><code>	}</code></span>
+<span class="codeline" id="line-131"><code></code></span>
+<span class="codeline" id="line-132"><code>	// Find the base of the mapping.</code></span>
+<span class="codeline" id="line-133"><code>	p := &amp;data[cap(data)-1]</code></span>
+<span class="codeline" id="line-134"><code>	m.Lock()</code></span>
+<span class="codeline" id="line-135"><code>	defer m.Unlock()</code></span>
+<span class="codeline" id="line-136"><code>	b := m.active[p]</code></span>
+<span class="codeline" id="line-137"><code>	if b == nil || &amp;b[0] != &amp;data[0] {</code></span>
+<span class="codeline" id="line-138"><code>		return EINVAL</code></span>
+<span class="codeline" id="line-139"><code>	}</code></span>
+<span class="codeline" id="line-140"><code></code></span>
+<span class="codeline" id="line-141"><code>	// Unmap the memory and update m.</code></span>
+<span class="codeline" id="line-142"><code>	if errno := m.munmap(uintptr(unsafe.Pointer(&amp;b[0])), uintptr(len(b))); errno != nil {</code></span>
+<span class="codeline" id="line-143"><code>		return errno</code></span>
+<span class="codeline" id="line-144"><code>	}</code></span>
+<span class="codeline" id="line-145"><code>	delete(m.active, p)</code></span>
+<span class="codeline" id="line-146"><code>	return nil</code></span>
+<span class="codeline" id="line-147"><code>}</code></span>
+<span class="codeline" id="line-148"><code></code></span>
+<span class="codeline" id="line-149"><code>func Mmap(fd int, offset int64, length int, prot int, flags int) (data []byte, err error) {</code></span>
+<span class="codeline" id="line-150"><code>	return mapper.Mmap(fd, offset, length, prot, flags)</code></span>
+<span class="codeline" id="line-151"><code>}</code></span>
+<span class="codeline" id="line-152"><code></code></span>
+<span class="codeline" id="line-153"><code>func Munmap(b []byte) (err error) {</code></span>
+<span class="codeline" id="line-154"><code>	return mapper.Munmap(b)</code></span>
+<span class="codeline" id="line-155"><code>}</code></span>
+<span class="codeline" id="line-156"><code></code></span>
+<span class="codeline" id="line-157"><code>func Read(fd int, p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-158"><code>	n, err = read(fd, p)</code></span>
+<span class="codeline" id="line-159"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-160"><code>		if n &gt; 0 {</code></span>
+<span class="codeline" id="line-161"><code>			raceWriteRange(unsafe.Pointer(&amp;p[0]), n)</code></span>
+<span class="codeline" id="line-162"><code>		}</code></span>
+<span class="codeline" id="line-163"><code>		if err == nil {</code></span>
+<span class="codeline" id="line-164"><code>			raceAcquire(unsafe.Pointer(&amp;ioSync))</code></span>
+<span class="codeline" id="line-165"><code>		}</code></span>
+<span class="codeline" id="line-166"><code>	}</code></span>
+<span class="codeline" id="line-167"><code>	return</code></span>
+<span class="codeline" id="line-168"><code>}</code></span>
+<span class="codeline" id="line-169"><code></code></span>
+<span class="codeline" id="line-170"><code>func Write(fd int, p []byte) (n int, err error) {</code></span>
+<span class="codeline" id="line-171"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-172"><code>		raceReleaseMerge(unsafe.Pointer(&amp;ioSync))</code></span>
+<span class="codeline" id="line-173"><code>	}</code></span>
+<span class="codeline" id="line-174"><code>	n, err = write(fd, p)</code></span>
+<span class="codeline" id="line-175"><code>	if raceenabled &amp;&amp; n &gt; 0 {</code></span>
+<span class="codeline" id="line-176"><code>		raceReadRange(unsafe.Pointer(&amp;p[0]), n)</code></span>
+<span class="codeline" id="line-177"><code>	}</code></span>
+<span class="codeline" id="line-178"><code>	return</code></span>
+<span class="codeline" id="line-179"><code>}</code></span>
+<span class="codeline" id="line-180"><code></code></span>
+<span class="codeline" id="line-181"><code>func Pread(fd int, p []byte, offset int64) (n int, err error) {</code></span>
+<span class="codeline" id="line-182"><code>	n, err = pread(fd, p, offset)</code></span>
+<span class="codeline" id="line-183"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-184"><code>		if n &gt; 0 {</code></span>
+<span class="codeline" id="line-185"><code>			raceWriteRange(unsafe.Pointer(&amp;p[0]), n)</code></span>
+<span class="codeline" id="line-186"><code>		}</code></span>
+<span class="codeline" id="line-187"><code>		if err == nil {</code></span>
+<span class="codeline" id="line-188"><code>			raceAcquire(unsafe.Pointer(&amp;ioSync))</code></span>
+<span class="codeline" id="line-189"><code>		}</code></span>
+<span class="codeline" id="line-190"><code>	}</code></span>
+<span class="codeline" id="line-191"><code>	return</code></span>
+<span class="codeline" id="line-192"><code>}</code></span>
+<span class="codeline" id="line-193"><code></code></span>
+<span class="codeline" id="line-194"><code>func Pwrite(fd int, p []byte, offset int64) (n int, err error) {</code></span>
+<span class="codeline" id="line-195"><code>	if raceenabled {</code></span>
+<span class="codeline" id="line-196"><code>		raceReleaseMerge(unsafe.Pointer(&amp;ioSync))</code></span>
+<span class="codeline" id="line-197"><code>	}</code></span>
+<span class="codeline" id="line-198"><code>	n, err = pwrite(fd, p, offset)</code></span>
+<span class="codeline" id="line-199"><code>	if raceenabled &amp;&amp; n &gt; 0 {</code></span>
+<span class="codeline" id="line-200"><code>		raceReadRange(unsafe.Pointer(&amp;p[0]), n)</code></span>
+<span class="codeline" id="line-201"><code>	}</code></span>
+<span class="codeline" id="line-202"><code>	return</code></span>
+<span class="codeline" id="line-203"><code>}</code></span>
+<span class="codeline" id="line-204"><code></code></span>
+<span class="codeline" id="line-205"><code>// For testing: clients can set this flag to force</code></span>
+<span class="codeline" id="line-206"><code>// creation of IPv6 sockets to return EAFNOSUPPORT.</code></span>
+<span class="codeline" id="line-207"><code>var SocketDisableIPv6 bool</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>// Sockaddr represents a socket address.</code></span>
+<span class="codeline" id="line-210"><code>type Sockaddr interface {</code></span>
+<span class="codeline" id="line-211"><code>	sockaddr() (ptr unsafe.Pointer, len _Socklen, err error) // lowercase; only we can define Sockaddrs</code></span>
+<span class="codeline" id="line-212"><code>}</code></span>
+<span class="codeline" id="line-213"><code></code></span>
+<span class="codeline" id="line-214"><code>// SockaddrInet4 implements the Sockaddr interface for AF_INET type sockets.</code></span>
+<span class="codeline" id="line-215"><code>type SockaddrInet4 struct {</code></span>
+<span class="codeline" id="line-216"><code>	Port int</code></span>
+<span class="codeline" id="line-217"><code>	Addr [4]byte</code></span>
+<span class="codeline" id="line-218"><code>	raw  RawSockaddrInet4</code></span>
+<span class="codeline" id="line-219"><code>}</code></span>
+<span class="codeline" id="line-220"><code></code></span>
+<span class="codeline" id="line-221"><code>// SockaddrInet6 implements the Sockaddr interface for AF_INET6 type sockets.</code></span>
+<span class="codeline" id="line-222"><code>type SockaddrInet6 struct {</code></span>
+<span class="codeline" id="line-223"><code>	Port   int</code></span>
+<span class="codeline" id="line-224"><code>	ZoneId uint32</code></span>
+<span class="codeline" id="line-225"><code>	Addr   [16]byte</code></span>
+<span class="codeline" id="line-226"><code>	raw    RawSockaddrInet6</code></span>
+<span class="codeline" id="line-227"><code>}</code></span>
+<span class="codeline" id="line-228"><code></code></span>
+<span class="codeline" id="line-229"><code>// SockaddrUnix implements the Sockaddr interface for AF_UNIX type sockets.</code></span>
+<span class="codeline" id="line-230"><code>type SockaddrUnix struct {</code></span>
+<span class="codeline" id="line-231"><code>	Name string</code></span>
+<span class="codeline" id="line-232"><code>	raw  RawSockaddrUnix</code></span>
+<span class="codeline" id="line-233"><code>}</code></span>
+<span class="codeline" id="line-234"><code></code></span>
+<span class="codeline" id="line-235"><code>func Bind(fd int, sa Sockaddr) (err error) {</code></span>
+<span class="codeline" id="line-236"><code>	ptr, n, err := sa.sockaddr()</code></span>
+<span class="codeline" id="line-237"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-238"><code>		return err</code></span>
+<span class="codeline" id="line-239"><code>	}</code></span>
+<span class="codeline" id="line-240"><code>	return bind(fd, ptr, n)</code></span>
+<span class="codeline" id="line-241"><code>}</code></span>
+<span class="codeline" id="line-242"><code></code></span>
+<span class="codeline" id="line-243"><code>func Connect(fd int, sa Sockaddr) (err error) {</code></span>
+<span class="codeline" id="line-244"><code>	ptr, n, err := sa.sockaddr()</code></span>
+<span class="codeline" id="line-245"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-246"><code>		return err</code></span>
+<span class="codeline" id="line-247"><code>	}</code></span>
+<span class="codeline" id="line-248"><code>	return connect(fd, ptr, n)</code></span>
+<span class="codeline" id="line-249"><code>}</code></span>
+<span class="codeline" id="line-250"><code></code></span>
+<span class="codeline" id="line-251"><code>func Getpeername(fd int) (sa Sockaddr, err error) {</code></span>
+<span class="codeline" id="line-252"><code>	var rsa RawSockaddrAny</code></span>
+<span class="codeline" id="line-253"><code>	var len _Socklen = SizeofSockaddrAny</code></span>
+<span class="codeline" id="line-254"><code>	if err = getpeername(fd, &amp;rsa, &amp;len); err != nil {</code></span>
+<span class="codeline" id="line-255"><code>		return</code></span>
+<span class="codeline" id="line-256"><code>	}</code></span>
+<span class="codeline" id="line-257"><code>	return anyToSockaddr(fd, &amp;rsa)</code></span>
+<span class="codeline" id="line-258"><code>}</code></span>
+<span class="codeline" id="line-259"><code></code></span>
+<span class="codeline" id="line-260"><code>func GetsockoptByte(fd, level, opt int) (value byte, err error) {</code></span>
+<span class="codeline" id="line-261"><code>	var n byte</code></span>
+<span class="codeline" id="line-262"><code>	vallen := _Socklen(1)</code></span>
+<span class="codeline" id="line-263"><code>	err = getsockopt(fd, level, opt, unsafe.Pointer(&amp;n), &amp;vallen)</code></span>
+<span class="codeline" id="line-264"><code>	return n, err</code></span>
+<span class="codeline" id="line-265"><code>}</code></span>
+<span class="codeline" id="line-266"><code></code></span>
+<span class="codeline" id="line-267"><code>func GetsockoptInt(fd, level, opt int) (value int, err error) {</code></span>
+<span class="codeline" id="line-268"><code>	var n int32</code></span>
+<span class="codeline" id="line-269"><code>	vallen := _Socklen(4)</code></span>
+<span class="codeline" id="line-270"><code>	err = getsockopt(fd, level, opt, unsafe.Pointer(&amp;n), &amp;vallen)</code></span>
+<span class="codeline" id="line-271"><code>	return int(n), err</code></span>
+<span class="codeline" id="line-272"><code>}</code></span>
+<span class="codeline" id="line-273"><code></code></span>
+<span class="codeline" id="line-274"><code>func GetsockoptInet4Addr(fd, level, opt int) (value [4]byte, err error) {</code></span>
+<span class="codeline" id="line-275"><code>	vallen := _Socklen(4)</code></span>
+<span class="codeline" id="line-276"><code>	err = getsockopt(fd, level, opt, unsafe.Pointer(&amp;value[0]), &amp;vallen)</code></span>
+<span class="codeline" id="line-277"><code>	return value, err</code></span>
+<span class="codeline" id="line-278"><code>}</code></span>
+<span class="codeline" id="line-279"><code></code></span>
+<span class="codeline" id="line-280"><code>func GetsockoptIPMreq(fd, level, opt int) (*IPMreq, error) {</code></span>
+<span class="codeline" id="line-281"><code>	var value IPMreq</code></span>
+<span class="codeline" id="line-282"><code>	vallen := _Socklen(SizeofIPMreq)</code></span>
+<span class="codeline" id="line-283"><code>	err := getsockopt(fd, level, opt, unsafe.Pointer(&amp;value), &amp;vallen)</code></span>
+<span class="codeline" id="line-284"><code>	return &amp;value, err</code></span>
+<span class="codeline" id="line-285"><code>}</code></span>
+<span class="codeline" id="line-286"><code></code></span>
+<span class="codeline" id="line-287"><code>func GetsockoptIPv6Mreq(fd, level, opt int) (*IPv6Mreq, error) {</code></span>
+<span class="codeline" id="line-288"><code>	var value IPv6Mreq</code></span>
+<span class="codeline" id="line-289"><code>	vallen := _Socklen(SizeofIPv6Mreq)</code></span>
+<span class="codeline" id="line-290"><code>	err := getsockopt(fd, level, opt, unsafe.Pointer(&amp;value), &amp;vallen)</code></span>
+<span class="codeline" id="line-291"><code>	return &amp;value, err</code></span>
+<span class="codeline" id="line-292"><code>}</code></span>
+<span class="codeline" id="line-293"><code></code></span>
+<span class="codeline" id="line-294"><code>func GetsockoptIPv6MTUInfo(fd, level, opt int) (*IPv6MTUInfo, error) {</code></span>
+<span class="codeline" id="line-295"><code>	var value IPv6MTUInfo</code></span>
+<span class="codeline" id="line-296"><code>	vallen := _Socklen(SizeofIPv6MTUInfo)</code></span>
+<span class="codeline" id="line-297"><code>	err := getsockopt(fd, level, opt, unsafe.Pointer(&amp;value), &amp;vallen)</code></span>
+<span class="codeline" id="line-298"><code>	return &amp;value, err</code></span>
+<span class="codeline" id="line-299"><code>}</code></span>
+<span class="codeline" id="line-300"><code></code></span>
+<span class="codeline" id="line-301"><code>func GetsockoptICMPv6Filter(fd, level, opt int) (*ICMPv6Filter, error) {</code></span>
+<span class="codeline" id="line-302"><code>	var value ICMPv6Filter</code></span>
+<span class="codeline" id="line-303"><code>	vallen := _Socklen(SizeofICMPv6Filter)</code></span>
+<span class="codeline" id="line-304"><code>	err := getsockopt(fd, level, opt, unsafe.Pointer(&amp;value), &amp;vallen)</code></span>
+<span class="codeline" id="line-305"><code>	return &amp;value, err</code></span>
+<span class="codeline" id="line-306"><code>}</code></span>
+<span class="codeline" id="line-307"><code></code></span>
+<span class="codeline" id="line-308"><code>func GetsockoptLinger(fd, level, opt int) (*Linger, error) {</code></span>
+<span class="codeline" id="line-309"><code>	var linger Linger</code></span>
+<span class="codeline" id="line-310"><code>	vallen := _Socklen(SizeofLinger)</code></span>
+<span class="codeline" id="line-311"><code>	err := getsockopt(fd, level, opt, unsafe.Pointer(&amp;linger), &amp;vallen)</code></span>
+<span class="codeline" id="line-312"><code>	return &amp;linger, err</code></span>
+<span class="codeline" id="line-313"><code>}</code></span>
+<span class="codeline" id="line-314"><code></code></span>
+<span class="codeline" id="line-315"><code>func GetsockoptTimeval(fd, level, opt int) (*Timeval, error) {</code></span>
+<span class="codeline" id="line-316"><code>	var tv Timeval</code></span>
+<span class="codeline" id="line-317"><code>	vallen := _Socklen(unsafe.Sizeof(tv))</code></span>
+<span class="codeline" id="line-318"><code>	err := getsockopt(fd, level, opt, unsafe.Pointer(&amp;tv), &amp;vallen)</code></span>
+<span class="codeline" id="line-319"><code>	return &amp;tv, err</code></span>
+<span class="codeline" id="line-320"><code>}</code></span>
+<span class="codeline" id="line-321"><code></code></span>
+<span class="codeline" id="line-322"><code>func GetsockoptUint64(fd, level, opt int) (value uint64, err error) {</code></span>
+<span class="codeline" id="line-323"><code>	var n uint64</code></span>
+<span class="codeline" id="line-324"><code>	vallen := _Socklen(8)</code></span>
+<span class="codeline" id="line-325"><code>	err = getsockopt(fd, level, opt, unsafe.Pointer(&amp;n), &amp;vallen)</code></span>
+<span class="codeline" id="line-326"><code>	return n, err</code></span>
+<span class="codeline" id="line-327"><code>}</code></span>
+<span class="codeline" id="line-328"><code></code></span>
+<span class="codeline" id="line-329"><code>func Recvfrom(fd int, p []byte, flags int) (n int, from Sockaddr, err error) {</code></span>
+<span class="codeline" id="line-330"><code>	var rsa RawSockaddrAny</code></span>
+<span class="codeline" id="line-331"><code>	var len _Socklen = SizeofSockaddrAny</code></span>
+<span class="codeline" id="line-332"><code>	if n, err = recvfrom(fd, p, flags, &amp;rsa, &amp;len); err != nil {</code></span>
+<span class="codeline" id="line-333"><code>		return</code></span>
+<span class="codeline" id="line-334"><code>	}</code></span>
+<span class="codeline" id="line-335"><code>	if rsa.Addr.Family != AF_UNSPEC {</code></span>
+<span class="codeline" id="line-336"><code>		from, err = anyToSockaddr(fd, &amp;rsa)</code></span>
+<span class="codeline" id="line-337"><code>	}</code></span>
+<span class="codeline" id="line-338"><code>	return</code></span>
+<span class="codeline" id="line-339"><code>}</code></span>
+<span class="codeline" id="line-340"><code></code></span>
+<span class="codeline" id="line-341"><code>// Recvmsg receives a message from a socket using the recvmsg system call. The</code></span>
+<span class="codeline" id="line-342"><code>// received non-control data will be written to p, and any "out of band"</code></span>
+<span class="codeline" id="line-343"><code>// control data will be written to oob. The flags are passed to recvmsg.</code></span>
+<span class="codeline" id="line-344"><code>//</code></span>
+<span class="codeline" id="line-345"><code>// The results are:</code></span>
+<span class="codeline" id="line-346"><code>//   - n is the number of non-control data bytes read into p</code></span>
+<span class="codeline" id="line-347"><code>//   - oobn is the number of control data bytes read into oob; this may be interpreted using [ParseSocketControlMessage]</code></span>
+<span class="codeline" id="line-348"><code>//   - recvflags is flags returned by recvmsg</code></span>
+<span class="codeline" id="line-349"><code>//   - from is the address of the sender</code></span>
+<span class="codeline" id="line-350"><code>//</code></span>
+<span class="codeline" id="line-351"><code>// If the underlying socket type is not SOCK_DGRAM, a received message</code></span>
+<span class="codeline" id="line-352"><code>// containing oob data and a single '\0' of non-control data is treated as if</code></span>
+<span class="codeline" id="line-353"><code>// the message contained only control data, i.e. n will be zero on return.</code></span>
+<span class="codeline" id="line-354"><code>func Recvmsg(fd int, p, oob []byte, flags int) (n, oobn int, recvflags int, from Sockaddr, err error) {</code></span>
+<span class="codeline" id="line-355"><code>	var iov [1]Iovec</code></span>
+<span class="codeline" id="line-356"><code>	if len(p) &gt; 0 {</code></span>
+<span class="codeline" id="line-357"><code>		iov[0].Base = &amp;p[0]</code></span>
+<span class="codeline" id="line-358"><code>		iov[0].SetLen(len(p))</code></span>
+<span class="codeline" id="line-359"><code>	}</code></span>
+<span class="codeline" id="line-360"><code>	var rsa RawSockaddrAny</code></span>
+<span class="codeline" id="line-361"><code>	n, oobn, recvflags, err = recvmsgRaw(fd, iov[:], oob, flags, &amp;rsa)</code></span>
+<span class="codeline" id="line-362"><code>	// source address is only specified if the socket is unconnected</code></span>
+<span class="codeline" id="line-363"><code>	if rsa.Addr.Family != AF_UNSPEC {</code></span>
+<span class="codeline" id="line-364"><code>		from, err = anyToSockaddr(fd, &amp;rsa)</code></span>
+<span class="codeline" id="line-365"><code>	}</code></span>
+<span class="codeline" id="line-366"><code>	return</code></span>
+<span class="codeline" id="line-367"><code>}</code></span>
+<span class="codeline" id="line-368"><code></code></span>
+<span class="codeline" id="line-369"><code>// RecvmsgBuffers receives a message from a socket using the recvmsg system</code></span>
+<span class="codeline" id="line-370"><code>// call. This function is equivalent to Recvmsg, but non-control data read is</code></span>
+<span class="codeline" id="line-371"><code>// scattered into the buffers slices.</code></span>
+<span class="codeline" id="line-372"><code>func RecvmsgBuffers(fd int, buffers [][]byte, oob []byte, flags int) (n, oobn int, recvflags int, from Sockaddr, err error) {</code></span>
+<span class="codeline" id="line-373"><code>	iov := make([]Iovec, len(buffers))</code></span>
+<span class="codeline" id="line-374"><code>	for i := range buffers {</code></span>
+<span class="codeline" id="line-375"><code>		if len(buffers[i]) &gt; 0 {</code></span>
+<span class="codeline" id="line-376"><code>			iov[i].Base = &amp;buffers[i][0]</code></span>
+<span class="codeline" id="line-377"><code>			iov[i].SetLen(len(buffers[i]))</code></span>
+<span class="codeline" id="line-378"><code>		} else {</code></span>
+<span class="codeline" id="line-379"><code>			iov[i].Base = (*byte)(unsafe.Pointer(&amp;_zero))</code></span>
+<span class="codeline" id="line-380"><code>		}</code></span>
+<span class="codeline" id="line-381"><code>	}</code></span>
+<span class="codeline" id="line-382"><code>	var rsa RawSockaddrAny</code></span>
+<span class="codeline" id="line-383"><code>	n, oobn, recvflags, err = recvmsgRaw(fd, iov, oob, flags, &amp;rsa)</code></span>
+<span class="codeline" id="line-384"><code>	if err == nil &amp;&amp; rsa.Addr.Family != AF_UNSPEC {</code></span>
+<span class="codeline" id="line-385"><code>		from, err = anyToSockaddr(fd, &amp;rsa)</code></span>
+<span class="codeline" id="line-386"><code>	}</code></span>
+<span class="codeline" id="line-387"><code>	return</code></span>
+<span class="codeline" id="line-388"><code>}</code></span>
+<span class="codeline" id="line-389"><code></code></span>
+<span class="codeline" id="line-390"><code>// Sendmsg sends a message on a socket to an address using the sendmsg system</code></span>
+<span class="codeline" id="line-391"><code>// call. This function is equivalent to SendmsgN, but does not return the</code></span>
+<span class="codeline" id="line-392"><code>// number of bytes actually sent.</code></span>
+<span class="codeline" id="line-393"><code>func Sendmsg(fd int, p, oob []byte, to Sockaddr, flags int) (err error) {</code></span>
+<span class="codeline" id="line-394"><code>	_, err = SendmsgN(fd, p, oob, to, flags)</code></span>
+<span class="codeline" id="line-395"><code>	return</code></span>
+<span class="codeline" id="line-396"><code>}</code></span>
+<span class="codeline" id="line-397"><code></code></span>
+<span class="codeline" id="line-398"><code>// SendmsgN sends a message on a socket to an address using the sendmsg system</code></span>
+<span class="codeline" id="line-399"><code>// call. p contains the non-control data to send, and oob contains the "out of</code></span>
+<span class="codeline" id="line-400"><code>// band" control data. The flags are passed to sendmsg. The number of</code></span>
+<span class="codeline" id="line-401"><code>// non-control bytes actually written to the socket is returned.</code></span>
+<span class="codeline" id="line-402"><code>//</code></span>
+<span class="codeline" id="line-403"><code>// Some socket types do not support sending control data without accompanying</code></span>
+<span class="codeline" id="line-404"><code>// non-control data. If p is empty, and oob contains control data, and the</code></span>
+<span class="codeline" id="line-405"><code>// underlying socket type is not SOCK_DGRAM, p will be treated as containing a</code></span>
+<span class="codeline" id="line-406"><code>// single '\0' and the return value will indicate zero bytes sent.</code></span>
+<span class="codeline" id="line-407"><code>//</code></span>
+<span class="codeline" id="line-408"><code>// The Go function Recvmsg, if called with an empty p and a non-empty oob,</code></span>
+<span class="codeline" id="line-409"><code>// will read and ignore this additional '\0'.  If the message is received by</code></span>
+<span class="codeline" id="line-410"><code>// code that does not use Recvmsg, or that does not use Go at all, that code</code></span>
+<span class="codeline" id="line-411"><code>// will need to be written to expect and ignore the additional '\0'.</code></span>
+<span class="codeline" id="line-412"><code>//</code></span>
+<span class="codeline" id="line-413"><code>// If you need to send non-empty oob with p actually empty, and if the</code></span>
+<span class="codeline" id="line-414"><code>// underlying socket type supports it, you can do so via a raw system call as</code></span>
+<span class="codeline" id="line-415"><code>// follows:</code></span>
+<span class="codeline" id="line-416"><code>//</code></span>
+<span class="codeline" id="line-417"><code>//	msg := &amp;unix.Msghdr{</code></span>
+<span class="codeline" id="line-418"><code>//	    Control: &amp;oob[0],</code></span>
+<span class="codeline" id="line-419"><code>//	}</code></span>
+<span class="codeline" id="line-420"><code>//	msg.SetControllen(len(oob))</code></span>
+<span class="codeline" id="line-421"><code>//	n, _, errno := unix.Syscall(unix.SYS_SENDMSG, uintptr(fd), uintptr(unsafe.Pointer(msg)), flags)</code></span>
+<span class="codeline" id="line-422"><code>func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) {</code></span>
+<span class="codeline" id="line-423"><code>	var iov [1]Iovec</code></span>
+<span class="codeline" id="line-424"><code>	if len(p) &gt; 0 {</code></span>
+<span class="codeline" id="line-425"><code>		iov[0].Base = &amp;p[0]</code></span>
+<span class="codeline" id="line-426"><code>		iov[0].SetLen(len(p))</code></span>
+<span class="codeline" id="line-427"><code>	}</code></span>
+<span class="codeline" id="line-428"><code>	var ptr unsafe.Pointer</code></span>
+<span class="codeline" id="line-429"><code>	var salen _Socklen</code></span>
+<span class="codeline" id="line-430"><code>	if to != nil {</code></span>
+<span class="codeline" id="line-431"><code>		ptr, salen, err = to.sockaddr()</code></span>
+<span class="codeline" id="line-432"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-433"><code>			return 0, err</code></span>
+<span class="codeline" id="line-434"><code>		}</code></span>
+<span class="codeline" id="line-435"><code>	}</code></span>
+<span class="codeline" id="line-436"><code>	return sendmsgN(fd, iov[:], oob, ptr, salen, flags)</code></span>
+<span class="codeline" id="line-437"><code>}</code></span>
+<span class="codeline" id="line-438"><code></code></span>
+<span class="codeline" id="line-439"><code>// SendmsgBuffers sends a message on a socket to an address using the sendmsg</code></span>
+<span class="codeline" id="line-440"><code>// system call. This function is equivalent to SendmsgN, but the non-control</code></span>
+<span class="codeline" id="line-441"><code>// data is gathered from buffers.</code></span>
+<span class="codeline" id="line-442"><code>func SendmsgBuffers(fd int, buffers [][]byte, oob []byte, to Sockaddr, flags int) (n int, err error) {</code></span>
+<span class="codeline" id="line-443"><code>	iov := make([]Iovec, len(buffers))</code></span>
+<span class="codeline" id="line-444"><code>	for i := range buffers {</code></span>
+<span class="codeline" id="line-445"><code>		if len(buffers[i]) &gt; 0 {</code></span>
+<span class="codeline" id="line-446"><code>			iov[i].Base = &amp;buffers[i][0]</code></span>
+<span class="codeline" id="line-447"><code>			iov[i].SetLen(len(buffers[i]))</code></span>
+<span class="codeline" id="line-448"><code>		} else {</code></span>
+<span class="codeline" id="line-449"><code>			iov[i].Base = (*byte)(unsafe.Pointer(&amp;_zero))</code></span>
+<span class="codeline" id="line-450"><code>		}</code></span>
+<span class="codeline" id="line-451"><code>	}</code></span>
+<span class="codeline" id="line-452"><code>	var ptr unsafe.Pointer</code></span>
+<span class="codeline" id="line-453"><code>	var salen _Socklen</code></span>
+<span class="codeline" id="line-454"><code>	if to != nil {</code></span>
+<span class="codeline" id="line-455"><code>		ptr, salen, err = to.sockaddr()</code></span>
+<span class="codeline" id="line-456"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-457"><code>			return 0, err</code></span>
+<span class="codeline" id="line-458"><code>		}</code></span>
+<span class="codeline" id="line-459"><code>	}</code></span>
+<span class="codeline" id="line-460"><code>	return sendmsgN(fd, iov, oob, ptr, salen, flags)</code></span>
+<span class="codeline" id="line-461"><code>}</code></span>
+<span class="codeline" id="line-462"><code></code></span>
+<span class="codeline" id="line-463"><code>func Send(s int, buf []byte, flags int) (err error) {</code></span>
+<span class="codeline" id="line-464"><code>	return sendto(s, buf, flags, nil, 0)</code></span>
+<span class="codeline" id="line-465"><code>}</code></span>
+<span class="codeline" id="line-466"><code></code></span>
+<span class="codeline" id="line-467"><code>func Sendto(fd int, p []byte, flags int, to Sockaddr) (err error) {</code></span>
+<span class="codeline" id="line-468"><code>	var ptr unsafe.Pointer</code></span>
+<span class="codeline" id="line-469"><code>	var salen _Socklen</code></span>
+<span class="codeline" id="line-470"><code>	if to != nil {</code></span>
+<span class="codeline" id="line-471"><code>		ptr, salen, err = to.sockaddr()</code></span>
+<span class="codeline" id="line-472"><code>		if err != nil {</code></span>
+<span class="codeline" id="line-473"><code>			return err</code></span>
+<span class="codeline" id="line-474"><code>		}</code></span>
+<span class="codeline" id="line-475"><code>	}</code></span>
+<span class="codeline" id="line-476"><code>	return sendto(fd, p, flags, ptr, salen)</code></span>
+<span class="codeline" id="line-477"><code>}</code></span>
+<span class="codeline" id="line-478"><code></code></span>
+<span class="codeline" id="line-479"><code>func SetsockoptByte(fd, level, opt int, value byte) (err error) {</code></span>
+<span class="codeline" id="line-480"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(&amp;value), 1)</code></span>
+<span class="codeline" id="line-481"><code>}</code></span>
+<span class="codeline" id="line-482"><code></code></span>
+<span class="codeline" id="line-483"><code>func SetsockoptInt(fd, level, opt int, value int) (err error) {</code></span>
+<span class="codeline" id="line-484"><code>	var n = int32(value)</code></span>
+<span class="codeline" id="line-485"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(&amp;n), 4)</code></span>
+<span class="codeline" id="line-486"><code>}</code></span>
+<span class="codeline" id="line-487"><code></code></span>
+<span class="codeline" id="line-488"><code>func SetsockoptInet4Addr(fd, level, opt int, value [4]byte) (err error) {</code></span>
+<span class="codeline" id="line-489"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(&amp;value[0]), 4)</code></span>
+<span class="codeline" id="line-490"><code>}</code></span>
+<span class="codeline" id="line-491"><code></code></span>
+<span class="codeline" id="line-492"><code>func SetsockoptIPMreq(fd, level, opt int, mreq *IPMreq) (err error) {</code></span>
+<span class="codeline" id="line-493"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(mreq), SizeofIPMreq)</code></span>
+<span class="codeline" id="line-494"><code>}</code></span>
+<span class="codeline" id="line-495"><code></code></span>
+<span class="codeline" id="line-496"><code>func SetsockoptIPv6Mreq(fd, level, opt int, mreq *IPv6Mreq) (err error) {</code></span>
+<span class="codeline" id="line-497"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(mreq), SizeofIPv6Mreq)</code></span>
+<span class="codeline" id="line-498"><code>}</code></span>
+<span class="codeline" id="line-499"><code></code></span>
+<span class="codeline" id="line-500"><code>func SetsockoptICMPv6Filter(fd, level, opt int, filter *ICMPv6Filter) error {</code></span>
+<span class="codeline" id="line-501"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(filter), SizeofICMPv6Filter)</code></span>
+<span class="codeline" id="line-502"><code>}</code></span>
+<span class="codeline" id="line-503"><code></code></span>
+<span class="codeline" id="line-504"><code>func SetsockoptLinger(fd, level, opt int, l *Linger) (err error) {</code></span>
+<span class="codeline" id="line-505"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(l), SizeofLinger)</code></span>
+<span class="codeline" id="line-506"><code>}</code></span>
+<span class="codeline" id="line-507"><code></code></span>
+<span class="codeline" id="line-508"><code>func SetsockoptString(fd, level, opt int, s string) (err error) {</code></span>
+<span class="codeline" id="line-509"><code>	var p unsafe.Pointer</code></span>
+<span class="codeline" id="line-510"><code>	if len(s) &gt; 0 {</code></span>
+<span class="codeline" id="line-511"><code>		p = unsafe.Pointer(&amp;[]byte(s)[0])</code></span>
+<span class="codeline" id="line-512"><code>	}</code></span>
+<span class="codeline" id="line-513"><code>	return setsockopt(fd, level, opt, p, uintptr(len(s)))</code></span>
+<span class="codeline" id="line-514"><code>}</code></span>
+<span class="codeline" id="line-515"><code></code></span>
+<span class="codeline" id="line-516"><code>func SetsockoptTimeval(fd, level, opt int, tv *Timeval) (err error) {</code></span>
+<span class="codeline" id="line-517"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(tv), unsafe.Sizeof(*tv))</code></span>
+<span class="codeline" id="line-518"><code>}</code></span>
+<span class="codeline" id="line-519"><code></code></span>
+<span class="codeline" id="line-520"><code>func SetsockoptUint64(fd, level, opt int, value uint64) (err error) {</code></span>
+<span class="codeline" id="line-521"><code>	return setsockopt(fd, level, opt, unsafe.Pointer(&amp;value), 8)</code></span>
+<span class="codeline" id="line-522"><code>}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>func Socket(domain, typ, proto int) (fd int, err error) {</code></span>
+<span class="codeline" id="line-525"><code>	if domain == AF_INET6 &amp;&amp; SocketDisableIPv6 {</code></span>
+<span class="codeline" id="line-526"><code>		return -1, EAFNOSUPPORT</code></span>
+<span class="codeline" id="line-527"><code>	}</code></span>
+<span class="codeline" id="line-528"><code>	fd, err = socket(domain, typ, proto)</code></span>
+<span class="codeline" id="line-529"><code>	return</code></span>
+<span class="codeline" id="line-530"><code>}</code></span>
+<span class="codeline" id="line-531"><code></code></span>
+<span class="codeline" id="line-532"><code>func Socketpair(domain, typ, proto int) (fd [2]int, err error) {</code></span>
+<span class="codeline" id="line-533"><code>	var fdx [2]int32</code></span>
+<span class="codeline" id="line-534"><code>	err = socketpair(domain, typ, proto, &amp;fdx)</code></span>
+<span class="codeline" id="line-535"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-536"><code>		fd[0] = int(fdx[0])</code></span>
+<span class="codeline" id="line-537"><code>		fd[1] = int(fdx[1])</code></span>
+<span class="codeline" id="line-538"><code>	}</code></span>
+<span class="codeline" id="line-539"><code>	return</code></span>
+<span class="codeline" id="line-540"><code>}</code></span>
+<span class="codeline" id="line-541"><code></code></span>
+<span class="codeline" id="line-542"><code>var ioSync int64</code></span>
+<span class="codeline" id="line-543"><code></code></span>
+<span class="codeline" id="line-544"><code>func CloseOnExec(fd int) { fcntl(fd, F_SETFD, FD_CLOEXEC) }</code></span>
+<span class="codeline" id="line-545"><code></code></span>
+<span class="codeline" id="line-546"><code>func SetNonblock(fd int, nonblocking bool) (err error) {</code></span>
+<span class="codeline" id="line-547"><code>	flag, err := fcntl(fd, F_GETFL, 0)</code></span>
+<span class="codeline" id="line-548"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-549"><code>		return err</code></span>
+<span class="codeline" id="line-550"><code>	}</code></span>
+<span class="codeline" id="line-551"><code>	if (flag&amp;O_NONBLOCK != 0) == nonblocking {</code></span>
+<span class="codeline" id="line-552"><code>		return nil</code></span>
+<span class="codeline" id="line-553"><code>	}</code></span>
+<span class="codeline" id="line-554"><code>	if nonblocking {</code></span>
+<span class="codeline" id="line-555"><code>		flag |= O_NONBLOCK</code></span>
+<span class="codeline" id="line-556"><code>	} else {</code></span>
+<span class="codeline" id="line-557"><code>		flag &amp;= ^O_NONBLOCK</code></span>
+<span class="codeline" id="line-558"><code>	}</code></span>
+<span class="codeline" id="line-559"><code>	_, err = fcntl(fd, F_SETFL, flag)</code></span>
+<span class="codeline" id="line-560"><code>	return err</code></span>
+<span class="codeline" id="line-561"><code>}</code></span>
+<span class="codeline" id="line-562"><code></code></span>
+<span class="codeline" id="line-563"><code>// Exec calls execve(2), which replaces the calling executable in the process</code></span>
+<span class="codeline" id="line-564"><code>// tree. argv0 should be the full path to an executable ("/bin/ls") and the</code></span>
+<span class="codeline" id="line-565"><code>// executable name should also be the first argument in argv (["ls", "-l"]).</code></span>
+<span class="codeline" id="line-566"><code>// envv are the environment variables that should be passed to the new</code></span>
+<span class="codeline" id="line-567"><code>// process (["USER=go", "PWD=/tmp"]).</code></span>
+<span class="codeline" id="line-568"><code>func Exec(argv0 string, argv []string, envv []string) error {</code></span>
+<span class="codeline" id="line-569"><code>	return syscall.Exec(argv0, argv, envv)</code></span>
+<span class="codeline" id="line-570"><code>}</code></span>
+<span class="codeline" id="line-571"><code></code></span>
+<span class="codeline" id="line-572"><code>// Lutimes sets the access and modification times tv on path. If path refers to</code></span>
+<span class="codeline" id="line-573"><code>// a symlink, it is not dereferenced and the timestamps are set on the symlink.</code></span>
+<span class="codeline" id="line-574"><code>// If tv is nil, the access and modification times are set to the current time.</code></span>
+<span class="codeline" id="line-575"><code>// Otherwise tv must contain exactly 2 elements, with access time as the first</code></span>
+<span class="codeline" id="line-576"><code>// element and modification time as the second element.</code></span>
+<span class="codeline" id="line-577"><code>func Lutimes(path string, tv []Timeval) error {</code></span>
+<span class="codeline" id="line-578"><code>	if tv == nil {</code></span>
+<span class="codeline" id="line-579"><code>		return UtimesNanoAt(AT_FDCWD, path, nil, AT_SYMLINK_NOFOLLOW)</code></span>
+<span class="codeline" id="line-580"><code>	}</code></span>
+<span class="codeline" id="line-581"><code>	if len(tv) != 2 {</code></span>
+<span class="codeline" id="line-582"><code>		return EINVAL</code></span>
+<span class="codeline" id="line-583"><code>	}</code></span>
+<span class="codeline" id="line-584"><code>	ts := []Timespec{</code></span>
+<span class="codeline" id="line-585"><code>		NsecToTimespec(TimevalToNsec(tv[0])),</code></span>
+<span class="codeline" id="line-586"><code>		NsecToTimespec(TimevalToNsec(tv[1])),</code></span>
+<span class="codeline" id="line-587"><code>	}</code></span>
+<span class="codeline" id="line-588"><code>	return UtimesNanoAt(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW)</code></span>
+<span class="codeline" id="line-589"><code>}</code></span>
+<span class="codeline" id="line-590"><code></code></span>
+<span class="codeline" id="line-591"><code>// emptyIovecs reports whether there are no bytes in the slice of Iovec.</code></span>
+<span class="codeline" id="line-592"><code>func emptyIovecs(iov []Iovec) bool {</code></span>
+<span class="codeline" id="line-593"><code>	for i := range iov {</code></span>
+<span class="codeline" id="line-594"><code>		if iov[i].Len &gt; 0 {</code></span>
+<span class="codeline" id="line-595"><code>			return false</code></span>
+<span class="codeline" id="line-596"><code>		}</code></span>
+<span class="codeline" id="line-597"><code>	}</code></span>
+<span class="codeline" id="line-598"><code>	return true</code></span>
+<span class="codeline" id="line-599"><code>}</code></span>
+<span class="codeline" id="line-600"><code></code></span>
+<span class="codeline" id="line-601"><code>// Setrlimit sets a resource limit.</code></span>
+<span class="codeline" id="line-602"><code>func Setrlimit(resource int, rlim *Rlimit) error {</code></span>
+<span class="codeline" id="line-603"><code>	// Just call the syscall version, because as of Go 1.21</code></span>
+<span class="codeline" id="line-604"><code>	// it will affect starting a new process.</code></span>
+<span class="codeline" id="line-605"><code>	return syscall.Setrlimit(resource, (*syscall.Rlimit)(rlim))</code></span>
+<span class="codeline" id="line-606"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>
