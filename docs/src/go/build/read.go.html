@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: read.go in package go/build</title>
+<link href="../../../css/dark-v0.6.8.css" rel="stylesheet">
+<script src="../../../jvs/golds-v0.6.8.js"></script>
+<body onload="onPageLoad()"><div>
+
+<pre id="header"><code><span class="title">Source File</span>
+	read.go
+
+<span class="title">Belonging Package</span>
+	<a href="../../../pkg/go/build.html">go/build</a>
+</code></pre>
+
+<pre class="line-numbers">
+<span class="codeline" id="line-1"><code>// Copyright 2012 The Go Authors. All rights reserved.</code></span>
+<span class="codeline" id="line-2"><code>// Use of this source code is governed by a BSD-style</code></span>
+<span class="codeline" id="line-3"><code>// license that can be found in the LICENSE file.</code></span>
+<span class="codeline" id="line-4"><code></code></span>
+<span class="codeline" id="line-5"><code>package build</code></span>
+<span class="codeline" id="line-6"><code></code></span>
+<span class="codeline" id="line-7"><code>import (</code></span>
+<span class="codeline" id="line-8"><code>	"bufio"</code></span>
+<span class="codeline" id="line-9"><code>	"bytes"</code></span>
+<span class="codeline" id="line-10"><code>	"errors"</code></span>
+<span class="codeline" id="line-11"><code>	"fmt"</code></span>
+<span class="codeline" id="line-12"><code>	"go/ast"</code></span>
+<span class="codeline" id="line-13"><code>	"go/parser"</code></span>
+<span class="codeline" id="line-14"><code>	"go/scanner"</code></span>
+<span class="codeline" id="line-15"><code>	"go/token"</code></span>
+<span class="codeline" id="line-16"><code>	"io"</code></span>
+<span class="codeline" id="line-17"><code>	"strconv"</code></span>
+<span class="codeline" id="line-18"><code>	"strings"</code></span>
+<span class="codeline" id="line-19"><code>	"unicode"</code></span>
+<span class="codeline" id="line-20"><code>	"unicode/utf8"</code></span>
+<span class="codeline" id="line-21"><code>)</code></span>
+<span class="codeline" id="line-22"><code></code></span>
+<span class="codeline" id="line-23"><code>type importReader struct {</code></span>
+<span class="codeline" id="line-24"><code>	b    *bufio.Reader</code></span>
+<span class="codeline" id="line-25"><code>	buf  []byte</code></span>
+<span class="codeline" id="line-26"><code>	peek byte</code></span>
+<span class="codeline" id="line-27"><code>	err  error</code></span>
+<span class="codeline" id="line-28"><code>	eof  bool</code></span>
+<span class="codeline" id="line-29"><code>	nerr int</code></span>
+<span class="codeline" id="line-30"><code>	pos  token.Position</code></span>
+<span class="codeline" id="line-31"><code>}</code></span>
+<span class="codeline" id="line-32"><code></code></span>
+<span class="codeline" id="line-33"><code>var bom = []byte{0xef, 0xbb, 0xbf}</code></span>
+<span class="codeline" id="line-34"><code></code></span>
+<span class="codeline" id="line-35"><code>func newImportReader(name string, r io.Reader) *importReader {</code></span>
+<span class="codeline" id="line-36"><code>	b := bufio.NewReader(r)</code></span>
+<span class="codeline" id="line-37"><code>	// Remove leading UTF-8 BOM.</code></span>
+<span class="codeline" id="line-38"><code>	// Per https://golang.org/ref/spec#Source_code_representation:</code></span>
+<span class="codeline" id="line-39"><code>	// a compiler may ignore a UTF-8-encoded byte order mark (U+FEFF)</code></span>
+<span class="codeline" id="line-40"><code>	// if it is the first Unicode code point in the source text.</code></span>
+<span class="codeline" id="line-41"><code>	if leadingBytes, err := b.Peek(3); err == nil &amp;&amp; bytes.Equal(leadingBytes, bom) {</code></span>
+<span class="codeline" id="line-42"><code>		b.Discard(3)</code></span>
+<span class="codeline" id="line-43"><code>	}</code></span>
+<span class="codeline" id="line-44"><code>	return &amp;importReader{</code></span>
+<span class="codeline" id="line-45"><code>		b: b,</code></span>
+<span class="codeline" id="line-46"><code>		pos: token.Position{</code></span>
+<span class="codeline" id="line-47"><code>			Filename: name,</code></span>
+<span class="codeline" id="line-48"><code>			Line:     1,</code></span>
+<span class="codeline" id="line-49"><code>			Column:   1,</code></span>
+<span class="codeline" id="line-50"><code>		},</code></span>
+<span class="codeline" id="line-51"><code>	}</code></span>
+<span class="codeline" id="line-52"><code>}</code></span>
+<span class="codeline" id="line-53"><code></code></span>
+<span class="codeline" id="line-54"><code>func isIdent(c byte) bool {</code></span>
+<span class="codeline" id="line-55"><code>	return 'A' &lt;= c &amp;&amp; c &lt;= 'Z' || 'a' &lt;= c &amp;&amp; c &lt;= 'z' || '0' &lt;= c &amp;&amp; c &lt;= '9' || c == '_' || c &gt;= utf8.RuneSelf</code></span>
+<span class="codeline" id="line-56"><code>}</code></span>
+<span class="codeline" id="line-57"><code></code></span>
+<span class="codeline" id="line-58"><code>var (</code></span>
+<span class="codeline" id="line-59"><code>	errSyntax = errors.New("syntax error")</code></span>
+<span class="codeline" id="line-60"><code>	errNUL    = errors.New("unexpected NUL in input")</code></span>
+<span class="codeline" id="line-61"><code>)</code></span>
+<span class="codeline" id="line-62"><code></code></span>
+<span class="codeline" id="line-63"><code>// syntaxError records a syntax error, but only if an I/O error has not already been recorded.</code></span>
+<span class="codeline" id="line-64"><code>func (r *importReader) syntaxError() {</code></span>
+<span class="codeline" id="line-65"><code>	if r.err == nil {</code></span>
+<span class="codeline" id="line-66"><code>		r.err = errSyntax</code></span>
+<span class="codeline" id="line-67"><code>	}</code></span>
+<span class="codeline" id="line-68"><code>}</code></span>
+<span class="codeline" id="line-69"><code></code></span>
+<span class="codeline" id="line-70"><code>// readByte reads the next byte from the input, saves it in buf, and returns it.</code></span>
+<span class="codeline" id="line-71"><code>// If an error occurs, readByte records the error in r.err and returns 0.</code></span>
+<span class="codeline" id="line-72"><code>func (r *importReader) readByte() byte {</code></span>
+<span class="codeline" id="line-73"><code>	c, err := r.b.ReadByte()</code></span>
+<span class="codeline" id="line-74"><code>	if err == nil {</code></span>
+<span class="codeline" id="line-75"><code>		r.buf = append(r.buf, c)</code></span>
+<span class="codeline" id="line-76"><code>		if c == 0 {</code></span>
+<span class="codeline" id="line-77"><code>			err = errNUL</code></span>
+<span class="codeline" id="line-78"><code>		}</code></span>
+<span class="codeline" id="line-79"><code>	}</code></span>
+<span class="codeline" id="line-80"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-81"><code>		if err == io.EOF {</code></span>
+<span class="codeline" id="line-82"><code>			r.eof = true</code></span>
+<span class="codeline" id="line-83"><code>		} else if r.err == nil {</code></span>
+<span class="codeline" id="line-84"><code>			r.err = err</code></span>
+<span class="codeline" id="line-85"><code>		}</code></span>
+<span class="codeline" id="line-86"><code>		c = 0</code></span>
+<span class="codeline" id="line-87"><code>	}</code></span>
+<span class="codeline" id="line-88"><code>	return c</code></span>
+<span class="codeline" id="line-89"><code>}</code></span>
+<span class="codeline" id="line-90"><code></code></span>
+<span class="codeline" id="line-91"><code>// readByteNoBuf is like readByte but doesn't buffer the byte.</code></span>
+<span class="codeline" id="line-92"><code>// It exhausts r.buf before reading from r.b.</code></span>
+<span class="codeline" id="line-93"><code>func (r *importReader) readByteNoBuf() byte {</code></span>
+<span class="codeline" id="line-94"><code>	var c byte</code></span>
+<span class="codeline" id="line-95"><code>	var err error</code></span>
+<span class="codeline" id="line-96"><code>	if len(r.buf) &gt; 0 {</code></span>
+<span class="codeline" id="line-97"><code>		c = r.buf[0]</code></span>
+<span class="codeline" id="line-98"><code>		r.buf = r.buf[1:]</code></span>
+<span class="codeline" id="line-99"><code>	} else {</code></span>
+<span class="codeline" id="line-100"><code>		c, err = r.b.ReadByte()</code></span>
+<span class="codeline" id="line-101"><code>		if err == nil &amp;&amp; c == 0 {</code></span>
+<span class="codeline" id="line-102"><code>			err = errNUL</code></span>
+<span class="codeline" id="line-103"><code>		}</code></span>
+<span class="codeline" id="line-104"><code>	}</code></span>
+<span class="codeline" id="line-105"><code></code></span>
+<span class="codeline" id="line-106"><code>	if err != nil {</code></span>
+<span class="codeline" id="line-107"><code>		if err == io.EOF {</code></span>
+<span class="codeline" id="line-108"><code>			r.eof = true</code></span>
+<span class="codeline" id="line-109"><code>		} else if r.err == nil {</code></span>
+<span class="codeline" id="line-110"><code>			r.err = err</code></span>
+<span class="codeline" id="line-111"><code>		}</code></span>
+<span class="codeline" id="line-112"><code>		return 0</code></span>
+<span class="codeline" id="line-113"><code>	}</code></span>
+<span class="codeline" id="line-114"><code>	r.pos.Offset++</code></span>
+<span class="codeline" id="line-115"><code>	if c == '\n' {</code></span>
+<span class="codeline" id="line-116"><code>		r.pos.Line++</code></span>
+<span class="codeline" id="line-117"><code>		r.pos.Column = 1</code></span>
+<span class="codeline" id="line-118"><code>	} else {</code></span>
+<span class="codeline" id="line-119"><code>		r.pos.Column++</code></span>
+<span class="codeline" id="line-120"><code>	}</code></span>
+<span class="codeline" id="line-121"><code>	return c</code></span>
+<span class="codeline" id="line-122"><code>}</code></span>
+<span class="codeline" id="line-123"><code></code></span>
+<span class="codeline" id="line-124"><code>// peekByte returns the next byte from the input reader but does not advance beyond it.</code></span>
+<span class="codeline" id="line-125"><code>// If skipSpace is set, peekByte skips leading spaces and comments.</code></span>
+<span class="codeline" id="line-126"><code>func (r *importReader) peekByte(skipSpace bool) byte {</code></span>
+<span class="codeline" id="line-127"><code>	if r.err != nil {</code></span>
+<span class="codeline" id="line-128"><code>		if r.nerr++; r.nerr &gt; 10000 {</code></span>
+<span class="codeline" id="line-129"><code>			panic("go/build: import reader looping")</code></span>
+<span class="codeline" id="line-130"><code>		}</code></span>
+<span class="codeline" id="line-131"><code>		return 0</code></span>
+<span class="codeline" id="line-132"><code>	}</code></span>
+<span class="codeline" id="line-133"><code></code></span>
+<span class="codeline" id="line-134"><code>	// Use r.peek as first input byte.</code></span>
+<span class="codeline" id="line-135"><code>	// Don't just return r.peek here: it might have been left by peekByte(false)</code></span>
+<span class="codeline" id="line-136"><code>	// and this might be peekByte(true).</code></span>
+<span class="codeline" id="line-137"><code>	c := r.peek</code></span>
+<span class="codeline" id="line-138"><code>	if c == 0 {</code></span>
+<span class="codeline" id="line-139"><code>		c = r.readByte()</code></span>
+<span class="codeline" id="line-140"><code>	}</code></span>
+<span class="codeline" id="line-141"><code>	for r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-142"><code>		if skipSpace {</code></span>
+<span class="codeline" id="line-143"><code>			// For the purposes of this reader, semicolons are never necessary to</code></span>
+<span class="codeline" id="line-144"><code>			// understand the input and are treated as spaces.</code></span>
+<span class="codeline" id="line-145"><code>			switch c {</code></span>
+<span class="codeline" id="line-146"><code>			case ' ', '\f', '\t', '\r', '\n', ';':</code></span>
+<span class="codeline" id="line-147"><code>				c = r.readByte()</code></span>
+<span class="codeline" id="line-148"><code>				continue</code></span>
+<span class="codeline" id="line-149"><code></code></span>
+<span class="codeline" id="line-150"><code>			case '/':</code></span>
+<span class="codeline" id="line-151"><code>				c = r.readByte()</code></span>
+<span class="codeline" id="line-152"><code>				if c == '/' {</code></span>
+<span class="codeline" id="line-153"><code>					for c != '\n' &amp;&amp; r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-154"><code>						c = r.readByte()</code></span>
+<span class="codeline" id="line-155"><code>					}</code></span>
+<span class="codeline" id="line-156"><code>				} else if c == '*' {</code></span>
+<span class="codeline" id="line-157"><code>					var c1 byte</code></span>
+<span class="codeline" id="line-158"><code>					for (c != '*' || c1 != '/') &amp;&amp; r.err == nil {</code></span>
+<span class="codeline" id="line-159"><code>						if r.eof {</code></span>
+<span class="codeline" id="line-160"><code>							r.syntaxError()</code></span>
+<span class="codeline" id="line-161"><code>						}</code></span>
+<span class="codeline" id="line-162"><code>						c, c1 = c1, r.readByte()</code></span>
+<span class="codeline" id="line-163"><code>					}</code></span>
+<span class="codeline" id="line-164"><code>				} else {</code></span>
+<span class="codeline" id="line-165"><code>					r.syntaxError()</code></span>
+<span class="codeline" id="line-166"><code>				}</code></span>
+<span class="codeline" id="line-167"><code>				c = r.readByte()</code></span>
+<span class="codeline" id="line-168"><code>				continue</code></span>
+<span class="codeline" id="line-169"><code>			}</code></span>
+<span class="codeline" id="line-170"><code>		}</code></span>
+<span class="codeline" id="line-171"><code>		break</code></span>
+<span class="codeline" id="line-172"><code>	}</code></span>
+<span class="codeline" id="line-173"><code>	r.peek = c</code></span>
+<span class="codeline" id="line-174"><code>	return r.peek</code></span>
+<span class="codeline" id="line-175"><code>}</code></span>
+<span class="codeline" id="line-176"><code></code></span>
+<span class="codeline" id="line-177"><code>// nextByte is like peekByte but advances beyond the returned byte.</code></span>
+<span class="codeline" id="line-178"><code>func (r *importReader) nextByte(skipSpace bool) byte {</code></span>
+<span class="codeline" id="line-179"><code>	c := r.peekByte(skipSpace)</code></span>
+<span class="codeline" id="line-180"><code>	r.peek = 0</code></span>
+<span class="codeline" id="line-181"><code>	return c</code></span>
+<span class="codeline" id="line-182"><code>}</code></span>
+<span class="codeline" id="line-183"><code></code></span>
+<span class="codeline" id="line-184"><code>var goEmbed = []byte("go:embed")</code></span>
+<span class="codeline" id="line-185"><code></code></span>
+<span class="codeline" id="line-186"><code>// findEmbed advances the input reader to the next //go:embed comment.</code></span>
+<span class="codeline" id="line-187"><code>// It reports whether it found a comment.</code></span>
+<span class="codeline" id="line-188"><code>// (Otherwise it found an error or EOF.)</code></span>
+<span class="codeline" id="line-189"><code>func (r *importReader) findEmbed(first bool) bool {</code></span>
+<span class="codeline" id="line-190"><code>	// The import block scan stopped after a non-space character,</code></span>
+<span class="codeline" id="line-191"><code>	// so the reader is not at the start of a line on the first call.</code></span>
+<span class="codeline" id="line-192"><code>	// After that, each //go:embed extraction leaves the reader</code></span>
+<span class="codeline" id="line-193"><code>	// at the end of a line.</code></span>
+<span class="codeline" id="line-194"><code>	startLine := !first</code></span>
+<span class="codeline" id="line-195"><code>	var c byte</code></span>
+<span class="codeline" id="line-196"><code>	for r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-197"><code>		c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-198"><code>	Reswitch:</code></span>
+<span class="codeline" id="line-199"><code>		switch c {</code></span>
+<span class="codeline" id="line-200"><code>		default:</code></span>
+<span class="codeline" id="line-201"><code>			startLine = false</code></span>
+<span class="codeline" id="line-202"><code></code></span>
+<span class="codeline" id="line-203"><code>		case '\n':</code></span>
+<span class="codeline" id="line-204"><code>			startLine = true</code></span>
+<span class="codeline" id="line-205"><code></code></span>
+<span class="codeline" id="line-206"><code>		case ' ', '\t':</code></span>
+<span class="codeline" id="line-207"><code>			// leave startLine alone</code></span>
+<span class="codeline" id="line-208"><code></code></span>
+<span class="codeline" id="line-209"><code>		case '"':</code></span>
+<span class="codeline" id="line-210"><code>			startLine = false</code></span>
+<span class="codeline" id="line-211"><code>			for r.err == nil {</code></span>
+<span class="codeline" id="line-212"><code>				if r.eof {</code></span>
+<span class="codeline" id="line-213"><code>					r.syntaxError()</code></span>
+<span class="codeline" id="line-214"><code>				}</code></span>
+<span class="codeline" id="line-215"><code>				c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-216"><code>				if c == '\\' {</code></span>
+<span class="codeline" id="line-217"><code>					r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-218"><code>					if r.err != nil {</code></span>
+<span class="codeline" id="line-219"><code>						r.syntaxError()</code></span>
+<span class="codeline" id="line-220"><code>						return false</code></span>
+<span class="codeline" id="line-221"><code>					}</code></span>
+<span class="codeline" id="line-222"><code>					continue</code></span>
+<span class="codeline" id="line-223"><code>				}</code></span>
+<span class="codeline" id="line-224"><code>				if c == '"' {</code></span>
+<span class="codeline" id="line-225"><code>					c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-226"><code>					goto Reswitch</code></span>
+<span class="codeline" id="line-227"><code>				}</code></span>
+<span class="codeline" id="line-228"><code>			}</code></span>
+<span class="codeline" id="line-229"><code>			goto Reswitch</code></span>
+<span class="codeline" id="line-230"><code></code></span>
+<span class="codeline" id="line-231"><code>		case '`':</code></span>
+<span class="codeline" id="line-232"><code>			startLine = false</code></span>
+<span class="codeline" id="line-233"><code>			for r.err == nil {</code></span>
+<span class="codeline" id="line-234"><code>				if r.eof {</code></span>
+<span class="codeline" id="line-235"><code>					r.syntaxError()</code></span>
+<span class="codeline" id="line-236"><code>				}</code></span>
+<span class="codeline" id="line-237"><code>				c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-238"><code>				if c == '`' {</code></span>
+<span class="codeline" id="line-239"><code>					c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-240"><code>					goto Reswitch</code></span>
+<span class="codeline" id="line-241"><code>				}</code></span>
+<span class="codeline" id="line-242"><code>			}</code></span>
+<span class="codeline" id="line-243"><code></code></span>
+<span class="codeline" id="line-244"><code>		case '\'':</code></span>
+<span class="codeline" id="line-245"><code>			startLine = false</code></span>
+<span class="codeline" id="line-246"><code>			for r.err == nil {</code></span>
+<span class="codeline" id="line-247"><code>				if r.eof {</code></span>
+<span class="codeline" id="line-248"><code>					r.syntaxError()</code></span>
+<span class="codeline" id="line-249"><code>				}</code></span>
+<span class="codeline" id="line-250"><code>				c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-251"><code>				if c == '\\' {</code></span>
+<span class="codeline" id="line-252"><code>					r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-253"><code>					if r.err != nil {</code></span>
+<span class="codeline" id="line-254"><code>						r.syntaxError()</code></span>
+<span class="codeline" id="line-255"><code>						return false</code></span>
+<span class="codeline" id="line-256"><code>					}</code></span>
+<span class="codeline" id="line-257"><code>					continue</code></span>
+<span class="codeline" id="line-258"><code>				}</code></span>
+<span class="codeline" id="line-259"><code>				if c == '\'' {</code></span>
+<span class="codeline" id="line-260"><code>					c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-261"><code>					goto Reswitch</code></span>
+<span class="codeline" id="line-262"><code>				}</code></span>
+<span class="codeline" id="line-263"><code>			}</code></span>
+<span class="codeline" id="line-264"><code></code></span>
+<span class="codeline" id="line-265"><code>		case '/':</code></span>
+<span class="codeline" id="line-266"><code>			c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-267"><code>			switch c {</code></span>
+<span class="codeline" id="line-268"><code>			default:</code></span>
+<span class="codeline" id="line-269"><code>				startLine = false</code></span>
+<span class="codeline" id="line-270"><code>				goto Reswitch</code></span>
+<span class="codeline" id="line-271"><code></code></span>
+<span class="codeline" id="line-272"><code>			case '*':</code></span>
+<span class="codeline" id="line-273"><code>				var c1 byte</code></span>
+<span class="codeline" id="line-274"><code>				for (c != '*' || c1 != '/') &amp;&amp; r.err == nil {</code></span>
+<span class="codeline" id="line-275"><code>					if r.eof {</code></span>
+<span class="codeline" id="line-276"><code>						r.syntaxError()</code></span>
+<span class="codeline" id="line-277"><code>					}</code></span>
+<span class="codeline" id="line-278"><code>					c, c1 = c1, r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-279"><code>				}</code></span>
+<span class="codeline" id="line-280"><code>				startLine = false</code></span>
+<span class="codeline" id="line-281"><code></code></span>
+<span class="codeline" id="line-282"><code>			case '/':</code></span>
+<span class="codeline" id="line-283"><code>				if startLine {</code></span>
+<span class="codeline" id="line-284"><code>					// Try to read this as a //go:embed comment.</code></span>
+<span class="codeline" id="line-285"><code>					for i := range goEmbed {</code></span>
+<span class="codeline" id="line-286"><code>						c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-287"><code>						if c != goEmbed[i] {</code></span>
+<span class="codeline" id="line-288"><code>							goto SkipSlashSlash</code></span>
+<span class="codeline" id="line-289"><code>						}</code></span>
+<span class="codeline" id="line-290"><code>					}</code></span>
+<span class="codeline" id="line-291"><code>					c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-292"><code>					if c == ' ' || c == '\t' {</code></span>
+<span class="codeline" id="line-293"><code>						// Found one!</code></span>
+<span class="codeline" id="line-294"><code>						return true</code></span>
+<span class="codeline" id="line-295"><code>					}</code></span>
+<span class="codeline" id="line-296"><code>				}</code></span>
+<span class="codeline" id="line-297"><code>			SkipSlashSlash:</code></span>
+<span class="codeline" id="line-298"><code>				for c != '\n' &amp;&amp; r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-299"><code>					c = r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-300"><code>				}</code></span>
+<span class="codeline" id="line-301"><code>				startLine = true</code></span>
+<span class="codeline" id="line-302"><code>			}</code></span>
+<span class="codeline" id="line-303"><code>		}</code></span>
+<span class="codeline" id="line-304"><code>	}</code></span>
+<span class="codeline" id="line-305"><code>	return false</code></span>
+<span class="codeline" id="line-306"><code>}</code></span>
+<span class="codeline" id="line-307"><code></code></span>
+<span class="codeline" id="line-308"><code>// readKeyword reads the given keyword from the input.</code></span>
+<span class="codeline" id="line-309"><code>// If the keyword is not present, readKeyword records a syntax error.</code></span>
+<span class="codeline" id="line-310"><code>func (r *importReader) readKeyword(kw string) {</code></span>
+<span class="codeline" id="line-311"><code>	r.peekByte(true)</code></span>
+<span class="codeline" id="line-312"><code>	for i := 0; i &lt; len(kw); i++ {</code></span>
+<span class="codeline" id="line-313"><code>		if r.nextByte(false) != kw[i] {</code></span>
+<span class="codeline" id="line-314"><code>			r.syntaxError()</code></span>
+<span class="codeline" id="line-315"><code>			return</code></span>
+<span class="codeline" id="line-316"><code>		}</code></span>
+<span class="codeline" id="line-317"><code>	}</code></span>
+<span class="codeline" id="line-318"><code>	if isIdent(r.peekByte(false)) {</code></span>
+<span class="codeline" id="line-319"><code>		r.syntaxError()</code></span>
+<span class="codeline" id="line-320"><code>	}</code></span>
+<span class="codeline" id="line-321"><code>}</code></span>
+<span class="codeline" id="line-322"><code></code></span>
+<span class="codeline" id="line-323"><code>// readIdent reads an identifier from the input.</code></span>
+<span class="codeline" id="line-324"><code>// If an identifier is not present, readIdent records a syntax error.</code></span>
+<span class="codeline" id="line-325"><code>func (r *importReader) readIdent() {</code></span>
+<span class="codeline" id="line-326"><code>	c := r.peekByte(true)</code></span>
+<span class="codeline" id="line-327"><code>	if !isIdent(c) {</code></span>
+<span class="codeline" id="line-328"><code>		r.syntaxError()</code></span>
+<span class="codeline" id="line-329"><code>		return</code></span>
+<span class="codeline" id="line-330"><code>	}</code></span>
+<span class="codeline" id="line-331"><code>	for isIdent(r.peekByte(false)) {</code></span>
+<span class="codeline" id="line-332"><code>		r.peek = 0</code></span>
+<span class="codeline" id="line-333"><code>	}</code></span>
+<span class="codeline" id="line-334"><code>}</code></span>
+<span class="codeline" id="line-335"><code></code></span>
+<span class="codeline" id="line-336"><code>// readString reads a quoted string literal from the input.</code></span>
+<span class="codeline" id="line-337"><code>// If an identifier is not present, readString records a syntax error.</code></span>
+<span class="codeline" id="line-338"><code>func (r *importReader) readString() {</code></span>
+<span class="codeline" id="line-339"><code>	switch r.nextByte(true) {</code></span>
+<span class="codeline" id="line-340"><code>	case '`':</code></span>
+<span class="codeline" id="line-341"><code>		for r.err == nil {</code></span>
+<span class="codeline" id="line-342"><code>			if r.nextByte(false) == '`' {</code></span>
+<span class="codeline" id="line-343"><code>				break</code></span>
+<span class="codeline" id="line-344"><code>			}</code></span>
+<span class="codeline" id="line-345"><code>			if r.eof {</code></span>
+<span class="codeline" id="line-346"><code>				r.syntaxError()</code></span>
+<span class="codeline" id="line-347"><code>			}</code></span>
+<span class="codeline" id="line-348"><code>		}</code></span>
+<span class="codeline" id="line-349"><code>	case '"':</code></span>
+<span class="codeline" id="line-350"><code>		for r.err == nil {</code></span>
+<span class="codeline" id="line-351"><code>			c := r.nextByte(false)</code></span>
+<span class="codeline" id="line-352"><code>			if c == '"' {</code></span>
+<span class="codeline" id="line-353"><code>				break</code></span>
+<span class="codeline" id="line-354"><code>			}</code></span>
+<span class="codeline" id="line-355"><code>			if r.eof || c == '\n' {</code></span>
+<span class="codeline" id="line-356"><code>				r.syntaxError()</code></span>
+<span class="codeline" id="line-357"><code>			}</code></span>
+<span class="codeline" id="line-358"><code>			if c == '\\' {</code></span>
+<span class="codeline" id="line-359"><code>				r.nextByte(false)</code></span>
+<span class="codeline" id="line-360"><code>			}</code></span>
+<span class="codeline" id="line-361"><code>		}</code></span>
+<span class="codeline" id="line-362"><code>	default:</code></span>
+<span class="codeline" id="line-363"><code>		r.syntaxError()</code></span>
+<span class="codeline" id="line-364"><code>	}</code></span>
+<span class="codeline" id="line-365"><code>}</code></span>
+<span class="codeline" id="line-366"><code></code></span>
+<span class="codeline" id="line-367"><code>// readImport reads an import clause - optional identifier followed by quoted string -</code></span>
+<span class="codeline" id="line-368"><code>// from the input.</code></span>
+<span class="codeline" id="line-369"><code>func (r *importReader) readImport() {</code></span>
+<span class="codeline" id="line-370"><code>	c := r.peekByte(true)</code></span>
+<span class="codeline" id="line-371"><code>	if c == '.' {</code></span>
+<span class="codeline" id="line-372"><code>		r.peek = 0</code></span>
+<span class="codeline" id="line-373"><code>	} else if isIdent(c) {</code></span>
+<span class="codeline" id="line-374"><code>		r.readIdent()</code></span>
+<span class="codeline" id="line-375"><code>	}</code></span>
+<span class="codeline" id="line-376"><code>	r.readString()</code></span>
+<span class="codeline" id="line-377"><code>}</code></span>
+<span class="codeline" id="line-378"><code></code></span>
+<span class="codeline" id="line-379"><code>// readComments is like io.ReadAll, except that it only reads the leading</code></span>
+<span class="codeline" id="line-380"><code>// block of comments in the file.</code></span>
+<span class="codeline" id="line-381"><code>func readComments(f io.Reader) ([]byte, error) {</code></span>
+<span class="codeline" id="line-382"><code>	r := newImportReader("", f)</code></span>
+<span class="codeline" id="line-383"><code>	r.peekByte(true)</code></span>
+<span class="codeline" id="line-384"><code>	if r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-385"><code>		// Didn't reach EOF, so must have found a non-space byte. Remove it.</code></span>
+<span class="codeline" id="line-386"><code>		r.buf = r.buf[:len(r.buf)-1]</code></span>
+<span class="codeline" id="line-387"><code>	}</code></span>
+<span class="codeline" id="line-388"><code>	return r.buf, r.err</code></span>
+<span class="codeline" id="line-389"><code>}</code></span>
+<span class="codeline" id="line-390"><code></code></span>
+<span class="codeline" id="line-391"><code>// readGoInfo expects a Go file as input and reads the file up to and including the import section.</code></span>
+<span class="codeline" id="line-392"><code>// It records what it learned in *info.</code></span>
+<span class="codeline" id="line-393"><code>// If info.fset is non-nil, readGoInfo parses the file and sets info.parsed, info.parseErr,</code></span>
+<span class="codeline" id="line-394"><code>// info.imports and info.embeds.</code></span>
+<span class="codeline" id="line-395"><code>//</code></span>
+<span class="codeline" id="line-396"><code>// It only returns an error if there are problems reading the file,</code></span>
+<span class="codeline" id="line-397"><code>// not for syntax errors in the file itself.</code></span>
+<span class="codeline" id="line-398"><code>func readGoInfo(f io.Reader, info *fileInfo) error {</code></span>
+<span class="codeline" id="line-399"><code>	r := newImportReader(info.name, f)</code></span>
+<span class="codeline" id="line-400"><code></code></span>
+<span class="codeline" id="line-401"><code>	r.readKeyword("package")</code></span>
+<span class="codeline" id="line-402"><code>	r.readIdent()</code></span>
+<span class="codeline" id="line-403"><code>	for r.peekByte(true) == 'i' {</code></span>
+<span class="codeline" id="line-404"><code>		r.readKeyword("import")</code></span>
+<span class="codeline" id="line-405"><code>		if r.peekByte(true) == '(' {</code></span>
+<span class="codeline" id="line-406"><code>			r.nextByte(false)</code></span>
+<span class="codeline" id="line-407"><code>			for r.peekByte(true) != ')' &amp;&amp; r.err == nil {</code></span>
+<span class="codeline" id="line-408"><code>				r.readImport()</code></span>
+<span class="codeline" id="line-409"><code>			}</code></span>
+<span class="codeline" id="line-410"><code>			r.nextByte(false)</code></span>
+<span class="codeline" id="line-411"><code>		} else {</code></span>
+<span class="codeline" id="line-412"><code>			r.readImport()</code></span>
+<span class="codeline" id="line-413"><code>		}</code></span>
+<span class="codeline" id="line-414"><code>	}</code></span>
+<span class="codeline" id="line-415"><code></code></span>
+<span class="codeline" id="line-416"><code>	info.header = r.buf</code></span>
+<span class="codeline" id="line-417"><code></code></span>
+<span class="codeline" id="line-418"><code>	// If we stopped successfully before EOF, we read a byte that told us we were done.</code></span>
+<span class="codeline" id="line-419"><code>	// Return all but that last byte, which would cause a syntax error if we let it through.</code></span>
+<span class="codeline" id="line-420"><code>	if r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-421"><code>		info.header = r.buf[:len(r.buf)-1]</code></span>
+<span class="codeline" id="line-422"><code>	}</code></span>
+<span class="codeline" id="line-423"><code></code></span>
+<span class="codeline" id="line-424"><code>	// If we stopped for a syntax error, consume the whole file so that</code></span>
+<span class="codeline" id="line-425"><code>	// we are sure we don't change the errors that go/parser returns.</code></span>
+<span class="codeline" id="line-426"><code>	if r.err == errSyntax {</code></span>
+<span class="codeline" id="line-427"><code>		r.err = nil</code></span>
+<span class="codeline" id="line-428"><code>		for r.err == nil &amp;&amp; !r.eof {</code></span>
+<span class="codeline" id="line-429"><code>			r.readByte()</code></span>
+<span class="codeline" id="line-430"><code>		}</code></span>
+<span class="codeline" id="line-431"><code>		info.header = r.buf</code></span>
+<span class="codeline" id="line-432"><code>	}</code></span>
+<span class="codeline" id="line-433"><code>	if r.err != nil {</code></span>
+<span class="codeline" id="line-434"><code>		return r.err</code></span>
+<span class="codeline" id="line-435"><code>	}</code></span>
+<span class="codeline" id="line-436"><code></code></span>
+<span class="codeline" id="line-437"><code>	if info.fset == nil {</code></span>
+<span class="codeline" id="line-438"><code>		return nil</code></span>
+<span class="codeline" id="line-439"><code>	}</code></span>
+<span class="codeline" id="line-440"><code></code></span>
+<span class="codeline" id="line-441"><code>	// Parse file header &amp; record imports.</code></span>
+<span class="codeline" id="line-442"><code>	info.parsed, info.parseErr = parser.ParseFile(info.fset, info.name, info.header, parser.ImportsOnly|parser.ParseComments)</code></span>
+<span class="codeline" id="line-443"><code>	if info.parseErr != nil {</code></span>
+<span class="codeline" id="line-444"><code>		return nil</code></span>
+<span class="codeline" id="line-445"><code>	}</code></span>
+<span class="codeline" id="line-446"><code></code></span>
+<span class="codeline" id="line-447"><code>	hasEmbed := false</code></span>
+<span class="codeline" id="line-448"><code>	for _, decl := range info.parsed.Decls {</code></span>
+<span class="codeline" id="line-449"><code>		d, ok := decl.(*ast.GenDecl)</code></span>
+<span class="codeline" id="line-450"><code>		if !ok {</code></span>
+<span class="codeline" id="line-451"><code>			continue</code></span>
+<span class="codeline" id="line-452"><code>		}</code></span>
+<span class="codeline" id="line-453"><code>		for _, dspec := range d.Specs {</code></span>
+<span class="codeline" id="line-454"><code>			spec, ok := dspec.(*ast.ImportSpec)</code></span>
+<span class="codeline" id="line-455"><code>			if !ok {</code></span>
+<span class="codeline" id="line-456"><code>				continue</code></span>
+<span class="codeline" id="line-457"><code>			}</code></span>
+<span class="codeline" id="line-458"><code>			quoted := spec.Path.Value</code></span>
+<span class="codeline" id="line-459"><code>			path, err := strconv.Unquote(quoted)</code></span>
+<span class="codeline" id="line-460"><code>			if err != nil {</code></span>
+<span class="codeline" id="line-461"><code>				return fmt.Errorf("parser returned invalid quoted string: &lt;%s&gt;", quoted)</code></span>
+<span class="codeline" id="line-462"><code>			}</code></span>
+<span class="codeline" id="line-463"><code>			if !isValidImport(path) {</code></span>
+<span class="codeline" id="line-464"><code>				// The parser used to return a parse error for invalid import paths, but</code></span>
+<span class="codeline" id="line-465"><code>				// no longer does, so check for and create the error here instead.</code></span>
+<span class="codeline" id="line-466"><code>				info.parseErr = scanner.Error{Pos: info.fset.Position(spec.Pos()), Msg: "invalid import path: " + path}</code></span>
+<span class="codeline" id="line-467"><code>				info.imports = nil</code></span>
+<span class="codeline" id="line-468"><code>				return nil</code></span>
+<span class="codeline" id="line-469"><code>			}</code></span>
+<span class="codeline" id="line-470"><code>			if path == "embed" {</code></span>
+<span class="codeline" id="line-471"><code>				hasEmbed = true</code></span>
+<span class="codeline" id="line-472"><code>			}</code></span>
+<span class="codeline" id="line-473"><code></code></span>
+<span class="codeline" id="line-474"><code>			doc := spec.Doc</code></span>
+<span class="codeline" id="line-475"><code>			if doc == nil &amp;&amp; len(d.Specs) == 1 {</code></span>
+<span class="codeline" id="line-476"><code>				doc = d.Doc</code></span>
+<span class="codeline" id="line-477"><code>			}</code></span>
+<span class="codeline" id="line-478"><code>			info.imports = append(info.imports, fileImport{path, spec.Pos(), doc})</code></span>
+<span class="codeline" id="line-479"><code>		}</code></span>
+<span class="codeline" id="line-480"><code>	}</code></span>
+<span class="codeline" id="line-481"><code></code></span>
+<span class="codeline" id="line-482"><code>	// Extract directives.</code></span>
+<span class="codeline" id="line-483"><code>	for _, group := range info.parsed.Comments {</code></span>
+<span class="codeline" id="line-484"><code>		if group.Pos() &gt;= info.parsed.Package {</code></span>
+<span class="codeline" id="line-485"><code>			break</code></span>
+<span class="codeline" id="line-486"><code>		}</code></span>
+<span class="codeline" id="line-487"><code>		for _, c := range group.List {</code></span>
+<span class="codeline" id="line-488"><code>			if strings.HasPrefix(c.Text, "//go:") {</code></span>
+<span class="codeline" id="line-489"><code>				info.directives = append(info.directives, Directive{c.Text, info.fset.Position(c.Slash)})</code></span>
+<span class="codeline" id="line-490"><code>			}</code></span>
+<span class="codeline" id="line-491"><code>		}</code></span>
+<span class="codeline" id="line-492"><code>	}</code></span>
+<span class="codeline" id="line-493"><code></code></span>
+<span class="codeline" id="line-494"><code>	// If the file imports "embed",</code></span>
+<span class="codeline" id="line-495"><code>	// we have to look for //go:embed comments</code></span>
+<span class="codeline" id="line-496"><code>	// in the remainder of the file.</code></span>
+<span class="codeline" id="line-497"><code>	// The compiler will enforce the mapping of comments to</code></span>
+<span class="codeline" id="line-498"><code>	// declared variables. We just need to know the patterns.</code></span>
+<span class="codeline" id="line-499"><code>	// If there were //go:embed comments earlier in the file</code></span>
+<span class="codeline" id="line-500"><code>	// (near the package statement or imports), the compiler</code></span>
+<span class="codeline" id="line-501"><code>	// will reject them. They can be (and have already been) ignored.</code></span>
+<span class="codeline" id="line-502"><code>	if hasEmbed {</code></span>
+<span class="codeline" id="line-503"><code>		var line []byte</code></span>
+<span class="codeline" id="line-504"><code>		for first := true; r.findEmbed(first); first = false {</code></span>
+<span class="codeline" id="line-505"><code>			line = line[:0]</code></span>
+<span class="codeline" id="line-506"><code>			pos := r.pos</code></span>
+<span class="codeline" id="line-507"><code>			for {</code></span>
+<span class="codeline" id="line-508"><code>				c := r.readByteNoBuf()</code></span>
+<span class="codeline" id="line-509"><code>				if c == '\n' || r.err != nil || r.eof {</code></span>
+<span class="codeline" id="line-510"><code>					break</code></span>
+<span class="codeline" id="line-511"><code>				}</code></span>
+<span class="codeline" id="line-512"><code>				line = append(line, c)</code></span>
+<span class="codeline" id="line-513"><code>			}</code></span>
+<span class="codeline" id="line-514"><code>			// Add args if line is well-formed.</code></span>
+<span class="codeline" id="line-515"><code>			// Ignore badly-formed lines - the compiler will report them when it finds them,</code></span>
+<span class="codeline" id="line-516"><code>			// and we can pretend they are not there to help go list succeed with what it knows.</code></span>
+<span class="codeline" id="line-517"><code>			embs, err := parseGoEmbed(string(line), pos)</code></span>
+<span class="codeline" id="line-518"><code>			if err == nil {</code></span>
+<span class="codeline" id="line-519"><code>				info.embeds = append(info.embeds, embs...)</code></span>
+<span class="codeline" id="line-520"><code>			}</code></span>
+<span class="codeline" id="line-521"><code>		}</code></span>
+<span class="codeline" id="line-522"><code>	}</code></span>
+<span class="codeline" id="line-523"><code></code></span>
+<span class="codeline" id="line-524"><code>	return nil</code></span>
+<span class="codeline" id="line-525"><code>}</code></span>
+<span class="codeline" id="line-526"><code></code></span>
+<span class="codeline" id="line-527"><code>// isValidImport checks if the import is a valid import using the more strict</code></span>
+<span class="codeline" id="line-528"><code>// checks allowed by the implementation restriction in https://go.dev/ref/spec#Import_declarations.</code></span>
+<span class="codeline" id="line-529"><code>// It was ported from the function of the same name that was removed from the</code></span>
+<span class="codeline" id="line-530"><code>// parser in CL 424855, when the parser stopped doing these checks.</code></span>
+<span class="codeline" id="line-531"><code>func isValidImport(s string) bool {</code></span>
+<span class="codeline" id="line-532"><code>	const illegalChars = `!"#$%&amp;'()*,:;&lt;=&gt;?[\]^{|}` + "`\uFFFD"</code></span>
+<span class="codeline" id="line-533"><code>	for _, r := range s {</code></span>
+<span class="codeline" id="line-534"><code>		if !unicode.IsGraphic(r) || unicode.IsSpace(r) || strings.ContainsRune(illegalChars, r) {</code></span>
+<span class="codeline" id="line-535"><code>			return false</code></span>
+<span class="codeline" id="line-536"><code>		}</code></span>
+<span class="codeline" id="line-537"><code>	}</code></span>
+<span class="codeline" id="line-538"><code>	return s != ""</code></span>
+<span class="codeline" id="line-539"><code>}</code></span>
+<span class="codeline" id="line-540"><code></code></span>
+<span class="codeline" id="line-541"><code>// parseGoEmbed parses the text following "//go:embed" to extract the glob patterns.</code></span>
+<span class="codeline" id="line-542"><code>// It accepts unquoted space-separated patterns as well as double-quoted and back-quoted Go strings.</code></span>
+<span class="codeline" id="line-543"><code>// This is based on a similar function in cmd/compile/internal/gc/noder.go;</code></span>
+<span class="codeline" id="line-544"><code>// this version calculates position information as well.</code></span>
+<span class="codeline" id="line-545"><code>func parseGoEmbed(args string, pos token.Position) ([]fileEmbed, error) {</code></span>
+<span class="codeline" id="line-546"><code>	trimBytes := func(n int) {</code></span>
+<span class="codeline" id="line-547"><code>		pos.Offset += n</code></span>
+<span class="codeline" id="line-548"><code>		pos.Column += utf8.RuneCountInString(args[:n])</code></span>
+<span class="codeline" id="line-549"><code>		args = args[n:]</code></span>
+<span class="codeline" id="line-550"><code>	}</code></span>
+<span class="codeline" id="line-551"><code>	trimSpace := func() {</code></span>
+<span class="codeline" id="line-552"><code>		trim := strings.TrimLeftFunc(args, unicode.IsSpace)</code></span>
+<span class="codeline" id="line-553"><code>		trimBytes(len(args) - len(trim))</code></span>
+<span class="codeline" id="line-554"><code>	}</code></span>
+<span class="codeline" id="line-555"><code></code></span>
+<span class="codeline" id="line-556"><code>	var list []fileEmbed</code></span>
+<span class="codeline" id="line-557"><code>	for trimSpace(); args != ""; trimSpace() {</code></span>
+<span class="codeline" id="line-558"><code>		var path string</code></span>
+<span class="codeline" id="line-559"><code>		pathPos := pos</code></span>
+<span class="codeline" id="line-560"><code>	Switch:</code></span>
+<span class="codeline" id="line-561"><code>		switch args[0] {</code></span>
+<span class="codeline" id="line-562"><code>		default:</code></span>
+<span class="codeline" id="line-563"><code>			i := len(args)</code></span>
+<span class="codeline" id="line-564"><code>			for j, c := range args {</code></span>
+<span class="codeline" id="line-565"><code>				if unicode.IsSpace(c) {</code></span>
+<span class="codeline" id="line-566"><code>					i = j</code></span>
+<span class="codeline" id="line-567"><code>					break</code></span>
+<span class="codeline" id="line-568"><code>				}</code></span>
+<span class="codeline" id="line-569"><code>			}</code></span>
+<span class="codeline" id="line-570"><code>			path = args[:i]</code></span>
+<span class="codeline" id="line-571"><code>			trimBytes(i)</code></span>
+<span class="codeline" id="line-572"><code></code></span>
+<span class="codeline" id="line-573"><code>		case '`':</code></span>
+<span class="codeline" id="line-574"><code>			var ok bool</code></span>
+<span class="codeline" id="line-575"><code>			path, _, ok = strings.Cut(args[1:], "`")</code></span>
+<span class="codeline" id="line-576"><code>			if !ok {</code></span>
+<span class="codeline" id="line-577"><code>				return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args)</code></span>
+<span class="codeline" id="line-578"><code>			}</code></span>
+<span class="codeline" id="line-579"><code>			trimBytes(1 + len(path) + 1)</code></span>
+<span class="codeline" id="line-580"><code></code></span>
+<span class="codeline" id="line-581"><code>		case '"':</code></span>
+<span class="codeline" id="line-582"><code>			i := 1</code></span>
+<span class="codeline" id="line-583"><code>			for ; i &lt; len(args); i++ {</code></span>
+<span class="codeline" id="line-584"><code>				if args[i] == '\\' {</code></span>
+<span class="codeline" id="line-585"><code>					i++</code></span>
+<span class="codeline" id="line-586"><code>					continue</code></span>
+<span class="codeline" id="line-587"><code>				}</code></span>
+<span class="codeline" id="line-588"><code>				if args[i] == '"' {</code></span>
+<span class="codeline" id="line-589"><code>					q, err := strconv.Unquote(args[:i+1])</code></span>
+<span class="codeline" id="line-590"><code>					if err != nil {</code></span>
+<span class="codeline" id="line-591"><code>						return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args[:i+1])</code></span>
+<span class="codeline" id="line-592"><code>					}</code></span>
+<span class="codeline" id="line-593"><code>					path = q</code></span>
+<span class="codeline" id="line-594"><code>					trimBytes(i + 1)</code></span>
+<span class="codeline" id="line-595"><code>					break Switch</code></span>
+<span class="codeline" id="line-596"><code>				}</code></span>
+<span class="codeline" id="line-597"><code>			}</code></span>
+<span class="codeline" id="line-598"><code>			if i &gt;= len(args) {</code></span>
+<span class="codeline" id="line-599"><code>				return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args)</code></span>
+<span class="codeline" id="line-600"><code>			}</code></span>
+<span class="codeline" id="line-601"><code>		}</code></span>
+<span class="codeline" id="line-602"><code></code></span>
+<span class="codeline" id="line-603"><code>		if args != "" {</code></span>
+<span class="codeline" id="line-604"><code>			r, _ := utf8.DecodeRuneInString(args)</code></span>
+<span class="codeline" id="line-605"><code>			if !unicode.IsSpace(r) {</code></span>
+<span class="codeline" id="line-606"><code>				return nil, fmt.Errorf("invalid quoted string in //go:embed: %s", args)</code></span>
+<span class="codeline" id="line-607"><code>			}</code></span>
+<span class="codeline" id="line-608"><code>		}</code></span>
+<span class="codeline" id="line-609"><code>		list = append(list, fileEmbed{path, pathPos})</code></span>
+<span class="codeline" id="line-610"><code>	}</code></span>
+<span class="codeline" id="line-611"><code>	return list, nil</code></span>
+<span class="codeline" id="line-612"><code>}</code></span>
+</pre><pre id="footer">
+<table><tr><td><img src="../../../png/go101-twitter.png"></td>
+<td>The pages are generated with <a href="https://go101.org/apps-and-libs/golds.html"><b>Golds</b></a> <i>v0.6.8</i>. (GOOS=linux GOARCH=amd64)
+<b>Golds</b> is a <a href="https://go101.org">Go 101</a> project developed by <a href="https://tapirgames.com">Tapir Liu</a>.
+PR and bug reports are welcome and can be submitted to <a href="https://github.com/go101/golds">the issue list</a>.
+Please follow <a href="https://twitter.com/go100and1">@Go100and1</a> (reachable from the left QR code) to get the latest news of <b>Golds</b>.</td></tr></table></pre>
