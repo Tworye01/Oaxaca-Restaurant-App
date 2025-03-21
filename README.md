@@ -1,8 +1,10 @@
 # Oaxaca
+Restaurant website for Customers and Staff 
+Team Project Module, Oaxaca
 
-Team Project Module, Oaxaca!
+A group of 7 people did the Team Project, mostly worked on the Websockets, Database functionality and frontend side of the project.
 
-Commit history has been wiped.
+Commit history has been wiped and forked. 
 
 ## Managment System
 
